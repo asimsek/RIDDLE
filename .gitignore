@@ -1,0 +1,13 @@
+.venv/
+external/lacathode/
+.cache/
+data/
+results/
+figures/
+nrp_jobs/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.DS_Store

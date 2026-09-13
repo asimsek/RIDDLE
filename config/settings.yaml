@@ -1,0 +1,52 @@
+schema: 1
+inputs:
+  features: [m1, delta_m, tau21_j1, tau21_j2]
+  deltaR_features: [deltaR]
+  mass_column: mjj
+  label_column: label
+riddle:
+  runs: 20
+  epochs: 300
+  fractions: [learned]
+  initialization: background
+  flow:
+    layers: 6
+    hidden_features: 64
+    num_blocks: 2
+    use_residual_blocks: false
+    use_batch_norm: true
+    dropout_probability: 0.2
+    activation: leaky_relu
+    random_mask: true
+    num_bins: 8
+    tails: linear
+    tail_bound: 8
+    min_bin_width: 0.000001
+    min_bin_height: 0.000001
+    min_derivative: 0.000001
+  training:
+    batch_size: 256
+    validation_batch_size: 1280
+    learning_rate: 0.0003
+    weight_decay: 0.01
+    gradient_clip_norm: 1
+    selected_checkpoints: 10
+background:
+  configuration:
+    ModelType: MAF
+    Transform: Affine
+    num_inputs: 4
+    num_cond_inputs: 1
+    num_blocks: 15
+    num_hidden: 128
+    activation_function: relu
+    pre_exp_tanh: false
+    batch_norm: true
+    batch_norm_momentum: 1
+    optimizer:
+      name: Adam
+      lr: 0.0001
+      weight_decay: 0.000001
+  epochs: 100
+  batch_size: 256
+  reference_samples: 267000

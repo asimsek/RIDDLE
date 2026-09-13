@@ -1,0 +1,28 @@
+schema_version: riddle.datasets.v1
+
+input_schemas:
+  mass_unit: GeV
+  canonical: [mjj, m1, delta_m, tau21_j1, tau21_j2]
+  raw_jets: [pxj1, pyj1, pzj1, mj1, tau1j1, tau2j1, pxj2, pyj2, pzj2, mj2, tau1j2, tau2j2]
+  optional: [label, event_weight]
+
+datasets:
+  lhco:
+    format: hdf5
+    enforce_expected_counts: true
+    defaults:
+      label: 0
+      event_weight: 1.0
+    files:
+      - uri: https://zenodo.org/api/records/6466204/files/events_anomalydetection_v2.features.h5/content
+        filename: events_anomalydetection_v2.features.h5
+        purpose: primary
+        checksum:
+          algorithm: md5
+          value: 271cf5e71fc756b2a8d2b32730689bdb
+      - uri: https://zenodo.org/api/records/5759087/files/events_anomalydetection_qcd_extra_inneronly_features.h5/content
+        filename: events_anomalydetection_qcd_extra_inneronly_features.h5
+        purpose: sic_background
+        checksum:
+          algorithm: md5
+          value: c3e2d0cbecaccf21dbc774dae0dcae68

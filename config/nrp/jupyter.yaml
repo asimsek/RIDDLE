@@ -1,0 +1,71 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: riddle-jupyter
+spec:
+  priorityClassName: owner-no-preempt
+  restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/arch: amd64
+  securityContext:
+    fsGroup: 100
+    fsGroupChangePolicy: OnRootMismatch
+  initContainers:
+    - name: initialize-shared-storage
+      image: gitlab-registry.nrp-nautilus.io/nrp/scientific-images/python
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          set -e
+          mkdir -p /shared/work/RIDDLE
+          chown 1000:100 /shared/work/RIDDLE
+          chmod 2775 /shared/work/RIDDLE
+      securityContext:
+        runAsUser: 0
+        runAsGroup: 0
+      volumeMounts:
+        - name: shared
+          mountPath: /shared
+  containers:
+    - name: jupyter
+      image: gitlab-registry.nrp-nautilus.io/nrp/scientific-images/python
+      securityContext:
+        runAsUser: 0
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          set -e
+          exec start-notebook.py \
+            --ServerApp.ip=0.0.0.0 --ServerApp.port=8888 \
+            --ServerApp.port_retries=0 --ServerApp.open_browser=False \
+            --ServerApp.root_dir=/shared --allow-root
+      env:
+        - name: GRANT_SUDO
+          value: "yes"
+        - name: XDG_CACHE_HOME
+          value: /shared/work/RIDDLE/.cache/jupyter
+        - name: MPLCONFIGDIR
+          value: /shared/work/RIDDLE/.cache/jupyter/matplotlib
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: PYTHONDONTWRITEBYTECODE
+          value: "1"
+      resources:
+        requests:
+          cpu: "16"
+          memory: 32Gi
+        limits:
+          cpu: "16"
+          memory: 32Gi
+      volumeMounts:
+        - name: shared
+          mountPath: /shared
+        - name: home
+          mountPath: /home/jovyan
+  volumes:
+    - name: shared
+      persistentVolumeClaim:
+        claimName: riddle-shared
+    - name: home
+      emptyDir:
+        sizeLimit: 5Gi
