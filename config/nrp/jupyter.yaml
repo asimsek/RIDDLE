@@ -12,7 +12,8 @@ spec:
     fsGroupChangePolicy: OnRootMismatch
   initContainers:
     - name: initialize-shared-storage
-      image: gitlab-registry.nrp-nautilus.io/nrp/scientific-images/python
+      image: ghcr.io/asimsek/riddle-runtime@sha256:ee19759acf2da9ac8316aaf18e03c279a4114b16b3be6edffceb9a4bd982eae6
+      imagePullPolicy: IfNotPresent
       command: ["/bin/bash", "-c"]
       args:
         - |
@@ -28,7 +29,8 @@ spec:
           mountPath: /shared
   containers:
     - name: jupyter
-      image: gitlab-registry.nrp-nautilus.io/nrp/scientific-images/python
+      image: ghcr.io/asimsek/riddle-runtime@sha256:ee19759acf2da9ac8316aaf18e03c279a4114b16b3be6edffceb9a4bd982eae6
+      imagePullPolicy: IfNotPresent
       securityContext:
         runAsUser: 0
       command: ["/bin/bash", "-c"]
@@ -49,6 +51,8 @@ spec:
         - name: PYTHONUNBUFFERED
           value: "1"
         - name: PYTHONDONTWRITEBYTECODE
+          value: "1"
+        - name: PYTHONNOUSERSITE
           value: "1"
       resources:
         requests:

@@ -6,7 +6,9 @@
 
 > [!IMPORTANT]
 > For NRP, follow [README_NRP.md](README_NRP.md) for setup, data preparation, batch submission, and plotting.<br>
-> The instructions below apply to local machines and other computing environments.
+> The instructions below apply to local machines and other computing environments.<br><br>
+> NRP uses the pre-built `ghcr.io/asimsek/riddle-runtime:v1` image, pinned by digest, for Jupyter and GPU jobs.<br> 
+> No environment creation or package installation is needed on NRP.
 
 ```bash
 python3 -m venv .venv
@@ -84,4 +86,4 @@ Use the corresponding `shifted` locations for the shifted control.
 python plot.py --results results --output plots --methods lacathode riddle --verbose 1
 ```
 
-Request either method alone with `--methods lacathode` or `--methods riddle`. 
+Request either method alone with `--methods lacathode` or `--methods riddle`.

@@ -10,14 +10,25 @@ import yaml
 from riddle.cli import METHODS, SCENARIOS, seeds, positive
 from riddle.storage import atomic_write
 
+ROOT = Path(__file__).resolve().parent
+PYTHON = "/opt/conda/bin/python"
+
+
+def setup_runtime():
+    spec = yaml.safe_load((ROOT / "config/nrp/jupyter.yaml").read_text())["spec"]
+    image = next(c["image"] for c in spec["containers"] if c["name"] == "jupyter")
+    return image, spec.get("imagePullSecrets", [])
+
 
 def job(args):
-    if not args.image or not re.fullmatch(r"[^\s@]+/[^\s@]+@sha256:[0-9a-f]{64}", args.image):
+    default_image, default_secrets = setup_runtime()
+    image = args.image or default_image
+    if not re.fullmatch(r"[^\s@]+/[^\s@]+@sha256:[0-9a-f]{64}", image):
         raise ValueError("Provide an immutable registry/image@sha256:<64 hex digits> reference")
     if not re.fullmatch("[a-z0-9]([-a-z0-9]*[a-z0-9])?", args.name) or len(args.name) > 63:
         raise ValueError("Use a Kubernetes-compatible job name of at most 63 characters")
     command = [
-        "python",
+        PYTHON,
         "run.py",
         "run",
         "--methods",
@@ -52,14 +63,13 @@ def job(args):
         [
             "set -Eeuo pipefail",
             "cd /shared/work/RIDDLE",
-            "source .venv/bin/activate",
-            "python scripts/nrp_runtime.py",
+            f"{PYTHON} scripts/nrp_runtime.py --require-cuda",
             "nvidia-smi",
             "exec " + shlex.join(command),
         ]
     )
     resource = {"cpu": "16", "memory": "64Gi", "nvidia.com/a100": 1}
-    return {
+    result = {
         "apiVersion": "batch/v1",
         "kind": "Job",
         "metadata": {"name": args.name},
@@ -81,7 +91,8 @@ def job(args):
                     "containers": [
                         {
                             "name": "campaign",
-                            "image": args.image,
+                            "image": image,
+                            "imagePullPolicy": "IfNotPresent",
                             "command": ["/bin/bash", "-lc"],
                             "args": [script],
                             "env": [
@@ -89,6 +100,7 @@ def job(args):
                                 for k, v in {
                                     "PYTHONUNBUFFERED": "1",
                                     "PYTHONDONTWRITEBYTECODE": "1",
+                                    "PYTHONNOUSERSITE": "1",
                                     "MPLCONFIGDIR": f"/shared/work/RIDDLE/.cache/{args.name}/matplotlib",
                                     "XDG_CACHE_HOME": f"/shared/work/RIDDLE/.cache/{args.name}",
                                 }.items()
@@ -106,6 +118,15 @@ def job(args):
             },
         },
     }
+    secrets = [dict(item) for item in default_secrets]
+    for name in getattr(args, "image_pull_secret", None) or []:
+        if not re.fullmatch(r"[a-z0-9]([-a-z0-9.]*[a-z0-9])?", name) or len(name) > 253:
+            raise ValueError("Use a Kubernetes-compatible image-pull secret name")
+        if {"name": name} not in secrets:
+            secrets.append({"name": name})
+    if secrets:
+        result["spec"]["template"]["spec"]["imagePullSecrets"] = secrets
+    return result
 
 
 def main(argv=None):
@@ -122,8 +143,9 @@ def main(argv=None):
     p.add_argument("--workers", type=positive, default=2)
     p.add_argument("--io-workers", type=positive, default=4)
     p.add_argument(
-        "--image", required=True, help="Use the same immutable image digest as the environment setup pod"
+        "--image", help="Override the pinned runtime image from config/nrp/jupyter.yaml"
     )
+    p.add_argument("--image-pull-secret", action="append", help="Existing namespace secret for a private image")
     p.add_argument("--output", type=Path)
     args = p.parse_args(argv)
     try:

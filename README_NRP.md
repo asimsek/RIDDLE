@@ -29,10 +29,18 @@ kubectl describe pvc riddle-shared -n cua-asimsek
 Confirm creation succeeded and the claim is `Bound`, uses `ReadWriteMany`, and has storage class `rook-cephfs`.<br>
 If `riddle-shared` already exists, stop and inspect it before proceeding; these instructions do not delete or reuse previous storage automatically.
 
-Then start the setup pod:
+### JupterHub Setup (on your local terminal)
+
+Download the pod definition:
 
 ```bash
-kubectl apply -n cua-asimsek -f https://raw.githubusercontent.com/asimsek/RIDDLE/main/config/nrp/jupyter.yaml
+curl -fSL https://raw.githubusercontent.com/asimsek/RIDDLE/main/config/nrp/jupyter.yaml -o riddle-jupyter.yaml
+```
+
+Then start Jupyter:
+
+```bash
+kubectl apply -n cua-asimsek -f riddle-jupyter.yaml
 kubectl get pod riddle-jupyter -n cua-asimsek -o wide
 kubectl logs -n cua-asimsek riddle-jupyter -c jupyter
 ```
@@ -53,12 +61,11 @@ It may stay running while they use the same storage.
 kubectl delete pod riddle-jupyter -n cua-asimsek --grace-period=0 --force --wait=false
 ```
 
-**!!! CAUTION!!! To kill the process/port-forward:**
+**!!! CAUTION!!! To stop your port-forward:**
 
 ```bash
-kill "$(cat "$HOME/qlacathode-port-forward.pid")"
+kill "$(cat "$HOME/riddle-port-forward.pid")"
 ```
-
 
 
 ## Jupyter terminal: pull the RIDDLE framework
@@ -80,15 +87,11 @@ cd /shared/work/RIDDLE
 git pull --ff-only origin main
 ```
 
-## Jupyter terminal: shared environment, source and data
+## Jupyter terminal: verify the runtime, source and data
 
 ```bash
 cd /shared/work/RIDDLE
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements.txt
-python -c 'import torch; print(torch.__version__, torch.version.cuda); assert torch.version.cuda is not None'
-python scripts/nrp_runtime.py --freeze
+python scripts/nrp_runtime.py
 
 git clone --no-checkout https://github.com/HEPML-AnomalyDetection/CATHODE.git external/lacathode
 git -C external/lacathode checkout --detach 8ead8cd6671b93fc385d8f440c06b8fa870b0be5
@@ -100,32 +103,27 @@ python run.py prepare --dataset lhco --catalog config/datasets.yaml --output dat
 ## Local terminal: two independent A100 jobs
 
 Each block submits one seed-42 job requesting **one A100, 16 CPUs and 64 GiB RAM**.<br>
-Together they use two separate GPU allocations, not a two-GPU request. They may run concurrently and write to separate method directories. 
+Together they use two separate GPU allocations, not a two-GPU request. They may run concurrently and write to separate method directories.
 
-These examples use `signal_injection` inputs; replace the scenario with `background_only`, or list both scenarios for sequential runs within each job.
+**These examples use `signal_injection` inputs; replace the scenario with `background_only`, or list both scenarios for sequential runs within each job.**
 
-**RIDDLE, using the YAML settings:**
+**RIDDLE:**
 
 ```bash
-riddle_image=$(kubectl get pod riddle-jupyter -n cua-asimsek \
-  -o jsonpath='{.status.containerStatuses[?(@.name=="jupyter")].imageID}')
-riddle_image="${riddle_image#docker-pullable://}"
 kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
-  /shared/work/RIDDLE/.venv/bin/python /shared/work/RIDDLE/nrp.py \
+  python /shared/work/RIDDLE/nrp.py \
   --name riddle-seed42 --methods riddle --scenarios signal_injection \
-  --seeds 42 --config config/settings.yaml --workers 2 --io-workers 4 --image "$riddle_image" | \
+  --seeds 42 --config config/settings.yaml --workers 2 --io-workers 4 | \
   kubectl apply -n cua-asimsek -f -
 ```
 
 **LaCathode:**
 
 ```bash
-riddle_image=$(kubectl get pod riddle-jupyter -n cua-asimsek -o jsonpath='{.status.containerStatuses[?(@.name=="jupyter")].imageID}')
-riddle_image="${riddle_image#docker-pullable://}"
 kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
-  /shared/work/RIDDLE/.venv/bin/python /shared/work/RIDDLE/nrp.py \
+  python /shared/work/RIDDLE/nrp.py \
   --name lacathode-seed42 --methods lacathode --scenarios signal_injection \
-  --seeds 42 --workers 1 --io-workers 4 --image "$riddle_image" | \
+  --seeds 42 --workers 1 --io-workers 4 | \
   kubectl apply -n cua-asimsek -f -
 ```
 
@@ -153,7 +151,6 @@ kubectl logs -n cua-asimsek -f job/riddle-seed42 -c campaign
 
 ```bash
 cd /shared/work/RIDDLE
-source .venv/bin/activate
 python scripts/nrp_runtime.py
 python plot.py --results results --output plots --methods lacathode riddle --verbose 1
 ```
