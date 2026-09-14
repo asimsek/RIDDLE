@@ -21,7 +21,6 @@ test = ["pytest>=7.4,<9"]
 include = ["riddle*", "external", "external.lacathode_utils*"]
 
 [tool.setuptools.package-data]
-"riddle" = ["extraction.json"]
 "external.lacathode_utils" = ["source_hashes.json"]
 
 [tool.setuptools.data-files]
