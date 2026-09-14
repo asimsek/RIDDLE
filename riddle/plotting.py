@@ -143,8 +143,12 @@ def render_bundle(bundle, target, args):
             f.render_scores,
             f.render_efficiency,
             f.render_mass,
+            f.render_mass_scan,
             f.render_features,
         ):
+            if renderer is f.render_mass_scan:
+                renderer(bundle, target)  # This renderer reports its own 70-cut progress.
+                continue
             with ProgressStage(renderer.__name__, renderer.__name__.replace("render_", "Plot ")):
                 renderer(bundle, target, args) if renderer in (
                     f.render_roc,
@@ -561,6 +565,16 @@ def main(argv=None):
                         "schema": 1,
                         "uncertainty": audit,
                         "cuts": "Validation-SR background thresholds; frozen cuts evaluated on independent physical test rows",
+                        "mass_cut_scan": {
+                            "thresholds": list(f.SCORE_CUTS),
+                            "comparison": "strict score > threshold",
+                            "score_coordinate": "LaCathode classifier score; sigmoid of RIDDLE log density ratio (not a signal probability)",
+                            "scope": "full physical test mass range",
+                            "retention_denominator": "all physical test events of the corresponding class, before cuts and mapping rejection",
+                            "panels_per_page": 6,
+                            "individual_directory": "04_mass_cuts/individual_cuts",
+                            "histograms": "unweighted event counts, identical mass bins, no smoothing; B + S is the sum of background and signal counts",
+                        },
                         "mass_summary": "BG-Only: test-SR quantiles, 300 equal-occupancy full-range bins, normalized-shape Poisson chi2",
                         "uncertainty_scope": "SIC/mass bands: 16/50/84 percentiles across independent seeds; not internal fits",
                         "warnings": [w for b in bundles for w in b["warnings"]],

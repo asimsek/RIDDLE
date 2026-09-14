@@ -159,7 +159,7 @@ Both require `--resume` and can be combined.
 ### RIDDLE:
 
 ```bash
-kubectl get jobs,pods -n cua-asimsek
+kubectl get jobs,pods -n cua-asimsek -o wide
 kubectl get pods -n cua-asimsek -l job-name=riddle-seed42 -o wide
 kubectl get pods -n cua-asimsek -l job-name=riddle-bg-seed42 -o wide
 ```
@@ -181,7 +181,7 @@ kubectl delete job riddle-bg-seed42 -n cua-asimsek --ignore-not-found --wait=tru
 ### LaCathode:
 
 ```bash
-kubectl get jobs,pods -n cua-asimsek
+kubectl get jobs,pods -n cua-asimsek -o wide
 kubectl get pods -n cua-asimsek -l job-name=lacathode-seed42 -o wide
 kubectl get pods -n cua-asimsek -l job-name=lacathode-bg-seed42 -o wide
 ```

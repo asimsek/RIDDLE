@@ -5,6 +5,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.collections import LineCollection, PathCollection, PolyCollection
 from matplotlib.colors import LogNorm
 from matplotlib.lines import Line2D
@@ -22,6 +23,7 @@ POPULATIONS = {
 }
 VIEWS = {"comparison": tuple(METHODS), "LaCathode": ("raw",), "RIDDLE": ("residual",)}
 BUDGETS = (("loose", 0.1), ("medium", 0.05), ("tight", 0.01), ("extra_tight", 0.004))
+SCORE_CUTS = tuple(value / 100 for value in range(30, 100))
 MASS_TARGETS = (0.20, 0.15, 0.10, 0.075, 0.05, 0.025, 0.01, 0.005, 0.004)
 EFFICIENCIES = np.arange(0.01, 0.21, 0.01)[::-1]
 GRID = np.logspace(-4, 0, 500)
@@ -269,7 +271,7 @@ def signal_retention_label(key, passed, total):
     return f"{METHODS[key][0]} (S: {fraction})"
 
 
-def population_legend(fig, columns, title=None):
+def population_legend(fig, columns, title=None, *, ax=None):
     rows = 1 + max(len(entries) for _, entries in columns)
     handles, labels = [], []
     for heading, entries in columns:
@@ -278,7 +280,7 @@ def population_legend(fig, columns, title=None):
         for handle, label in entries:
             handles.append(handle if handle is not None else Line2D([], [], linestyle="none"))
             labels.append(label)
-    if len(columns) == 3:
+    if len(columns) == 3 and ax is None:
         fig.set_figwidth(7.6)
     legend(
         fig,
@@ -288,6 +290,7 @@ def population_legend(fig, columns, title=None):
         title=title,
         fontsize=9.5,
         headers=[name for name, _ in columns],
+        ax=ax,
     )
 
 
@@ -784,6 +787,119 @@ def render_mass(bundle, output):
                     ratios.append(values)
                 finish_ratio(fig, lower, edges, ratios)
                 save(fig, output / view / "03_mass_sculpting" / f"background_mass_{kind}_{name}")
+
+
+def mass_scan_histograms(sample, keys, cuts=SCORE_CUTS):
+    """Histogram strict cuts in each method's displayed 0--1 score coordinate.
+
+    RIDDLE stores log density ratios, so invert the display sigmoid before
+    selecting events. Neither scores nor thresholds are fitted on test labels.
+    Retentions use all physical test events, including rejected mapping rows.
+    """
+    from scipy.special import logit
+
+    mass, labels = sample["mass"], sample["labels"]
+    edges = np.linspace(min(1.0, float(mass.min())), max(9.0, float(mass.max())), 81)
+    nominal = {y: np.histogram(mass[labels == y], edges)[0] for y in (0, 1)}
+    records = []
+    for cut in cuts:
+        if not np.isfinite(cut) or not 0 < cut < 1:
+            raise ValueError("Mass-scan score thresholds must be strictly between zero and one")
+        histograms = {}
+        for key in keys:
+            # Match the stored array precision so events exactly at a cut fail.
+            threshold = logit(cut) if key == "residual" else cut
+            threshold = np.asarray(threshold, dtype=sample[key + "_scores"].dtype)
+            keep = selected(sample, key, threshold)
+            histograms[key] = {
+                y: np.histogram(mass[keep & (labels == y)], edges)[0] for y in (0, 1)
+            }
+        records.append((cut, histograms))
+    return edges, nominal, records
+
+
+def draw_mass_scan(fig, ax, edges, nominal, histograms, keys, cut):
+    """Draw the same counts and legend in the individual and six-panel exports."""
+    keys = tuple(key for key in POPULATIONS if key in keys)
+    ax.set(xlabel=r"$m_{jj}$ [TeV]", ylabel="Events / bin")
+    ax.minorticks_on()
+    columns = []
+    for key in (None, *keys):
+        counts = nominal if key is None else histograms[key]
+        heading = "No cut" if key is None else METHODS[key][0]
+        total_style = (".65", "-") if key is None else (".22", "-" if key == "raw" else "-.")
+        total = step(
+            ax,
+            counts[0] + counts[1],
+            edges,
+            color=total_style[0],
+            ls=total_style[1],
+            lw=2.1,
+        )
+        entries = [(total, "B + S")]
+        for y in (0, 1):
+            color, ls = (
+                (("#9CBACB", "-") if y == 0 else ("#BDA8B4", "--"))
+                if key is None
+                else POPULATIONS[key][y]
+            )
+            handle = step(ax, counts[y], edges, color=color, ls=ls, lw=1.35)
+            entries.append((handle, retention_label(y, counts[y].sum(), nominal[y].sum())))
+        columns.append((heading, entries))
+    decorate_mass(ax, edges)
+    count_scale(ax, max(1, float(np.max(nominal[0] + nominal[1]))) * 1.3)
+    population_legend(fig, columns, f"Full mass range | Score > {cut:.2f}", ax=ax)
+
+
+def render_mass_scan(bundle, output):
+    """Save all 70 fixed-score cuts individually and six per multipage PDF."""
+    from .storage import atomic_write
+    from .worker_progress import ProgressStage
+
+    sample = bundle["samples"].get("test")
+    if sample is None or not len(sample["mass"]):
+        return
+    edges, nominal, records = mass_scan_histograms(sample, tuple(METHODS))
+    for view, keys in VIEWS.items():
+        destination = output / view / "04_mass_cuts"
+        individual = destination / "individual_cuts"
+
+        def write_scan(temporary):
+            metadata = {
+                "Title": "Mass cut scan",
+                "Subject": "Fixed displayed-score thresholds from 0.30 to 0.99",
+            }
+            with PdfPages(temporary, metadata=metadata) as pdf:
+                with ProgressStage(
+                    "mass_scan_" + view, "Plot mass cut scan: " + view, len(records), "cut"
+                ) as progress:
+                    for first in range(0, len(records), 6):
+                        page, axes = plt.subplots(3, 2, figsize=(16, 17.2))
+                        page.subplots_adjust(
+                            left=0.075, right=0.985, bottom=0.055, top=0.985,
+                            wspace=0.22, hspace=0.25,
+                        )
+                        try:
+                            chunk = records[first : first + 6]
+                            for ax, (cut, histograms) in zip(axes.flat, chunk):
+                                draw_mass_scan(page, ax, edges, nominal, histograms, keys, cut)
+                                fig, single, _ = canvas("Events / bin", r"$m_{jj}$ [TeV]")
+                                if len(keys) == 2:
+                                    fig.set_figwidth(7.6)
+                                try:
+                                    draw_mass_scan(fig, single, edges, nominal, histograms, keys, cut)
+                                    save(fig, individual / ("mass_score_" + f"{cut:.2f}".replace(".", "p")))
+                                finally:
+                                    plt.close(fig)
+                            for ax in list(axes.flat)[len(chunk) :]:
+                                ax.set_axis_off()
+                            place_legend(page)
+                            pdf.savefig(page)
+                            progress.update(first + len(chunk))
+                        finally:
+                            plt.close(page)
+
+        atomic_write(destination / "mass_cut_scan.pdf", write_scan)
 
 
 def render_features(bundle, output):
