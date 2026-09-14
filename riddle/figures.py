@@ -27,6 +27,10 @@ SCORE_CUTS = tuple(value / 100 for value in range(30, 100))
 MASS_TARGETS = (0.20, 0.15, 0.10, 0.075, 0.05, 0.025, 0.01, 0.005, 0.004)
 EFFICIENCIES = np.arange(0.01, 0.21, 0.01)[::-1]
 GRID = np.logspace(-4, 0, 500)
+SUMMARY_AXES = {
+    "sic": dict(xscale="log", xlim=(1e-4, 1), yscale="linear", ylim=(0, 17)),
+    "mass_flatness": dict(xscale="linear", xlim=(0.20, 0.01), yscale="log", ylim=(0.5, 350)),
+}
 SCENARIOS = ("signal_injection", "background_only")
 SCENARIO_LABELS = {"signal_injection": "Signal-Injected", "background_only": "BG-Only"}
 STYLE = {
@@ -368,6 +372,8 @@ def place_axis_legend(fig, ax, spec):
                 fig.canvas.draw()
                 if not overlaps_data(ax, item.get_window_extent(fig.canvas.get_renderer())):
                     return
+        if getattr(ax, "_publication_fixed_ylim", False):
+            break
         transform = ax.yaxis.get_transform()
         low, high = transform.transform(ax.get_ylim())
         ax.set_ylim(*transform.inverted().transform([low, high + 0.3 * (high - low)]))
@@ -1162,6 +1168,11 @@ def central68(values):
     summary = np.full((3, values.shape[1]), np.nan)
     summary[:, supported] = np.percentile(values[:, supported], [16, 50, 84], axis=0)
     return summary
+
+
+def summary_axes(ax, metric):
+    ax.set(**SUMMARY_AXES[metric])
+    ax._publication_fixed_ylim = True
 
 
 def draw_band(ax, x, values, label, color, linestyle, *, band=True):

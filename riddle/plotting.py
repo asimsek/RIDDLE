@@ -404,6 +404,21 @@ def read_metadata(root, report, name):
     return json.loads(verify_plot_input(root, report, name).read_text())
 
 
+def method_band(ax, x, values, key, scenario, metric, seeds):
+    name, color, ls = STYLES[key]
+    summary = f.draw_band(ax, x, values, name, color, ls)
+    summary.update(uncertainty_source="independent_training_runs", seeds=seeds)
+    if not summary["band_drawn"]:
+        colored_status(
+            f"{name} | {f.SCENARIO_LABELS[scenario]} | {metric}: "
+            "uncertainty band unavailable with only one independent run; "
+            "include additional training seeds (ten for the paper comparison). "
+            "Internal fits and checkpoints are not independent full runs.",
+            kind="WARNING",
+        )
+    return summary
+
+
 def summary_figures(bundles, output, args):
     audit = {}
     for scenario in f.SCENARIOS:
@@ -414,6 +429,7 @@ def summary_figures(bundles, output, args):
         any_curve = False
         for key in STYLES:
             values = []
+            seeds = []
             for bundle in cohort:
                 labels, scores = bundle["curves"]["signal_region"]
                 if key not in scores or len(np.unique(labels)) != 2:
@@ -430,13 +446,16 @@ def summary_figures(bundles, output, args):
                         fill_value=np.nan,
                     )(f.GRID)
                 )
+                seeds.append(bundle["report"]["seed"])
             if values:
-                name, color, ls = STYLES[key]
-                audit[scenario + "/" + name + "/sic"] = f.draw_band(ax, f.GRID, values, name, color, ls)
+                name = STYLES[key][0]
+                audit[scenario + "/" + name + "/sic"] = method_band(
+                    ax, f.GRID, values, key, scenario, "SIC", seeds
+                )
                 any_curve = True
         if any_curve:
             ax.plot(f.GRID, np.sqrt(f.GRID), color=".5", ls=":", label="Random")
-            ax.set(xscale="log", xlim=(1e-4, 1), ylim=(0, None))
+            f.summary_axes(ax, "sic")
             f.legend(fig, title=f.SCENARIO_LABELS[scenario])
             f.save(fig, output / scenario / "signal_region_sic")
         else:
@@ -447,6 +466,7 @@ def summary_figures(bundles, output, args):
         found = False
         for key in STYLES:
             curves = []
+            seeds = []
             for bundle in cohort:
                 sample = bundle["samples"]["test"]
                 if key + "_scores" not in sample:
@@ -471,19 +491,22 @@ def summary_figures(bundles, output, args):
                         for e in f.EFFICIENCIES
                     ]
                 )
+                seeds.append(bundle["report"]["seed"])
             if curves:
-                name, color, ls = STYLES[key]
-                audit[scenario + "/" + name + "/mass_flatness"] = f.draw_band(
-                    ax, f.EFFICIENCIES, curves, name, color, ls
+                name = STYLES[key][0]
+                audit[scenario + "/" + name + "/mass_flatness"] = method_band(
+                    ax, f.EFFICIENCIES, curves, key, scenario, "mass flatness", seeds
                 )
                 found = True
         if found:
             sample = cohort[0]["samples"]["test"]
             mass = sample["mass"][sample["labels"] == 0]
-            audit[scenario + "/random/mass_flatness"] = f.draw_band(
+            random_summary = f.draw_band(
                 ax, f.EFFICIENCIES, random_reference(mass), "Random", ".5", ":"
             )
-            ax.set(xlim=(0.205, 0), ylim=(0, None))
+            random_summary["uncertainty_source"] = "random_selection_trials"
+            audit[scenario + "/random/mass_flatness"] = random_summary
+            f.summary_axes(ax, "mass_flatness")
             f.legend(fig, title="BG-Only")
             f.save(fig, output / scenario / "mass_flatness_vs_selection")
         else:
@@ -586,6 +609,7 @@ def main(argv=None):
                         },
                         "mass_summary": "BG-Only: test-SR quantiles, 300 equal-occupancy full-range bins, normalized-shape Poisson chi2",
                         "uncertainty_scope": "SIC/mass bands: 16/50/84 percentiles across independent seeds; not internal fits",
+                        "summary_axes": f.SUMMARY_AXES,
                         "warnings": [w for b in bundles for w in b["warnings"]],
                     }
                 ),

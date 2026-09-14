@@ -207,7 +207,7 @@ kubectl delete job lacathode-bg-seed42 -n cua-asimsek --ignore-not-found --wait=
 ```bash
 cd /shared/work/RIDDLE
 python scripts/nrp_runtime.py
-python plot.py --results results --output plots --methods lacathode riddle --verbose 1
+python plot.py --results results --output plots --methods lacathode riddle --verbose 1 --overwrite
 ```
 
 Request either method alone with `--methods lacathode` or `--methods riddle`.<br>
