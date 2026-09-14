@@ -5,6 +5,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+from .resume import add_resume_options, resume_policy
 
 ROOT = Path(__file__).resolve().parents[1]
 METHODS = ("lacathode", "riddle")
@@ -70,12 +71,13 @@ def parser():
         "--epochs", type=positive, help="Override YAML RIDDLE epochs; LaCathode remains fixed at 100"
     )
     run.add_argument("--fractions", nargs="+", help="Override YAML mixture-fraction configurations")
-    run.add_argument("--resume", action="store_true")
+    add_resume_options(run)
     run.add_argument("--verbose", type=int, choices=[0, 1, 2], default=1)
     return p
 
 
 def run_campaign(args):
+    resume_policy(args)
     from .storage import locked
     from .worker_progress import monitor_worker
     from .data import validate
@@ -153,6 +155,11 @@ def run_campaign(args):
 def main(argv=None):
     p = parser()
     args = p.parse_args(argv)
+    if args.command == "run":
+        try:
+            resume_policy(args)
+        except ValueError as error:
+            p.error(str(error))
     from .progress import set_verbosity, progress_session, colored_status
     from .worker_progress import local_progress
 

@@ -15,6 +15,7 @@ from .epoch_hook import install_epoch_recovery
 from .acceleration import install_validation_counts, install_tensor_batches, execution_report
 from .worker_progress import ProgressStage, emit_progress
 from .source import verify, COMMIT
+from .resume import resume_policy
 
 
 def device_masks(module):
@@ -59,7 +60,7 @@ def run(args, contract):
 
     torch.load = trusted_load
     root = args.output / "training"
-    recovery = EpochRecovery(root, contract, args.resume)
+    recovery = EpochRecovery(root, contract, args.resume, **resume_policy(args))
     run_ANODE_training.train_ANODE = install_epoch_recovery(
         ANODE_training_utils, "train_ANODE", "flow", recovery
     )

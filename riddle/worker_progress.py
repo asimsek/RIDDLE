@@ -213,9 +213,14 @@ class WorkerDisplay:
                 )
             )
             self.completed = initial
-            self.activity.report_every = event.get("report_every")
             if self.activity.bar is not None:
                 self.activity.bar.set_description_str(f"  {self.phase_label}", refresh=False)
+        # Epoch completions are the durable log records; heartbeats must not
+        # repeat their counters or recalculate an ETA mid-epoch.
+        if self.activity.unit == "epoch":
+            self.activity.report_every = 1
+        elif "report_every" in event:
+            self.activity.report_every = event["report_every"]
         if "file_bytes" in raw_metrics and self._file_bytes != raw_metrics["file_bytes"]:
             self._file_bytes = raw_metrics["file_bytes"]
             self.last_advance = time.monotonic()
@@ -235,19 +240,21 @@ class WorkerDisplay:
             if completed == self.activity.total and (not self.finished):
                 self.finish()
         if not self.finished and (
-            new_phase or (detail_changed and self.activity.unit != "epoch" and (previous == self.completed))
+            previous == self.completed
+            and (new_phase or (detail_changed and self.activity.unit != "epoch"))
         ):
             colored_status(self.snapshot(), kind="WORK", label=self.label, level=1)
 
     def finish(self):
         self.finished = True
         elapsed = _duration(time.monotonic() - self.started)
-        colored_status(
-            f"{self.phase_label}: {self.completed}/{self.activity.total} {self.activity.unit}; elapsed={elapsed}",
-            kind="WORK",
-            label=self.label,
-            level=1,
-        )
+        if self.activity.unit != "epoch" or self.completed == self.activity.initial:
+            colored_status(
+                f"{self.phase_label}: {self.completed}/{self.activity.total} {self.activity.unit}; elapsed={elapsed}",
+                kind="WORK",
+                label=self.label,
+                level=1,
+            )
         self.stack.close()
 
     def snapshot(self):
@@ -288,6 +295,8 @@ class WorkerDisplay:
         if now - self.last_refresh >= 1:
             self.activity.refresh(**self.metrics)
             self.last_refresh = now
+        if self.activity.unit == "epoch":
+            return
         if now - self.last_heartbeat >= self.heartbeat_seconds:
             if self.activity.bar is None or verbosity() >= 2:
                 colored_status(self.snapshot(), kind="WORK", label=self.label, level=1)

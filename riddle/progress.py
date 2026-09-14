@@ -140,7 +140,11 @@ class ActivityProgress:
 
     def announce_finish(self, *, success: bool, level: int | None = None, show_count: bool = True) -> None:
         elapsed = time.monotonic() - self._started
-        count = f" at {self._completed}/{self.total} {self.unit}" if show_count else ""
+        count = (
+            f" at {self._completed}/{self.total} {self.unit}"
+            if show_count and (self.unit != "epoch" or not success)
+            else ""
+        )
         colored_status(
             f"{('Finished' if success else 'Failed')} {self.label}{count}; elapsed={_duration(elapsed)}",
             kind="PASS" if success else "ERROR",

@@ -175,7 +175,6 @@ def run_fits(
                     "epoch": 0,
                     "initial": 0,
                     "printed_epoch": -1,
-                    "last_print": 0.0,
                     "metrics": {},
                 }
                 emit_message(
@@ -205,7 +204,7 @@ def run_fits(
                     finalization += event["finalization_seconds"]
                     measured_fits += 1
                 completed += 1
-                if event["status"] == "completed":
+                if event["status"] == "completed" and state["printed_epoch"] < epochs:
                     emit_message(
                         f"RIDDLE fit {fit}/{total}: {epochs}/{epochs} epoch; fit_elapsed={_duration(time.monotonic() - state['started'])}",
                         kind="WORK",
@@ -235,7 +234,7 @@ def run_fits(
                         state["training_started"] = time.monotonic()
             now = time.monotonic()
             for fit, state in active.items():
-                if state["epoch"] == state["printed_epoch"] and now - state["last_print"] < 30:
+                if state["epoch"] <= max(state["initial"], state["printed_epoch"]):
                     continue
                 elapsed = now - state.get("training_started", state["started"])
                 processed = state["epoch"] - state["initial"]
@@ -252,7 +251,7 @@ def run_fits(
                     + (f"; {metrics}" if metrics else ""),
                     kind="PROGRESS",
                 )
-                state.update(printed_epoch=state["epoch"], last_print=now)
+                state["printed_epoch"] = state["epoch"]
     finally:
         signal.signal(signal.SIGTERM, previous_handler)
         for state in active.values():

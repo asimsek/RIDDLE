@@ -6,10 +6,13 @@ import torch
 
 from .storage import atomic_write, write_json, rng_state, restore_rng, file_digest, verify_artifacts
 from .worker_progress import emit_progress
+from .resume import check_contract, record_transition
 
 
 class EpochRecovery:
-    def __init__(self, root, contract, resume=False):
+    def __init__(self, root, contract, resume=False, *, allow_code_change=False, allow_device_change=False):
+        if (allow_code_change or allow_device_change) and not resume:
+            raise ValueError("Resume override options require --resume")
         self.root = Path(root)
         self.path = self.root / ".resume/stages.pt"
         self.manifest = self.root / ".resume/contract.json"
@@ -20,15 +23,22 @@ class EpochRecovery:
         if self.manifest.exists():
             if not resume:
                 raise FileExistsError("Work already started; use --resume")
-            if json.loads(self.manifest.read_text()) != contract:
-                raise ValueError(
-                    "Resume inputs, code, environment or scientific settings changed; use a new output"
-                )
+            previous = json.loads(self.manifest.read_text())
+            changes = check_contract(
+                previous, contract, allow_code_change=allow_code_change,
+                allow_device_change=allow_device_change,
+            )
             if self.path.exists():
                 self.state = torch.load(self.path, map_location="cpu", weights_only=False)
                 self.done = self.state["done"][:]
                 self.files = dict(self.state["files"])
                 verify_artifacts(self.root, self.files, "Verify training recovery")
+            if changes:
+                record_transition(
+                    self.root / ".resume/resume_history.json", previous, contract, changes,
+                    action="epoch_recovery_accepted",
+                )
+                write_json(self.manifest, contract)
         else:
             if any(p.name != ".resume" for p in self.root.iterdir()):
                 raise ValueError("Unrecognized nonempty training directory")

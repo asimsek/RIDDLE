@@ -135,12 +135,24 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   kubectl apply -n cua-asimsek -f -
 ```
 
+```bash
+kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
+  python /shared/work/RIDDLE/nrp.py \
+  --name lacathode-bg-seed42 --methods lacathode --scenarios background_only \
+  --seeds 42 --workers 1 --io-workers 4 | \
+  kubectl apply -n cua-asimsek -f -
+```
+
 For one combined job instead, request `--methods lacathode riddle` with a different job name.<br>
 Do not submit that alongside these two jobs for the same result identities.
 
 Optional controls use the preparation commands in `README.md`.<br>
 To submit one later, add `--data data/lhco_shifted --results results_shifted` or `--data data/lhco_deltaR --results results_deltaR` to the generator command and choose a new job name.<br>
 Each control still requests only one A100 per job.
+
+To continue compatible checkpoints after an implementation update, add `--resume-across-code-change`.<br>
+To move between CUDA GPUs, add `--resume-across-device-change`.<br>
+Both require `--resume` and can be combined.
 
 ## Monitoring and resuming
 

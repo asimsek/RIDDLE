@@ -69,6 +69,10 @@ MPS is optional on Linux NVIDIA GPUs; `auto` falls back to ordinary concurrency,
 The runner reads `config/settings.yaml` automatically. Use `--config path/to/settings.yaml` for a separate, self-contained study configuration.<br>
 Explicit `--runs`, `--epochs` and `--fractions learned 0.003 0.01` arguments override RIDDLE's YAML values.
 
+To continue compatible checkpoints after an implementation update, add `--resume-across-code-change`.<br>
+To move between CUDA GPUs, add `--resume-across-device-change`.<br>
+Both require `--resume` and can be combined.
+
 To run a control, change both the data and results locations, for example:
 
 ```bash

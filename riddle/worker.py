@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from .storage import code_hashes, environment, file_digest, write_json, verify_artifacts, fingerprint_files
 from .data import validate
 from .worker_progress import emit_message
+from .resume import inspect_resume, record_transition, resume_policy
 
 
 def runtime_code(method, root=None):
@@ -32,6 +33,7 @@ def runtime_code(method, root=None):
         "storage.py",
         "worker_progress.py",
         "progress.py",
+        "resume.py",
     )
     code = {f"framework/{name}": file_digest(package / name) for name in framework}
     code.update(
@@ -42,6 +44,7 @@ def runtime_code(method, root=None):
 
 def main():
     args = SimpleNamespace(**json.loads(sys.argv[1]))
+    policy = resume_policy(args)
     for name in ("output", "data", "sources"):
         setattr(args, name, Path(getattr(args, name)))
 
@@ -101,14 +104,24 @@ def main():
 
         contract.update(source_sha256=verify(args.sources), source_commit=COMMIT)
     path = args.output / "result.json"
-    if path.exists():
-        saved = json.loads(path.read_text())
-        if not args.resume or saved["contract"] != contract:
-            raise ValueError("Resume contract changed; retain these results and use a new output")
-        if saved["completed"]:
-            verify_artifacts(args.output, saved["artifacts_sha256"])
-            emit_message("Reuse verified completed result", kind="PASS")
-            return
+    saved, changes = inspect_resume(args.output, contract, resume=args.resume, **policy)
+    completed = saved is not None and saved["completed"]
+    if completed:
+        verify_artifacts(args.output, saved["artifacts_sha256"])
+    if saved is not None:
+        record_transition(
+            args.output / ".resume/resume_history.json", saved["contract"], contract, changes,
+            action="reuse_completed_result" if completed else "resume_requested",
+        )
+    if changes:
+        kinds = "/".join(sorted({c["kind"] for c in changes}))
+        emit_message(
+            f"Permitted resume across {kinds} changes recorded; bitwise reproducibility is not guaranteed",
+            kind="WARNING",
+        )
+    if completed:
+        emit_message("Reuse verified completed result; original provenance retained", kind="PASS")
+        return
     report = {
         "schema": 1,
         "method": args.method,
@@ -118,6 +131,8 @@ def main():
         "contract": contract,
         "completed": False,
     }
+    if saved is not None and (changes or "initial_contract" in saved):
+        report["initial_contract"] = saved.get("initial_contract", saved["contract"])
     write_json(path, report)
     if args.method == "riddle":
         from .pipeline import run

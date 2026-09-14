@@ -9,6 +9,7 @@ import yaml
 
 from riddle.cli import METHODS, SCENARIOS, seeds, positive
 from riddle.storage import atomic_write
+from riddle.resume import add_resume_options
 
 ROOT = Path(__file__).resolve().parent
 PYTHON = "/opt/conda/bin/python"
@@ -58,6 +59,9 @@ def job(args):
         "--verbose",
         "1",
     ]
+    for option in ("resume_across_code_change", "resume_across_device_change"):
+        if getattr(args, option, False):
+            command.append("--" + option.replace("_", "-"))
     for key in ("runs", "epochs"):
         value = getattr(args, key, None)
         if value is not None:
@@ -148,6 +152,7 @@ def main(argv=None):
     p.add_argument("--epochs", type=positive, help="Override YAML epochs")
     p.add_argument("--workers", type=positive, default=2)
     p.add_argument("--io-workers", type=positive, default=4)
+    add_resume_options(p, always_resume=True)
     p.add_argument("--region", help="Storage region; defaults to the Jupyter node selector")
     p.add_argument(
         "--image", help="Override the pinned runtime image from config/nrp/jupyter.yaml"

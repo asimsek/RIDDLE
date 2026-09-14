@@ -7,6 +7,7 @@ from .latent import prepare, Mapper
 from .campaign import train_campaign, ensemble_predict, fractions, PROTOCOL
 from .runtime import ordered_map
 from .settings import input_features
+from .resume import resume_policy
 
 
 def run(args, contract):
@@ -14,7 +15,7 @@ def run(args, contract):
     acceleration = install_tensor_batches()
     output = args.output
     latent_root = output / "background"
-    recovery = EpochRecovery(latent_root, contract, args.resume)
+    recovery = EpochRecovery(latent_root, contract, args.resume, **resume_policy(args))
     settings = args.settings
     selection = prepare(
         args.data, latent_root, args.seed, args.device, recovery, settings=settings["background"]
