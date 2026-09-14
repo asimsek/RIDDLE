@@ -117,6 +117,14 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   kubectl apply -n cua-asimsek -f -
 ```
 
+```bash
+kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
+  python /shared/work/RIDDLE/nrp.py \
+  --name riddle-bg-seed42 --methods riddle --scenarios background_only \
+  --seeds 42 --config config/settings.yaml --workers 2 --io-workers 4 | \
+  kubectl apply -n cua-asimsek -f -
+```
+
 **LaCathode:**
 
 ```bash
@@ -138,13 +146,20 @@ Each control still requests only one A100 per job.
 
 ```bash
 kubectl get jobs,pods -n cua-asimsek
-kubectl get pods -n cua-asimsek -l job-name=lacathode-seed42 -o wide
 kubectl get pods -n cua-asimsek -l job-name=riddle-seed42 -o wide
+kubectl get pods -n cua-asimsek -l job-name=riddle-bg-seed42 -o wide
+kubectl get pods -n cua-asimsek -l job-name=lacathode-seed42 -o wide
 kubectl logs -n cua-asimsek -f job/lacathode-seed42 -c campaign
 ```
 
 ```bash
 kubectl logs -n cua-asimsek -f job/riddle-seed42 -c campaign
+kubectl logs -n cua-asimsek -f job/riddle-bg-seed42 -c campaign
+```
+
+```bash
+kubectl delete job riddle-seed42 -n cua-asimsek --ignore-not-found --wait=true
+kubectl delete job riddle-bg-seed42 -n cua-asimsek --ignore-not-found --wait=true
 ```
 
 ## Jupyter terminal: plots

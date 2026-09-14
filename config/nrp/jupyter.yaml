@@ -34,16 +34,17 @@ spec:
       imagePullPolicy: IfNotPresent
       securityContext:
         runAsUser: 0
-      command: ["/bin/bash", "-c"]
       args:
-        - |
-          set -e
-          exec start-notebook.py \
-            --ServerApp.ip=0.0.0.0 --ServerApp.port=8888 \
-            --ServerApp.port_retries=0 --ServerApp.open_browser=False \
-            --ServerApp.root_dir=/shared --allow-root
+        - start-notebook.py
+        - --ServerApp.ip=0.0.0.0
+        - --ServerApp.port=8888
+        - --ServerApp.port_retries=0
+        - --ServerApp.open_browser=False
+        - --ServerApp.root_dir=/shared
       env:
         - name: GRANT_SUDO
+          value: "yes"
+        - name: CHOWN_HOME
           value: "yes"
         - name: XDG_CACHE_HOME
           value: /shared/work/RIDDLE/.cache/jupyter
