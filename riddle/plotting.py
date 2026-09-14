@@ -13,6 +13,7 @@ from . import figures as f
 from .storage import atomic_write, file_digest, locked, write_json
 from .progress import set_verbosity, colored_status
 from .worker_progress import ProgressStage, local_progress
+from .metrics import acceptance_report, efficiency_curve, oracle_metrics
 
 KEYS = {"lacathode": "raw", "riddle": "residual"}
 STYLES = dict(f.METHODS)
@@ -33,15 +34,23 @@ def methods(keys):
         f.METHODS, f.VIEWS = previous
 
 
-def discover(root, requested):
+def discover(root, requested, *, scan=False):
     paths = [root / "result.json"] if (root / "result.json").is_file() else sorted(root.rglob("result.json"))
     groups = {}
     variants = set()
+    versions = {}
     for path in paths:
         report = json.loads(path.read_text())
         method = report.get("method")
         if method not in requested or not report.get("completed"):
             continue
+        point = report.get("contract", {}).get("inputs", {}).get("injection_scan")
+        if bool(point) != scan:
+            continue
+        method_versions = versions.setdefault(method, set())
+        method_versions.add(report.get("contract", {}).get("scientific_version", 1))
+        if len(method_versions) > 1:
+            raise ValueError(f"Do not combine different scientific protocols for {method}")
         variants.add(
             report.get("variant", report.get("contract", {}).get("inputs", {}).get("variant", "default"))
         )
@@ -50,7 +59,8 @@ def discover(root, requested):
         scenario, seed = report["scenario"], report["seed"]
         if scenario not in f.SCENARIOS or type(seed) is not int:
             raise ValueError("Invalid result identity")
-        group = groups.setdefault((scenario, seed), {})
+        identity = (point["signal_events"], point["replica"]) if scan else (scenario, seed)
+        group = groups.setdefault(identity, {})
         if method in group:
             raise ValueError("Duplicate method/scenario/seed results; choose a narrower input directory")
         group[method] = (path.parent, report)
@@ -64,6 +74,14 @@ def load_scores(root, report, name):
         raise ValueError("Score artifact is missing or changed")
     with np.load(path, allow_pickle=False) as archive:
         data = {k: archive[k] for k in ("mass", "labels", "mask", "scores", "physical", "latent")}
+        if report["method"] == "riddle":
+            from .production import validate_region
+
+            if "is_signal_region" not in archive:
+                raise ValueError("RIDDLE SR membership is missing; regenerate its score artifacts")
+            data["is_signal_region"] = validate_region(archive["is_signal_region"], len(data["mass"]))
+            if name == "signal_region" and not data["is_signal_region"].all():
+                raise ValueError("RIDDLE signal-region evaluation contains non-SR events")
     n = len(data["mass"])
     variant = report.get("variant", report.get("contract", {}).get("inputs", {}).get("variant", "default"))
     dimensions = 5 if variant == "deltaR" else 4
@@ -89,16 +107,31 @@ def load_scores(root, report, name):
 
 def make_bundle(group, confidence):
     keys = [KEYS[m] for m in group]
-    bundle = {"samples": {}, "curves": {}, "warnings": [], "sources": group, "latents_by_method": {}}
+    bundle = {"samples": {}, "curves": {}, "warnings": [], "sources": group, "latents_by_method": {},
+              "evaluation": {}, "acceptance": {}}
     for partition in ("validation", "test", "signal_region"):
         records = {KEYS[m]: load_scores(root, report, partition) for m, (root, report) in group.items()}
+        bundle["evaluation"][partition] = records
+        from .production import region_acceptance
+        bundle["acceptance"][partition] = {
+            k: (region_acceptance(r["labels"], r["mask"], r["is_signal_region"])
+                if k == "residual" else acceptance_report(r["labels"], r["mask"], r["mass"]))
+            for k, r in records.items()
+        }
         base = records[keys[0]]
         for record in records.values():
             if any(not np.array_equal(base[k], record[k]) for k in ("mass", "labels", "mask", "physical")):
                 raise PopulationMismatch(
                     "Methods have different evaluation populations or mapping masks; plot them separately"
                 )
+        sr_masks = {k: r["is_signal_region"] for k, r in records.items() if k == "residual"}
+        if partition != "signal_region" and "residual" in sr_masks and "raw" in records:
+            if not np.array_equal(sr_masks["residual"], f.sr(records["raw"]["mass"])):
+                raise PopulationMismatch(
+                    "Methods have different SR memberships; separate plots preserve LaCathode's unchanged definition"
+                )
         sample = {k: base[k] for k in ("mass", "labels", "mask")}
+        sample["sr_masks"] = sr_masks
         sample.update({k + "_scores": r["scores"] for k, r in records.items()})
         if partition == "signal_region":
             bundle["curves"]["signal_region"] = (
@@ -158,7 +191,139 @@ def render_bundle(bundle, target, args):
         with methods([key]), ProgressStage("representation", "Plot input and latent distributions"):
             f.render_representation({**bundle, "latents": bundle["latents_by_method"][key]}, target)
     training_figures(group, target)
+    render_full_pipeline(bundle, target, args)
+    bundle["metrics"]["mapping_acceptance"] = bundle["acceptance"]
     write_json(target / "metrics.json", json_safe(bundle["metrics"]))
+
+
+def render_full_pipeline(bundle, output, args):
+    records = bundle["evaluation"]["signal_region"]
+    audit = {}
+    for metric in ("roc", "sic"):
+        fig, ax, _ = f.canvas("Signal efficiency" if metric == "roc" else "Significance improvement",
+                             "Background efficiency")
+        drawn = False
+        for key, record in records.items():
+            if len(np.unique(record["labels"][record["mask"]])) != 2:
+                continue
+            b, s, _ = efficiency_curve(record["labels"], record["scores"], record["mask"], full_pipeline=True)
+            supported = (b >= 1e-4) & (np.rint(b * (record["labels"] == 0).sum()) >= args.min_background)
+            keep = b > 0 if metric == "roc" else supported
+            label, color, ls = STYLES[key]
+            if keep.any():
+                ax.plot(b[keep], s[keep] if metric == "roc" else s[keep]/np.sqrt(b[keep]),
+                        color=color, ls=ls, label=label)
+                drawn = True
+            audit[label] = oracle_metrics(record["labels"], record["scores"], record["mask"],
+                                          min_background=args.min_background)
+        if drawn:
+            ax.set(xscale="log", xlim=(1e-4, 1), ylim=(0, None))
+            f.legend(fig, title=f.SCENARIO_LABELS[bundle["report"]["scenario"]] + " | Full pipeline")
+            f.save(fig, output / "full_pipeline" / ("signal_region_" + metric))
+        else:
+            f.plt.close(fig)
+    bundle["metrics"]["oracle_benchmarks"] = audit
+
+
+def render_injection_scan(groups, output, args):
+    rows, cohorts = [], {}
+    for (count, replica), group in sorted(groups.items()):
+        reference = None
+        for method, (root, report) in group.items():
+            inputs = report["contract"]["inputs"]
+            if inputs.get("synthetic_smoke_fixture") and not args.allow_smoke:
+                raise ValueError("Synthetic scan requires --allow-smoke for QA")
+            expected_protocol = 2 if method == "riddle" else "pinned_upstream"
+            if report["contract"].get("scientific_version") != expected_protocol:
+                raise ValueError(f"Injection scans require protocol {expected_protocol!r} for {method}")
+            point = inputs["injection_scan"]
+            if report["seed"] != point["training_seed"]:
+                raise ValueError("Scan result has an incompatible training seed")
+            if reference is not None and inputs != reference:
+                raise ValueError("Scan methods must share identical prepared data at each point")
+            reference = inputs
+            data = load_scores(root, report, "signal_region")
+            values = oracle_metrics(data["labels"], data["scores"], data["mask"],
+                                    min_background=args.min_background)
+            initial = inputs["uncut_signal_region"]
+            b0, s0 = initial["background"], initial["signal"]
+            if b0 <= 0 or s0 <= 0:
+                raise ValueError("Positive realized SR background and signal counts required for a scan")
+            maximum = values["full_pipeline_max_sic"]
+            row = dict(method=method, signal_events=count, replica=replica,
+                       training_seed=point["training_seed"], preparation_seed=point["preparation_seed"],
+                       sr_background=b0, sr_signal=s0, signal_to_background_percent=100*s0/b0,
+                       uncut_nominal_significance=s0/np.sqrt(b0),
+                       conditional_mapped_auc=values["conditional_auc"],
+                       oracle_conditional_max_sic=values["conditional_max_sic"],
+                       oracle_full_pipeline_max_sic=maximum,
+                       oracle_max_nominal_significance=maximum*s0/np.sqrt(b0) if maximum is not None else None,
+                       background_mapping_acceptance=values["acceptance"]["background"]["acceptance"],
+                       signal_mapping_acceptance=values["acceptance"]["signal"]["acceptance"])
+            rows.append(row)
+            cohorts.setdefault((method, count), []).append(row)
+    csv_write(output / "injection_scan.csv", rows)
+    audit = dict(
+        metric="Oracle maximum on truth-labelled SR test sample; mapping failures never pass",
+        nominal_significance="Per replica: maximum SIC times realized uncut SR S/sqrt(B), then aggregate",
+        uncertainty="16/50/84 percentiles across independently seeded partitions and training; finite source pool is reused, not independent collision datasets",
+        minimum_background_count=args.min_background, minimum_background_efficiency=1e-4,
+        significance_caveat="Nominal S/sqrt(B); no systematics, background fit, Poisson calibration or trials correction",
+        points=[], plotted_metrics={},
+    )
+    for field, title, filename in (
+        ("oracle_full_pipeline_max_sic", "Oracle maximum significance improvement", "maximum_sic_vs_injection"),
+        ("oracle_max_nominal_significance", "Oracle maximum nominal significance", "maximum_nominal_significance_vs_injection"),
+    ):
+        fig, ax, _ = f.canvas(title, "Injected SR S/B [%]")
+        any_drawn = False
+        plotted = {}
+        for method in KEYS:
+            values = []
+            for (name, count), cohort in cohorts.items():
+                if name != method:
+                    continue
+                finite = [r for r in cohort if r[field] is not None and np.isfinite(r[field])]
+                if not finite:
+                    continue
+                x = float(np.median([r["signal_to_background_percent"] for r in finite]))
+                low, median, high = np.quantile([r[field] for r in finite], [.16, .5, .84])
+                values.append((x, low, median, high, len(finite), count))
+            if not values:
+                continue
+            values.sort()
+            matrix = np.asarray(values)
+            x, low, median, high = matrix[:, :4].T
+            name, color, ls = STYLES[KEYS[method]]
+            ax.plot(x, median, marker="x", color=color, ls=ls, label=name)
+            # A single replica has no uncertainty band, even beside multi-replica points.
+            supported = matrix[:, 4] >= 2
+            if supported.any():
+                ax.fill_between(x, low, high, where=supported, color=color, alpha=.22)
+            if not supported.all():
+                colored_status(f"{name}: scan band unavailable at single-replica points", kind="WARNING")
+            plotted[method] = [dict(x=float(a), low=float(l), median=float(m), high=float(h),
+                                   replicas=int(n), signal_events=int(c)) for a,l,m,h,n,c in values]
+            any_drawn = True
+        if any_drawn:
+            if field == "oracle_max_nominal_significance":
+                for level in (3, 5):
+                    ax.axhline(level, ls=":", color=".5", lw=1)
+            ax.set_ylim(bottom=0)
+            ax.invert_xaxis()
+            backgrounds = np.asarray([r["sr_background"] for r in rows])
+            if len(backgrounds) and np.all(backgrounds == backgrounds[0]):
+                factor = np.sqrt(backgrounds[0])/100
+                top = ax.secondary_xaxis("top", functions=(lambda x: x*factor, lambda x: x/factor))
+                top.set_xlabel(r"Uncut $S/\sqrt{B}$")
+            f.legend(fig, title="Signal-Injected")
+            f.save(fig, output / filename)
+        else:
+            f.plt.close(fig)
+        audit["plotted_metrics"][field] = plotted
+    audit["points"] = rows
+    write_json(output / "injection_scan.json", json_safe(audit))
+    return audit
 
 
 def comparison_rows(bundle, args):
@@ -191,20 +356,27 @@ def comparison_rows(bundle, args):
             continue
         parts = {k: f.auc_components(labels, s) for k, s in scores.items()}
         add(
-            "auc",
+            "conditional_mapped_auc",
             {k: roc_auc_score(labels, s) for k, s in scores.items()},
             ci={k: f.auc_interval(p, args.confidence) for k, p in parts.items()},
         )
         if set(parts) == set(STYLES):
             low, high = f.paired_auc_interval(parts, args.confidence)
             rows[-1].update(RIDDLE_minus_LaCathode_ci_low=low, RIDDLE_minus_LaCathode_ci_high=high)
-        add("average_precision", {k: average_precision_score(labels, s) for k, s in scores.items()})
+        add("conditional_mapped_average_precision", {k: average_precision_score(labels, s) for k, s in scores.items()})
         maxima = {}
         for key, score in scores.items():
             b, s, _ = roc_curve(labels, score, drop_intermediate=False)
             good = (b >= 1e-4) & (np.rint(b * (labels == 0).sum()) >= args.min_background)
             maxima[key] = np.max(s[good] / np.sqrt(b[good])) if good.any() else None
-        add("max_sic_supported", maxima)
+        add("oracle_conditional_max_sic_supported", maxima)
+    evaluation = {
+        key: oracle_metrics(record["labels"], record["scores"], record["mask"], min_background=args.min_background)
+        for key, record in bundle["evaluation"]["signal_region"].items()
+    }
+    add("oracle_full_pipeline_max_sic_supported", {key: r["full_pipeline_max_sic"] for key,r in evaluation.items()})
+    for name in ("signal", "background"):
+        add(name + "_mapping_acceptance", {key: r["acceptance"][name]["acceptance"] for key,r in evaluation.items()})
     for point in bundle["metrics"]["working_points"]:
         records = point["methods"]
         selection = ("<" if point["name"] == "extra_tight" else "<=") + str(
@@ -375,10 +547,13 @@ def training_figures(group, output):
         for stage in ("background", "classifier") if method == "lacathode" else ("background",):
             directory = root / ("training" if method == "lacathode" else "background")
             names = (
-                ("my_ANODE_model_train_losses.npy", "my_ANODE_model_val_losses.npy")
+                (f"{method}_model_train_losses.npy", f"{method}_model_val_losses.npy")
                 if stage == "background"
                 else ("loss_matris.npy", "val_loss_matris.npy")
             )
+            if stage == "background" and not all((directory / name).is_file() for name in names):
+                # Read legacy artifacts without renaming or modifying saved results.
+                names = ("my_ANODE_model_train_losses.npy", "my_ANODE_model_val_losses.npy")
             if not all((directory / name).is_file() for name in names):
                 continue
             fig, ax, _ = f.canvas(
@@ -407,7 +582,7 @@ def read_metadata(root, report, name):
 def method_band(ax, x, values, key, scenario, metric, seeds):
     name, color, ls = STYLES[key]
     summary = f.draw_band(ax, x, values, name, color, ls)
-    summary.update(uncertainty_source="independent_training_runs", seeds=seeds)
+    summary.update(uncertainty_source="training_seed_variation_on_fixed_data_partition", seeds=seeds)
     if not summary["band_drawn"]:
         colored_status(
             f"{name} | {f.SCENARIO_LABELS[scenario]} | {metric}: "
@@ -425,7 +600,13 @@ def summary_figures(bundles, output, args):
         cohort = [b for b in bundles if b["report"]["scenario"] == scenario]
         if not cohort:
             continue
-        fig, ax, _ = f.canvas("Significance improvement", "Background efficiency")
+        partitions = {
+            json.dumps(report.get("contract", {}).get("inputs", {}).get("files"), sort_keys=True)
+            for bundle in cohort for _, report in bundle["sources"].values()
+        }
+        if len(partitions) > 1:
+            raise ValueError("Ordinary seed bands require a fixed prepared partition; use the injection-scan workflow for varied partitions")
+        fig, ax, _ = f.canvas("Significance improvement (mapped)", "Background efficiency (mapped)")
         any_curve = False
         for key in STYLES:
             values = []
@@ -435,7 +616,7 @@ def summary_figures(bundles, output, args):
                 if key not in scores or len(np.unique(labels)) != 2:
                     continue
                 b, s, _ = roc_curve(labels, scores[key])
-                supported = b > 1.6173483250740743e-5
+                supported = (b >= 1e-4) & (np.rint(b * (labels == 0).sum()) >= args.min_background)
                 if supported.sum() < 2:
                     continue
                 values.append(
@@ -474,7 +655,7 @@ def summary_figures(bundles, output, args):
                 pop = sample["labels"] == 0
                 mass, score = sample["mass"][pop], sample[key + "_scores"][pop]
                 mask = sample["mask"][pop]
-                region = f.sr(mass) & mask
+                region = f.sample_sr(sample, key)[pop] & mask
                 if len(mass) < 300 or not region.any():
                     continue
                 edges = f.equal_occupancy(mass)
@@ -502,9 +683,11 @@ def summary_figures(bundles, output, args):
             sample = cohort[0]["samples"]["test"]
             mass = sample["mass"][sample["labels"] == 0]
             random_summary = f.draw_band(
-                ax, f.EFFICIENCIES, random_reference(mass), "Random", ".5", ":"
+                ax, f.EFFICIENCIES, random_reference(mass, mode=args.random_reference),
+                "Random bootstrap" if args.random_reference == "bootstrap" else "Random subset", ".5", ":"
             )
-            random_summary["uncertainty_source"] = "random_selection_trials"
+            random_summary["uncertainty_source"] = "random_" + args.random_reference + "_trials"
+            random_summary["sampling_with_replacement"] = args.random_reference == "bootstrap"
             audit[scenario + "/random/mass_flatness"] = random_summary
             f.summary_axes(ax, "mass_flatness")
             f.legend(fig, title="BG-Only")
@@ -514,7 +697,9 @@ def summary_figures(bundles, output, args):
     return audit
 
 
-def random_reference(mass, trials=100):
+def random_reference(mass, trials=100, *, mode="bootstrap"):
+    if mode not in ("bootstrap", "subset"):
+        raise ValueError("Random reference must be bootstrap or subset")
     edges = f.equal_occupancy(mass)
     full = np.histogram(mass, edges)[0]
     bin_id = np.minimum(np.searchsorted(edges, mass, side="right") - 1, len(full) - 1)
@@ -523,7 +708,7 @@ def random_reference(mass, trials=100):
         rng = np.random.RandomState(42)
         values = []
         for _ in range(trials):
-            indices = rng.choice(len(mass), size=int(efficiency * len(mass)), replace=True)
+            indices = rng.choice(len(mass), size=int(efficiency * len(mass)), replace=mode == "bootstrap")
             values.append(f.shape_chi2(full, np.bincount(bin_id[indices], minlength=len(full)), efficiency))
         result.append(values)
     return np.asarray(result).T
@@ -540,6 +725,7 @@ def main(argv=None):
     parser.add_argument("--methods", nargs="+", choices=tuple(KEYS), default=list(KEYS))
     parser.add_argument("--confidence", type=float, default=0.95)
     parser.add_argument("--min-background", type=int, default=10)
+    parser.add_argument("--random-reference", choices=("bootstrap", "subset"), default="bootstrap")
     parser.add_argument("--allow-smoke", action="store_true", help="Permit synthetic QA fixtures")
     parser.add_argument("--verbose", type=int, choices=(0, 1, 2), default=1)
     args = parser.parse_args(argv)
@@ -549,7 +735,8 @@ def main(argv=None):
         if not 0 < args.confidence < 1 or args.min_background < 1:
             raise ValueError("Invalid confidence level or background support")
         groups = discover(args.results, args.methods)
-        if not groups:
+        scan_groups = discover(args.results, args.methods, scan=True)
+        if not groups and not scan_groups:
             colored_status("No completed results for the requested methods", kind="WARNING")
             return 0
         args.results, args.output = args.results.resolve(), args.output.resolve()
@@ -565,6 +752,7 @@ def main(argv=None):
         args.output.mkdir(parents=True, exist_ok=args.overwrite)
         rows, settings, bundles = [], [], []
         with local_progress("Plots"), f.plt.style.context(f.STYLE), locked(args.output / ".plot.lock"):
+            scan_audit = render_injection_scan(scan_groups, args.output / "injection_scan", args) if scan_groups else None
             for (scenario, seed), group in groups.items():
                 if (
                     any(
@@ -596,7 +784,8 @@ def main(argv=None):
                     {
                         "schema": 1,
                         "uncertainty": audit,
-                        "cuts": "Validation-SR background thresholds; frozen cuts evaluated on independent physical test rows",
+                        "cuts": "Truth-assisted MC benchmark: validation-SR background thresholds; frozen cuts evaluated on independent physical test rows",
+                        "injection_scan": scan_audit,
                         "mass_cut_scan": {
                             "thresholds": list(f.SCORE_CUTS),
                             "comparison": "strict score > threshold",
@@ -608,7 +797,7 @@ def main(argv=None):
                             "histograms": "unweighted event counts, identical mass bins, no smoothing; B + S is the sum of background and signal counts",
                         },
                         "mass_summary": "BG-Only: test-SR quantiles, 300 equal-occupancy full-range bins, normalized-shape Poisson chi2",
-                        "uncertainty_scope": "SIC/mass bands: 16/50/84 percentiles across independent seeds; not internal fits",
+                        "uncertainty_scope": "SIC/mass bands: 16/50/84 percentiles of training-seed variation on a fixed data partition; not internal fits or statistical pseudoexperiments",
                         "summary_axes": f.SUMMARY_AXES,
                         "warnings": [w for b in bundles for w in b["warnings"]],
                     }

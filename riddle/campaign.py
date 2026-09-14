@@ -12,14 +12,16 @@ from riddle.storage import atomic_write, write_json
 from riddle.storage import digest, file_digest
 from .model import PROTOCOL as SINGLE_PROTOCOL, background_log_prob, real_sr_latents
 from .training import train_residual, residual_scores
+from .integrity import SCIENTIFIC_VERSION
+from .production import PRODUCTION_POLICY, require_complete_members, require_complete_ensemble
 
 PROTOCOL = {
     **SINGLE_PROTOCOL,
     "name": "RIDDLE",
-    "campaign_version": 1,
-    "ensemble": "equal-weight mean signal density over valid runs and ten validation-selected epochs per run",
+    "campaign_version": SCIENTIFIC_VERSION,
+    "ensemble": "equal-weight mean signal density over all requested runs and ten validation-selected epochs per run",
     "splits": "80/20 resamples of development training rows; reserved validation reserved for configuration/cuts",
-    "failures": "exclude and record numerical failures only; retain finite near-zero-fraction fits",
+    "failures": "record numerical failures and reject incomplete production; retain finite near-zero-fraction fits",
 }
 
 
@@ -150,6 +152,8 @@ def train_campaign(
         (np.full(len(ztrain), 3.5), ztrain, np.ones(len(ztrain)), np.zeros(len(ztrain)))
     ).astype(np.float32)
     identity = {
+        "scientific_version": SCIENTIFIC_VERSION,
+        "production_policy": PRODUCTION_POLICY,
         "training_sha256": digest(ztrain),
         "selection_sha256": digest(zval),
         "epochs": epochs,
@@ -300,8 +304,20 @@ def train_campaign(
                         training_finished=training_finished,
                     )
                 timing.report(config_index * runs + index + 1, total_fits, len(pending))
+        checkpoints = settings["training"]["selected_checkpoints"]
+        current = {"name": tag, "fraction": fraction, "members": members, "valid_runs": len(members)}
+        pending_selection = {
+            "status": "incomplete", "production_policy": PRODUCTION_POLICY,
+            "requested_runs": runs, "checkpoints_per_run": checkpoints,
+            "configurations": [*configs, current], "failures": failures,
+        }
+        write_json(output / "ensemble_selection.json", pending_selection)
+        require_complete_members(members, runs, checkpoints, configuration=tag)
         histories = {member["directory"]: history for member, history in zip(members, histories)}
-        nll = heldout_nll(output, members, zval, device, failures, tag) if members else None
+        nll = heldout_nll(output, members, zval, device, failures, tag)
+        current["valid_runs"] = len(members)
+        write_json(output / "ensemble_selection.json", pending_selection)
+        require_complete_members(members, runs, checkpoints, configuration=tag)
         histories = [histories[member["directory"]] for member in members]
         config = {"name": tag, "fraction": fraction, "members": members, "valid_runs": len(members)}
         if members:
@@ -317,12 +333,14 @@ def train_campaign(
                 for e in range(epochs)
             ]
         configs.append(config)
-        write_json(output / "ensemble_selection.json", {"configurations": configs, "failures": failures})
-    valid = [c for c in configs if c["valid_runs"]]
-    if not valid:
-        raise FloatingPointError("All residual fits failed numerically; failures were recorded")
-    chosen = min(valid, key=lambda c: c["selection_nll"])
+        write_json(output / "ensemble_selection.json", {
+            **pending_selection, "status": "in_progress", "configurations": configs,
+        })
+    chosen = min(configs, key=lambda c: c["selection_nll"])
     result = {
+        "status": "completed",
+        "production_policy": PRODUCTION_POLICY,
+        "checkpoints_per_run": settings["training"]["selected_checkpoints"],
         "configurations": configs,
         "selected_configuration": chosen["name"],
         "members": chosen["members"],
@@ -332,6 +350,7 @@ def train_campaign(
         "selected_checkpoints": sum((len(m["epochs"]) for m in chosen["members"])),
         "selection": "held-out reserved validation mixture NLL; no signal truth",
     }
+    require_complete_ensemble(result)
     write_json(output / "ensemble_selection.json", result)
     write_json(output / "numerical_failures.json", {"failures": failures})
     write_json(
@@ -343,6 +362,7 @@ def train_campaign(
 def ensemble_predict(output, z, device):
     root = Path(output)
     selection = json.loads((root / "ensemble_selection.json").read_text())
+    require_complete_ensemble(selection)
     combined = None
     for member in selection["members"]:
         ratio = residual_scores(root / member["directory"], member["epochs"], z, device)

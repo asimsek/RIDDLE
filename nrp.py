@@ -34,17 +34,13 @@ def job(args):
     command = [
         PYTHON,
         "run.py",
-        "run",
+        getattr(args, "workflow", "run"),
         "--methods",
         *args.methods,
-        "--scenarios",
-        *args.scenarios,
-        "--seeds",
-        ",".join(map(str, args.seeds)),
         "--data",
-        str(getattr(args, "data", "data/lhco")),
+        str(getattr(args, "data", None) or ("data/injection_scan" if getattr(args, "workflow", "run") == "scan" else "data/lhco")),
         "--output",
-        str(getattr(args, "results", "results")),
+        str(getattr(args, "results", None) or ("results/injection_scan" if getattr(args, "workflow", "run") == "scan" else "results")),
         "--device",
         "cuda:0",
         "--config",
@@ -59,6 +55,12 @@ def job(args):
         "--verbose",
         "1",
     ]
+    if getattr(args, "workflow", "run") == "scan":
+        for key in ("replicas", "signal_events"):
+            if getattr(args, key, None) is not None:
+                command.extend(["--" + key.replace("_", "-"), ",".join(map(str, getattr(args, key)))])
+    else:
+        command.extend(["--scenarios", *args.scenarios, "--seeds", ",".join(map(str, args.seeds))])
     for option in ("resume_across_code_change", "resume_across_device_change"):
         if getattr(args, option, False):
             command.append("--" + option.replace("_", "-"))
@@ -143,11 +145,14 @@ def main(argv=None):
     p = argparse.ArgumentParser(description="Generate an NRP GPU job; does not submit it")
     p.add_argument("--name", required=True)
     p.add_argument("--methods", nargs="+", choices=METHODS, default=list(METHODS))
+    p.add_argument("--workflow", choices=("run", "scan"), default="run")
+    p.add_argument("--replicas", type=seeds, help="Scan replica indices, e.g. 0-9")
+    p.add_argument("--signal-events", type=seeds, help="Scan total signal counts, e.g. 1000,667")
     p.add_argument("--scenarios", nargs="+", choices=SCENARIOS, default=["signal_injection"])
     p.add_argument("--seeds", type=seeds, default=[42])
     p.add_argument("--config", default="config/settings.yaml", help="Settings path inside the job")
-    p.add_argument("--data", default="data/lhco", help="Prepared dataset path inside the job")
-    p.add_argument("--results", default="results", help="Result directory inside the job")
+    p.add_argument("--data", help="Prepared dataset path; defaults to data/lhco or data/injection_scan for scans")
+    p.add_argument("--results", help="Result directory; defaults to results or results/injection_scan for scans")
     p.add_argument("--runs", type=positive, help="Override YAML fit count")
     p.add_argument("--epochs", type=positive, help="Override YAML epochs")
     p.add_argument("--workers", type=positive, default=2)

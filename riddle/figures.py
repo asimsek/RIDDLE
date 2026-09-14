@@ -65,7 +65,18 @@ STYLE = {
 
 
 def sr(mass):
+    """Preserved LaCathode plotting convention; RIDDLE uses saved membership."""
     return (mass >= 3.3) & (mass <= 3.7)
+
+
+def sample_sr(sample, key):
+    if key == "residual":
+        from .production import validate_region
+
+        if key not in sample.get("sr_masks", {}):
+            raise ValueError("RIDDLE SR membership is missing; regenerate its score artifacts")
+        return validate_region(sample["sr_masks"][key], len(sample["mass"]))
+    return sr(sample["mass"])
 
 
 def display(key, values):
@@ -101,7 +112,7 @@ def safe_div(a, b):
 
 
 def choose_cut(sample, key, budget, strict=False):
-    mask = sr(sample["mass"]) & (sample["labels"] == 0)
+    mask = sample_sr(sample, key) & (sample["labels"] == 0)
     total = int(mask.sum())
     values = np.sort(sample[key + "_scores"][mask & sample["mask"]])
     allowed = math.floor(total * budget)
@@ -150,7 +161,7 @@ def selected(sample, key, cut):
 
 
 def selection_stats(sample, key, cut, edges, confidence):
-    keep, region = selected(sample, key, cut), sr(sample["mass"])
+    keep, region = selected(sample, key, cut), sample_sr(sample, key)
     out = {"cut": cut, "display_cut": float(display(key, cut)), "status": "available"}
     for name, label in (("signal", 1), ("background", 0)):
         population = region & (sample["labels"] == label)
@@ -261,7 +272,7 @@ def legend(fig, handles=None, labels=None, *, ax=None, ncols=None, title=None, f
 def working_point_title(point, scope=None):
     relation = "<" if slug(point["name"]) == "extra_tight" else "≤"
     scope = "Signal region" if scope and scope.lower() in ("sr", "signal region") else "Full mass range"
-    return f"{scope} | B {relation} {100 * point['validation_background_budget']:g}%"
+    return f"{scope} | B {relation} {100 * point['validation_background_budget']:g}% (MC truth)"
 
 
 def retention_label(truth, passed, total):
@@ -411,6 +422,7 @@ def render_roc(bundle, output, args):
                 "signal_events": int((labels == 1).sum()),
                 "unique_scores": int(len(np.unique(scores[key]))),
                 "auc": float(roc_auc_score(labels, scores[key])),
+                "population": "conditional on successful mapping",
                 "monotonic": monotonic,
                 "interpolation_or_smoothing": False,
             }
@@ -476,7 +488,7 @@ def render_roc(bundle, output, args):
                     ax.set(
                         xscale="log", xlim=(1e-4, 1), ylim=(0, 1.02 if kind == "roc_log" else max_sic * 1.08)
                     )
-                legend(fig, title=SCENARIO_LABELS.get(bundle.get("metrics", {}).get("scenario")))
+                legend(fig, title=SCENARIO_LABELS.get(bundle.get("metrics", {}).get("scenario"), "") + " | Mapped events")
                 save(fig, output / view / "01_performance" / f"{dataset}_{kind}")
 
 
@@ -485,9 +497,10 @@ def render_scores(bundle, output):
         return
     sample = bundle["samples"]["test"]
     edges = np.linspace(0, 1, 41)
-    for region, mask in (("sr", sr(sample["mass"])), ("full", np.ones(len(sample["mass"]), bool))):
+    for region in ("sr", "full"):
         histograms = {}
         for key in METHODS:
+            mask = sample_sr(sample, key) if region == "sr" else np.ones(len(sample["mass"]), bool)
             for truth in (0, 1):
                 values = display(
                     key, sample[key + "_scores"][mask & sample["mask"] & (sample["labels"] == truth)]
@@ -1024,7 +1037,8 @@ def render_representation(bundle, output):
         "latent_reference": "standard normal; not a signal model",
         "regions": {},
     }
-    for region, mask in (("sr", sr(m)), ("full", np.ones(len(m), bool))):
+    region_mask = sample_sr(sample, next(iter(METHODS)))[sample["mask"]]
+    for region, mask in (("sr", region_mask), ("full", np.ones(len(m), bool))):
         groups = {label: mask & (y == truth) for label, truth in (("background", 0), ("signal", 1))}
         record = {"events": {name: int(v.sum()) for name, v in groups.items()}, "spaces": {}}
         bundle["representation"]["regions"][region] = record
@@ -1221,6 +1235,8 @@ def build_metrics(bundle, confidence):
         "scenario": report["scenario"],
         "smoke": report.get("smoke"),
         "working_points": points,
+        "working_point_protocol": "Truth-assisted MC benchmark: validation-SR background cuts, frozen before independent test evaluation; full physical class denominators",
+        "oracle_maximum_protocol": "Test-truth-optimized SIC is an oracle benchmark, not a deployable threshold",
         "mass_edges": edges.tolist(),
         "protocol": report.get("protocol", {}),
         "ensemble": report.get("ensemble"),
@@ -1280,7 +1296,7 @@ def feature_records(bundle):
         names.insert(-1, r"$\Delta R_{jj}$")
         ids.insert(-1, "deltaR")
     records = {"pages": []}
-    for region, scope in (("SR", sr(m)), ("Full mass range", np.ones(len(m), bool))):
+    for region in ("SR", "Full mass range"):
         for point in bundle["metrics"]["working_points"]:
             page = {"region": region, "working_point": point["name"], "features": []}
             for i, name in enumerate(names):
@@ -1294,6 +1310,11 @@ def feature_records(bundle):
                     edges = np.linspace(low - width, high + width, 41)
                 feature = {"id": ids[i], "name": name, "edges": edges.tolist(), "methods": {}}
                 for key in METHODS:
+                    scope = (
+                        (sample_sr(sample, key) if key == "residual" else sr(m))
+                        if region == "SR"
+                        else np.ones(len(m), bool)
+                    )
                     x = physical[i] if i < len(physical) else display(key, sample[key + "_scores"])
                     classes = []
                     for label in (0, 1):

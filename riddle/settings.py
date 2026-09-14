@@ -88,7 +88,7 @@ def validate_residual(value):
 def load_settings(path=DEFAULT_PATH):
     path = Path(path).resolve()
     value = yaml.safe_load(path.read_text())
-    keys(value, "schema inputs riddle background", "top-level")
+    keys(value, "schema inputs riddle background injection_scan", "top-level")
     if type(value["schema"]) is not int or value["schema"] != 1:
         raise ValueError("Unsupported settings schema")
     inputs = value["inputs"]
@@ -116,6 +116,22 @@ def load_settings(path=DEFAULT_PATH):
     )
     if b["configuration"]["num_inputs"] != 4:
         raise ValueError("Keep num_inputs=4; the DeltaR control automatically selects five dimensions")
+    scan = value["injection_scan"]
+    keys(scan, "signal_events replicas preparation_seed training_seed", "injection scan")
+    if not isinstance(scan["signal_events"], list) or not scan["signal_events"]:
+        raise ValueError("Provide injection strengths as positive total signal counts")
+    from .data_spec import DatasetSpec
+    for n in scan["signal_events"]:
+        integer(n, "injected signal count", 3)
+        if n >= DatasetSpec().signal_rows:
+            raise ValueError("Reserve uninjected signal for independent evaluation")
+    if len(set(scan["signal_events"])) != len(scan["signal_events"]):
+        raise ValueError("Duplicate injection strengths")
+    integer(scan["replicas"], "scan replicas")
+    for key in ("preparation_seed", "training_seed"):
+        integer(scan[key], key, 0)
+        if scan[key] + scan["replicas"] >= 2**32:
+            raise ValueError("Scan seeds exceed the NumPy seed range")
     return value
 
 

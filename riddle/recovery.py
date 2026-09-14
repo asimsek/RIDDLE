@@ -106,7 +106,10 @@ class EpochRecovery:
             }
             for name, module in model.named_modules()
         }
-        checkpoint = f"my_ANODE_model_epoch_{epoch}.par" if phase == "flow" else f"model_run0_ep{epoch}"
+        checkpoint = (
+            f"{values['model_file_name']}_epoch_{epoch}.par"
+            if phase == "flow" else f"model_run0_ep{epoch}"
+        )
         self.files[checkpoint] = file_digest(self.root / checkpoint)
         self.save(
             phase,

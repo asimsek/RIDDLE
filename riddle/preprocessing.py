@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+from .integrity import require_finite
 
 
 class LHCORD_data_handler:
@@ -157,12 +158,7 @@ def logit_transform(data, datamax, datamin, domain_cut=False, fiducial_cut=False
         mask = torch.ones(data2.shape[0], dtype=torch.bool)
     data3 = data2[mask]
     data4 = torch.log(data3 / (1 - data3))
-    for idx in range(data4.shape[1]):
-        if torch.isinf(data4[:, idx]).any():
-            no_inf_max = torch.max(data4[~torch.isinf(data4[:, idx]), idx])
-            no_inf_min = torch.min(data4[~torch.isinf(data4[:, idx]), idx])
-            data4[data4[:, idx] == np.inf, idx] = no_inf_max
-            data4[data4[:, idx] == -np.inf, idx] = no_inf_min
+    require_finite(data4, "Logit-transformed mapped features")
     return (data4, mask)
 
 
@@ -197,6 +193,7 @@ def load_dataset(
     device=torch.device("cpu"),
     no_mean_shift=False,
 ):
+    require_finite(data, "Physical input preprocessing")
     if cond_range is not None:
         assert len(cond_range) == 2, "cond_range must be 2-element array-like object!"
         cond_mask = np.logical_and(data[:, 0] > cond_range[0], data[:, 0] < cond_range[1])
@@ -213,6 +210,8 @@ def load_dataset(
     else:
         datadict["max"] = torch.max(datadict["tensor"], dim=0).values
         datadict["min"] = torch.min(datadict["tensor"], dim=0).values
+    if torch.any(datadict["max"] <= datadict["min"]):
+        raise ValueError("Preprocessing requires nonconstant feature domains")
     if no_logit:
         if fiducial_cut:
             _, mask = logit_transform(
@@ -266,6 +265,7 @@ def load_dataset(
         datadict["tensor2"] = (tensor2 - datadict["mean2"]) / datadict["std2"]
     else:
         datadict["tensor2"] = tensor2
+    require_finite(datadict["tensor2"], "Normalized mapped features")
     datadict["dataset"] = torch.utils.data.TensorDataset(datadict["tensor2"], datadict["labels"])
     datadict["loader"] = torch.utils.data.DataLoader(
         datadict["dataset"], batch_size=batch_size, shuffle=shuffle_loader
@@ -283,6 +283,6 @@ def stack_data(data_array, cond_labels, sig_labels=None, samples=False):
     stacked_data = np.hstack(
         (cond_labels.reshape((-1, 1)), data_array, data_or_sample, sig_labels.reshape((-1, 1)))
     ).astype("float32")
-    stacked_data = np.delete(stacked_data, np.argwhere(np.isinf(stacked_data)), 0)
-    stacked_data = np.delete(stacked_data, np.argwhere(np.isnan(stacked_data)), 0)
+    from .integrity import require_finite
+    require_finite(stacked_data, "Development latent stacking")
     return stacked_data

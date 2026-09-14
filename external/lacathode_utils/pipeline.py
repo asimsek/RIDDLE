@@ -16,6 +16,9 @@ from .acceleration import install_validation_counts, install_tensor_batches, exe
 from .worker_progress import ProgressStage, emit_progress
 from .source import verify, COMMIT
 from .resume import resume_policy
+from riddle.metrics import acceptance_report
+
+FLOW_PREFIX = "lacathode_model"
 
 
 def device_masks(module):
@@ -88,6 +91,8 @@ def run(args, contract):
         "100",
         "--cf_epochs",
         "100",
+        "--DE_file_name",
+        FLOW_PREFIX,
         "--DE_config_file",
         config_file,
     ]
@@ -131,6 +136,8 @@ def run(args, contract):
         args.output / "protocol.json",
         {
             "name": "LaCathode",
+            "scientific_version": "pinned_upstream",
+            "flow_checkpoint_prefix": FLOW_PREFIX,
             "commit": COMMIT,
             "flow_epochs": 100,
             "classifier_epochs": 100,
@@ -189,22 +196,24 @@ def evaluate(args, root, data_handler, *, config_file="DE_MAF_model.yml"):
             str(root / "sr_evaluation.pkl"),
             True,
             config_file=str(args.sources / config_file),
+            model_file_name=FLOW_PREFIX,
             num_DE_models=1,
             num_clsf_models=10,
             multirun=True,
         )
-    losses = np.load(root / "my_ANODE_model_val_losses.npy")
+    losses = np.load(root / f"{FLOW_PREFIX}_val_losses.npy")
     epoch = int(np.argpartition(losses, 1)[0]) - 1
     if epoch < 0:
         raise ValueError("Inference selected the untrained flow entry")
     reference = data_handler.load_dataset(np.load(args.data / "outerdata_train.npy").astype("float32"))
     model = DensityEstimator(str(args.sources / config_file), eval_mode=True).model
     model.load_state_dict(
-        torch.load(root / f"my_ANODE_model_epoch_{epoch}.par", map_location="cpu", weights_only=True)
+        torch.load(root / f"{FLOW_PREFIX}_epoch_{epoch}.par", map_location="cpu", weights_only=True)
     )
     model.eval().requires_grad_(False)
     paths = minimum_validation_loss_models(str(root), n_epochs=10)[0]
     write_json(root / "classifier_selection.json", {"ordered_checkpoints": [Path(p).name for p in paths]})
+    acceptance = {}
     for partition, suffix in (("validation", "val"), ("test", "test"), ("signal_region", None)):
         names = (
             (f"innerdata_{suffix}.npy", f"outerdata_{suffix}.npy")
@@ -245,6 +254,7 @@ def evaluate(args, root, data_handler, *, config_file="DE_MAF_model.yml"):
             scores = captured["scores"]
         aligned = np.full(len(rows), np.nan, dtype=scores.dtype)
         aligned[mask] = scores
+        acceptance[partition] = acceptance_report(rows[:, -1], mask, rows[:, 0])
         atomic_write(
             args.output / f"{partition}_scores.npz",
             lambda p: save_npz(
@@ -257,3 +267,4 @@ def evaluate(args, root, data_handler, *, config_file="DE_MAF_model.yml"):
                 latent=z,
             ),
         )
+    write_json(args.output / "mapping_acceptance.json", acceptance)

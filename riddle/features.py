@@ -125,10 +125,14 @@ def build_dataset_roles(
     *,
     sic_background_arrays: Mapping[str, np.ndarray] | None = None,
     enforce_expected_counts: bool = True,
+    independent_partition: bool = False,
 ) -> dict[str, dict[str, np.ndarray]]:
     labels = np.asarray(arrays["label"], dtype=np.int8)
     background = np.flatnonzero(labels == 0)
     signal = np.flatnonzero(labels == 1)
+    if independent_partition:
+        rng = np.random.RandomState(spec.preparation_seed)
+        background, signal = rng.permutation(background), rng.permutation(signal)
     if enforce_expected_counts and (len(background), len(signal)) != (spec.background_rows, spec.signal_rows):
         raise RuntimeError(
             f"Expected dataset counts are {(spec.background_rows, spec.signal_rows)}, observed {(len(background), len(signal))}"

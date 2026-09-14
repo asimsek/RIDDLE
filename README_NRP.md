@@ -200,8 +200,6 @@ kubectl delete job lacathode-seed42 -n cua-asimsek --ignore-not-found --wait=tru
 kubectl delete job lacathode-bg-seed42 -n cua-asimsek --ignore-not-found --wait=true
 ```
 
-
-
 ## Jupyter terminal: plots
 
 ```bash
@@ -212,6 +210,46 @@ python plot.py --results results --output plots --methods lacathode riddle --ver
 
 Request either method alone with `--methods lacathode` or `--methods riddle`.<br>
 Add `--overwrite` to regenerate matching plots and tables in an existing output directory without removing other files.
+
+
+## Optional injection scan
+
+In the Jupyter terminal, prepare the configured strengths and replicas once.
+
+```bash
+cd /shared/work/RIDDLE
+python run.py prepare-scan --config config/settings.yaml --output data/injection_scan --io-workers 4 --resume
+```
+
+After preparation is complete, submit these two separate one-A100 jobs from your local terminal.
+
+**RIDDLE:**
+
+```bash
+kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
+  python /shared/work/RIDDLE/nrp.py \
+  --workflow scan --name riddle-injection-scan --methods riddle \
+  --config config/settings.yaml --data data/injection_scan --results results_injection_scan \
+  --workers 2 --io-workers 4 | \
+  kubectl apply -n cua-asimsek -f -
+```
+
+**LaCathode:**
+
+```bash
+kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
+  python /shared/work/RIDDLE/nrp.py \
+  --workflow scan --name lacathode-injection-scan --methods lacathode \
+  --config config/settings.yaml --data data/injection_scan --results results_injection_scan \
+  --workers 1 --io-workers 4 | \
+  kubectl apply -n cua-asimsek -f -
+```
+
+In Jupyter, plot completed scan results:
+
+```bash
+python plot.py --results results_injection_scan --output plots_injection_scan --methods lacathode riddle --verbose 1 --overwrite
+```
 
 
 ## Troubleshooting

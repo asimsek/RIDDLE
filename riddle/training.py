@@ -13,10 +13,14 @@ from .model import (
     real_sr_latents,
     train_epoch,
     background_log_prob,
+    residual_optimizer,
 )
+from .integrity import SCIENTIFIC_VERSION, ordered_epochs
 
 
 def validate_checkpoint(checkpoint, epochs):
+    if checkpoint.get("scientific_version") != SCIENTIFIC_VERSION:
+        raise ValueError("Residual checkpoint uses a legacy scientific protocol; retrain in a new output")
     epoch, history = checkpoint.get("epoch"), checkpoint.get("history")
     if (
         type(epoch) is not int
@@ -104,11 +108,7 @@ def train_residual(
         if not np.isfinite(fraction) or not 0 < fraction < 1:
             raise ValueError("Fixed signal fraction must lie in (0,1)")
         logit = torch.tensor(np.log(fraction / (1 - fraction)), dtype=torch.float64, device=device)
-    optimizer = torch.optim.AdamW(
-        list(model.parameters()) + ([logit] if logit.requires_grad else []),
-        lr=options["learning_rate"],
-        weight_decay=options["weight_decay"],
-    )
+    optimizer = residual_optimizer(model, logit, options)
     history, files, start = [], {}, 0
     if checkpoint is not None:
         model.load_state_dict(checkpoint["model"])
@@ -122,6 +122,7 @@ def train_residual(
     write_json(
         output / "residual_training_inputs.json",
         {
+            "scientific_version": SCIENTIFIC_VERSION,
             "train_events": len(ztrain),
             "validation_events": len(zval),
             "train_latents_sha256": digest(ztrain),
@@ -162,11 +163,13 @@ def train_residual(
         atomic_write(
             output / name,
             lambda p: torch.save(
-                {"model": model.state_dict(), "fraction_logit": logit.detach(), "epoch": epoch}, p
+                {"model": model.state_dict(), "fraction_logit": logit.detach(), "epoch": epoch,
+                 "scientific_version": SCIENTIFIC_VERSION}, p
             ),
         )
         files[name] = file_digest(output / name)
         state = {
+            "scientific_version": SCIENTIFIC_VERSION,
             "epoch": epoch,
             "model": model.state_dict(),
             "fraction_logit": logit.detach(),
@@ -182,7 +185,7 @@ def train_residual(
         if after_epoch is not None:
             after_epoch(epoch)
     write_json(output / "residual_losses.json", {"history": history})
-    order = np.argsort([r["validation_nll"] for r in history])[: options["selected_checkpoints"]].tolist()
+    order = ordered_epochs([r["validation_nll"] for r in history], options["selected_checkpoints"])
     write_json(
         output / "residual_selection.json",
         {
@@ -199,6 +202,8 @@ def residual_scores(output, order, z, device):
     if not len(order):
         raise ValueError("Residual scoring requires at least one checkpoint")
     inputs = json.loads((output / "residual_training_inputs.json").read_text())
+    if inputs.get("scientific_version") != SCIENTIFIC_VERSION:
+        raise ValueError("Legacy residual inputs; use saved legacy scores or retrain")
     if inputs["features"] != z.shape[1]:
         raise ValueError("Scoring feature count differs from training")
     model = build_signal_flow(device, features=z.shape[1], settings=inputs["settings"]).eval()
@@ -211,6 +216,10 @@ def residual_scores(output, order, z, device):
                 checkpoint = torch.load(
                     output / f"residual_epoch_{epoch}.pt", map_location=device, weights_only=True
                 )
+                if checkpoint.get("scientific_version") != SCIENTIFIC_VERSION:
+                    raise ValueError("Cannot mix scientific checkpoint versions")
+                if checkpoint.get("epoch") != epoch:
+                    raise ValueError("Residual checkpoint epoch differs from requested selection")
                 model.load_state_dict(checkpoint["model"])
                 chunks = []
                 for offset in range(0, len(z), 8192):

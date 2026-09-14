@@ -1,38 +1,10 @@
 from __future__ import annotations
-import ast
-import functools
-import inspect
 import torch
 
 
-def install_validation_counts(module):
-    original = module.compute_loss_over_batches
-    if getattr(original, "_runtime_vectorized_counts", False):
-        return
-    tree = ast.parse(inspect.getsource(original))
-    for expression in ("torch.isnan(loss_vals)", "torch.abs(loss_vals) >= 1000"):
-        expected = ast.parse(f"sum({expression})", mode="eval").body
-        matches = [
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call) and ast.dump(node) == ast.dump(expected)
-        ]
-        if len(matches) != 1:
-            raise RuntimeError("Unexpected runtime validation counters; refusing acceleration patch")
-        matches[0].func = ast.Attribute(
-            value=ast.Name(id="torch", ctx=ast.Load()), attr="count_nonzero", ctx=ast.Load()
-        )
-    ast.fix_missing_locations(tree)
-    ast.increment_lineno(tree, original.__code__.co_firstlineno - 1)
-    namespace = {}
-    exec(
-        compile(tree, f"<runtime validation counters: {original.__code__.co_filename}>", "exec"),
-        original.__globals__,
-        namespace,
-    )
-    patched = functools.update_wrapper(namespace[original.__name__], original)
-    patched._runtime_vectorized_counts = True
-    module.compute_loss_over_batches = patched
+def install_validation_counts(module, diagnostics=None):
+    from .integrity import install_flow_validation
+    install_flow_validation(module, diagnostics)
 
 
 class TensorBatchAcceleration:

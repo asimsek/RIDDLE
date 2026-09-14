@@ -1,4 +1,5 @@
 import argparse
+from copy import deepcopy
 import json
 import os
 from pathlib import Path
@@ -49,30 +50,42 @@ def parser():
     prep.add_argument("--io-workers", type=positive, default=4)
     prep.add_argument("--resume", action="store_true")
     prep.add_argument("--verbose", type=int, choices=[0, 1, 2], default=1)
-    run = subs.add_parser("run", help="Run either or both independent methods")
-    run.add_argument("--methods", nargs="+", choices=METHODS, default=list(METHODS))
-    run.add_argument("--data", type=Path, default=Path("data/lhco"))
-    run.add_argument("--output", type=Path, default=Path("results"))
-    run.add_argument("--sources", type=Path, default=ROOT / "external/lacathode")
-    run.add_argument("--config", type=Path, default=ROOT / "config/settings.yaml")
-    run.add_argument("--scenarios", nargs="+", choices=SCENARIOS, default=["signal_injection"])
-    run.add_argument("--seeds", type=seeds, default=[42])
-    run.add_argument("--device", default="cpu")
-    run.add_argument(
-        "--workers",
-        type=positive,
-        default=1,
-        help="Concurrent RIDDLE fits; method/seed jobs remain isolated subprocesses",
-    )
-    run.add_argument("--io-workers", type=positive, default=2)
-    run.add_argument("--mps", choices=["auto", "on", "off"], default="auto")
-    run.add_argument("--runs", type=positive, help="Override YAML RIDDLE fits per fraction")
-    run.add_argument(
-        "--epochs", type=positive, help="Override YAML RIDDLE epochs; LaCathode remains fixed at 100"
-    )
-    run.add_argument("--fractions", nargs="+", help="Override YAML mixture-fraction configurations")
-    add_resume_options(run)
-    run.add_argument("--verbose", type=int, choices=[0, 1, 2], default=1)
+    prep_scan = subs.add_parser("prepare-scan", parents=[deepcopy(prep)], add_help=False,
+                                help="Prepare independently partitioned injection strengths")
+    prep_scan.set_defaults(output=Path("data/injection_scan"))
+    prep_scan.add_argument("--config", type=Path, default=ROOT / "config/settings.yaml")
+    prep_scan.add_argument("--signal-events", type=seeds, help="Subset of configured total signal counts")
+    prep_scan.add_argument("--replicas", type=seeds, help="Zero-based replica indices, e.g. 0-9")
+    for command in ("run", "scan"):
+        run = subs.add_parser(command, help="Run independent methods" if command == "run" else "Run the optional injection scan")
+        run.add_argument("--methods", nargs="+", choices=METHODS, default=list(METHODS))
+        run.add_argument("--data", type=Path, default=Path("data/lhco"))
+        run.add_argument("--output", type=Path, default=Path("results"))
+        run.add_argument("--sources", type=Path, default=ROOT / "external/lacathode")
+        run.add_argument("--config", type=Path, default=ROOT / "config/settings.yaml")
+        run.add_argument("--device", default="cpu")
+        run.add_argument(
+            "--workers",
+            type=positive,
+            default=1,
+            help="Concurrent RIDDLE fits; method/seed jobs remain isolated subprocesses",
+        )
+        run.add_argument("--io-workers", type=positive, default=2)
+        run.add_argument("--mps", choices=["auto", "on", "off"], default="auto")
+        run.add_argument("--runs", type=positive, help="Override YAML RIDDLE fits per fraction")
+        run.add_argument(
+            "--epochs", type=positive, help="Override YAML RIDDLE epochs; LaCathode remains fixed at 100"
+        )
+        run.add_argument("--fractions", nargs="+", help="Override YAML mixture-fraction configurations")
+        add_resume_options(run)
+        run.add_argument("--verbose", type=int, choices=[0, 1, 2], default=1)
+        if command == "run":
+            run.add_argument("--scenarios", nargs="+", choices=SCENARIOS, default=["signal_injection"])
+            run.add_argument("--seeds", type=seeds, default=[42])
+        else:
+            run.set_defaults(data=Path("data/injection_scan"), output=Path("results/injection_scan"))
+            run.add_argument("--signal-events", type=seeds, help="Subset of configured total signal counts")
+            run.add_argument("--replicas", type=seeds, help="Zero-based replica indices, e.g. 0-9")
     return p
 
 
@@ -155,7 +168,7 @@ def run_campaign(args):
 def main(argv=None):
     p = parser()
     args = p.parse_args(argv)
-    if args.command == "run":
+    if args.command in ("run", "scan"):
         try:
             resume_policy(args)
         except ValueError as error:
@@ -174,11 +187,17 @@ def main(argv=None):
                 from .data import prepare
 
                 prepare(args)
+            elif args.command == "prepare-scan":
+                from .scan import prepare_scan
+                prepare_scan(args)
+            elif args.command == "scan":
+                from .scan import run_scan
+                run_scan(args)
             else:
                 run_campaign(args)
         colored_status("Completed", kind="PASS")
         return 0
-    except (ValueError, OSError, RuntimeError, subprocess.SubprocessError) as error:
+    except (ValueError, OSError, RuntimeError, FloatingPointError, subprocess.SubprocessError) as error:
         p.exit(1, f"[ERROR] {error}\n")
     except KeyboardInterrupt:
         p.exit(130, "[WARNING] Interrupted; completed checkpoints retained\n")

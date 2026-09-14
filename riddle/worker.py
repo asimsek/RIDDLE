@@ -10,6 +10,7 @@ from .storage import code_hashes, environment, file_digest, write_json, verify_a
 from .data import validate
 from .worker_progress import emit_message
 from .resume import inspect_resume, record_transition, resume_policy
+from .integrity import SCIENTIFIC_VERSION
 
 
 def runtime_code(method, root=None):
@@ -23,6 +24,9 @@ def runtime_code(method, root=None):
     if method != "lacathode":
         raise ValueError("Unknown method")
     framework = (
+        "integrity.py",
+        "metrics.py",
+        "scan.py",
         "cli.py",
         "worker.py",
         "data.py",
@@ -92,6 +96,8 @@ def main():
     if args.method == "riddle":
         settings.update(args.settings)
     contract = {
+        "scientific_version": SCIENTIFIC_VERSION if args.method == "riddle" else "pinned_upstream",
+        "flow_checkpoint_prefix": args.method + "_model",
         "schema": 1,
         "method": args.method,
         "inputs": inputs,
@@ -99,6 +105,10 @@ def main():
         "code": code,
         "settings": settings,
     }
+    if args.method == "riddle":
+        from .production import PRODUCTION_POLICY
+
+        contract["riddle_production_policy"] = PRODUCTION_POLICY
     if args.method == "lacathode":
         from external.lacathode_utils.source import verify, COMMIT
 

@@ -50,3 +50,8 @@ background:
   epochs: 100
   batch_size: 256
   reference_samples: 267000
+injection_scan:
+  signal_events: [1000, 667, 500, 333, 250, 167, 83]
+  replicas: 10
+  preparation_seed: 1001
+  training_seed: 42

@@ -3,8 +3,10 @@ import math
 import numpy as np
 import torch
 from .settings import DEFAULTS
+from .integrity import SCIENTIFIC_VERSION, mixture_log_density
 
 PROTOCOL = {
+    "scientific_version": SCIENTIFIC_VERSION,
     "name": "Residual",
     "features": 4,
     "layers": 6,
@@ -16,6 +18,9 @@ PROTOCOL = {
     "optimizer": "AdamW",
     "learning_rate": 0.0003,
     "weight_decay": 0.01,
+    "fraction_weight_decay": 0.0,
+    "mixture_loss": "logaddexp with log-sigmoid weights; no density floor",
+    "fraction_interpretation": "fitted mixture parameter, not an unbiased contamination measurement",
     "gradient_clip": "flow parameters only; norm 1",
     "selected_checkpoints": 10,
     "inputs": "saved real-data SR latents; no mass or truth labels",
@@ -27,6 +32,8 @@ PROTOCOL = {
 
 
 def build_signal_flow(device="cpu", *, features=4, settings=None):
+    if features not in (4, 5):
+        raise ValueError("Residual flow accepts four configured latents, or five for DeltaR")
     if version("nflows") != "0.14":
         raise RuntimeError("RIDDLE requires nflows==0.14")
     from nflows.distributions.normal import StandardNormal
@@ -86,14 +93,17 @@ def background_log_prob(z):
 
 
 def residual_loss(signal_log_prob, background_log_density, fraction_logit):
-    weight = torch.sigmoid(fraction_logit)
-    density = weight * signal_log_prob.exp() + (1 - weight) * background_log_density.exp() * torch.ones_like(
-        background_log_density, dtype=torch.float64
-    )
-    log_density = torch.log(density + 1e-32)
+    log_density = mixture_log_density(signal_log_prob, background_log_density, fraction_logit)
     if not torch.isfinite(log_density).all():
         raise FloatingPointError("Nonfinite residual likelihood; last completed epoch retained")
     return -log_density.mean()
+
+
+def residual_optimizer(model, logit, options):
+    groups = [{"params": list(model.parameters()), "weight_decay": options["weight_decay"]}]
+    if logit.requires_grad:
+        groups.append({"params": [logit], "weight_decay": 0.0})
+    return torch.optim.AdamW(groups, lr=options["learning_rate"])
 
 
 def real_sr_latents(rows):
@@ -111,13 +121,15 @@ def real_sr_latents(rows):
 def train_epoch(model, logit, loader, optimizer=None, progress=None, *, gradient_clip_norm=1):
     model.train(optimizer is not None)
     total = 0.0
+    events = 0
     with torch.set_grad_enabled(optimizer is not None):
         for index, (z,) in enumerate(loader):
             z = z.to(logit.device)
             if optimizer is not None:
                 optimizer.zero_grad()
             loss = residual_loss(model.log_prob(z), background_log_prob(z), logit)
-            total += loss.item()
+            total += loss.item() * len(z)
+            events += len(z)
             if optimizer is not None:
                 loss.backward()
                 if logit.requires_grad and (logit.grad is None or not torch.isfinite(logit.grad).all()):
@@ -133,4 +145,6 @@ def train_epoch(model, logit, loader, optimizer=None, progress=None, *, gradient
                 optimizer.step()
             if progress is not None:
                 progress(index + 1, len(loader))
-    return total / len(loader)
+    if not events or events != len(loader.dataset):
+        raise ValueError("Residual epoch must include every expected event")
+    return total / events

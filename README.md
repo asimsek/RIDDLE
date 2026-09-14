@@ -92,3 +92,16 @@ python plot.py --results results --output plots --methods lacathode riddle --ver
 
 Request either method alone with `--methods lacathode` or `--methods riddle`.<br>
 Add `--overwrite` to regenerate matching plots and tables in an existing output directory without removing other files.
+
+
+## Optional signal-strength scan
+
+```bash
+python run.py prepare-scan --config config/settings.yaml --output data/injection_scan --io-workers 4 --resume
+
+python run.py scan --methods lacathode riddle --config config/settings.yaml \
+  --data data/injection_scan --output results_injection_scan \
+  --device cuda:0 --workers 2 --io-workers 4 --mps auto --resume
+
+python plot.py --results results_injection_scan --output plots_injection_scan --methods lacathode riddle --verbose 1
+```

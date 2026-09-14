@@ -12,12 +12,13 @@ from .preprocessing import LHCORD_data_handler, load_dataset, stack_data
 from .density_estimator import DensityEstimator
 from . import flow_training
 from .settings import DEFAULTS
+from .integrity import ordered_epochs, require_finite
 
 
 def require_common_mapping(selection):
     training = selection.get("training_mapping_epoch")
     inference = selection.get("inference_mapping_epoch")
-    if type(inference) is not int or not 0 <= inference < 100:
+    if type(inference) is not int or not 0 <= inference < selection.get("trained_epochs", 100):
         raise ValueError("Invalid frozen flow epoch")
     if type(training) is not int or training != inference:
         raise ValueError(
@@ -27,17 +28,17 @@ def require_common_mapping(selection):
 
 
 def flow_selection(output):
-    losses = np.load(output / "my_ANODE_model_val_losses.npy")
+    losses = np.load(output / "riddle_model_val_losses.npy")
     if losses.dtype != np.float32 or not np.isfinite(losses).all() or len(losses) <= 10:
         raise ValueError("Invalid initial-plus-trained flow validation loss array")
-    mapping = np.argpartition(losses, 10)[:10]
-    inference = int(np.argpartition(losses, 1)[0])
-    if 0 in mapping or inference == 0:
-        raise ValueError("Selection includes the untrained flow entry; no corresponding checkpoint exists")
+    mapping = ordered_epochs(losses, 10, initial_entry=True)
+    inference = mapping[0]
     result = {
-        "training_mapping_epoch": int(mapping[0] - 1),
-        "inference_mapping_epoch": inference - 1,
-        "ordered_mapping_epochs": (mapping - 1).tolist(),
+        "training_mapping_epoch": mapping[0],
+        "inference_mapping_epoch": inference,
+        "ordered_mapping_epochs": mapping,
+        "trained_epochs": len(losses) - 1,
+        "criterion": "lowest all-event validation NLL among trained checkpoints; stable epoch tie-break",
     }
     write_json(output / "flow_selection.json", result)
     require_common_mapping(result)
@@ -67,7 +68,7 @@ def prepare(data, output, seed, device, recovery, *, settings=None):
     configuration = settings["configuration"]
     configuration["num_inputs"] = np.load(data / "outerdata_train.npy", mmap_mode="r").shape[1] - 2
     write_json(output / "background_settings.json", settings)
-    install_validation_counts(flow_training)
+    install_validation_counts(flow_training, output / "validation_diagnostics.json")
     install_epoch_recovery(flow_training, "train_ANODE", "flow", recovery)
     seed_start(seed)
 
@@ -82,7 +83,7 @@ def prepare(data, output, seed, device, recovery, *, settings=None):
                 estimator.optimizer,
                 handler.outer_ANODE_datadict_train["loader"],
                 handler.outer_ANODE_datadict_test["loader"],
-                "my_ANODE_model",
+                "riddle_model",
                 settings["epochs"],
                 savedir=str(output),
                 device=device,
@@ -102,7 +103,7 @@ def prepare(data, output, seed, device, recovery, *, settings=None):
                 DensityEstimator(
                     configuration,
                     eval_mode=True,
-                    load_path=str(output / f"my_ANODE_model_epoch_{e}.par"),
+                    load_path=str(output / f"riddle_model_epoch_{e}.par"),
                     device=device,
                     verbose=False,
                     bound=False,
@@ -154,7 +155,7 @@ class Mapper:
         settings = json.loads((Path(output) / "background_settings.json").read_text())
         self.model = DensityEstimator(settings["configuration"], eval_mode=True).model
         weights = torch.load(
-            Path(output) / f"my_ANODE_model_epoch_{epoch}.par", map_location="cpu", weights_only=True
+            Path(output) / f"riddle_model_epoch_{epoch}.par", map_location="cpu", weights_only=True
         )
         self.model.load_state_dict(weights)
         self.model.to(device).eval().requires_grad_(False)
@@ -178,4 +179,6 @@ class Mapper:
                 progress.update(min(offset + 8192, len(x)))
         if not outputs:
             raise ValueError("No events remain inside the flow domain")
-        return np.concatenate(outputs), prepared["mask"].cpu().numpy()
+        result = np.concatenate(outputs)
+        require_finite(result, "Frozen background mapping")
+        return result, prepared["mask"].cpu().numpy()
