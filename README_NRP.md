@@ -156,23 +156,51 @@ Both require `--resume` and can be combined.
 
 ## Monitoring and resuming
 
+### RIDDLE:
+
 ```bash
 kubectl get jobs,pods -n cua-asimsek
 kubectl get pods -n cua-asimsek -l job-name=riddle-seed42 -o wide
 kubectl get pods -n cua-asimsek -l job-name=riddle-bg-seed42 -o wide
-kubectl get pods -n cua-asimsek -l job-name=lacathode-seed42 -o wide
-kubectl logs -n cua-asimsek -f job/lacathode-seed42 -c campaign
 ```
+
+**Check logs:**
 
 ```bash
 kubectl logs -n cua-asimsek -f job/riddle-seed42 -c campaign
 kubectl logs -n cua-asimsek -f job/riddle-bg-seed42 -c campaign
 ```
 
+**!!! CAUTION !!! Delete pods:**
+
 ```bash
 kubectl delete job riddle-seed42 -n cua-asimsek --ignore-not-found --wait=true
 kubectl delete job riddle-bg-seed42 -n cua-asimsek --ignore-not-found --wait=true
 ```
+
+### LaCathode:
+
+```bash
+kubectl get jobs,pods -n cua-asimsek
+kubectl get pods -n cua-asimsek -l job-name=lacathode-seed42 -o wide
+kubectl get pods -n cua-asimsek -l job-name=lacathode-bg-seed42 -o wide
+```
+
+**Check logs:**
+
+```bash
+kubectl logs -n cua-asimsek -f job/lacathode-seed42 -c campaign
+kubectl logs -n cua-asimsek -f job/lacathode-bg-seed42 -c campaign
+```
+
+**!!! CAUTION !!! Delete pods:**
+
+```bash
+kubectl delete job lacathode-seed42 -n cua-asimsek --ignore-not-found --wait=true
+kubectl delete job lacathode-bg-seed42 -n cua-asimsek --ignore-not-found --wait=true
+```
+
+
 
 ## Jupyter terminal: plots
 
