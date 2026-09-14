@@ -510,6 +510,10 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Figures from frozen LaCathode/RIDDLE results; no fitting")
     parser.add_argument("--results", type=Path, default=Path("results"))
     parser.add_argument("--output", type=Path, default=Path("plots"))
+    parser.add_argument(
+        "--overwrite", action="store_true",
+        help="Regenerate matching plots and tables in an existing output directory; preserve other files",
+    )
     parser.add_argument("--methods", nargs="+", choices=tuple(KEYS), default=list(KEYS))
     parser.add_argument("--confidence", type=float, default=0.95)
     parser.add_argument("--min-background", type=int, default=10)
@@ -526,11 +530,16 @@ def main(argv=None):
             colored_status("No completed results for the requested methods", kind="WARNING")
             return 0
         args.results, args.output = args.results.resolve(), args.output.resolve()
-        if args.output.exists():
-            raise FileExistsError("Plot output exists; choose a new output directory")
         if args.output.is_relative_to(args.results) or args.results.is_relative_to(args.output):
             raise ValueError("Keep plots outside the result input tree")
-        args.output.mkdir(parents=True)
+        if args.output.exists():
+            if not args.output.is_dir():
+                raise NotADirectoryError("Plot output must be a directory")
+            if not args.overwrite:
+                raise FileExistsError("Plot output exists; use --overwrite or choose a new output directory")
+            if any(path.is_symlink() for path in args.output.rglob("*")):
+                raise ValueError("Cannot overwrite a plot directory containing symbolic links")
+        args.output.mkdir(parents=True, exist_ok=args.overwrite)
         rows, settings, bundles = [], [], []
         with local_progress("Plots"), f.plt.style.context(f.STYLE), locked(args.output / ".plot.lock"):
             for (scenario, seed), group in groups.items():
@@ -583,7 +592,7 @@ def main(argv=None):
             )
         colored_status("Figures and CSV tables completed", kind="PASS")
         return 0
-    except (ValueError, OSError, KeyError) as error:
+    except (ValueError, OSError, KeyError, RuntimeError) as error:
         parser.exit(1, f"[ERROR] {error}\n")
 
 

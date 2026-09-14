@@ -90,4 +90,5 @@ Use the corresponding `shifted` locations for the shifted control.
 python plot.py --results results --output plots --methods lacathode riddle --verbose 1
 ```
 
-Request either method alone with `--methods lacathode` or `--methods riddle`.
+Request either method alone with `--methods lacathode` or `--methods riddle`.<br>
+Add `--overwrite` to regenerate matching plots and tables in an existing output directory without removing other files.
