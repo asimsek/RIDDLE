@@ -113,16 +113,16 @@ Together they use two separate GPU allocations, not a two-GPU request. They may 
 kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --name riddle-seed42 --methods riddle --scenarios signal_injection \
-  --seeds 42 --config config/settings.yaml --workers 2 --io-workers 4 | \
-  kubectl apply -n cua-asimsek -f -
+  --seeds 42 --config config/settings.yaml --workers 2 --io-workers 8 \
+  --runs 10 --epochs 100 | kubectl apply -n cua-asimsek -f -
 ```
 
 ```bash
 kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --name riddle-bg-seed42 --methods riddle --scenarios background_only \
-  --seeds 42 --config config/settings.yaml --workers 2 --io-workers 4 | \
-  kubectl apply -n cua-asimsek -f -
+  --seeds 42 --config config/settings.yaml --workers 2 --io-workers 8 \
+  --runs 10 --epochs 100 | kubectl apply -n cua-asimsek -f -
 ```
 
 **LaCathode:**
@@ -131,7 +131,7 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
 kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --name lacathode-seed42 --methods lacathode --scenarios signal_injection \
-  --seeds 42 --workers 1 --io-workers 4 | \
+  --seeds 42 --workers 1 --io-workers 8 | \
   kubectl apply -n cua-asimsek -f -
 ```
 
@@ -139,7 +139,7 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
 kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --name lacathode-bg-seed42 --methods lacathode --scenarios background_only \
-  --seeds 42 --workers 1 --io-workers 4 | \
+  --seeds 42 --workers 1 --io-workers 8 | \
   kubectl apply -n cua-asimsek -f -
 ```
 

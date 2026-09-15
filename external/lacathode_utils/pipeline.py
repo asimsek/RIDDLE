@@ -1,4 +1,5 @@
 import ast
+from contextlib import contextmanager
 import inspect
 import json
 import os
@@ -19,6 +20,25 @@ from .resume import resume_policy
 from riddle.metrics import acceptance_report
 
 FLOW_PREFIX = "lacathode_model"
+
+
+@contextmanager
+def classifier_prediction_device(classifier_type):
+    """Match prediction inputs to the loaded model, only during SR evaluation."""
+    original = classifier_type.predict
+
+    def predict(self, x):
+        device = next(self.parameters()).device
+        with torch.no_grad():
+            self.eval()
+            x = torch.tensor(x, device=device)
+            return self.forward(x).detach().cpu().numpy()
+
+    classifier_type.predict = predict
+    try:
+        yield
+    finally:
+        classifier_type.predict = original
 
 
 def device_masks(module):
@@ -154,6 +174,7 @@ def run(args, contract):
 
 
 def evaluate(args, root, data_handler, *, config_file="DE_MAF_model.yml"):
+    from classifier import Classifier
     from density_estimator import DensityEstimator
     from evaluation_utils import minimum_validation_loss_models
     import matplotlib.pyplot as plt
@@ -187,7 +208,10 @@ def evaluate(args, root, data_handler, *, config_file="DE_MAF_model.yml"):
     }
     exec(compile(ast.Module(body=[function], type_ignores=[]), "<pinned SR evaluation>", "exec"), namespace)
     seed_start(args.seed)
-    with ProgressStage("evaluation", "Evaluate signal-region ensemble"):
+    with (
+        ProgressStage("evaluation", "Evaluate signal-region ensemble"),
+        classifier_prediction_device(Classifier),
+    ):
         namespace["make_ROCs"](
             str(root),
             str(args.data),
