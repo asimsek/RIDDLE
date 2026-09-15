@@ -1,5 +1,7 @@
 .venv/
+.venv-ranode/
 external/lacathode/
+external/ranode/
 .cache/
 data/
 results/
