@@ -154,6 +154,10 @@ To continue compatible checkpoints after an implementation update, add `--resume
 To move between CUDA GPUs, add `--resume-across-device-change`.<br>
 Both require `--resume` and can be combined.
 
+Add `--gpu l40` or `--gpu l40s` to any `nrp.py` submission, including injection scans and either method. Omitting `--gpu` keeps the existing A100 request.<br>
+Supported values (case-insensitive): `a100`, `l40`, `l40s`, `l4`, `a40`, `rtxa6000`, `rtx8000`, `rtx3090`, `rtx4090`, `h100`, `h200`.
+
+
 ## Monitoring and resuming
 
 ### RIDDLE:

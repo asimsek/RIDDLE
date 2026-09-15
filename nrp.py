@@ -14,6 +14,21 @@ from riddle.resume import add_resume_options
 ROOT = Path(__file__).resolve().parent
 PYTHON = "/opt/conda/bin/python"
 
+# NRP resource key and, for generic GPU resources, the exact node product label.
+GPU_TYPES = {
+    "a100": ("nvidia.com/a100", None),
+    "l40": ("nvidia.com/gpu", "NVIDIA-L40"),
+    "l40s": ("nvidia.com/gpu", "NVIDIA-L40S"),
+    "l4": ("nvidia.com/gpu", "NVIDIA-L4"),
+    "a40": ("nvidia.com/a40", None),
+    "rtxa6000": ("nvidia.com/rtxa6000", None),
+    "rtx8000": ("nvidia.com/rtx8000", None),
+    "rtx3090": ("nvidia.com/gpu", "NVIDIA-GeForce-RTX-3090"),
+    "rtx4090": ("nvidia.com/gpu", "NVIDIA-GeForce-RTX-4090"),
+    "h100": ("nvidia.com/h100", None),
+    "h200": ("nvidia.com/h200", None),
+}
+
 
 def setup_runtime():
     spec = yaml.safe_load((ROOT / "config/nrp/jupyter.yaml").read_text())["spec"]
@@ -77,7 +92,11 @@ def job(args):
             "exec " + shlex.join(command),
         ]
     )
-    resource = {"cpu": "16", "memory": "64Gi", "nvidia.com/a100": 1}
+    gpu = getattr(args, "gpu", "a100").lower()
+    if gpu not in GPU_TYPES:
+        raise ValueError(f"Unknown GPU {gpu!r}; choose from {', '.join(GPU_TYPES)}")
+    gpu_resource, gpu_product = GPU_TYPES[gpu]
+    resource = {"cpu": "16", "memory": "64Gi", gpu_resource: 1}
     result = {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -130,6 +149,8 @@ def job(args):
             },
         },
     }
+    if gpu_product is not None:
+        result["spec"]["template"]["spec"]["nodeSelector"]["nvidia.com/gpu.product"] = gpu_product
     secrets = [dict(item) for item in default_secrets]
     for name in getattr(args, "image_pull_secret", None) or []:
         if not re.fullmatch(r"[a-z0-9]([-a-z0-9.]*[a-z0-9])?", name) or len(name) > 253:
@@ -157,6 +178,10 @@ def main(argv=None):
     p.add_argument("--epochs", type=positive, help="Override YAML epochs")
     p.add_argument("--workers", type=positive, default=2)
     p.add_argument("--io-workers", type=positive, default=4)
+    p.add_argument(
+        "--gpu", type=str.lower, choices=GPU_TYPES, default="a100",
+        help="Request one GPU of this type (case-insensitive; default: a100); namespace access is still required",
+    )
     add_resume_options(p, always_resume=True)
     p.add_argument("--region", help="Storage region; defaults to the Jupyter node selector")
     p.add_argument(
