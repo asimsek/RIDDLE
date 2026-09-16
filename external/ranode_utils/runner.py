@@ -3,6 +3,7 @@ import fcntl
 import importlib.metadata
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -17,8 +18,64 @@ from .data import BACKGROUND_PROTOCOL, input_features, scientific_version, valid
 from .ensemble import combine_fits, selected_epochs
 from .resume import check_contract, policy, transition_history
 from .source import COMMIT, REPOSITORY, digest, verify
+from riddle.worker_progress import EVENT_PREFIX, ProgressStage, emit_message, emit_progress
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+class StageReporter:
+    """Translate existing upstream stdout without touching its training loop."""
+
+    epoch_pattern = re.compile(r"^epoch:\s*(\d+)\s+trainloss:\s*(\S+)\s+valloss:\s*(\S+)\s*$")
+
+    def __init__(self, options):
+        self.options = options
+        self.stream = "Background" if options["stage"] == "background" else f"Fit {options['fit_index']:03d}"
+        self.current = None
+        self.phase("imports", "Start stage process and load dependencies")
+
+    def publish(self, **updates):
+        self.current.update(updates)
+        emit_progress(**self.current, stream=self.stream)
+
+    def phase(self, phase, label, *, total=1, unit="step"):
+        if self.current and self.current["phase"] == phase:
+            return
+        self.finish()
+        self.current = dict(phase=phase, label=label, total=total, unit=unit, completed=0)
+        self.publish()
+
+    def finish(self):
+        if self.current and self.current["unit"] != "epoch":
+            self.publish(completed=self.current["total"])
+
+    def line(self, line):
+        text = line.strip()
+        if text.startswith(EVENT_PREFIX):
+            event = json.loads(text[len(EVENT_PREFIX):])
+            self.phase(event["phase"], event["label"])
+            if event.get("completed") is not None:
+                self.publish(completed=event["completed"])
+            return
+        prefix = "" if self.options["stage"] == "background" else f"[R-ANODE fit {self.options['fit_index']}] "
+        if text:
+            if os.environ.get("RIDDLE_WORKER_PROGRESS") == "1":
+                print(prefix + line.rstrip(), flush=True)
+            else:
+                from riddle.progress import colored_status
+
+                colored_status(prefix + line.rstrip(), level=2)
+        match = self.epoch_pattern.fullmatch(text)
+        if text.startswith("X_test shape") or match:
+            total = self.options.get("epochs", 1)
+            if self.current["phase"] not in ("training", "evaluation"):
+                self.phase("training", f"Train {self.options['stage']} flow", total=total, unit="epoch")
+            if match and self.current["phase"] == "training":
+                completed = int(match[1]) + 1
+                if self.current["completed"] < completed <= total:
+                    self.publish(completed=completed, train_loss=match[2], validation_loss=match[3])
+                    if completed == total:
+                        self.phase("evaluation", "Upstream checkpoint selection and evaluation")
 
 
 def write_json(path, value):
@@ -150,14 +207,26 @@ def stop_processes(processes):
 
 
 def execute(options, env):
-    process = subprocess.Popen(stage_command(options), env=env, start_new_session=True)
-    try:
-        if process.wait() != 0:
-            raise RuntimeError(
-                f"Upstream R-ANODE {options['stage']} stage failed; artifacts retained in {options['attempt']}"
-            )
-    finally:
-        stop_processes([process])
+    reporter = StageReporter(options)
+    log_path = Path(options["attempt"]) / "stage.log"
+    with log_path.open("w") as stream:
+        process = subprocess.Popen(
+            stage_command(options), env=env, start_new_session=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            encoding="utf-8", errors="replace", bufsize=1,
+        )
+        try:
+            for line in process.stdout:
+                stream.write(line)
+                stream.flush()
+                reporter.line(line)
+            if process.wait() != 0:
+                raise RuntimeError(
+                    f"Upstream R-ANODE {options['stage']} stage failed; artifacts retained in {options['attempt']}; see {log_path}"
+                )
+        finally:
+            stop_processes([process])
+            process.stdout.close()
 
 
 def stage_root(args, stage, config):
@@ -170,9 +239,12 @@ def prepare_stage(args, stage, config, background=None):
     root = stage_root(args, stage, config)
     receipt = root / (stage + "_complete.json")
     if receipt.exists():
+        label = "Background" if stage == "background" else f"Fit {config['fit_index']:03d}"
+        emit_progress("reuse", "Verify saved stage artifacts", stream=label, completed=0)
         saved = json.loads(receipt.read_text())
         check_files(args.output, saved["files"])
-        print(f"[PASS] Reuse verified R-ANODE {stage} stage", flush=True)
+        emit_progress("reuse", "Verify saved stage artifacts", stream=label, completed=1)
+        emit_message(f"{label}: reuse verified R-ANODE {stage} stage", kind="PASS")
         return args.output / saved["attempt"]
     attempts = root / "upstream_runs" / stage
     attempts.mkdir(parents=True, exist_ok=True)
@@ -198,16 +270,18 @@ def prepare_stage(args, stage, config, background=None):
         PYTHONUNBUFFERED="1",
         MPLBACKEND="Agg",
         WANDB_MODE="disabled",
+        RIDDLE_WORKER_PROGRESS="1",
         PYTHONPATH=os.pathsep.join(filter(None, (str(ROOT), env.get("PYTHONPATH")))),
     )
     for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
         env[key] = str(args.io_workers)
     write_json(attempt / "producer_contract.json", args.production_contract)
-    print(f"[WORK] Original R-ANODE {stage}: {options['epochs']} epochs", flush=True)
     return options, env
 
 
 def complete_stage(args, options):
+    label = "Background" if options["stage"] == "background" else f"Fit {options['fit_index']:03d}"
+    emit_progress("receipt", "Verify and record stage artifacts", stream=label, completed=0)
     attempt = Path(options["attempt"])
     relative = attempt.relative_to(args.output)
     hashes = {
@@ -215,6 +289,7 @@ def complete_stage(args, options):
     }
     receipt = stage_root(args, options["stage"], options) / (options["stage"] + "_complete.json")
     write_json(receipt, {"attempt": str(relative), "files": hashes})
+    emit_progress("receipt", "Verify and record stage artifacts", stream=label, completed=1)
     return attempt
 
 
@@ -235,23 +310,25 @@ def fit_log(state, *, final=False):
         if not final and not line.endswith(("\n", "\r")):
             state["pending_log"] = line
         elif line.strip():
-            print(f"[R-ANODE fit {state['options']['fit_index']}] {line.rstrip()}", flush=True)
+            state["reporter"].line(line)
 
 
 def run_signal_fits(args, config, background):
     """Schedule isolated upstream processes; retain fit-index ensemble order."""
     indices = list(range(config["fit_index"], config["fit_index"] + config["runs"]))
     workers = min(getattr(args, "workers", 1), len(indices))
+    progress = ProgressStage("ranode_fits", "Train and evaluate signal fits", len(indices), "fit", report_every=1)
     if workers == 1:
         fits = []
         for index in indices:
-            print(f"[WORK] R-ANODE fit {len(fits) + 1}/{len(indices)}", flush=True)
+            emit_message(f"Fit {len(fits) + 1}/{len(indices)} (fit_{index:03d}): starting")
             fits.append(run_stage(args, "signal", {**config, "fit_index": index}, background))
+            progress.update(len(fits), force=True)
         return fits
     from .runtime import concurrent_environment
 
     extra_env, mps = concurrent_environment(getattr(args, "mps", "auto"), args.device)
-    print(f"[INFO] R-ANODE: up to {workers} concurrent fits on {args.device}; MPS: {mps['reason']}", flush=True)
+    emit_message(f"R-ANODE: up to {workers} concurrent fits on {args.device}; MPS: {mps['reason']}")
     execution = {"workers": workers, "device": args.device, "mps": mps, "fits": [], "completed": False}
     execution_path = args.output / ".resume" / f"concurrency_{time.time_ns()}.json"
     write_json(execution_path, execution)
@@ -265,8 +342,10 @@ def run_signal_fits(args, config, background):
                 if isinstance(request, Path):
                     completed[index] = request
                     execution["fits"].append({"fit_index": index, "reused": True})
+                    progress.update(len(completed), force=True)
                     continue
                 options, env = request
+                reporter = StageReporter(options)
                 log_path = Path(options["attempt"]) / "stage.log"
                 stream = log_path.open("w")
                 reader = log_path.open(encoding="utf-8", errors="replace")
@@ -280,8 +359,8 @@ def run_signal_fits(args, config, background):
                 timing = {"fit_index": index, "pid": process.pid, "started": time.time(), "reused": False}
                 execution["fits"].append(timing)
                 active[index] = dict(process=process, options=options, stream=stream, reader=reader,
-                                     pending_log="", timing=timing)
-                print(f"[WORK] R-ANODE fit {index}: started; log: {log_path}", flush=True)
+                                     pending_log="", timing=timing, reporter=reporter)
+                emit_message(f"Fit {cursor}/{len(indices)} (fit_{index:03d}): started; log: {log_path}")
             finished = []
             for index, state in active.items():
                 fit_log(state)
@@ -296,7 +375,8 @@ def run_signal_fits(args, config, background):
                 state["reader"].close()
                 completed[index] = complete_stage(args, state["options"])
                 finished.append(index)
-                print(f"[PASS] R-ANODE fit {index}: completed", flush=True)
+                emit_message(f"Fit {index:03d}: completed", kind="PASS")
+                progress.update(len(completed), force=True)
             for index in finished:
                 del active[index]
             if active and not finished:
@@ -333,16 +413,25 @@ def run(args):
     config = settings(
         args.config, runs=getattr(args, "runs", None), epochs=getattr(args, "epochs", None)
     )
+    checks = ProgressStage("ranode_checks", "Verify inputs, upstream sources and runtime", 3)
     inputs, _ = validate(args.data)
+    checks.update(1, force=True)
     if inputs["scenario"] != args.scenario:
         raise ValueError("R-ANODE scenario disagrees with prepared inputs")
     source = verify(args.sources)
+    checks.update(2, force=True)
     try:
         environment = runtime()
     except importlib.metadata.PackageNotFoundError as error:
         raise RuntimeError(
             "R-ANODE runtime is incomplete; install requirements.txt locally or use the updated riddle-runtime image"
         ) from error
+    checks.update(3, force=True)
+    emit_message(
+        f"R-ANODE on {args.device}: shared background {config['background_epochs']} epochs; "
+        f"{config['runs']} signal fits × {config['signal_epochs']} epochs; "
+        f"workers={min(getattr(args, 'workers', 1), config['runs'])}. Epochs are displayed starting at 1."
+    )
     contract = {
         "schema": 1,
         "method": "ranode",
@@ -379,6 +468,7 @@ def run(args):
                 "R-ANODE artifacts exist without their result contract; use a new output"
             )
         if saved:
+            resume_progress = ProgressStage("ranode_resume", "Verify resume contract and saved artifacts")
             if not args.resume:
                 raise FileExistsError(
                     "R-ANODE result exists; use --resume or a new output"
@@ -400,10 +490,11 @@ def run(args):
                     history_path, saved["contract"], contract, changes,
                     action="reuse_completed" if saved["completed"] else "resume_incomplete",
                 ))
-                print("[WARNING] Approved R-ANODE resume changes: "
-                      + ", ".join(change["field"] for change in changes), flush=True)
+                emit_message("Approved R-ANODE resume changes: "
+                             + ", ".join(change["field"] for change in changes), kind="WARNING", level=0)
+            resume_progress.update(1, force=True)
             if saved["completed"]:
-                print("[PASS] Reuse verified completed R-ANODE result", flush=True)
+                emit_message("Reuse verified completed R-ANODE result", kind="PASS")
                 return
         report = {
             "schema": 1,
@@ -418,9 +509,11 @@ def run(args):
             report["initial_contract"] = saved.get("initial_contract", saved["contract"])
         write_json(manifest, report)
         args.production_contract = contract
-        background = run_stage(args, "background", config)
+        with ProgressStage("ranode_background", "Train and evaluate shared background"):
+            background = run_stage(args, "background", config)
         fits = run_signal_fits(args, config, background)
         members = []
+        ensemble_progress = ProgressStage("ranode_ensemble", "Select checkpoints and combine fit scores", config["runs"] + 1)
         for index, fit in zip(range(config["fit_index"], config["fit_index"] + config["runs"]), fits):
             epochs = selected_epochs(fit, config["signal_epochs"])
             members.append({
@@ -428,7 +521,9 @@ def run(args):
                 "attempt": str(fit.relative_to(args.output)),
                 "epochs": epochs,
             })
+            ensemble_progress.update(len(members), force=True)
         combine_fits(fits, args.output, requested_runs=config["runs"])
+        ensemble_progress.update(config["runs"] + 1, force=True)
         protocol = {
             "repository": REPOSITORY,
             "commit": COMMIT,
@@ -471,8 +566,11 @@ def run(args):
                 "unchanged": "Upstream flow classes, preprocessing, likelihood, optimization, split rules, checkpoint selection and score definition",
             }
         write_json(args.output / "protocol.json", protocol)
+        final_progress = ProgressStage("ranode_final", "Verify inputs, sources and final result artifacts", 3)
         validate(args.data)
+        final_progress.update(1, force=True)
         verify(args.sources)
+        final_progress.update(2, force=True)
         # Only successful attempts enter the published receipt; partial attempts remain recoverable.
         artifacts = [
             p
@@ -492,7 +590,8 @@ def run(args):
             )
         report.update(completed=True, artifacts_sha256=hashes)
         write_json(manifest, report)
-        print("[PASS] Independent upstream R-ANODE result verified", flush=True)
+        final_progress.update(3, force=True)
+        emit_message("Independent upstream R-ANODE result verified", kind="PASS")
 
 
 def main(argv=None):
@@ -535,7 +634,15 @@ def main(argv=None):
     for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
         os.environ[key] = str(args.io_workers)
     try:
-        run(args)
+        if os.environ.get("RIDDLE_WORKER_PROGRESS") == "1":
+            run(args)
+        else:
+            from riddle.progress import set_verbosity
+            from riddle.worker_progress import local_progress
+
+            set_verbosity(int(os.environ.get("RIDDLE_VERBOSE", "1")))
+            with local_progress(f"ranode | {args.scenario}"):
+                run(args)
     except (ValueError, OSError, RuntimeError, subprocess.SubprocessError) as error:
         parser.exit(1, f"[ERROR] {error}\n")
 

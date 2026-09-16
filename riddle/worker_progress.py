@@ -17,7 +17,8 @@ _NO_DIGEST = object()
 
 
 def emit_progress(
-    phase, label, *, total=1, unit="step", completed=None, initial=None, report_every=None, **metrics
+    phase, label, *, total=1, unit="step", completed=None, initial=None, report_every=None,
+    stream=None, **metrics
 ):
     event = {
         "phase": phase,
@@ -31,6 +32,8 @@ def emit_progress(
         event["initial"] = initial
     if report_every is not None:
         event["report_every"] = report_every
+    if stream is not None:
+        event["stream"] = stream
     _emit_event(event)
 
 
@@ -120,7 +123,7 @@ class ProgressStage:
 @contextmanager
 def local_progress(label):
     with ExitStack() as stack:
-        display = WorkerDisplay(stack, label, startup=False)
+        display = WorkerDisplays(stack, label, startup=False)
         guard, stop = (threading.RLock(), threading.Event())
 
         def publish(event):
@@ -151,6 +154,32 @@ def progress_items(items, label, *, unit="file"):
             colored_status(f"{label}: {detail}", kind="WORK", level=2)
             yield item
             progress.update(item=detail)
+
+
+class WorkerDisplays:
+    """Keep independent phase counters and clocks for concurrent subprocesses."""
+
+    def __init__(self, stack, label, *, startup=True):
+        self.stack, self.label = stack, label
+        self.displays = {None: WorkerDisplay(stack.enter_context(ExitStack()), label, startup=startup)}
+
+    def event(self, event):
+        stream = event.get("stream")
+        if stream not in self.displays:
+            self.displays[stream] = WorkerDisplay(
+                self.stack.enter_context(ExitStack()), f"{self.label} | {stream}", startup=False
+            )
+        self.displays[stream].event(event)
+
+    def line(self, line):
+        if line.startswith(EVENT_PREFIX):
+            self.event(json.loads(line[len(EVENT_PREFIX):]))
+        else:
+            self.displays[None].line(line)
+
+    def tick(self):
+        for display in self.displays.values():
+            display.tick()
 
 
 class WorkerDisplay:
@@ -191,6 +220,12 @@ class WorkerDisplay:
         detail_changed = any(
             (key in metrics and self.metrics.get(key) != metrics[key] for key in ("operation", "array"))
         )
+        resumed = (
+            not new_phase and self.activity is not None
+            and self.completed == self.activity.initial
+            and event.get("initial", 0) > self.completed
+            and event.get("completed") == event.get("initial")
+        )
         if new_phase:
             if self.phase == "startup" and (not self.finished):
                 self.activity.update(self.activity.total - self.completed)
@@ -215,6 +250,19 @@ class WorkerDisplay:
             self.completed = initial
             if self.activity.bar is not None:
                 self.activity.bar.set_description_str(f"  {self.phase_label}", refresh=False)
+        elif resumed:
+            initial = int(event["initial"])
+            if initial > self.activity.total:
+                raise ValueError("Invalid subprocess resume count")
+            self.completed = self.activity.initial = self.activity._completed = initial
+            self.phase_label = event["label"]
+            self.activity.label = f"{self.label} | {self.phase_label}"
+            self.started = self.last_advance = self.last_heartbeat = time.monotonic()
+            self.activity._started = self.activity._last_update = self.started
+            if self.activity.bar is not None:
+                self.activity.bar.reset()
+                self.activity.bar.set_description_str(f"  {self.phase_label}", refresh=False)
+                self.activity.bar.update(initial)
         # Epoch completions are the durable log records; heartbeats must not
         # repeat their counters or recalculate an ETA mid-epoch.
         if self.activity.unit == "epoch":
@@ -241,7 +289,7 @@ class WorkerDisplay:
                 self.finish()
         if not self.finished and (
             previous == self.completed
-            and (new_phase or (detail_changed and self.activity.unit != "epoch"))
+            and (new_phase or resumed or (detail_changed and self.activity.unit != "epoch"))
         ):
             colored_status(self.snapshot(), kind="WORK", label=self.label, level=1)
 
@@ -331,7 +379,7 @@ def monitor_worker(command, env, log, label, *, resume=False):
         reader.start()
         try:
             with ExitStack() as phases:
-                display = WorkerDisplay(phases, label)
+                display = WorkerDisplays(phases, label)
                 while True:
                     try:
                         line = messages.get(timeout=1)

@@ -92,25 +92,18 @@ def launch_run(options, index, count):
 
 
 def concurrent_log(state, count, *, final=False):
-    from .worker_progress import EVENT_PREFIX, emit_message
+    from .worker_progress import EVENT_PREFIX, _emit_event
 
     text = state["pending_log"] + state["reader"].read()
     state["pending_log"] = ""
-    prefix = f"Run {state['index'] + 1}/{count} | "
     for line in text.splitlines(keepends=True):
         if not final and not line.endswith(("\n", "\r")):
             state["pending_log"] = line
             continue
         if line.startswith(EVENT_PREFIX):
             event = json.loads(line[len(EVENT_PREFIX):])
-            if "message" in event:
-                emit_message(prefix + event["message"], kind=event.get("kind", "INFO"),
-                             level=event.get("level", 1))
-            else:
-                phase, completed = event["phase"], event.get("completed")
-                if completed is not None and state["progress"].get(phase) != completed:
-                    state["progress"][phase] = completed
-                    emit_message(f"{prefix}{event['label']}: {completed}/{event['total']} {event['unit']}", kind="WORK")
+            event["stream"] = f"Run {state['index'] + 1}/{count}"
+            _emit_event(event)
         elif line.strip():
             print(f"[LaCathode run {state['index']:03d}] {line.rstrip()}", flush=True)
 
@@ -167,7 +160,7 @@ def launch_runs(args, requests):
                         raise
                     timing = {"run": index, "seed": options["seed"], "pid": process.pid, "started": time.time()}
                     active[index] = dict(process=process, stream=stream, reader=reader, index=index,
-                                         pending_log="", progress={}, timing=timing)
+                                         pending_log="", timing=timing)
                     execution["runs"].append(timing)
                     cursor += 1
                     emit_message(f"Run {index + 1}/{count}: started; log: {log_path}", kind="WORK")

@@ -14,6 +14,7 @@ import torch
 from .data import BACKGROUND_PROTOCOL, MatchedPartitions, evaluation, export_scores, input_features, region, validate
 from .source import digest, verify
 from .variants import background_diagnostics, extend_delta_r, model_config
+from riddle.worker_progress import emit_progress as stage_progress
 
 
 @contextmanager
@@ -152,6 +153,7 @@ def main():
     sources, data, attempt = (
         Path(options[k]).resolve() for k in ("sources", "data", "attempt")
     )
+    stage_progress("inputs", "Verify upstream sources and load input arrays")
     verify(sources)
     inputs, arrays = validate(data)
     variant = inputs.get("variant", "default")
@@ -161,6 +163,7 @@ def main():
 
     if options["device"] != "cpu" and not torch.cuda.is_available():
         raise RuntimeError("R-ANODE requested CUDA, but it is unavailable")
+    stage_progress("prepare", "Prepare physical features and restore stage RNG")
     initial_rng(options["rng"])
     records = evaluation(arrays)
     upstream_data = attempt / "inputs"
@@ -223,6 +226,7 @@ def main():
         argv += ["--n_sig", "2000", "--try_", "1"]
     (attempt / "command.json").write_text(json.dumps(argv, indent=2) + "\n")
     sys.argv = argv
+    stage_progress("setup", "Prepare upstream model and data split")
     with matched_inputs(
         arrays, stage, resample_training=options.get("resample_training", False)
     ) as adapter:
@@ -230,6 +234,7 @@ def main():
             script, cpu_background=stage == "background" and options["device"] == "cpu",
             variant=variant,
         )
+    stage_progress("losses", "Validate losses and record data partitions")
     output = attempt / "results/upstream" / stage / "fit"
     loss_names = (
         ("trainloss_list", "valloss_list")
@@ -252,9 +257,12 @@ def main():
         training=adapter.split_indices[0], validation=adapter.split_indices[1],
     )
     if stage == "signal":
+        stage_progress("export", "Export validation, test and signal-region scores")
         export_scores(namespace, arrays, attempt)
         np.save(attempt / "upstream_likelihood.npy", namespace["likelihood"])
+    stage_progress("sources", "Verify upstream sources are unchanged")
     verify(sources)
+    stage_progress("sources", "Verify upstream sources are unchanged", completed=1)
 
 
 if __name__ == "__main__":
