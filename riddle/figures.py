@@ -406,7 +406,7 @@ def legend(fig, handles=None, labels=None, *, ax=None, ncols=None, title=None, f
 def working_point_title(point, scope=None):
     relation = "<" if slug(point["name"]) == "extra_tight" else "≤"
     scope = "Signal region" if scope and scope.lower() in ("sr", "signal region") else "Full mass range"
-    return f"{scope} | B {relation} {100 * point['validation_background_budget']:g}% (MC truth)"
+    return f"{scope} | B {relation} {100 * point['validation_background_budget']:g}%"
 
 
 def retention_label(truth, passed, total):
@@ -446,7 +446,7 @@ def population_legend(fig, columns, title=None, *, ax=None):
 def occupied_geometry(ax):
     paths, points = [], []
     for item in (*ax.lines, *ax.patches):
-        if item.get_visible():
+        if item.get_visible() and item.get_gid() != "publication-guide":
             paths.append(
                 (
                     item.get_transform().transform_path(item.get_path()),
@@ -454,6 +454,8 @@ def occupied_geometry(ax):
                 )
             )
     for item in ax.collections:
+        if not item.get_visible():
+            continue
         if isinstance(item, LineCollection):
             paths.extend((item.get_transform().transform_path(p), False) for p in item.get_paths())
         elif isinstance(item, PathCollection):
@@ -463,8 +465,8 @@ def occupied_geometry(ax):
     return paths, np.asarray(points).reshape(-1, 2)
 
 
-def overlaps_data(ax, box):
-    paths, points = occupied_geometry(ax)
+def overlaps_data(ax, box, *, geometry=None):
+    paths, points = occupied_geometry(ax) if geometry is None else geometry
     padded = box.padded(5)
     return any(p.intersects_bbox(padded, filled=filled) for p, filled in paths) or bool(
         len(points)
@@ -483,46 +485,51 @@ def place_legend(fig):
 
 
 def place_axis_legend(fig, ax, spec):
-    item = ax.legend(
-        spec["handles"],
-        spec["labels"],
-        loc="lower left",
-        ncol=spec["ncols"],
-        title=spec["title"],
-        fontsize=spec["fontsize"],
-        title_fontsize=9.5,
-        frameon=False,
-        handlelength=1.9,
-        columnspacing=1.4,
-        borderaxespad=0,
-    )
-    for text in item.get_texts():
-        if text.get_text() in spec["headers"]:
-            text.set_weight("bold")
-    for _ in range(8):
-        fig.canvas.draw()
-        renderer = fig.canvas.get_renderer()
-        area, size = ax.get_window_extent(renderer), item.get_window_extent(renderer)
-        for x, y in ((1, 1), (0, 1), (1, 0), (0, 0), (0.5, 1), (0.5, 0), (1, 0.5), (0, 0.5), (0.5, 0.5)):
-            left = area.x0 + 9 + x * (area.width - size.width - 18)
-            bottom = area.y0 + 9 + y * (area.height - size.height - 18)
-            box = Bbox.from_bounds(left, bottom, size.width, size.height)
-            if (
-                size.width + 18 <= area.width
-                and size.height + 18 <= area.height
-                and not overlaps_data(ax, box)
-            ):
+    original_ylim = ax.get_ylim()
+    base_size = spec["fontsize"]
+    minimum = min(base_size, max(7.0, 0.8 * base_size))
+    sizes = np.linspace(max(minimum, 0.95 * base_size), minimum, 4)
+    positions = [(1, 1), (0, 1), (1, 0), (0, 0), (0.5, 1), (0.5, 0), (1, 0.5), (0, 0.5), (0.5, 0.5)]
+    positions.extend(p for p in itertools.product(np.linspace(0, 1, 5), repeat=2) if p not in positions)
+    for attempt in range(8):
+        for fontsize in sizes:
+            item = ax.legend(
+                spec["handles"], spec["labels"], loc="lower left", ncol=spec["ncols"],
+                title=spec["title"], fontsize=fontsize, title_fontsize=9.5 * fontsize / base_size,
+                frameon=True, facecolor=ax.get_facecolor(), edgecolor="none", framealpha=1,
+                handlelength=1.7, handletextpad=0.5, columnspacing=0.9,
+                labelspacing=0.35, borderpad=0.25, borderaxespad=0,
+            )
+            for text in item.get_texts():
+                if text.get_text() in spec["headers"]:
+                    text.set_weight("bold")
+            fig.canvas.draw()
+            renderer = fig.canvas.get_renderer()
+            area, size = ax.get_window_extent(renderer), item.get_window_extent(renderer)
+            if size.width + 18 > area.width or size.height + 18 > area.height:
+                continue
+            geometry = occupied_geometry(ax)
+            for x, y in positions:
+                left = area.x0 + 9 + x * (area.width - size.width - 18)
+                bottom = area.y0 + 9 + y * (area.height - size.height - 18)
+                box = Bbox.from_bounds(left, bottom, size.width, size.height)
+                if overlaps_data(ax, box, geometry=geometry):
+                    continue
                 anchor = ax.transAxes.inverted().transform((left, bottom))
                 item.set_bbox_to_anchor(anchor, transform=ax.transAxes)
-                fig.canvas.draw()
-                if not overlaps_data(ax, item.get_window_extent(fig.canvas.get_renderer())):
+                actual = item.get_window_extent(renderer)
+                if (
+                    area.contains(actual.x0, actual.y0) and area.contains(actual.x1, actual.y1)
+                    and not overlaps_data(ax, actual, geometry=geometry)
+                ):
                     return
-        if getattr(ax, "_publication_fixed_ylim", False):
+        if getattr(ax, "_publication_fixed_ylim", False) or attempt == 7:
             break
         transform = ax.yaxis.get_transform()
         low, high = transform.transform(ax.get_ylim())
         ax.set_ylim(*transform.inverted().transform([low, high + 0.3 * (high - low)]))
-    raise ValueError("Cannot place an internal legend without covering data")
+    ax.set_ylim(original_ylim)
+    raise ValueError(f"Cannot fit an internal legend in the {ax.get_ylabel()!r} panel without covering data")
 
 
 def save(fig, path):
@@ -534,8 +541,8 @@ def save(fig, path):
 
 
 def decorate_mass(ax, edges):
-    ax.axvline(3.3, color=".65", lw=0.8, ls=":")
-    ax.axvline(3.7, color=".65", lw=0.8, ls=":")
+    ax.axvline(3.3, color=".65", lw=0.8, ls=":", gid="publication-guide")
+    ax.axvline(3.7, color=".65", lw=0.8, ls=":", gid="publication-guide")
     ax.set_xlim(edges[0], edges[-1])
 
 
@@ -637,7 +644,7 @@ def render_roc(bundle, output, args):
                     ax.set(
                         xscale="log", xlim=(1e-4, 1), ylim=(0, 1.02 if kind == "roc_log" else max_sic * 1.08)
                     )
-                legend(fig, title=SCENARIO_LABELS.get(bundle.get("metrics", {}).get("scenario"), "") + " | Mapped events")
+                legend(fig, title=SCENARIO_LABELS.get(bundle.get("metrics", {}).get("scenario")))
                 save(fig, output / view / "01_performance" / f"{dataset}_{kind}")
 
 

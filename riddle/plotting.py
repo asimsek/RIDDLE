@@ -275,7 +275,7 @@ def render_full_pipeline(bundle, output, args):
                                           min_background=args.min_background)
         if drawn:
             ax.set(xscale="log", xlim=(1e-4, 1), ylim=(0, None))
-            f.legend(fig, title=f.SCENARIO_LABELS[bundle["report"]["scenario"]] + " | Full pipeline")
+            f.legend(fig, title=f.SCENARIO_LABELS[bundle["report"]["scenario"]])
             f.save(fig, output / "full_pipeline" / ("signal_region_" + metric))
         else:
             f.plt.close(fig)
@@ -343,8 +343,8 @@ def render_injection_scan(groups, output, args):
         points=[], plotted_metrics={},
     )
     for field, title, filename in (
-        ("oracle_full_pipeline_max_sic", "Oracle maximum significance improvement", "maximum_sic_vs_injection"),
-        ("oracle_max_nominal_significance", "Oracle maximum nominal significance", "maximum_nominal_significance_vs_injection"),
+        ("oracle_full_pipeline_max_sic", "Maximum significance improvement", "maximum_sic_vs_injection"),
+        ("oracle_max_nominal_significance", "Maximum nominal significance", "maximum_nominal_significance_vs_injection"),
     ):
         fig, ax, _ = f.canvas(title, "Injected SR S/B [%]")
         any_drawn = False
@@ -716,7 +716,7 @@ def summary_figures(bundles, output, args):
         }
         if len(partitions) > 1:
             raise ValueError("Ordinary seed bands require a fixed prepared partition; use the injection-scan workflow for varied partitions")
-        fig, ax, _ = f.canvas("Significance improvement (mapped)", "Background efficiency (mapped)")
+        fig, ax, _ = f.canvas("Significance improvement", "Background efficiency")
         any_curve = False
         for key in STYLES:
             values = []
@@ -812,7 +812,7 @@ def summary_figures(bundles, output, args):
             mass = sample["mass"][sample["labels"] == 0]
             random_summary = f.draw_band(
                 ax, f.EFFICIENCIES, random_reference(mass, mode=args.random_reference),
-                "Random bootstrap" if args.random_reference == "bootstrap" else "Random subset", ".5", ":"
+                "Random", ".5", ":"
             )
             random_summary["uncertainty_source"] = "random_" + args.random_reference + "_trials"
             random_summary["sampling_with_replacement"] = args.random_reference == "bootstrap"
