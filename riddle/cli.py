@@ -74,11 +74,13 @@ def parser():
             "--workers",
             type=positive,
             default=1,
-            help="Concurrent RIDDLE fits; method/seed jobs remain isolated subprocesses",
+            help="Concurrent RIDDLE/R-ANODE fits or independent LaCathode runs; fixed-background LaCathode and method/seed jobs stay sequential",
         )
         run.add_argument("--io-workers", type=positive, default=2)
         run.add_argument("--mps", choices=["auto", "on", "off"], default="auto")
-        run.add_argument("--runs", type=positive, help="Override RIDDLE/R-ANODE fit count and LaCathode independent flow-plus-classifier run count")
+        run.add_argument("--runs", "--run", type=positive, help="Override RIDDLE/R-ANODE fit count and LaCathode run count")
+        run.add_argument("--lacathode-background", choices=("independent", "fixed"), default="independent",
+                         help="Retrain each LaCathode background flow (default), or share one flow across classifier fits")
         run.add_argument(
             "--epochs", type=positive, help="Override RIDDLE/R-ANODE signal-fit and LaCathode classifier epochs; background stages are unchanged"
         )
@@ -101,7 +103,7 @@ def run_campaign(args):
     if "lacathode" in args.methods:
         from external.lacathode_utils.pipeline import run_settings
 
-        run_settings(**fit_overrides)
+        run_settings(**fit_overrides, background=getattr(args, "lacathode_background", "independent"))
     from .storage import locked
     from .worker_progress import monitor_worker
 
@@ -191,7 +193,8 @@ def run_campaign(args):
                                "--sources", str(args.ranode_sources), "--data", options["data"],
                                "--output", str(output), "--config", str(args.ranode_config),
                                "--scenario", scenario, "--seed", str(seed), "--device", options["device"],
-                               "--io-workers", str(args.io_workers)]
+                               "--io-workers", str(args.io_workers), "--workers", str(args.workers),
+                               "--mps", args.mps]
                     for key, value in fit_overrides.items():
                         if value is not None:
                             command.extend(["--" + key, str(value)])

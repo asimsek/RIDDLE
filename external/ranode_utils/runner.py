@@ -7,6 +7,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -125,22 +126,38 @@ def fingerprint(root):
     }
 
 
+def stage_command(options):
+    return [sys.executable, "-m", "external.ranode_utils.stage", json.dumps(options)]
+
+
+def stop_processes(processes):
+    running = [process for process in processes if process.poll() is None]
+    for process in running:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + 10
+    for process in running:
+        try:
+            process.wait(timeout=max(0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+
+
 def execute(options, env):
-    command = [sys.executable, "-m", "external.ranode_utils.stage", json.dumps(options)]
-    process = subprocess.Popen(command, env=env, start_new_session=True)
+    process = subprocess.Popen(stage_command(options), env=env, start_new_session=True)
     try:
         if process.wait() != 0:
             raise RuntimeError(
                 f"Upstream R-ANODE {options['stage']} stage failed; artifacts retained in {options['attempt']}"
             )
     finally:
-        if process.poll() is None:
-            os.killpg(process.pid, signal.SIGTERM)
-            try:
-                process.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
+        stop_processes([process])
 
 
 def stage_root(args, stage, config):
@@ -149,7 +166,7 @@ def stage_root(args, stage, config):
     return args.output / "fits" / f"fit_{config['fit_index']:03d}"
 
 
-def run_stage(args, stage, config, background=None):
+def prepare_stage(args, stage, config, background=None):
     root = stage_root(args, stage, config)
     receipt = root / (stage + "_complete.json")
     if receipt.exists():
@@ -187,17 +204,120 @@ def run_stage(args, stage, config, background=None):
         env[key] = str(args.io_workers)
     write_json(attempt / "producer_contract.json", args.production_contract)
     print(f"[WORK] Original R-ANODE {stage}: {options['epochs']} epochs", flush=True)
-    execute(options, env)
+    return options, env
+
+
+def complete_stage(args, options):
+    attempt = Path(options["attempt"])
     relative = attempt.relative_to(args.output)
     hashes = {
         str(relative / name): value for name, value in fingerprint(attempt).items()
     }
+    receipt = stage_root(args, options["stage"], options) / (options["stage"] + "_complete.json")
     write_json(receipt, {"attempt": str(relative), "files": hashes})
     return attempt
 
 
+def run_stage(args, stage, config, background=None):
+    request = prepare_stage(args, stage, config, background)
+    if isinstance(request, Path):
+        return request
+    options, env = request
+    execute(options, env)
+    return complete_stage(args, options)
+
+
+def fit_log(state, *, final=False):
+    text = state["pending_log"] + state["reader"].read()
+    lines = text.splitlines(keepends=True)
+    state["pending_log"] = ""
+    for line in lines:
+        if not final and not line.endswith(("\n", "\r")):
+            state["pending_log"] = line
+        elif line.strip():
+            print(f"[R-ANODE fit {state['options']['fit_index']}] {line.rstrip()}", flush=True)
+
+
+def run_signal_fits(args, config, background):
+    """Schedule isolated upstream processes; retain fit-index ensemble order."""
+    indices = list(range(config["fit_index"], config["fit_index"] + config["runs"]))
+    workers = min(getattr(args, "workers", 1), len(indices))
+    if workers == 1:
+        fits = []
+        for index in indices:
+            print(f"[WORK] R-ANODE fit {len(fits) + 1}/{len(indices)}", flush=True)
+            fits.append(run_stage(args, "signal", {**config, "fit_index": index}, background))
+        return fits
+    from .runtime import concurrent_environment
+
+    extra_env, mps = concurrent_environment(getattr(args, "mps", "auto"), args.device)
+    print(f"[INFO] R-ANODE: up to {workers} concurrent fits on {args.device}; MPS: {mps['reason']}", flush=True)
+    execution = {"workers": workers, "device": args.device, "mps": mps, "fits": [], "completed": False}
+    execution_path = args.output / ".resume" / f"concurrency_{time.time_ns()}.json"
+    write_json(execution_path, execution)
+    active, completed, cursor = {}, {}, 0
+    try:
+        while cursor < len(indices) or active:
+            while cursor < len(indices) and len(active) < workers:
+                index = indices[cursor]
+                request = prepare_stage(args, "signal", {**config, "fit_index": index}, background)
+                cursor += 1
+                if isinstance(request, Path):
+                    completed[index] = request
+                    execution["fits"].append({"fit_index": index, "reused": True})
+                    continue
+                options, env = request
+                log_path = Path(options["attempt"]) / "stage.log"
+                stream = log_path.open("w")
+                reader = log_path.open(encoding="utf-8", errors="replace")
+                try:
+                    process = subprocess.Popen(stage_command(options), env={**env, **extra_env},
+                                               stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
+                except BaseException:
+                    stream.close()
+                    reader.close()
+                    raise
+                timing = {"fit_index": index, "pid": process.pid, "started": time.time(), "reused": False}
+                execution["fits"].append(timing)
+                active[index] = dict(process=process, options=options, stream=stream, reader=reader,
+                                     pending_log="", timing=timing)
+                print(f"[WORK] R-ANODE fit {index}: started; log: {log_path}", flush=True)
+            finished = []
+            for index, state in active.items():
+                fit_log(state)
+                code = state["process"].poll()
+                if code is None:
+                    continue
+                state["timing"].update(finished=time.time(), returncode=code)
+                fit_log(state, final=True)
+                if code:
+                    raise RuntimeError(f"R-ANODE fit {index} failed (exit {code}); see {state['options']['attempt']}/stage.log")
+                state["stream"].close()
+                state["reader"].close()
+                completed[index] = complete_stage(args, state["options"])
+                finished.append(index)
+                print(f"[PASS] R-ANODE fit {index}: completed", flush=True)
+            for index in finished:
+                del active[index]
+            if active and not finished:
+                time.sleep(.2)
+        execution["completed"] = True
+    finally:
+        stop_processes([state["process"] for state in active.values()])
+        for state in active.values():
+            state["timing"].update(finished=time.time(), returncode=state["process"].returncode)
+            if not state["reader"].closed:
+                fit_log(state, final=True)
+            state["stream"].close()
+            state["reader"].close()
+        write_json(execution_path, execution)
+    return [completed[index] for index in indices]
+
+
 def run(args):
     resume_options = policy(args)
+    if type(getattr(args, "workers", 1)) is not int or getattr(args, "workers", 1) < 1:
+        raise ValueError("R-ANODE workers must be a positive integer")
     for name in ("sources", "data", "output", "config"):
         setattr(args, name, Path(getattr(args, name)).resolve())
     if args.device not in ("cpu", "cuda:0"):
@@ -299,13 +419,10 @@ def run(args):
         write_json(manifest, report)
         args.production_contract = contract
         background = run_stage(args, "background", config)
-        fits, members = [], []
-        for index in range(config["fit_index"], config["fit_index"] + config["runs"]):
-            print(f"[WORK] R-ANODE fit {len(fits) + 1}/{config['runs']}", flush=True)
-            member_config = {**config, "fit_index": index}
-            fit = run_stage(args, "signal", member_config, background)
+        fits = run_signal_fits(args, config, background)
+        members = []
+        for index, fit in zip(range(config["fit_index"], config["fit_index"] + config["runs"]), fits):
             epochs = selected_epochs(fit, config["signal_epochs"])
-            fits.append(fit)
             members.append({
                 "fit_index": index,
                 "attempt": str(fit.relative_to(args.output)),
@@ -393,6 +510,8 @@ def main(argv=None):
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--workers", type=int, default=1, help="Concurrent signal fits after the shared background stage")
+    parser.add_argument("--mps", choices=("auto", "on", "off"), default="auto")
     parser.add_argument("--io-workers", type=int, default=2)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
@@ -404,8 +523,8 @@ def main(argv=None):
         help="With --resume, permit recorded CUDA GPU changes; software and precision stay strict",
     )
     args = parser.parse_args(argv)
-    if args.io_workers < 1 or not 0 <= args.seed < 2**32:
-        parser.error("Positive CPU threads and a nonnegative 32-bit seed are required")
+    if args.workers < 1 or args.io_workers < 1 or not 0 <= args.seed < 2**32:
+        parser.error("Positive workers/CPU threads and a nonnegative 32-bit seed are required")
 
     def terminate(signum, frame):
         raise SystemExit(128 + signum)

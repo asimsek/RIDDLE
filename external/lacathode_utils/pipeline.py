@@ -5,15 +5,20 @@ import json
 import os
 from pathlib import Path
 import pickle
+import signal
 import subprocess
 import sys
+import time
 
 FLOW_PREFIX = "lacathode_model"
 RUN_LAYOUT = "independent_background_classifier_v1"
+FIXED_RUN_LAYOUT = "fixed_background_classifiers_v1"
 DEFAULTS = {"pipeline_runs": 1, "classifier_epochs": 100}
 
 
-def run_settings(runs=None, epochs=None):
+def run_settings(runs=None, epochs=None, background="independent"):
+    if background not in ("independent", "fixed"):
+        raise ValueError("LaCathode background must be independent or fixed")
     values = {
         "pipeline_runs": DEFAULTS["pipeline_runs"] if runs is None else runs,
         "classifier_runs": 1,
@@ -24,6 +29,8 @@ def run_settings(runs=None, epochs=None):
     # The pinned selector uses argpartition(losses, 10), requiring more than ten epochs.
     if type(values["classifier_epochs"]) is not int or values["classifier_epochs"] < 11:
         raise ValueError("LaCathode --epochs must be at least 11 for its upstream ten-checkpoint selector")
+    if background == "fixed":
+        values["classifier_runs"], values["pipeline_runs"] = values["pipeline_runs"], 1
     return values
 
 
@@ -38,9 +45,7 @@ def run_seeds(seed, count):
     return seeds
 
 
-def launch_run(options, index, count):
-    from .worker_progress import EVENT_PREFIX
-
+def run_command(options):
     output = Path(options["output"])
     output.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
@@ -49,6 +54,14 @@ def launch_run(options, index, count):
                PYTHONDONTWRITEBYTECODE="1", RIDDLE_WORKER_PROGRESS="1",
                PYTHONPATH=os.pathsep.join(filter(None, (framework, env.get("PYTHONPATH")))))
     command = [sys.executable, "-m", "riddle.worker", json.dumps(options, default=str)]
+    return command, env
+
+
+def launch_run(options, index, count):
+    from .worker_progress import EVENT_PREFIX
+
+    output = Path(options["output"])
+    command, env = run_command(options)
     with (output / "training.log").open("a" if options["resume"] else "w") as log:
         with subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                               text=True, bufsize=1, errors="replace") as process:
@@ -76,6 +89,116 @@ def launch_run(options, index, count):
                         process.kill()
                         process.wait()
                 raise
+
+
+def concurrent_log(state, count, *, final=False):
+    from .worker_progress import EVENT_PREFIX, emit_message
+
+    text = state["pending_log"] + state["reader"].read()
+    state["pending_log"] = ""
+    prefix = f"Run {state['index'] + 1}/{count} | "
+    for line in text.splitlines(keepends=True):
+        if not final and not line.endswith(("\n", "\r")):
+            state["pending_log"] = line
+            continue
+        if line.startswith(EVENT_PREFIX):
+            event = json.loads(line[len(EVENT_PREFIX):])
+            if "message" in event:
+                emit_message(prefix + event["message"], kind=event.get("kind", "INFO"),
+                             level=event.get("level", 1))
+            else:
+                phase, completed = event["phase"], event.get("completed")
+                if completed is not None and state["progress"].get(phase) != completed:
+                    state["progress"][phase] = completed
+                    emit_message(f"{prefix}{event['label']}: {completed}/{event['total']} {event['unit']}", kind="WORK")
+        elif line.strip():
+            print(f"[LaCathode run {state['index']:03d}] {line.rstrip()}", flush=True)
+
+
+def stop_runs(active):
+    running = [state["process"] for state in active.values() if state["process"].poll() is None]
+    for process in running:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + 5
+    for process in running:
+        try:
+            process.wait(timeout=max(0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+
+
+def launch_runs(args, requests):
+    """Bounded, isolated complete pipelines; collection remains in run-index order."""
+    from .storage import write_json
+    from .worker_progress import ProgressStage, emit_message
+
+    count = len(requests)
+    workers = min(getattr(args, "workers", 1), count)
+    active, cursor, completed = {}, 0, 0
+    execution = {"workers": workers, "device": args.device, "runs": [], "completed": False}
+    audit = args.output / ".resume" / f"concurrency_{time.time_ns()}.json"
+    write_json(audit, execution)
+    emit_message(f"LaCathode independent mode: up to {workers} concurrent complete runs on {args.device}")
+    try:
+        with ProgressStage("independent_runs", "Independent LaCathode runs", count, "run") as progress:
+            while cursor < count or active:
+                while cursor < count and len(active) < workers:
+                    options = requests[cursor]
+                    index = options["run_index"]
+                    command, env = run_command(options)
+                    log_path = Path(options["output"]) / "training.log"
+                    stream = log_path.open("a" if options["resume"] else "w")
+                    reader = log_path.open(encoding="utf-8", errors="replace")
+                    if options["resume"]:
+                        reader.seek(0, os.SEEK_END)
+                    try:
+                        process = subprocess.Popen(command, env=env, stdout=stream,
+                                                   stderr=subprocess.STDOUT, start_new_session=True)
+                    except BaseException:
+                        stream.close()
+                        reader.close()
+                        raise
+                    timing = {"run": index, "seed": options["seed"], "pid": process.pid, "started": time.time()}
+                    active[index] = dict(process=process, stream=stream, reader=reader, index=index,
+                                         pending_log="", progress={}, timing=timing)
+                    execution["runs"].append(timing)
+                    cursor += 1
+                    emit_message(f"Run {index + 1}/{count}: started; log: {log_path}", kind="WORK")
+                finished = []
+                for index, state in active.items():
+                    concurrent_log(state, count)
+                    code = state["process"].poll()
+                    if code is None:
+                        continue
+                    state["timing"].update(finished=time.time(), returncode=code)
+                    concurrent_log(state, count, final=True)
+                    if code:
+                        raise RuntimeError(f"LaCathode run {index} failed (exit {code}); inspect {requests[index]['output']}/training.log")
+                    completed += 1
+                    progress.update(completed, force=True)
+                    finished.append(index)
+                for index in finished:
+                    state = active.pop(index)
+                    state["stream"].close()
+                    state["reader"].close()
+                if active and not finished:
+                    time.sleep(.2)
+        execution["completed"] = True
+    finally:
+        stop_runs(active)
+        for state in active.values():
+            state["timing"].update(finished=time.time(), returncode=state["process"].returncode)
+            concurrent_log(state, count, final=True)
+            state["stream"].close()
+            state["reader"].close()
+        write_json(audit, execution)
 
 
 def collect_runs(args, members):
@@ -133,6 +256,12 @@ def run(args, contract):
     from .storage import write_json
     from .worker_progress import emit_message
 
+    if getattr(args, "lacathode_background", "independent") == "fixed":
+        if getattr(args, "workers", 1) > 1:
+            emit_message("LaCathode fixed-background mode remains sequential; --workers does not parallelize its classifiers")
+        return run_single(args, contract)
+    if type(getattr(args, "workers", 1)) is not int or getattr(args, "workers", 1) < 1:
+        raise ValueError("LaCathode workers must be a positive integer")
     count = run_settings(getattr(args, "runs", None), getattr(args, "epochs", None))["pipeline_runs"]
     members = [dict(run=i, seed=seed, directory=f"runs/run_{i:03d}")
                for i, seed in enumerate(run_seeds(args.seed, count))]
@@ -141,12 +270,16 @@ def run(args, contract):
         "seed_rule": "run 0: campaign seed; run i>0: SeedSequence([campaign_seed, i])",
         "runs": members,
     })
-    for member in members:
-        emit_message(f"Independent LaCathode run {member['run'] + 1}/{count}; seed={member['seed']}")
-        options = {**vars(args), "output": str(args.output / member["directory"]),
+    requests = [{**vars(args), "output": str(args.output / member["directory"]),
                    "seed": member["seed"], "runs": 1, "lacathode_replica": True,
-                   "campaign_seed": args.seed, "run_index": member["run"]}
-        launch_run(options, member["run"], count)
+                   "campaign_seed": args.seed, "run_index": member["run"], "workers": 1}
+                for member in members]
+    if getattr(args, "workers", 1) > 1 and count > 1:
+        launch_runs(args, requests)
+    else:
+        for member, options in zip(members, requests):
+            emit_message(f"Independent LaCathode run {member['run'] + 1}/{count}; seed={member['seed']}")
+            launch_run(options, member["run"], count)
     collect_runs(args, members)
 
 
@@ -202,9 +335,10 @@ def run_single(args, contract):
     from .source import verify, COMMIT
     from .resume import resume_policy
 
-    settings = run_settings(getattr(args, "runs", None), getattr(args, "epochs", None))
+    settings = run_settings(getattr(args, "runs", None), getattr(args, "epochs", None),
+                            getattr(args, "lacathode_background", "independent"))
     if settings["pipeline_runs"] != 1:
-        raise ValueError("Each independent LaCathode run must contain exactly one classifier")
+        raise ValueError("A single LaCathode pipeline must contain exactly one background flow")
     config_file = (
         "DE_MAF_model_deltaR.yml" if contract["inputs"].get("variant") == "deltaR" else "DE_MAF_model.yml"
     )
@@ -315,6 +449,8 @@ def run_single(args, contract):
             "flow_epochs": 100,
             "classifier_epochs": parsed.cf_epochs,
             "classifier_runs": parsed.cf_n_runs,
+            "run_layout": contract["lacathode_run_layout"],
+            "background_mode": getattr(args, "lacathode_background", "independent"),
             "reference_samples": 267000,
             "selected_checkpoints": 10,
             "score": "Upstream ten-validation-checkpoint mean per classifier fit; no averaging across fits",

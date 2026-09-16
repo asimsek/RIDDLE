@@ -6,10 +6,10 @@ from pathlib import Path
 import re
 
 
-def contract_settings(runs=None, epochs=None):
+def contract_settings(runs=None, epochs=None, background="independent"):
     from .pipeline import run_settings
 
-    return run_settings(runs, epochs)
+    return run_settings(runs, epochs, background)
 
 
 def add_resume_options(parser, *, always_resume=False):

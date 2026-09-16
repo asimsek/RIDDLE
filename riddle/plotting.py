@@ -6,7 +6,6 @@ from pathlib import Path
 
 import numpy as np
 import yaml
-from scipy.interpolate import interp1d
 from scipy.special import expit
 from sklearn.metrics import average_precision_score, roc_auc_score, roc_curve
 
@@ -90,7 +89,7 @@ def load_scores(root, report, name):
         data = {k: archive[k] for k in fields}
         if report["method"] == "lacathode" and "fit_scores" in archive:
             data["fit_scores"] = archive["fit_scores"]
-            if report.get("contract", {}).get("lacathode_run_layout"):
+            if report.get("contract", {}).get("lacathode_run_layout") == "independent_background_classifier_v1":
                 data["fit_latents"] = archive["fit_latents"]
                 data["run_seeds"] = archive["run_seeds"]
         if report["method"] == "ranode":
@@ -130,7 +129,7 @@ def load_scores(root, report, name):
         raise ValueError("Scores disagree with the mapping mask")
     if report["method"] == "lacathode":
         settings = report.get("contract", {}).get("settings", {})
-        independent = bool(report.get("contract", {}).get("lacathode_run_layout"))
+        independent = report.get("contract", {}).get("lacathode_run_layout") == "independent_background_classifier_v1"
         runs = settings.get("pipeline_runs") if independent else settings.get("classifier_runs")
         fits = data.get("fit_scores", data["scores"][None, :])
         if (
@@ -153,6 +152,124 @@ def load_scores(root, report, name):
     return data
 
 
+class FitScoreLoader:
+    """Read-only member evaluation for SIC/sculpting; never replace ensemble scores."""
+
+    def __init__(self, *, mode="members", device="cpu", io_workers=2):
+        self.mode, self.device, self.io_workers = mode, device, io_workers
+        self.cache = {}
+        self.runtime_ready = False
+
+    def __call__(self, root, report, partition):
+        key = (str(root.resolve()), partition)
+        if key in self.cache:
+            return self.cache[key]
+        record = load_scores(root, report, partition)
+        needed = partition == "signal_region" or (partition == "test" and report["scenario"] == "background_only")
+        if self.mode != "members" or not needed or report["method"] == "lacathode":
+            return record
+        method = report["method"]
+        if method == "ranode":
+            protocol = read_metadata(root, report, "protocol.json")
+            members = protocol["members"]
+            count = protocol["requested_runs"]
+            if type(count) is not int or count < 1 or len(members) != count or protocol["valid_runs"] != count:
+                raise ValueError("R-ANODE fit-band inputs do not contain every requested fit")
+            ids = [member["fit_index"] for member in members]
+            scores = []
+            for member in members:
+                name = str(Path(member["attempt"]) / f"{partition}_scores.npz")
+                with np.load(verify_plot_input(root, report, name), allow_pickle=False) as data:
+                    if any(not np.array_equal(data[field], record[field]) for field in
+                           ("mass", "physical", "labels", "mask", "is_signal_region")):
+                        raise ValueError("R-ANODE member score events or acceptance differ from the ensemble")
+                    scores.append(data["scores"])
+        else:
+            from .production import require_complete_ensemble
+
+            selection = read_metadata(root, report, "density/ensemble_selection.json")
+            require_complete_ensemble(selection)
+            members = selection["members"]
+            ids = [member["directory"] for member in members]
+            if not self.runtime_ready:
+                import torch
+
+                torch.set_num_threads(self.io_workers)
+                torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False
+                if self.device != "cpu" and not torch.cuda.is_available():
+                    raise ValueError("Plot inference requested CUDA but CUDA is unavailable; use --device cpu")
+                self.runtime_ready = True
+            from .training import residual_scores
+
+            scores = []
+            for i, member in enumerate(members):
+                directory = Path("density") / member["directory"]
+                try:
+                    verify_plot_input(root, report, str(directory / "residual_training_inputs.json"))
+                    for epoch in member["epochs"]:
+                        verify_plot_input(root, report, str(directory / f"residual_epoch_{epoch}.pt"))
+                except (ValueError, OSError) as error:
+                    raise ValueError(
+                        f"RIDDLE fit-band checkpoint inputs are missing or changed: {directory}. "
+                        "Restore the original saved files, or use --fit-bands seeds to plot saved ensemble scores."
+                    ) from error
+                colored_status(f"RIDDLE | {partition} | Evaluate saved fit {i + 1}/{len(members)} (inference only)", kind="WORK")
+                values = residual_scores(root / directory, member["epochs"], record["latent"], self.device)
+                aligned = np.full(record["scores"].shape, np.nan, dtype=values.dtype)
+                aligned[record["mask"]] = values
+                scores.append(aligned)
+        if len(set(ids)) != len(ids):
+            raise ValueError("Duplicate member identities in fit-band inputs")
+        scores = np.asarray(scores)
+        mask = record["mask"]
+        if (scores.shape != (len(ids), len(mask)) or not np.isfinite(scores[:, mask]).all()
+                or not np.isnan(scores[:, ~mask]).all()):
+            raise ValueError("Invalid member scores for fit bands")
+        combined = scores[0, mask].astype(np.float64)
+        for score in scores[1:, mask]:
+            combined = np.logaddexp(combined, score)
+        combined -= np.log(len(scores))
+        difference = np.max(np.abs(combined - record["scores"][mask]), initial=0.)
+        if not np.allclose(combined, record["scores"][mask], rtol=1e-5, atol=5e-4):
+            raise ValueError(f"{method} per-fit scores do not reproduce the saved ensemble (max difference {difference:g})")
+        record.update(uncertainty_scores=scores, uncertainty_member_ids=ids,
+                      uncertainty_source="signal_fit_variation_with_fixed_background_per_seed",
+                      ensemble_reconstruction_max_abs_difference=float(difference))
+        self.cache[key] = record
+        return record
+
+
+def uncertainty_scores(record):
+    return record.get("uncertainty_scores", fit_scores(record))
+
+
+def sic_on_grid(background, signal):
+    unique, inverse = np.unique(background, return_inverse=True)
+    if len(unique) < 2:
+        return np.full(len(f.GRID), np.nan)
+    maximum = np.zeros(len(unique))
+    np.maximum.at(maximum, inverse, signal)
+    return np.interp(f.GRID, unique, maximum / np.sqrt(unique), left=np.nan, right=np.nan)
+
+
+def member_sic_band(ax, record, style, minimum, *, physical=False):
+    curves = []
+    background_count = int((record["labels"] == 0).sum() if physical
+                           else ((record["labels"] == 0) & record["mask"]).sum())
+    for score in uncertainty_scores(record):
+        b, s, _ = efficiency_curve(record["labels"], score, record["mask"], full_pipeline=physical)
+        use = (b >= 1e-4) & (np.rint(b * background_count) >= minimum)
+        curves.append(sic_on_grid(b[use], s[use]))
+    summary = f.draw_band(ax, f.GRID, curves, *style)
+    summary.update(percentiles=[16, 50, 84], fit_count=len(curves),
+                   aggregation="median of individual SIC curves at fixed background efficiency",
+                   uncertainty_source=record["uncertainty_source"],
+                   member_ids=record["uncertainty_member_ids"],
+                   ensemble_reconstruction_max_abs_difference=record["ensemble_reconstruction_max_abs_difference"])
+    summary.pop("independent_runs", None)
+    return summary
+
+
 def fit_scores(record):
     return f.fit_scores(record)
 
@@ -162,21 +279,28 @@ def fit_identity(bundle, key, fit):
     seed = bundle["report"]["seed"]
     return dict(seed=seed, fit=fit,
                 run_seed=int(record["run_seeds"][fit]) if "run_seeds" in record else seed,
-                independent=key != "raw" or record.get("independent_runs", False))
+                member_id=record.get("uncertainty_member_ids", list(range(len(uncertainty_scores(record)))))[fit],
+                independent=record.get("independent_runs", key != "raw" and "uncertainty_scores" not in record),
+                source=record.get("uncertainty_source", f.fit_uncertainty(record) if key == "raw"
+                                  else "training_seed_variation_on_fixed_data_partition"))
 
 
 def fit_uncertainty(identities):
+    sources = {item["source"] for item in identities if "source" in item}
+    if sources:
+        return next(iter(sources)) if len(sources) == 1 else "mixed_run_structures"
     if identities and all(item.get("independent", False) for item in identities):
         return "independent_background_flow_and_classifier_runs"
     return "classifier_fit_variation_with_shared_background_flow_per_seed"
 
 
-def make_bundle(group, confidence):
+def make_bundle(group, confidence, score_loader=None):
+    score_loader = load_scores if score_loader is None else score_loader
     keys = [KEYS[m] for m in group]
     bundle = {"samples": {}, "curves": {}, "warnings": [], "sources": group, "latents_by_method": {},
               "evaluation": {}, "acceptance": {}}
     for partition in ("validation", "test", "signal_region"):
-        records = {KEYS[m]: load_scores(root, report, partition) for m, (root, report) in group.items()}
+        records = {KEYS[m]: score_loader(root, report, partition) for m, (root, report) in group.items()}
         bundle["evaluation"][partition] = records
         from .production import region_acceptance
         bundle["acceptance"][partition] = {
@@ -227,14 +351,14 @@ def make_bundle(group, confidence):
     return bundle
 
 
-def bundles_for_group(group, confidence):
+def bundles_for_group(group, confidence, score_loader=None):
     try:
-        return [(None, make_bundle(group, confidence))]
+        return [(None, make_bundle(group, confidence, score_loader))]
     except PopulationMismatch as error:
         colored_status("Evaluation populations differ; producing separate method figures", kind="WARNING")
         result = []
         for method, source in group.items():
-            bundle = make_bundle({method: source}, confidence)
+            bundle = make_bundle({method: source}, confidence, score_loader)
             bundle["individual"] = method
             bundle["warnings"].append(str(error))
             result.append((method, bundle))
@@ -279,6 +403,11 @@ def render_full_pipeline(bundle, output, args):
         drawn = False
         for key, record in records.items():
             if len(np.unique(record["labels"][record["mask"]])) != 2:
+                continue
+            if metric == "sic" and "uncertainty_scores" in record:
+                audit.setdefault(STYLES[key][0], {})[metric] = member_sic_band(
+                    ax, record, STYLES[key], args.min_background, physical=True)
+                drawn = True
                 continue
             if len(fit_scores(record)) > 1:
                 curves, metrics = [], []
@@ -718,7 +847,8 @@ def method_band(ax, x, values, key, scenario, metric, seeds, classifier_fits=Non
     name, color, ls = STYLES[key]
     summary = f.draw_band(ax, x, values, name, color, ls)
     summary.update(uncertainty_source="training_seed_variation_on_fixed_data_partition", seeds=seeds)
-    if classifier_fits and any(fit["fit"] > 0 for fit in classifier_fits):
+    summary.update(percentiles=[16, 50, 84], aggregation="median of individual metric curves")
+    if classifier_fits:
         summary.update(
             uncertainty_source=fit_uncertainty(classifier_fits),
             classifier_fits=classifier_fits,
@@ -728,8 +858,7 @@ def method_band(ax, x, values, key, scenario, metric, seeds, classifier_fits=Non
     if not summary["band_drawn"]:
         colored_status(
             f"{name} | {f.SCENARIO_LABELS[scenario]} | {metric}: "
-            "uncertainty band unavailable with only one independent run; "
-            "include additional independent training runs.",
+            "uncertainty band unavailable; requires multiple fits/runs with common statistical support.",
             kind="WARNING",
         )
     return summary
@@ -759,26 +888,13 @@ def summary_figures(bundles, output, args):
                 if key not in scores or len(np.unique(labels)) != 2:
                     continue
                 record = bundle["evaluation"]["signal_region"][key]
-                for fit, score in enumerate(fit_scores(record)):
+                for fit, score in enumerate(uncertainty_scores(record)):
                     b, s, _ = roc_curve(labels, score[record["mask"]])
                     supported = (b >= 1e-4) & (np.rint(b * (labels == 0).sum()) >= args.min_background)
                     native_curves.append((b[supported], s[supported]))
-                    if key == "raw":
-                        seeds.append(bundle["report"]["seed"])
-                        classifier_fits.append(fit_identity(bundle, key, fit))
-                    if supported.sum() < 2:
-                        continue
-                    values.append(
-                        interp1d(
-                            b[supported],
-                            s[supported] / np.sqrt(b[supported]),
-                            bounds_error=False,
-                            fill_value=np.nan,
-                        )(f.GRID)
-                    )
-                    if key != "raw":
-                        seeds.append(bundle["report"]["seed"])
-                        classifier_fits.append(fit_identity(bundle, key, fit))
+                    values.append(sic_on_grid(b[supported], s[supported]))
+                    seeds.append(bundle["report"]["seed"])
+                    classifier_fits.append(fit_identity(bundle, key, fit))
             if values:
                 name = STYLES[key][0]
                 if key == "raw" and len(native_curves) > 1:
@@ -819,7 +935,7 @@ def summary_figures(bundles, output, args):
                 if np.any(full == 0):
                     continue
                 record = bundle["evaluation"]["test"][key]
-                for fit, scores in enumerate(fit_scores(record)):
+                for fit, scores in enumerate(uncertainty_scores(record)):
                     score = scores[pop]
                     curves.append(
                         [
@@ -908,6 +1024,11 @@ def render_physical_curves(records, output, scenario, minimum):
         for method, record in records.items():
             if len(np.unique(record["labels"][record["mask"]])) != 2:
                 continue
+            if metric == "sic" and "uncertainty_scores" in record:
+                summary = member_sic_band(ax, record, PHYSICAL_STYLES[method][:3], minimum, physical=True)
+                audit.setdefault(method, {})["sic_fit_band"] = summary
+                drawn = True
+                continue
             if len(f.fit_scores(record)) > 1:
                 curves, diagnostics = [], []
                 for score in f.fit_scores(record):
@@ -936,12 +1057,12 @@ def render_physical_curves(records, output, scenario, minimum):
                 else (b, s if metric == "roc" else s / np.sqrt(np.maximum(b, 1e-300)))
             )
             ax.plot(x[use], y[use], label=label, color=color, ls=ls)
-            audit[method] = oracle_metrics(
+            audit.setdefault(method, {}).update(oracle_metrics(
                 record["labels"],
                 record["scores"],
                 record["mask"],
                 min_background=minimum,
-            )
+            ))
             drawn = True
         if not drawn:
             f.plt.close(fig)
@@ -1270,9 +1391,9 @@ def physical_comparison_summary(groups, output, args, load_scores):
             raise ValueError(
                 "R-ANODE seed bands require a fixed common prepared partition; use scan plots for varied inputs"
             )
-        curves = {m: [] for m in PHYSICAL_STYLES}
+        curves = {metric: {m: [] for m in PHYSICAL_STYLES} for metric in ("roc", "sic")}
+        identities = {metric: {m: [] for m in PHYSICAL_STYLES} for metric in curves}
         native_curves = []
-        lacathode_sources = set()
         grid = np.geomspace(1e-4, 1, 300)
         for (name, seed), group in groups.items():
             if name != scenario or "ranode" not in group:
@@ -1285,30 +1406,35 @@ def physical_comparison_summary(groups, output, args, load_scores):
             for method, record in records.items():
                 if len(np.unique(record["labels"][record["mask"]])) != 2:
                     continue
-                for score in fit_scores(record):
-                    b, s, _ = efficiency_curve(
-                        record["labels"], score, record["mask"], full_pipeline=True,
-                    )
-                    if method == "lacathode":
-                        lacathode_sources.add(f.fit_uncertainty(record))
-                        use = (b >= 1e-4) & (np.rint(b * (record["labels"] == 0).sum()) >= args.min_background)
-                        native_curves.append((b[use], s[use]))
-                    unique, inverse = np.unique(b, return_inverse=True)
-                    maxima = np.zeros(len(unique))
-                    np.maximum.at(maxima, inverse, s)
-                    values = np.interp(grid, unique, maxima)
-                    supported = (
-                        grid >= args.min_background / (record["labels"] == 0).sum()
-                    ) & (grid <= b.max())
-                    values[~supported] = np.nan
-                    curves[method].append(values)
+                for metric in curves:
+                    scores = uncertainty_scores(record) if metric == "sic" else fit_scores(record)
+                    for fit, score in enumerate(scores):
+                        b, s, _ = efficiency_curve(record["labels"], score, record["mask"], full_pipeline=True)
+                        if method == "lacathode" and metric == "sic":
+                            use = (b >= 1e-4) & (np.rint(b * (record["labels"] == 0).sum()) >= args.min_background)
+                            native_curves.append((b[use], s[use]))
+                        unique, inverse = np.unique(b, return_inverse=True)
+                        maxima = np.zeros(len(unique))
+                        np.maximum.at(maxima, inverse, s)
+                        values = np.interp(grid, unique, maxima, left=np.nan, right=np.nan)
+                        supported = grid >= args.min_background / (record["labels"] == 0).sum()
+                        values[~supported] = np.nan
+                        curves[metric][method].append(values)
+                        source = (record.get("uncertainty_source") if metric == "sic" else None)
+                        source = source or (f.fit_uncertainty(record) if method == "lacathode"
+                                            else "training_seed_variation_on_fixed_data_partition")
+                        identities[metric][method].append(dict(
+                            seed=seed, fit=fit, source=source,
+                            member_id=record.get("uncertainty_member_ids", list(range(len(scores))))[fit],
+                            run_seed=int(record["run_seeds"][fit]) if "run_seeds" in record else seed,
+                        ))
         for metric in ("roc", "sic"):
             fig, ax, _ = f.canvas(
                 "Signal efficiency" if metric == "roc" else "Significance improvement",
                 "Background efficiency",
             )
             audit = {}
-            for method, cohort in curves.items():
+            for method, cohort in curves[metric].items():
                 if not cohort:
                     continue
                 label, color, ls, _ = PHYSICAL_STYLES[method]
@@ -1318,10 +1444,10 @@ def physical_comparison_summary(groups, output, args, load_scores):
                     if method == "lacathode" and len(native_curves) > 1
                     else f.draw_band(ax, grid, values, label, color, ls)
                 )
-                audit[method]["uncertainty_source"] = (
-                    (next(iter(lacathode_sources)) if len(lacathode_sources) == 1 else "mixed_run_structures")
-                    if method == "lacathode" else "training_seed_variation_on_fixed_data_partition"
-                )
+                audit[method].update(uncertainty_source=fit_uncertainty(identities[metric][method]),
+                                     percentiles=[16, 50, 84], fit_count=len(cohort),
+                                     members=identities[metric][method])
+                audit[method].pop("independent_runs", None)
             if not audit:
                 f.plt.close(fig)
                 continue
@@ -1337,12 +1463,73 @@ def physical_comparison_summary(groups, output, args, load_scores):
                 xlim=(1e-4, 1),
                 ylim=(0, 1.02 if metric == "roc" else None),
             )
+            if metric == "sic":
+                f.summary_axes(ax, "sic")
             f.legend(
                 fig, title=f.SCENARIO_LABELS[scenario] + " | Signal region", ncols=1
             )
             f.save(fig, output / scenario / ("signal_region_" + metric))
             audits[scenario + "/" + metric] = audit
+        if scenario == "background_only":
+            audits[scenario + "/mass_flatness"] = physical_mass_summary(groups, output, args, load_scores)
     return audits
+
+
+def physical_mass_summary(groups, output, args, score_loader):
+    """SR-only sculpting: R-ANODE has no sideband scores to extrapolate."""
+    curves = {m: [] for m in PHYSICAL_STYLES}
+    identities = {m: [] for m in PHYSICAL_STYLES}
+    reference_mass = None
+    for (scenario, seed), group in groups.items():
+        if scenario != "background_only" or "ranode" not in group:
+            continue
+        records = {m: score_loader(root, report, "test") for m, (root, report) in group.items()}
+        require_same_physical_population(records)
+        region = records["ranode"]["is_signal_region"]
+        base = records["ranode"]
+        pop = region & (base["labels"] == 0)
+        mass = base["mass"][pop]
+        if len(mass) < 300:
+            colored_status("SR-only mass-flatness bands need at least 300 background events", kind="WARNING")
+            continue
+        edges = f.equal_occupancy(mass)
+        full = np.histogram(mass, edges)[0]
+        reference_mass = mass
+        for method, record in records.items():
+            mask = record["mask"][pop]
+            if not mask.any():
+                continue
+            for i, scores in enumerate(uncertainty_scores(record)):
+                score = scores[pop]
+                curves[method].append([
+                    f.shape_chi2(full, np.histogram(mass[mask & (score > np.quantile(score[mask], 1 - e))], edges)[0], e)
+                    for e in f.EFFICIENCIES
+                ])
+                source = record.get("uncertainty_source", f.fit_uncertainty(record) if method == "lacathode"
+                                    else "training_seed_variation_on_fixed_data_partition")
+                identities[method].append(dict(
+                    seed=seed, fit=i, source=source,
+                    member_id=record.get("uncertainty_member_ids", list(range(len(uncertainty_scores(record)))))[i],
+                    run_seed=int(record["run_seeds"][i]) if "run_seeds" in record else seed,
+                ))
+    if not any(curves.values()):
+        return {"scope": "signal_region_only", "status": "insufficient_background_events"}
+    fig, ax, _ = f.canvas(r"$\chi^2/n_{\mathrm{dof}}$", "SR selection efficiency")
+    audit = {"scope": "signal_region_only", "bins": 300, "methods": {}}
+    for method, values in curves.items():
+        if not values:
+            continue
+        summary = f.draw_band(ax, f.EFFICIENCIES, values, *PHYSICAL_STYLES[method][:3])
+        summary.update(uncertainty_source=fit_uncertainty(identities[method]), percentiles=[16, 50, 84],
+                       fit_count=len(values), members=identities[method])
+        summary.pop("independent_runs", None)
+        audit["methods"][method] = summary
+    audit["random"] = f.draw_band(ax, f.EFFICIENCIES, random_reference(reference_mass, mode=args.random_reference),
+                                  "Random", ".5", ":")
+    f.summary_axes(ax, "mass_flatness")
+    f.legend(fig, title="BG-Only | Signal region")
+    f.save(fig, output / "background_only" / "mass_flatness_vs_selection")
+    return audit
 
 
 def main(argv=None):
@@ -1354,6 +1541,10 @@ def main(argv=None):
         help="Regenerate matching plots and tables in an existing output directory; preserve other files",
     )
     parser.add_argument("--methods", nargs="+", choices=tuple(KEYS), default=list(KEYS))
+    parser.add_argument("--fit-bands", choices=("members", "seeds"), default="members",
+                        help="RIDDLE/R-ANODE SIC/chi2: saved fits (default) or ensemble scores across seeds; LaCathode retains its saved fits")
+    parser.add_argument("--device", default="cpu", help="Device for RIDDLE saved-checkpoint inference only")
+    parser.add_argument("--io-workers", type=int, default=2, help="CPU threads for RIDDLE plotting inference")
     parser.add_argument("--confidence", type=float, default=0.95)
     parser.add_argument("--min-background", type=int, default=10)
     parser.add_argument("--random-reference", choices=("bootstrap", "subset"), default="bootstrap")
@@ -1363,8 +1554,11 @@ def main(argv=None):
     args.population_summary = True
     set_verbosity(args.verbose)
     try:
-        if not 0 < args.confidence < 1 or args.min_background < 1:
+        if not 0 < args.confidence < 1 or args.min_background < 1 or args.io_workers < 1:
             raise ValueError("Invalid confidence level or background support")
+        import re
+        if args.device != "cpu" and not re.fullmatch(r"cuda:\d+", args.device):
+            raise ValueError("Plot inference device must be cpu or cuda:<index>")
         groups = discover(args.results, args.methods)
         scan_groups = discover(args.results, args.methods, scan=True)
         if not groups and not scan_groups:
@@ -1383,6 +1577,7 @@ def main(argv=None):
         args.output.mkdir(parents=True, exist_ok=args.overwrite)
         rows, settings, bundles = [], [], []
         ranode_audit = {}
+        score_loader = FitScoreLoader(mode=args.fit_bands, device=args.device, io_workers=args.io_workers)
         with local_progress("Plots"), f.plt.style.context(f.STYLE), locked(args.output / ".plot.lock"):
             scan_audit = render_injection_scan(scan_groups, args.output / "injection_scan", args) if scan_groups else None
             for (scenario, seed), group in groups.items():
@@ -1399,7 +1594,7 @@ def main(argv=None):
                     colored_status("Using available method; requested counterpart is absent", kind="INFO")
                 target = args.output / scenario / f"seed_{seed:03d}"
                 if "ranode" in group:
-                    comparison = render_physical_comparison(group, target / "comparison_with_ranode", args, load_scores)
+                    comparison = render_physical_comparison(group, target / "comparison_with_ranode", args, score_loader)
                     ranode_audit[f"{scenario}/{seed}"] = comparison
                     settings.extend(settings_rows({"ranode": group["ranode"]}))
                     for method, metrics in comparison["methods"].items():
@@ -1408,14 +1603,14 @@ def main(argv=None):
                     group = {m: entry for m, entry in group.items() if m != "ranode"}
                     if not group:
                         continue
-                for individual, bundle in bundles_for_group(group, args.confidence):
+                for individual, bundle in bundles_for_group(group, args.confidence, score_loader):
                     rows.extend(comparison_rows(bundle, args))
                     settings.extend(settings_rows(bundle["sources"]))
                     render_bundle(bundle, target / individual if individual else target, args)
                     bundles.append(bundle)
             audit = summary_figures([b for b in bundles if not b.get("individual")], args.output, args)
             if ranode_audit:
-                ranode_audit["summary"] = physical_comparison_summary(groups, args.output / "comparison_with_ranode", args, load_scores)
+                ranode_audit["summary"] = physical_comparison_summary(groups, args.output / "comparison_with_ranode", args, score_loader)
                 write_json(args.output / "ranode_comparison.json", json_safe(ranode_audit))
             for method in KEYS:
                 individual = [b for b in bundles if b.get("individual") == method]
@@ -1443,7 +1638,9 @@ def main(argv=None):
                             "histograms": "unweighted counts per fit, averaged over LaCathode fits; identical bins, no smoothing or pooled events; B + S is the sum of background and signal counts",
                         },
                         "mass_summary": "BG-Only: test-SR quantiles, 300 equal-occupancy full-range bins, normalized-shape Poisson chi2",
-                        "uncertainty_scope": "SIC/mass bands: 16/50/84 percentiles across saved runs; new LaCathode campaigns retrain the flow and classifier independently per run; legacy shared-flow fits retain their recorded scope",
+                        "uncertainty_scope": "SIC/mass bands: 16/50/84 percentiles of per-fit metric curves, not uncertainty in an averaged ensemble; fixed-background fits exclude background-training variation; independent LaCathode runs retain their scope",
+                        "fit_bands": args.fit_bands,
+                        "fit_inference": {"device": args.device, "training": False, "result_files_modified": False},
                         "lacathode_event_plots": "Dynamically detected saved fits; mean per-fit histograms with matching per-fit validation cuts; shapes normalize those mean counts; no cross-fit score averaging",
                         "lacathode_roc_sic": "Median rejection and SIC interpolated at 1000 common signal efficiencies, as upstream, after statistical-support cuts. Bands are parametric 16/84-percentile ribbons at fixed signal efficiency; background-efficiency display axes retained.",
                         "lacathode_fit_counts": [{"scenario": b["report"]["scenario"], "seed": b["report"]["seed"], "fits": b["classifier_fit_count"]} for b in bundles if "classifier_fit_count" in b],

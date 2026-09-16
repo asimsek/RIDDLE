@@ -38,6 +38,8 @@ def runtime_code(method, root=None):
         "worker_progress.py",
         "progress.py",
         "resume.py",
+        "mps.py",
+        "gpu_identity.py",
     )
     code = {f"framework/{name}": file_digest(package / name) for name in framework}
     code.update(
@@ -56,12 +58,21 @@ def main():
         raise SystemExit(128 + signum)
 
     signal.signal(signal.SIGTERM, terminate)
-    if args.method == "riddle":
+    concurrent = args.method == "riddle"
+    workers = getattr(args, "workers", 1)
+    if args.method == "lacathode" and not getattr(args, "lacathode_replica", False):
+        from external.lacathode_utils.pipeline import run_settings
+
+        settings = run_settings(getattr(args, "runs", None), getattr(args, "epochs", None),
+                                getattr(args, "lacathode_background", "independent"))
+        workers = min(workers, settings["pipeline_runs"])
+        concurrent = getattr(args, "lacathode_background", "independent") == "independent" and workers > 1
+    if concurrent:
         from .mps import configure_mps
 
         if (
             args.device != "cpu"
-            and args.workers > 1
+            and workers > 1
             and args.mps != "off"
             and not os.environ.get("CUDA_VISIBLE_DEVICES", "").startswith(("GPU-", "MIG-"))
         ):
@@ -77,7 +88,7 @@ def main():
                     raise RuntimeError("Cannot verify GPU identity for MPS; use --mps off") from None
                 args.mps = "off"
                 emit_message("GPU identity unavailable; using ordinary concurrent fits", kind="WARNING")
-        status = configure_mps(args.mps, args.device, args.workers)
+        status = configure_mps(args.mps, args.device, workers)
         if status.requested and not status.active:
             emit_message("MPS unavailable; ordinary concurrent fits remain enabled", kind="WARNING")
     import torch
@@ -98,7 +109,8 @@ def main():
     else:
         from external.lacathode_utils.resume import contract_settings
 
-        settings.update(contract_settings(getattr(args, "runs", None), getattr(args, "epochs", None)))
+        settings.update(contract_settings(getattr(args, "runs", None), getattr(args, "epochs", None),
+                                          getattr(args, "lacathode_background", "independent")))
     contract = {
         "scientific_version": SCIENTIFIC_VERSION if args.method == "riddle" else "pinned_upstream",
         "flow_checkpoint_prefix": args.method + "_model",
@@ -115,10 +127,11 @@ def main():
         contract["riddle_production_policy"] = PRODUCTION_POLICY
     if args.method == "lacathode":
         from external.lacathode_utils.source import verify, COMMIT
-        from external.lacathode_utils.pipeline import RUN_LAYOUT
+        from external.lacathode_utils.pipeline import RUN_LAYOUT, FIXED_RUN_LAYOUT
 
         contract.update(source_sha256=verify(args.sources), source_commit=COMMIT,
-                        lacathode_run_layout=RUN_LAYOUT)
+                        lacathode_run_layout=(FIXED_RUN_LAYOUT
+                            if getattr(args, "lacathode_background", "independent") == "fixed" else RUN_LAYOUT))
         if getattr(args, "lacathode_replica", False):
             contract["settings"].update(campaign_seed=args.campaign_seed, run_index=args.run_index)
     path = args.output / "result.json"

@@ -148,17 +148,21 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
 kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --name lacathode-seed42 --methods lacathode --scenarios signal_injection \
-  --seeds 42 --runs 10 --epochs 100 --workers 1 --io-workers 8 | \
-  kubectl apply -n cua-asimsek -f -
+  --seeds 42 --runs 10 --epochs 100 --workers 1 --io-workers 8 \
+  --lacathode-background fixed \
+  | kubectl apply -n cua-asimsek -f -
 ```
 
 ```bash
 kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --name lacathode-bg-seed42 --methods lacathode --scenarios background_only \
-  --seeds 42 --runs 10 --epochs 100 --workers 1 --io-workers 8 | \
-  kubectl apply -n cua-asimsek -f -
+  --seeds 42 --runs 10 --epochs 100 --workers 1 --io-workers 8 \
+  --lacathode-background fixed \
+  | kubectl apply -n cua-asimsek -f -
 ```
+
+Add `--lacathode-background fixed` to a LaCathode submission to share one background flow across `--runs` classifiers; the default is `independent`.
 
 **R-ANODE:**
 
@@ -166,7 +170,7 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
 kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --name ranode-seed42 --methods ranode --scenarios signal_injection \
-  --runs 10 --epochs 100 --seeds 42 --workers 1 --io-workers 8 | \
+  --runs 10 --epochs 100 --seeds 42 --workers 2 --io-workers 8 | \
   kubectl apply -n cua-asimsek -f -
 ```
 
@@ -174,7 +178,7 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
 kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --name ranode-bg-seed42 --methods ranode --scenarios background_only \
-  --runs 10 --epochs 100 --seeds 42 --workers 1 --io-workers 8 | \
+  --runs 10 --epochs 100 --seeds 42 --workers 2 --io-workers 8 | \
   kubectl apply -n cua-asimsek -f -
 ```
 

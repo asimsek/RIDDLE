@@ -1377,7 +1377,7 @@ def shape_chi2(full, selected, efficiency):
 def central68(values):
     values = np.asarray(values, float)
     if values.ndim != 2 or not len(values):
-        raise ValueError("Expected one metric curve per independent seed")
+        raise ValueError("Expected one metric curve per fit/run")
     supported = np.isfinite(values).all(axis=0)
     summary = np.full((3, values.shape[1]), np.nan)
     summary[:, supported] = np.percentile(values[:, supported], [16, 50, 84], axis=0)
@@ -1391,7 +1391,8 @@ def summary_axes(ax, metric):
 
 def draw_band(ax, x, values, label, color, linestyle, *, band=True):
     low, median, high = central68(values)
-    if band and len(values) >= 2:
+    drawn = bool(band and len(values) >= 2 and np.isfinite(median).any())
+    if drawn:
         ax.fill_between(x, low, high, color=color, alpha=0.18, linewidth=0)
     ax.plot(x, median, color=color, ls=linestyle, label=label)
     return {
@@ -1399,10 +1400,10 @@ def draw_band(ax, x, values, label, color, linestyle, *, band=True):
         "median": median.tolist(),
         "high": high.tolist(),
         "independent_runs": len(values),
-        "band_drawn": bool(band and len(values) >= 2),
+        "band_drawn": drawn,
         "band_status": "drawn"
-        if band and len(values) >= 2
-        else "requires_multiple_independent_runs"
+        if drawn
+        else "requires_multiple_curves_with_common_support"
         if band
         else "disabled",
         "contributing_runs": np.isfinite(values).sum(axis=0).tolist(),
