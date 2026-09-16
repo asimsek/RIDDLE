@@ -12,6 +12,7 @@ from matplotlib.lines import Line2D
 from matplotlib.transforms import Bbox
 from mplhep import style as hep_style
 import numpy as np
+from scipy.interpolate import interp1d
 from scipy.special import expit
 from scipy.stats import beta, norm
 from sklearn.metrics import roc_auc_score, roc_curve
@@ -64,6 +65,102 @@ STYLE = {
 }
 
 
+def fit_scores(record):
+    return record.get("fit_scores", record["scores"][None, :])
+
+
+def sample_fit_scores(sample, key):
+    return sample.get(key + "_fit_scores", sample[key + "_scores"][None, :])
+
+
+def fit_histogram(values, edges, mask):
+    """Mean counts per fit, retaining event denominators rather than pooling fits."""
+    values, mask = np.broadcast_arrays(np.atleast_2d(values), np.atleast_2d(mask))
+    counts = np.asarray([np.histogram(v[m], edges)[0] for v, m in zip(values, mask)])
+    return counts[0] if len(counts) == 1 else counts.mean(axis=0)
+
+
+def validate_fit_counts(records):
+    counts = [len(fit_scores(record)) for record in records]
+    if len(set(counts)) != 1:
+        raise ValueError("LaCathode fit counts differ between evaluation partitions")
+    return counts[0]
+
+
+def fit_curve_summary(curves):
+    """Upstream interpolation of rejection and SIC at 1000 common signal efficiencies.
+
+    The caller applies its statistical-support cut before interpolation. Every
+    fit must contribute over the shared domain; unsupported fits are not dropped.
+    """
+    if not curves or any(len(b) < 2 or len(np.unique(s)) < 2 for b, s in curves):
+        raise ValueError("Insufficient common LaCathode ROC support across all fits")
+    low = max(float(np.min(s)) for _, s in curves)
+    high = min(float(np.max(s)) for _, s in curves)
+    if low >= high:
+        raise ValueError("LaCathode fits have no shared signal-efficiency range")
+    signal = np.linspace(low, high, 1000)
+    rejection = np.asarray([interp1d(s, 1 / b)(signal) for b, s in curves])
+    sic = np.asarray([interp1d(s, s / np.sqrt(b))(signal) for b, s in curves])
+    return signal, np.percentile(rejection, [16, 50, 84], axis=0), np.percentile(sic, [16, 50, 84], axis=0)
+
+
+def draw_fit_curves(ax, curves, metric, label, color, linestyle):
+    try:
+        signal, rejection, sic = fit_curve_summary(curves)
+    except ValueError as error:
+        drawn = False
+        for b, s in curves:
+            if not len(b):
+                continue
+            if metric in ("rejection", "background_rejection"):
+                x, y = s, 1 / b
+            else:
+                x, y = b, s if metric.startswith("roc") else s / np.sqrt(b)
+            ax.plot(x, y, label=label if not drawn else None, color=color,
+                    ls=linestyle, alpha=.4, marker="o" if len(b) == 1 else None)
+            drawn = True
+        return {"fit_count": len(curves), "band_drawn": False,
+                "band_status": str(error), "aggregation": "unavailable; individual supported fit curves only"}
+    if metric in ("rejection", "background_rejection"):
+        x, y = np.broadcast_to(signal, rejection.shape), rejection
+    elif metric.startswith("roc"):
+        x, y = 1 / rejection, np.broadcast_to(signal, rejection.shape)
+    else:
+        x, y = 1 / rejection, sic
+    if len(curves) > 1:
+        # A parametric ribbon at fixed signal efficiency, not a vertical band
+        # at fixed background efficiency. Keep the publication's displayed axes.
+        ax.fill(np.r_[x[0], x[2, ::-1]], np.r_[y[0], y[2, ::-1]],
+                color=color, alpha=.18, linewidth=0)
+    ax.plot(x[1], y[1], label=label, color=color, ls=linestyle)
+    return {
+        "fit_count": len(curves), "band_drawn": len(curves) > 1,
+        "aggregation": "upstream common signal-efficiency interpolation; median rejection and SIC",
+        "signal_efficiency": signal.tolist(), "background_rejection": rejection.tolist(),
+        "sic": sic.tolist(), "display_x": x[1].tolist(), "display_y": y[1].tolist(),
+        "percentiles": [16, 50, 84],
+        "uncertainty_source": "classifier_fit_variation_with_shared_background_flow_per_seed",
+    }
+
+
+def aggregate_fit_metrics(records):
+    """Median scalar diagnostics, with each original fit retained for auditing."""
+    if len(records) == 1:
+        return records[0]
+    result = {}
+    for key, value in records[0].items():
+        values = [record[key] for record in records]
+        if isinstance(value, dict):
+            result[key] = value if all(v == value for v in values) else aggregate_fit_metrics(values)
+        elif value is None or isinstance(value, (float, int, np.number)):
+            result[key] = float(np.median(values)) if all(v is not None for v in values) else None
+        elif all(v == value for v in values):
+            result[key] = value
+    result.update(fit_count=len(records), fits=records, aggregation="median of per-fit metrics")
+    return result
+
+
 def sr(mass):
     """Preserved LaCathode plotting convention; RIDDLE uses saved membership."""
     return (mass >= 3.3) & (mass <= 3.7)
@@ -112,6 +209,14 @@ def safe_div(a, b):
 
 
 def choose_cut(sample, key, budget, strict=False):
+    fits = sample_fit_scores(sample, key)
+    if len(fits) > 1:
+        rows = [choose_cut({**sample, key + "_scores": score, key + "_fit_scores": score[None, :]},
+                           key, budget, strict) for score in fits]
+        available = all(row["cut"] is not None for row in rows)
+        return {"cut": [row["cut"] for row in rows] if available else None,
+                "status": "available" if available else "unsupported_fit",
+                "fit_count": len(rows), "fits": rows, "scope": "validation_sr"}
     mask = sample_sr(sample, key) & (sample["labels"] == 0)
     total = int(mask.sum())
     values = np.sort(sample[key + "_scores"][mask & sample["mask"]])
@@ -157,10 +262,39 @@ def mass_edges(mass):
 
 
 def selected(sample, key, cut):
+    fits = sample_fit_scores(sample, key)
+    if len(fits) > 1:
+        thresholds = np.asarray(cut)
+        if thresholds.ndim:
+            if thresholds.shape != (len(fits),):
+                raise ValueError("Selection needs one validation threshold per LaCathode fit")
+            thresholds = thresholds[:, None]
+        return sample["mask"] & (fits > thresholds)
     return sample["mask"] & (sample[key + "_scores"] > cut)
 
 
 def selection_stats(sample, key, cut, edges, confidence):
+    fits = sample_fit_scores(sample, key)
+    if len(fits) > 1:
+        cuts = np.broadcast_to(cut, (len(fits),))
+        rows = [selection_stats({**sample, key + "_scores": score, key + "_fit_scores": score[None, :]},
+                                key, threshold, edges, confidence) for score, threshold in zip(fits, cuts)]
+        out = {"cut": cuts.tolist(), "display_cut": display(key, cuts).tolist(),
+               "status": "available", "fit_count": len(rows), "fits": rows,
+               "aggregation": "mean per-fit counts/efficiencies; median per-fit shape diagnostics"}
+        for name in ("signal", "background"):
+            for suffix in ("", "_passed", "_total"):
+                values = [r[name + suffix] for r in rows]
+                out[name + suffix] = float(np.mean(values)) if all(v is not None for v in values) else None
+            # Fit spread is not a binomial confidence interval on pooled events.
+            out[name + "_ci_low"] = out[name + "_ci_high"] = None
+        for name in ("total", "passed", "efficiency"):
+            out[name] = np.mean([r[name] for r in rows], axis=0).tolist()
+        out["overall_background_efficiency"] = np.mean([r["overall_background_efficiency"] for r in rows])
+        for name in ("relative_mass_rms", "chi2_ndof", "chi2_bins"):
+            values = [r[name] for r in rows]
+            out[name] = float(np.median(values)) if all(v is not None for v in values) else None
+        return out
     keep, region = selected(sample, key, cut), sample_sr(sample, key)
     out = {"cut": cut, "display_cut": float(display(key, cut)), "status": "available"}
     for name, label in (("signal", 1), ("background", 0)):
@@ -446,6 +580,21 @@ def render_roc(bundle, output, args):
                 )
                 for key in keys:
                     label, color, ls = METHODS[key]
+                    record = bundle.get("evaluation", {}).get(dataset, {}).get(key)
+                    if record is not None and len(fit_scores(record)) > 1:
+                        fit_curves = []
+                        for score in fit_scores(record):
+                            b, s, _ = roc_curve(labels, score[record["mask"]])
+                            use = b > 0 if kind.startswith("roc") else (b >= 1e-4) & (np.rint(b * nb) >= args.min_background)
+                            fit_curves.append((b[use], s[use]))
+                        audit[label][kind] = draw_fit_curves(ax, fit_curves, kind, label, color, ls)
+                        audit[label].update(fit_count=len(fit_curves),
+                                            unique_scores=[int(len(np.unique(v[record["mask"]]))) for v in fit_scores(record)],
+                                            interpolation_or_smoothing="linear interpolation on common signal efficiency; no smoothing",
+                                            auc=float(np.median([roc_auc_score(labels, v[record["mask"]]) for v in fit_scores(record)])))
+                        if kind == "sic":
+                            max_sic = max([max_sic, *[float(np.max(s / np.sqrt(b))) for b, s in fit_curves if len(b)]])
+                        continue
                     fpr, tpr = curves[key]
                     keep = (
                         np.ones(len(fpr), bool)
@@ -502,12 +651,10 @@ def render_scores(bundle, output):
         for key in METHODS:
             mask = sample_sr(sample, key) if region == "sr" else np.ones(len(sample["mass"]), bool)
             for truth in (0, 1):
-                values = display(
-                    key, sample[key + "_scores"][mask & sample["mask"] & (sample["labels"] == truth)]
-                )
-                counts = np.histogram(values, edges)[0]
+                population = mask & sample["mask"] & (sample["labels"] == truth)
+                counts = fit_histogram(display(key, sample_fit_scores(sample, key)), edges, population)
                 histograms[key, truth] = (
-                    counts / (len(values) * np.diff(edges)) if len(values) else np.zeros(40)
+                    counts / (population.sum() * np.diff(edges)) if population.any() else np.zeros(40)
                 )
         ymax = max(max(v) for v in histograms.values()) * 1.1 or 1
         for view, keys in VIEWS.items():
@@ -531,6 +678,12 @@ def render_scores(bundle, output):
                 save(fig, output / view / "01_performance/score_distributions" / f"{region}_{name}")
 
 
+def retention_interval(row, confidence):
+    if "fits" in row:
+        return np.percentile([r["efficiency"] for r in row["fits"]], [16, 84], axis=0)
+    return interval(row["passed"], row["total"], confidence)
+
+
 def render_efficiency(bundle, output, args):
     metrics = bundle["metrics"]
     edges = np.asarray(metrics["mass_edges"])
@@ -539,7 +692,7 @@ def render_efficiency(bundle, output, args):
         name, target = slug(point["name"]), point["validation_background_budget"]
         rows = point["methods"]
         highs = [
-            np.asarray(interval(row["passed"], row["total"], args.confidence)[1])
+            np.asarray(retention_interval(row, args.confidence)[1])
             for row in rows.values()
             if "passed" in row
         ]
@@ -554,18 +707,20 @@ def render_efficiency(bundle, output, args):
                 label, color, _ = METHODS[key]
                 n, k = np.asarray(row["total"]), np.asarray(row["passed"])
                 rate = np.divide(k, n, out=np.full(n.shape, np.nan), where=n > 0)
-                low, high = interval(k, n, args.confidence)
+                low, high = retention_interval(row, args.confidence)
                 ax.errorbar(
                     centers,
                     rate * 100,
                     xerr=np.diff(edges) / 2,
-                    yerr=np.array([rate - low, high - rate]) * 100,
+                    yerr=None if "fits" in row else np.array([rate - low, high - rate]) * 100,
                     fmt="o" if key == "raw" else "s",
                     ms=3,
                     color=color,
                     lw=1,
                     label=label,
                 )
+                if "fits" in row:
+                    ax.vlines(centers, low * 100, high * 100, color=color, lw=1)
             decorate_mass(ax, edges)
             ax.set_ylim(0, ymax)
             legend(fig, title=working_point_title(point))
@@ -651,7 +806,7 @@ def mass_histograms(bundle, point):
             cut = point["methods"][key].get("cut")
             if cut is not None:
                 mask = selected(sample, key, cut)
-                histograms[key] = {y: np.histogram(mass[mask & (labels == y)], edges)[0] for y in (0, 1)}
+                histograms[key] = {y: fit_histogram(mass, edges, mask & (labels == y)) for y in (0, 1)}
         return edges, nominal, histograms
     return None
 
@@ -831,7 +986,7 @@ def mass_scan_histograms(sample, keys, cuts=SCORE_CUTS):
             threshold = np.asarray(threshold, dtype=sample[key + "_scores"].dtype)
             keep = selected(sample, key, threshold)
             histograms[key] = {
-                y: np.histogram(mass[keep & (labels == y)], edges)[0] for y in (0, 1)
+                y: fit_histogram(mass, edges, keep & (labels == y)) for y in (0, 1)
             }
         records.append((cut, histograms))
     return edges, nominal, records
@@ -1315,14 +1470,14 @@ def feature_records(bundle):
                         if region == "SR"
                         else np.ones(len(m), bool)
                     )
-                    x = physical[i] if i < len(physical) else display(key, sample[key + "_scores"])
+                    x = physical[i] if i < len(physical) else display(key, sample_fit_scores(sample, key))
                     classes = []
                     for label in (0, 1):
                         pop = scope & (sample["labels"] == label) & np.isfinite(x)
-                        h = np.histogram(x[pop], edges)[0]
+                        h = fit_histogram(x, edges, pop)
                         cut = point["methods"][key].get("cut")
                         kept = (
-                            np.histogram(x[pop & selected(sample, key, cut)], edges)[0]
+                            fit_histogram(x, edges, pop & selected(sample, key, cut))
                             if cut is not None
                             else None
                         )

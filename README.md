@@ -7,7 +7,7 @@
 > [!IMPORTANT]
 > For NRP, follow [README_NRP.md](README_NRP.md) for setup, data preparation, batch submission, and plotting.<br>
 > The instructions below apply to local machines and other computing environments.<br><br>
-> NRP uses the pre-built `ghcr.io/asimsek/riddle-runtime:v1` image, pinned by digest, for Jupyter and GPU jobs.<br> 
+> NRP uses the pre-built `ghcr.io/asimsek/riddle-runtime:v1` image, pinned by digest, for Jupyter and GPU jobs.<br>
 > No environment creation or package installation is needed on NRP.
 
 ```bash
@@ -25,11 +25,18 @@ git -C external/lacathode checkout --detach 8ead8cd6671b93fc385d8f440c06b8fa870b
 python run.py setup
 ```
 
+**Pull R-ANODE framework from original GitHub repo:**
+
+```bash
+git clone --no-checkout https://github.com/rd804/R-ANODE.git external/ranode
+git -C external/ranode checkout --detach d6deed7cb949eb4483c6f484b96e8e4ff2133e25
+python run.py setup --methods ranode
+```
+
 ## Prepare LHCO data
 
 ```bash
-python run.py prepare --dataset lhco --catalog config/datasets.yaml \
-  --output data/lhco --io-workers 4 --verbose 1
+python run.py prepare --dataset lhco --catalog config/datasets.yaml --output data/lhco --io-workers 4 --verbose 1
 ```
 
 ### Optional control datasets
@@ -44,20 +51,38 @@ python run.py prepare --variant deltaR --output data/lhco_deltaR --io-workers 4
 
 ## Run
 
-```bash
-python run.py run --methods lacathode --data data/lhco --output results \
-  --scenarios signal_injection --seeds 42 --device cuda:0 --io-workers 2 --resume
 
+**RIDDLE:**
+
+```bash
 python run.py run --methods riddle --data data/lhco --output results \
-  --scenarios signal_injection --seeds 42 --device cuda:0 \
+  --scenarios signal_injection --seeds 42 --device cuda:0 --runs 10 --epochs 100 \
   --workers 2 --io-workers 2 --mps auto --resume
 ```
 
-Run both methods and both scenarios with independent seeds:
+**LaCathode:**
 
 ```bash
-python run.py run --methods lacathode riddle --data data/lhco --output results \
-  --scenarios signal_injection background_only --seeds 0-9 \
+python run.py run --methods lacathode --data data/lhco --output results \
+  --scenarios signal_injection --seeds 42 --device cuda:0 --runs 10 --epochs 100 \
+  --io-workers 2 --resume
+```
+
+**R-ANODE:**
+
+```bash
+python run.py run --methods ranode --data data/lhco --output results \
+  --scenarios signal_injection background_only --seeds 42 --device cuda:0 \
+  --runs 10 --epochs 100 \
+  --io-workers 2 --resume
+```
+
+Run all three methods and both scenarios (`signal_injection`, `background_only`) with independent seeds:
+
+```bash
+python run.py run --methods lacathode riddle ranode --data data/lhco --output results \
+  --scenarios signal_injection background_only --seeds 42 \
+  --runs 10 --epochs 100 \
   --device cuda:0 --workers 2 --io-workers 2 --mps auto --resume
 ```
 
@@ -66,20 +91,20 @@ python run.py run --methods lacathode riddle --data data/lhco --output results \
 `--io-workers` controls CPU threads per process.<br>
 MPS is optional on Linux NVIDIA GPUs; `auto` falls back to ordinary concurrency, while `on` requires MPS.
 
-The runner reads `config/settings.yaml` automatically. Use `--config path/to/settings.yaml` for a separate, self-contained study configuration.<br>
-Explicit `--runs`, `--epochs` and `--fractions learned 0.003 0.01` arguments override RIDDLE's YAML values.
+`--runs` and `--epochs` control RIDDLE/R-ANODE signal fits and LaCathode classifier fits; background training is unchanged.<br>
+LaCathode retains separate fits, each averaging ten validation-selected checkpoints.
 
-To continue compatible checkpoints after an implementation update, add `--resume-across-code-change`.<br>
+For all three methods, to continue compatible checkpoints after an implementation update, add `--resume-across-code-change`.<br>
 To move between CUDA GPUs, add `--resume-across-device-change`.<br>
 Both require `--resume` and can be combined.
 
 To run a control, change both the data and results locations, for example:
 
 ```bash
-python run.py run --methods lacathode riddle --data data/lhco_deltaR \
+python run.py run --methods lacathode riddle ranode --data data/lhco_deltaR \
   --output results_deltaR --scenarios signal_injection --seeds 42 \
   --device cuda:0 --workers 2 --io-workers 4 --mps auto --resume
-python plot.py --results results_deltaR --output plots_deltaR --methods lacathode riddle
+python plot.py --results results_deltaR --output plots_deltaR --methods lacathode riddle ranode
 ```
 
 Use the corresponding `shifted` locations for the shifted control.
@@ -87,7 +112,7 @@ Use the corresponding `shifted` locations for the shifted control.
 ## Plot
 
 ```bash
-python plot.py --results results --output plots --methods lacathode riddle --verbose 1
+python plot.py --results results --output plots --methods lacathode riddle ranode --verbose 1 --overwrite
 ```
 
 Request either method alone with `--methods lacathode` or `--methods riddle`.<br>
@@ -98,10 +123,15 @@ Add `--overwrite` to regenerate matching plots and tables in an existing output 
 
 ```bash
 python run.py prepare-scan --config config/settings.yaml --output data/injection_scan --io-workers 4 --resume
+```
 
-python run.py scan --methods lacathode riddle --config config/settings.yaml \
+```bash
+python run.py scan --methods lacathode riddle ranode --config config/settings.yaml \
   --data data/injection_scan --output results_injection_scan \
+  --runs 10 --epochs 100 \
   --device cuda:0 --workers 2 --io-workers 4 --mps auto --resume
+```
 
-python plot.py --results results_injection_scan --output plots_injection_scan --methods lacathode riddle --verbose 1
+```bash
+python plot.py --results results_injection_scan --output plots_injection_scan --methods lacathode riddle ranode --verbose 1 --overwrite
 ```

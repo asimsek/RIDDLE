@@ -6,6 +6,13 @@ from pathlib import Path
 import re
 
 
+def contract_settings(runs=None, epochs=None):
+    from .pipeline import DEFAULTS, classifier_settings
+
+    # Legacy contracts implicitly used one classifier fit and 100 epochs.
+    return {k: v for k, v in classifier_settings(runs, epochs).items() if v != DEFAULTS[k]}
+
+
 def add_resume_options(parser, *, always_resume=False):
     parser.add_argument(
         "--resume", action="store_true", default=always_resume,

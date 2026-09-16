@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 IMAGE_ROOT = Path("/opt/riddle-image")
 IMPORTS = (
     "h5py", "matplotlib", "mplhep", "numpy", "pandas", "yaml", "sklearn",
-    "scipy", "tables", "torch", "tqdm", "nflows.flows.base", "vector",
+    "scipy", "tables", "torch", "tqdm", "nflows.flows.base", "vector", "wandb",
 )
 
 

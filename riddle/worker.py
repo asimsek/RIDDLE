@@ -95,6 +95,10 @@ def main():
     settings = {"seed": args.seed, "scenario": args.scenario, "device": args.device}
     if args.method == "riddle":
         settings.update(args.settings)
+    else:
+        from external.lacathode_utils.resume import contract_settings
+
+        settings.update(contract_settings(getattr(args, "runs", None), getattr(args, "epochs", None)))
     contract = {
         "scientific_version": SCIENTIFIC_VERSION if args.method == "riddle" else "pinned_upstream",
         "flow_checkpoint_prefix": args.method + "_model",

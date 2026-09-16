@@ -7,24 +7,28 @@ from pathlib import Path
 import pickle
 import sys
 
-import numpy as np
-import torch
-
-from .storage import atomic_write, save_npz, seed_start, write_json
-from .recovery import EpochRecovery
-from .epoch_hook import install_epoch_recovery
-from .acceleration import install_validation_counts, install_tensor_batches, execution_report
-from .worker_progress import ProgressStage, emit_progress
-from .source import verify, COMMIT
-from .resume import resume_policy
-from riddle.metrics import acceptance_report
-
 FLOW_PREFIX = "lacathode_model"
+DEFAULTS = {"classifier_runs": 1, "classifier_epochs": 100}
+
+
+def classifier_settings(runs=None, epochs=None):
+    values = {
+        "classifier_runs": DEFAULTS["classifier_runs"] if runs is None else runs,
+        "classifier_epochs": DEFAULTS["classifier_epochs"] if epochs is None else epochs,
+    }
+    if type(values["classifier_runs"]) is not int or values["classifier_runs"] < 1:
+        raise ValueError("LaCathode --runs must be a positive integer")
+    # The pinned selector uses argpartition(losses, 10), requiring more than ten epochs.
+    if type(values["classifier_epochs"]) is not int or values["classifier_epochs"] < 11:
+        raise ValueError("LaCathode --epochs must be at least 11 for its upstream ten-checkpoint selector")
+    return values
 
 
 @contextmanager
 def classifier_prediction_device(classifier_type):
     """Match prediction inputs to the loaded model, only during SR evaluation."""
+    import torch
+
     original = classifier_type.predict
 
     def predict(self, x):
@@ -61,6 +65,18 @@ def device_masks(module):
 
 
 def run(args, contract):
+    import numpy as np
+    import torch
+
+    from .storage import seed_start, write_json
+    from .recovery import EpochRecovery
+    from .epoch_hook import install_epoch_recovery
+    from .acceleration import install_validation_counts, install_tensor_batches, execution_report
+    from .worker_progress import ProgressStage, emit_progress
+    from .source import verify, COMMIT
+    from .resume import resume_policy
+
+    settings = classifier_settings(getattr(args, "runs", None), getattr(args, "epochs", None))
     config_file = (
         "DE_MAF_model_deltaR.yml" if contract["inputs"].get("variant") == "deltaR" else "DE_MAF_model.yml"
     )
@@ -87,7 +103,9 @@ def run(args, contract):
     run_ANODE_training.train_ANODE = install_epoch_recovery(
         ANODE_training_utils, "train_ANODE", "flow", recovery
     )
-    install_epoch_recovery(classifier_training_utils, "train_model", "classifier", recovery)
+    classifier_training_utils.train_model = recovery.classifier_fits(
+        install_epoch_recovery(classifier_training_utils, "train_model", "classifier", recovery)
+    )
     acceleration = install_tensor_batches()
     arguments = [
         "--data_dir",
@@ -106,11 +124,11 @@ def run(args, contract):
         "--cf_use_class_weights",
         "--cf_save_model",
         "--cf_n_runs",
-        "1",
+        str(settings["classifier_runs"]),
         "--DE_epochs",
         "100",
         "--cf_epochs",
-        "100",
+        str(settings["classifier_epochs"]),
         "--DE_file_name",
         FLOW_PREFIX,
         "--DE_config_file",
@@ -137,7 +155,6 @@ def run(args, contract):
     recovery.stage("creation", create)
 
     def classify():
-        emit_progress("classifier", "Train classifier", total=100, unit="epoch", completed=0)
         run_all.train_classifier(run_all.create_namespace_classifier_training(parsed))
 
     recovery.stage("classifier", classify)
@@ -151,7 +168,7 @@ def run(args, contract):
             sic_range=(0, 20),
             savefig=str(root / "internal_sic"),
         )
-    evaluate(args, root, data_handler, config_file=config_file)
+    evaluate(args, root, data_handler, config_file=config_file, classifier_runs=parsed.cf_n_runs)
     write_json(
         args.output / "protocol.json",
         {
@@ -160,10 +177,13 @@ def run(args, contract):
             "flow_checkpoint_prefix": FLOW_PREFIX,
             "commit": COMMIT,
             "flow_epochs": 100,
-            "classifier_epochs": 100,
-            "classifier_runs": 1,
+            "classifier_epochs": parsed.cf_epochs,
+            "classifier_runs": parsed.cf_n_runs,
             "reference_samples": 267000,
             "selected_checkpoints": 10,
+            "score": "Upstream ten-validation-checkpoint mean per classifier fit; no averaging across fits",
+            "primary_classifier_fit": 0,
+            "fit_scores": "All classifier fits, in upstream run order, when classifier_runs > 1",
             "acceleration": execution_report(acceleration),
             "configuration": {
                 name: (args.sources / name).read_text() for name in (config_file, "classifier.yml")
@@ -173,17 +193,24 @@ def run(args, contract):
     verify(args.sources)
 
 
-def evaluate(args, root, data_handler, *, config_file="DE_MAF_model.yml"):
+def evaluate(args, root, data_handler, *, config_file="DE_MAF_model.yml", classifier_runs=1):
+    import numpy as np
+    import torch
+
+    from .storage import atomic_write, save_npz, seed_start, write_json
+    from .worker_progress import ProgressStage
+    from riddle.metrics import acceptance_report
+
     from classifier import Classifier
     from density_estimator import DensityEstimator
     from evaluation_utils import minimum_validation_loss_models
     import matplotlib.pyplot as plt
     from sklearn.metrics import roc_curve
 
-    captured = {}
+    captured = []
 
     def capture(labels, scores):
-        captured.update(labels=labels, scores=scores)
+        captured.append(dict(labels=labels, scores=scores))
         return roc_curve(labels, scores)
 
     notebook = json.loads((args.sources / "bkg_sculpting_study.ipynb").read_text())
@@ -215,7 +242,7 @@ def evaluate(args, root, data_handler, *, config_file="DE_MAF_model.yml"):
         namespace["make_ROCs"](
             str(root),
             str(args.data),
-            [1],
+            list(range(1, classifier_runs + 1)),
             str(root / "sr_evaluation.pdf"),
             str(root / "sr_evaluation.pkl"),
             True,
@@ -235,8 +262,16 @@ def evaluate(args, root, data_handler, *, config_file="DE_MAF_model.yml"):
         torch.load(root / f"{FLOW_PREFIX}_epoch_{epoch}.par", map_location="cpu", weights_only=True)
     )
     model.eval().requires_grad_(False)
-    paths = minimum_validation_loss_models(str(root), n_epochs=10)[0]
-    write_json(root / "classifier_selection.json", {"ordered_checkpoints": [Path(p).name for p in paths]})
+    paths_by_fit = minimum_validation_loss_models(str(root), n_epochs=10)
+    if len(paths_by_fit) != classifier_runs or len(captured) != classifier_runs:
+        raise ValueError("Incomplete upstream LaCathode classifier fits")
+    selection = {"ordered_checkpoints": [Path(p).name for p in paths_by_fit[0]]}
+    if classifier_runs > 1:
+        selection["fits"] = [
+            {"fit": i, "ordered_checkpoints": [Path(p).name for p in paths]}
+            for i, paths in enumerate(paths_by_fit)
+        ]
+    write_json(root / "classifier_selection.json", selection)
     acceptance = {}
     for partition, suffix in (("validation", "val"), ("test", "test"), ("signal_region", None)):
         names = (
@@ -253,31 +288,42 @@ def evaluate(args, root, data_handler, *, config_file="DE_MAF_model.yml"):
             )
         mask = prepared["mask"].numpy()
         if suffix:
-            predictions = []
+            fit_predictions = []
             with (
                 ProgressStage(
-                    "scores_" + partition, "Score " + partition, len(paths), "checkpoint"
+                    "scores_" + partition, "Score " + partition,
+                    sum(map(len, paths_by_fit)), "checkpoint"
                 ) as progress,
                 torch.no_grad(),
             ):
-                for i, path in enumerate(paths):
-                    classifier = torch.load(path, map_location="cpu", weights_only=False).eval()
-                    predictions.append(
-                        np.concatenate(
-                            [
-                                classifier(torch.as_tensor(z[o : o + 8192])).numpy().ravel()
-                                for o in range(0, len(z), 8192)
-                            ]
+                completed = 0
+                for paths in paths_by_fit:
+                    predictions = []
+                    for path in paths:
+                        classifier = torch.load(path, map_location="cpu", weights_only=False).eval()
+                        predictions.append(
+                            np.concatenate(
+                                [
+                                    classifier(torch.as_tensor(z[o : o + 8192])).numpy().ravel()
+                                    for o in range(0, len(z), 8192)
+                                ]
+                            )
                         )
-                    )
-                    progress.update(i + 1)
-            scores = np.mean(np.stack(predictions), axis=0)
+                        completed += 1
+                        progress.update(completed)
+                    fit_predictions.append(np.mean(np.stack(predictions), axis=0))
         else:
-            if not np.array_equal(captured["labels"], rows[mask, -1]):
+            if any(not np.array_equal(fit["labels"], rows[mask, -1]) for fit in captured):
                 raise ValueError("Pinned SR evaluation event alignment changed")
-            scores = captured["scores"]
+            fit_predictions = [fit["scores"] for fit in captured]
+        scores = fit_predictions[0]
         aligned = np.full(len(rows), np.nan, dtype=scores.dtype)
         aligned[mask] = scores
+        extra = {}
+        if classifier_runs > 1:
+            fit_scores = np.full((classifier_runs, len(rows)), np.nan, dtype=scores.dtype)
+            fit_scores[:, mask] = np.stack(fit_predictions)
+            extra["fit_scores"] = fit_scores
         acceptance[partition] = acceptance_report(rows[:, -1], mask, rows[:, 0])
         atomic_write(
             args.output / f"{partition}_scores.npz",
@@ -289,6 +335,7 @@ def evaluate(args, root, data_handler, *, config_file="DE_MAF_model.yml"):
                 scores=aligned,
                 physical=rows[:, 1:-1],
                 latent=z,
+                **extra,
             ),
         )
     write_json(args.output / "mapping_acceptance.json", acceptance)

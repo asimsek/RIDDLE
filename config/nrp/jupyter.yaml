@@ -13,7 +13,7 @@ spec:
     fsGroupChangePolicy: OnRootMismatch
   initContainers:
     - name: initialize-shared-storage
-      image: ghcr.io/asimsek/riddle-runtime@sha256:ee19759acf2da9ac8316aaf18e03c279a4114b16b3be6edffceb9a4bd982eae6
+      image: ghcr.io/asimsek/riddle-runtime@sha256:bfe95597a1f1855ae4a6d2ba55d9e06895ce11ba3ffe6883dfa979aeb7db98c0
       imagePullPolicy: IfNotPresent
       command: ["/bin/bash", "-c"]
       args:
@@ -30,7 +30,7 @@ spec:
           mountPath: /shared
   containers:
     - name: jupyter
-      image: ghcr.io/asimsek/riddle-runtime@sha256:ee19759acf2da9ac8316aaf18e03c279a4114b16b3be6edffceb9a4bd982eae6
+      image: ghcr.io/asimsek/riddle-runtime@sha256:bfe95597a1f1855ae4a6d2ba55d9e06895ce11ba3ffe6883dfa979aeb7db98c0
       imagePullPolicy: IfNotPresent
       securityContext:
         runAsUser: 0

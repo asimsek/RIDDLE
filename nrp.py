@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import os
 from pathlib import Path
 import re
 import shlex
@@ -7,7 +8,7 @@ import sys
 
 import yaml
 
-from riddle.cli import METHODS, SCENARIOS, seeds, positive
+from riddle.cli import METHODS, DEFAULT_METHODS, SCENARIOS, seeds, positive
 from riddle.storage import atomic_write
 from riddle.resume import add_resume_options
 
@@ -37,6 +38,16 @@ def setup_runtime():
 
 
 def job(args):
+    if "lacathode" in args.methods:
+        from external.lacathode_utils.pipeline import classifier_settings
+
+        classifier_settings(getattr(args, "runs", None), getattr(args, "epochs", None))
+    if "ranode" in args.methods:
+        runs, epochs = getattr(args, "runs", None), getattr(args, "epochs", None)
+        if runs is not None and not 1 <= runs <= 20:
+            raise ValueError("R-ANODE --runs must be between 1 and 20")
+        if epochs is not None and epochs < 10:
+            raise ValueError("R-ANODE --epochs must be at least 10 for checkpoint ensembling")
     default_image, default_secrets, default_region = setup_runtime()
     image = args.image or default_image
     region = getattr(args, "region", None) or default_region
@@ -83,11 +94,13 @@ def job(args):
         value = getattr(args, key, None)
         if value is not None:
             command.extend(["--" + key, str(value)])
+    if "ranode" in args.methods:
+        command.extend(["--ranode-config", str(getattr(args, "ranode_config", "external/ranode_utils/ranode.yaml"))])
     script = "\n".join(
         [
             "set -Eeuo pipefail",
             "cd /shared/work/RIDDLE",
-            f"{PYTHON} scripts/nrp_runtime.py --require-cuda",
+            f"{PYTHON} -m external.ranode_utils.runtime --require-cuda" if args.methods == ["ranode"] else f"{PYTHON} scripts/nrp_runtime.py --require-cuda",
             "nvidia-smi",
             "exec " + shlex.join(command),
         ]
@@ -162,20 +175,56 @@ def job(args):
     return result
 
 
+def pin_image(image):
+    if not re.fullmatch(r"[^\s@]+/[^\s@]+@sha256:[0-9a-f]{64}", image):
+        raise ValueError("Provide an immutable registry/image@sha256:<64 hex digits> reference")
+    path = ROOT / "config/nrp/jupyter.yaml"
+    if path.is_symlink():
+        raise ValueError("Refusing to replace a symbolic-link runtime configuration")
+    metadata = path.stat()
+    original = path.read_text()
+    spec = yaml.safe_load(original)["spec"]
+    containers = {c["name"]: c for key in ("containers", "initContainers") for c in spec.get(key, [])}
+    names = ("jupyter", "initialize-shared-storage")
+    if any(name not in containers for name in names):
+        raise ValueError("Unrecognized Jupyter runtime containers; refusing to change the configuration")
+    updated = original
+    for previous in {containers[name]["image"] for name in names}:
+        updated = updated.replace("image: " + previous, "image: " + image)
+    actual = yaml.safe_load(updated)["spec"]
+    expected = yaml.safe_load(original)["spec"]
+    for key in ("containers", "initContainers"):
+        for container in expected.get(key, []):
+            if container["name"] in names:
+                container["image"] = image
+    if actual != expected:
+        raise ValueError("Image update would change unrelated configuration")
+    def write(temporary):
+        temporary.write_text(updated)
+        os.chmod(temporary, metadata.st_mode & 0o777)
+        if os.geteuid() == 0:
+            os.chown(temporary, metadata.st_uid, metadata.st_gid)
+    atomic_write(path, write)
+    print(f"[PASS] Pinned Jupyter and batch runtime to {image}")
+
+
 def main(argv=None):
-    p = argparse.ArgumentParser(description="Generate an NRP GPU job; does not submit it")
-    p.add_argument("--name", required=True)
-    p.add_argument("--methods", nargs="+", choices=METHODS, default=list(METHODS))
+    p = argparse.ArgumentParser(description="Generate an NRP GPU job or pin its runtime image; does not submit jobs")
+    action = p.add_mutually_exclusive_group(required=True)
+    action.add_argument("--name")
+    action.add_argument("--pin-image", help="Save a built image digest in config/nrp/jupyter.yaml")
+    p.add_argument("--methods", nargs="+", choices=METHODS, default=list(DEFAULT_METHODS))
     p.add_argument("--workflow", choices=("run", "scan"), default="run")
     p.add_argument("--replicas", type=seeds, help="Scan replica indices, e.g. 0-9")
     p.add_argument("--signal-events", type=seeds, help="Scan total signal counts, e.g. 1000,667")
     p.add_argument("--scenarios", nargs="+", choices=SCENARIOS, default=["signal_injection"])
     p.add_argument("--seeds", type=seeds, default=[42])
     p.add_argument("--config", default="config/settings.yaml", help="Settings path inside the job")
+    p.add_argument("--ranode-config", default="external/ranode_utils/ranode.yaml", help="Independent upstream R-ANODE settings")
     p.add_argument("--data", help="Prepared dataset path; defaults to data/lhco or data/injection_scan for scans")
     p.add_argument("--results", help="Result directory; defaults to results or results/injection_scan for scans")
-    p.add_argument("--runs", type=positive, help="Override YAML fit count")
-    p.add_argument("--epochs", type=positive, help="Override YAML epochs")
+    p.add_argument("--runs", type=positive, help="Override RIDDLE/R-ANODE fit count and LaCathode classifier fit count")
+    p.add_argument("--epochs", type=positive, help="Override RIDDLE/R-ANODE signal-fit and LaCathode classifier epochs; background stages are unchanged")
     p.add_argument("--workers", type=positive, default=2)
     p.add_argument("--io-workers", type=positive, default=4)
     p.add_argument(
@@ -191,6 +240,9 @@ def main(argv=None):
     p.add_argument("--output", type=Path)
     args = p.parse_args(argv)
     try:
+        if args.pin_image is not None:
+            pin_image(args.pin_image)
+            return
         text = yaml.safe_dump(job(args), sort_keys=False)
         if args.output:
             if args.output.exists():

@@ -9,7 +9,8 @@ import sys
 from .resume import add_resume_options, resume_policy
 
 ROOT = Path(__file__).resolve().parents[1]
-METHODS = ("lacathode", "riddle")
+METHODS = ("lacathode", "riddle", "ranode")
+DEFAULT_METHODS = ("lacathode", "riddle")
 SCENARIOS = ("signal_injection", "background_only")
 
 
@@ -38,10 +39,12 @@ def positive(value):
 
 
 def parser():
-    p = argparse.ArgumentParser(description="Independent LaCathode and RIDDLE LHCO pipelines")
+    p = argparse.ArgumentParser(description="Independent LaCathode, RIDDLE and R-ANODE LHCO pipelines")
     subs = p.add_subparsers(dest="command", required=True)
-    setup = subs.add_parser("setup", help="Verify the manually cloned, pinned LaCathode checkout")
+    setup = subs.add_parser("setup", help="Verify manually cloned, pinned upstream checkouts")
     setup.add_argument("--sources", type=Path, default=ROOT / "external/lacathode")
+    setup.add_argument("--methods", nargs="+", choices=("lacathode", "ranode"), default=["lacathode"])
+    setup.add_argument("--ranode-sources", type=Path, default=ROOT / "external/ranode")
     prep = subs.add_parser("prepare", help="Download, verify and prepare LHCO data")
     prep.add_argument("--dataset", choices=["lhco"], default="lhco")
     prep.add_argument("--catalog", type=Path, default=ROOT / "config/datasets.yaml")
@@ -58,10 +61,13 @@ def parser():
     prep_scan.add_argument("--replicas", type=seeds, help="Zero-based replica indices, e.g. 0-9")
     for command in ("run", "scan"):
         run = subs.add_parser(command, help="Run independent methods" if command == "run" else "Run the optional injection scan")
-        run.add_argument("--methods", nargs="+", choices=METHODS, default=list(METHODS))
+        run.add_argument("--methods", nargs="+", choices=METHODS, default=list(DEFAULT_METHODS))
         run.add_argument("--data", type=Path, default=Path("data/lhco"))
         run.add_argument("--output", type=Path, default=Path("results"))
         run.add_argument("--sources", type=Path, default=ROOT / "external/lacathode")
+        run.add_argument("--ranode-sources", type=Path, default=ROOT / "external/ranode")
+        run.add_argument("--ranode-config", type=Path, default=ROOT / "external/ranode_utils/ranode.yaml",
+                         help="R-ANODE settings (default: external/ranode_utils/ranode.yaml)")
         run.add_argument("--config", type=Path, default=ROOT / "config/settings.yaml")
         run.add_argument("--device", default="cpu")
         run.add_argument(
@@ -72,9 +78,9 @@ def parser():
         )
         run.add_argument("--io-workers", type=positive, default=2)
         run.add_argument("--mps", choices=["auto", "on", "off"], default="auto")
-        run.add_argument("--runs", type=positive, help="Override YAML RIDDLE fits per fraction")
+        run.add_argument("--runs", type=positive, help="Override RIDDLE/R-ANODE fit count and LaCathode classifier fit count")
         run.add_argument(
-            "--epochs", type=positive, help="Override YAML RIDDLE epochs; LaCathode remains fixed at 100"
+            "--epochs", type=positive, help="Override RIDDLE/R-ANODE signal-fit and LaCathode classifier epochs; background stages are unchanged"
         )
         run.add_argument("--fractions", nargs="+", help="Override YAML mixture-fraction configurations")
         add_resume_options(run)
@@ -91,9 +97,13 @@ def parser():
 
 def run_campaign(args):
     resume_policy(args)
+    fit_overrides = {key: getattr(args, key, None) for key in ("runs", "epochs")}
+    if "lacathode" in args.methods:
+        from external.lacathode_utils.pipeline import classifier_settings
+
+        classifier_settings(**fit_overrides)
     from .storage import locked
     from .worker_progress import monitor_worker
-    from .data import validate
 
     if "riddle" in args.methods:
         from .settings import resolve, input_features
@@ -109,13 +119,32 @@ def run_campaign(args):
     if args.output.is_relative_to(args.data) or args.data.is_relative_to(args.output):
         raise ValueError("Keep data and results in separate directories")
     for scenario in args.scenarios:
-        manifest = validate(args.data / scenario)
+        if args.methods == ["ranode"]:
+            from external.ranode_utils.data import validate as validate_ranode
+            manifest, _ = validate_ranode(args.data / scenario)
+        else:
+            from .data import validate
+            manifest = validate(args.data / scenario)
         if "riddle" in args.methods:
             input_features(args.settings, manifest)
+        if "ranode" in args.methods:
+            from external.ranode_utils.data import validate_schema
+
+            validate_schema(manifest)
     if "lacathode" in args.methods:
         from external.lacathode_utils.source import verify
 
         verify(args.sources)
+    if "ranode" in args.methods:
+        from external.ranode_utils.source import verify
+        from external.ranode_utils.runner import settings
+
+        args.ranode_sources = args.ranode_sources.resolve()
+        args.ranode_config = args.ranode_config.resolve()
+        verify(args.ranode_sources)
+        settings(args.ranode_config, **fit_overrides)
+        if args.methods == ["ranode"] and getattr(args, "fractions", None) is not None:
+            raise ValueError("R-ANODE retains its upstream learned fraction; --fractions is RIDDLE-only")
     for scenario in args.scenarios:
         for seed in args.seeds:
             for method in args.methods:
@@ -132,6 +161,8 @@ def run_campaign(args):
                     "data": str(args.data / scenario),
                     "sources": str(args.sources),
                 }
+                if method == "lacathode":
+                    options.update(fit_overrides)
                 env = os.environ.copy()
                 if args.device == "cpu":
                     env["CUDA_VISIBLE_DEVICES"] = ""
@@ -155,9 +186,25 @@ def run_campaign(args):
                 )
                 for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
                     env[key] = str(args.io_workers)
+                if method == "ranode":
+                    command = [sys.executable, "-m", "external.ranode_utils.runner",
+                               "--sources", str(args.ranode_sources), "--data", options["data"],
+                               "--output", str(output), "--config", str(args.ranode_config),
+                               "--scenario", scenario, "--seed", str(seed), "--device", options["device"],
+                               "--io-workers", str(args.io_workers)]
+                    for key, value in fit_overrides.items():
+                        if value is not None:
+                            command.extend(["--" + key, str(value)])
+                    if args.resume:
+                        command.append("--resume")
+                    for key in ("resume_across_code_change", "resume_across_device_change"):
+                        if getattr(args, key, False):
+                            command.append("--" + key.replace("_", "-"))
+                else:
+                    command = [sys.executable, "-m", "riddle.worker", json.dumps(options, default=str)]
                 with locked(output / ".resume/command.lock"):
                     monitor_worker(
-                        [sys.executable, "-m", "riddle.worker", json.dumps(options, default=str)],
+                        command,
                         env,
                         output / "training.log",
                         f"{method} | {scenario}",
@@ -180,9 +227,12 @@ def main(argv=None):
     try:
         with progress_session(enabled=True, name="RIDDLE"), local_progress("Framework"):
             if args.command == "setup":
-                from external.lacathode_utils.source import setup
-
-                setup(args.sources)
+                if "lacathode" in args.methods:
+                    from external.lacathode_utils.source import setup
+                    setup(args.sources)
+                if "ranode" in args.methods:
+                    from external.ranode_utils.source import verify
+                    verify(args.ranode_sources)
             elif args.command == "prepare":
                 from .data import prepare
 

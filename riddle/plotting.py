@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import yaml
 from scipy.interpolate import interp1d
+from scipy.special import expit
 from sklearn.metrics import average_precision_score, roc_auc_score, roc_curve
 
 from . import figures as f
@@ -15,8 +16,16 @@ from .progress import set_verbosity, colored_status
 from .worker_progress import ProgressStage, local_progress
 from .metrics import acceptance_report, efficiency_curve, oracle_metrics
 
-KEYS = {"lacathode": "raw", "riddle": "residual"}
+KEYS = {"lacathode": "raw", "riddle": "residual", "ranode": "ranode"}
 STYLES = dict(f.METHODS)
+STYLES["ranode"] = ("R-ANODE", "#8B1A1A", "-.")
+
+
+PHYSICAL_STYLES = {
+    "lacathode": ("LaCathode", "#0072B2", "-", "#CC79A7"),
+    "riddle": ("RIDDLE", "#D55E00", "--", "#009E73"),
+    "ranode": ("R-ANODE", "#8B1A1A", "-.", "#56B4E9"),
+}
 
 
 class PopulationMismatch(ValueError):
@@ -73,7 +82,19 @@ def load_scores(root, report, name):
     if not expected or file_digest(path) != expected:
         raise ValueError("Score artifact is missing or changed")
     with np.load(path, allow_pickle=False) as archive:
-        data = {k: archive[k] for k in ("mass", "labels", "mask", "scores", "physical", "latent")}
+        fields = ("mass", "labels", "mask", "scores", "physical")
+        if report["method"] != "ranode":
+            fields += ("latent",)
+        data = {k: archive[k] for k in fields}
+        if report["method"] == "lacathode" and "fit_scores" in archive:
+            data["fit_scores"] = archive["fit_scores"]
+        if report["method"] == "ranode":
+            data["is_signal_region"] = archive["is_signal_region"]
+            region = data["is_signal_region"]
+            if region.shape != data["mass"].shape or region.dtype != bool or (data["mask"] & ~region).any():
+                raise ValueError("Invalid R-ANODE signal-region membership")
+            if name == "signal_region" and not region.all():
+                raise ValueError("R-ANODE evaluation contains non-SR events")
         if report["method"] == "riddle":
             from .production import validate_region
 
@@ -90,11 +111,11 @@ def load_scores(root, report, name):
     if (
         data["mask"].dtype != bool
         or data["physical"].shape != (n, dimensions)
-        or data["latent"].shape != (data["mask"].sum(), dimensions)
+        or ("latent" in data and data["latent"].shape != (data["mask"].sum(), dimensions))
     ):
         raise ValueError("Invalid feature/mapping shapes")
     if not np.isin(data["labels"], [0, 1]).all() or not all(
-        np.isfinite(data[k]).all() for k in ("mass", "physical", "latent")
+        np.isfinite(data[k]).all() for k in ("mass", "physical", "latent") if k in data
     ):
         raise ValueError("Invalid event features or labels")
     if (
@@ -102,7 +123,22 @@ def load_scores(root, report, name):
         or np.isfinite(data["scores"][~data["mask"]]).any()
     ):
         raise ValueError("Scores disagree with the mapping mask")
+    if report["method"] == "lacathode":
+        runs = report.get("contract", {}).get("settings", {}).get("classifier_runs")
+        fits = data.get("fit_scores", data["scores"][None, :])
+        if (
+            fits.ndim != 2 or fits.shape[1:] != (n,) or len(fits) < 1
+            or (runs is not None and (type(runs) is not int or len(fits) != runs))
+            or not np.isfinite(fits[:, data["mask"]]).all()
+            or np.isfinite(fits[:, ~data["mask"]]).any()
+            or not np.array_equal(fits[0], data["scores"], equal_nan=True)
+        ):
+            raise ValueError("Invalid or incomplete LaCathode per-fit scores")
     return data
+
+
+def fit_scores(record):
+    return f.fit_scores(record)
 
 
 def make_bundle(group, confidence):
@@ -133,6 +169,7 @@ def make_bundle(group, confidence):
         sample = {k: base[k] for k in ("mass", "labels", "mask")}
         sample["sr_masks"] = sr_masks
         sample.update({k + "_scores": r["scores"] for k, r in records.items()})
+        sample.update({k + "_fit_scores": r["fit_scores"] for k, r in records.items() if "fit_scores" in r})
         if partition == "signal_region":
             bundle["curves"]["signal_region"] = (
                 base["labels"][base["mask"]],
@@ -144,12 +181,19 @@ def make_bundle(group, confidence):
             bundle["feature_values"] = np.column_stack((base["mass"], base["physical"]))
             bundle["latents_by_method"] = {k: r["latent"] for k, r in records.items()}
     report = next(iter(group.values()))[1]
+    if "lacathode" in group:
+        bundle["classifier_fit_count"] = f.validate_fit_counts(
+            [records["raw"] for records in bundle["evaluation"].values()]
+        )
     bundle["report"] = report
     bundle["variant"] = report.get(
         "variant", report.get("contract", {}).get("inputs", {}).get("variant", "default")
     )
     with methods(keys):
         f.build_metrics(bundle, confidence)
+    if "classifier_fit_count" in bundle:
+        bundle["metrics"]["lacathode_fit_count"] = bundle["classifier_fit_count"]
+        bundle["metrics"]["lacathode_histograms"] = "Mean counts per fit; separate validation cut per fit; no score averaging or event pooling"
     return bundle
 
 
@@ -206,6 +250,19 @@ def render_full_pipeline(bundle, output, args):
         for key, record in records.items():
             if len(np.unique(record["labels"][record["mask"]])) != 2:
                 continue
+            if len(fit_scores(record)) > 1:
+                curves, metrics = [], []
+                for score in fit_scores(record):
+                    b, s, _ = efficiency_curve(record["labels"], score, record["mask"], full_pipeline=True)
+                    use = b > 0 if metric == "roc" else (b >= 1e-4) & (np.rint(b * (record["labels"] == 0).sum()) >= args.min_background)
+                    curves.append((b[use], s[use]))
+                    metrics.append(oracle_metrics(record["labels"], score, record["mask"], min_background=args.min_background))
+                label, color, ls = STYLES[key]
+                summary = f.draw_fit_curves(ax, curves, metric, label, color, ls)
+                audit.setdefault(label, {}).update(f.aggregate_fit_metrics(metrics))
+                audit[label][metric] = summary
+                drawn = True
+                continue
             b, s, _ = efficiency_curve(record["labels"], record["scores"], record["mask"], full_pipeline=True)
             supported = (b >= 1e-4) & (np.rint(b * (record["labels"] == 0).sum()) >= args.min_background)
             keep = b > 0 if metric == "roc" else supported
@@ -226,7 +283,7 @@ def render_full_pipeline(bundle, output, args):
 
 
 def render_injection_scan(groups, output, args):
-    rows, cohorts = [], {}
+    rows, cohorts, classifier_fits = [], {}, []
     for (count, replica), group in sorted(groups.items()):
         reference = None
         for method, (root, report) in group.items():
@@ -234,6 +291,10 @@ def render_injection_scan(groups, output, args):
             if inputs.get("synthetic_smoke_fixture") and not args.allow_smoke:
                 raise ValueError("Synthetic scan requires --allow-smoke for QA")
             expected_protocol = 2 if method == "riddle" else "pinned_upstream"
+            if method == "ranode":
+                from external.ranode_utils.data import scientific_version
+
+                expected_protocol = scientific_version(inputs.get("variant", "default"))
             if report["contract"].get("scientific_version") != expected_protocol:
                 raise ValueError(f"Injection scans require protocol {expected_protocol!r} for {method}")
             point = inputs["injection_scan"]
@@ -245,6 +306,16 @@ def render_injection_scan(groups, output, args):
             data = load_scores(root, report, "signal_region")
             values = oracle_metrics(data["labels"], data["scores"], data["mask"],
                                     min_background=args.min_background)
+            if "fit_scores" in data:
+                fit_values = [
+                    oracle_metrics(data["labels"], score, data["mask"], min_background=args.min_background)
+                    for score in fit_scores(data)
+                ]
+                classifier_fits.append(dict(method=method, signal_events=count, replica=replica,
+                                            training_seed=point["training_seed"], fits=fit_values))
+                for field in ("conditional_auc", "conditional_max_sic", "full_pipeline_max_sic"):
+                    finite = [v[field] for v in fit_values if v[field] is not None and np.isfinite(v[field])]
+                    values[field] = float(np.median(finite)) if finite else None
             initial = inputs["uncut_signal_region"]
             b0, s0 = initial["background"], initial["signal"]
             if b0 <= 0 or s0 <= 0:
@@ -322,6 +393,9 @@ def render_injection_scan(groups, output, args):
             f.plt.close(fig)
         audit["plotted_metrics"][field] = plotted
     audit["points"] = rows
+    if classifier_fits:
+        audit["lacathode_classifier_fits"] = classifier_fits
+        audit["lacathode_aggregation"] = "Median of per-fit metrics within each replica; bands remain across replicas, not shared-flow fits"
     write_json(output / "injection_scan.json", json_safe(audit))
     return audit
 
@@ -360,7 +434,7 @@ def comparison_rows(bundle, args):
             {k: roc_auc_score(labels, s) for k, s in scores.items()},
             ci={k: f.auc_interval(p, args.confidence) for k, p in parts.items()},
         )
-        if set(parts) == set(STYLES):
+        if {"raw", "residual"}.issubset(parts):
             low, high = f.paired_auc_interval(parts, args.confidence)
             rows[-1].update(RIDDLE_minus_LaCathode_ci_low=low, RIDDLE_minus_LaCathode_ci_high=high)
         add("conditional_mapped_average_precision", {k: average_precision_score(labels, s) for k, s in scores.items()})
@@ -370,8 +444,33 @@ def comparison_rows(bundle, args):
             good = (b >= 1e-4) & (np.rint(b * (labels == 0).sum()) >= args.min_background)
             maxima[key] = np.max(s[good] / np.sqrt(b[good])) if good.any() else None
         add("oracle_conditional_max_sic_supported", maxima)
+        record = bundle["evaluation"][dataset].get("raw")
+        if record is not None and len(fit_scores(record)) > 1:
+            diagnostics = []
+            for score in fit_scores(record):
+                score = score[record["mask"]]
+                b, s, _ = roc_curve(labels, score, drop_intermediate=False)
+                good = (b >= 1e-4) & (np.rint(b * (labels == 0).sum()) >= args.min_background)
+                diagnostics.append({
+                    "conditional_mapped_auc": roc_auc_score(labels, score),
+                    "conditional_mapped_average_precision": average_precision_score(labels, score),
+                    "oracle_conditional_max_sic_supported": float(np.max(s[good] / np.sqrt(b[good]))) if good.any() else None,
+                })
+            for row in rows[-3:]:
+                values = [d[row["metric"]] for d in diagnostics]
+                row["LaCathode"] = float(np.median(values)) if all(v is not None for v in values) else None
+                row["LaCathode_fit_count"] = len(values)
+                row["LaCathode_aggregation"] = "median per-fit metric"
+                row["LaCathode_ci_low"] = row["LaCathode_ci_high"] = None
+                if all(v is not None for v in values):
+                    row["LaCathode_fit_p16"], row["LaCathode_fit_p84"] = np.percentile(values, [16, 84])
+                row["RIDDLE_minus_LaCathode"] = (row["RIDDLE"] - row["LaCathode"]
+                                                if row["RIDDLE"] is not None and row["LaCathode"] is not None else None)
+                row.pop("RIDDLE_minus_LaCathode_ci_low", None)
+                row.pop("RIDDLE_minus_LaCathode_ci_high", None)
     evaluation = {
-        key: oracle_metrics(record["labels"], record["scores"], record["mask"], min_background=args.min_background)
+        key: f.aggregate_fit_metrics([oracle_metrics(record["labels"], score, record["mask"], min_background=args.min_background)
+                                   for score in fit_scores(record)])
         for key, record in bundle["evaluation"]["signal_region"].items()
     }
     add("oracle_full_pipeline_max_sic_supported", {key: r["full_pipeline_max_sic"] for key,r in evaluation.items()})
@@ -400,7 +499,7 @@ def comparison_rows(bundle, args):
             )
             add(
                 metric,
-                {k: r.get(metric) for k, r in records.items()},
+                {k: (None if metric == "cut" and "fits" in r else r.get(metric)) for k, r in records.items()},
                 selection,
                 "full_mass_range" if metric in ("relative_mass_rms", "chi2_ndof") else "physical_test_sr",
                 better,
@@ -561,8 +660,13 @@ def training_figures(group, output):
             )
             for name, label in zip(names, ("Train", "Validation")):
                 verify_plot_input(root, report, str((directory / name).relative_to(root)))
-                values = np.load(directory / name).squeeze()
-                ax.plot(np.arange(len(values)), values, label=label)
+                values = np.load(directory / name)
+                histories = values if stage == "classifier" else values.reshape(1, -1)
+                epochs = np.arange(histories.shape[1])
+                line, = ax.plot(epochs, histories.mean(axis=0), label=label)
+                if len(histories) > 1:
+                    low, high = np.quantile(histories, [.16, .84], axis=0)
+                    ax.fill_between(epochs, low, high, color=line.get_color(), alpha=.18)
             f.legend(fig)
             f.save(fig, destination / stage)
 
@@ -579,15 +683,21 @@ def read_metadata(root, report, name):
     return json.loads(verify_plot_input(root, report, name).read_text())
 
 
-def method_band(ax, x, values, key, scenario, metric, seeds):
+def method_band(ax, x, values, key, scenario, metric, seeds, classifier_fits=None):
     name, color, ls = STYLES[key]
     summary = f.draw_band(ax, x, values, name, color, ls)
     summary.update(uncertainty_source="training_seed_variation_on_fixed_data_partition", seeds=seeds)
+    if classifier_fits and any(fit["fit"] > 0 for fit in classifier_fits):
+        summary.update(
+            uncertainty_source="classifier_fit_variation_with_shared_background_flow_per_seed",
+            classifier_fits=classifier_fits,
+            fit_count=len(classifier_fits), independent_runs=len(set(seeds)),
+        )
     if not summary["band_drawn"]:
         colored_status(
             f"{name} | {f.SCENARIO_LABELS[scenario]} | {metric}: "
             "uncertainty band unavailable with only one independent run; "
-            "include additional training seeds (ten for the paper comparison). "
+            "include additional training seeds or saved LaCathode classifier fits. "
             "Internal fits and checkpoints are not independent full runs.",
             kind="WARNING",
         )
@@ -610,29 +720,42 @@ def summary_figures(bundles, output, args):
         any_curve = False
         for key in STYLES:
             values = []
+            native_curves = []
             seeds = []
+            classifier_fits = []
             for bundle in cohort:
                 labels, scores = bundle["curves"]["signal_region"]
                 if key not in scores or len(np.unique(labels)) != 2:
                     continue
-                b, s, _ = roc_curve(labels, scores[key])
-                supported = (b >= 1e-4) & (np.rint(b * (labels == 0).sum()) >= args.min_background)
-                if supported.sum() < 2:
-                    continue
-                values.append(
-                    interp1d(
-                        b[supported],
-                        s[supported] / np.sqrt(b[supported]),
-                        bounds_error=False,
-                        fill_value=np.nan,
-                    )(f.GRID)
-                )
-                seeds.append(bundle["report"]["seed"])
+                record = bundle["evaluation"]["signal_region"][key]
+                for fit, score in enumerate(fit_scores(record)):
+                    b, s, _ = roc_curve(labels, score[record["mask"]])
+                    supported = (b >= 1e-4) & (np.rint(b * (labels == 0).sum()) >= args.min_background)
+                    native_curves.append((b[supported], s[supported]))
+                    if key == "raw":
+                        seeds.append(bundle["report"]["seed"])
+                        classifier_fits.append(dict(seed=seeds[-1], fit=fit))
+                    if supported.sum() < 2:
+                        continue
+                    values.append(
+                        interp1d(
+                            b[supported],
+                            s[supported] / np.sqrt(b[supported]),
+                            bounds_error=False,
+                            fill_value=np.nan,
+                        )(f.GRID)
+                    )
+                    if key != "raw":
+                        seeds.append(bundle["report"]["seed"])
+                        classifier_fits.append(dict(seed=seeds[-1], fit=fit))
             if values:
                 name = STYLES[key][0]
-                audit[scenario + "/" + name + "/sic"] = method_band(
-                    ax, f.GRID, values, key, scenario, "SIC", seeds
-                )
+                if key == "raw" and len(native_curves) > 1:
+                    summary = f.draw_fit_curves(ax, native_curves, "sic", *STYLES[key])
+                    summary.update(classifier_fits=classifier_fits, seeds=seeds)
+                else:
+                    summary = method_band(ax, f.GRID, values, key, scenario, "SIC", seeds, classifier_fits)
+                audit[scenario + "/" + name + "/sic"] = summary
                 any_curve = True
         if any_curve:
             ax.plot(f.GRID, np.sqrt(f.GRID), color=".5", ls=":", label="Random")
@@ -648,6 +771,7 @@ def summary_figures(bundles, output, args):
         for key in STYLES:
             curves = []
             seeds = []
+            classifier_fits = []
             for bundle in cohort:
                 sample = bundle["samples"]["test"]
                 if key + "_scores" not in sample:
@@ -662,21 +786,25 @@ def summary_figures(bundles, output, args):
                 full = np.histogram(mass, edges)[0]
                 if np.any(full == 0):
                     continue
-                curves.append(
-                    [
-                        f.shape_chi2(
-                            full,
-                            np.histogram(mass[mask & (score > np.quantile(score[region], 1 - e))], edges)[0],
-                            e,
-                        )
-                        for e in f.EFFICIENCIES
-                    ]
-                )
-                seeds.append(bundle["report"]["seed"])
+                record = bundle["evaluation"]["test"][key]
+                for fit, scores in enumerate(fit_scores(record)):
+                    score = scores[pop]
+                    curves.append(
+                        [
+                            f.shape_chi2(
+                                full,
+                                np.histogram(mass[mask & (score > np.quantile(score[region], 1 - e))], edges)[0],
+                                e,
+                            )
+                            for e in f.EFFICIENCIES
+                        ]
+                    )
+                    seeds.append(bundle["report"]["seed"])
+                    classifier_fits.append(dict(seed=seeds[-1], fit=fit))
             if curves:
                 name = STYLES[key][0]
                 audit[scenario + "/" + name + "/mass_flatness"] = method_band(
-                    ax, f.EFFICIENCIES, curves, key, scenario, "mass flatness", seeds
+                    ax, f.EFFICIENCIES, curves, key, scenario, "mass flatness", seeds, classifier_fits
                 )
                 found = True
         if found:
@@ -714,8 +842,463 @@ def random_reference(mass, trials=100, *, mode="bootstrap"):
     return np.asarray(result).T
 
 
+def require_same_physical_population(records):
+    base = next(iter(records.values()))
+    if any(
+        any(not np.array_equal(base[k], r[k]) for k in ("mass", "labels", "physical"))
+        for r in records.values()
+    ):
+        raise ValueError(
+            "R-ANODE comparison requires identical physical evaluation events; use separate --methods plots"
+        )
+
+
+def physical_score_coordinate(method, values):
+    return values if method == "lacathode" else expit(values)
+
+
+def render_physical_curves(records, output, scenario, minimum):
+    require_same_physical_population(records)
+    audit = {}
+    for metric in ("roc", "sic", "background_rejection"):
+        ylabel = {
+            "roc": "Signal efficiency",
+            "sic": "Significance improvement",
+            "background_rejection": "Background rejection",
+        }[metric]
+        xlabel = (
+            "Signal efficiency"
+            if metric == "background_rejection"
+            else "Background efficiency"
+        )
+        fig, ax, _ = f.canvas(ylabel, xlabel)
+        drawn = False
+        for method, record in records.items():
+            if len(np.unique(record["labels"][record["mask"]])) != 2:
+                continue
+            if len(f.fit_scores(record)) > 1:
+                curves, diagnostics = [], []
+                for score in f.fit_scores(record):
+                    b, s, _ = efficiency_curve(record["labels"], score, record["mask"], full_pipeline=True)
+                    use = b > 0 if metric == "roc" else (b >= 1e-4) & (np.rint(b * (record["labels"] == 0).sum()) >= minimum)
+                    curves.append((b[use], s[use]))
+                    diagnostics.append(oracle_metrics(record["labels"], score, record["mask"], min_background=minimum))
+                f.draw_fit_curves(ax, curves, metric, *PHYSICAL_STYLES[method][:3])
+                audit[method] = f.aggregate_fit_metrics(diagnostics)
+                drawn = True
+                continue
+            b, s, _ = efficiency_curve(
+                record["labels"], record["scores"], record["mask"], full_pipeline=True
+            )
+            supported = (b >= 1e-4) & (
+                np.rint(b * (record["labels"] == 0).sum()) >= minimum
+            )
+            use = (b > 0) if metric == "roc" else supported
+            if not use.any():
+                continue
+            label, color, ls, _ = PHYSICAL_STYLES[method]
+            x, y = (
+                (s, 1 / np.maximum(b, 1e-300))
+                if metric == "background_rejection"
+                else (b, s if metric == "roc" else s / np.sqrt(np.maximum(b, 1e-300)))
+            )
+            ax.plot(x[use], y[use], label=label, color=color, ls=ls)
+            audit[method] = oracle_metrics(
+                record["labels"],
+                record["scores"],
+                record["mask"],
+                min_background=minimum,
+            )
+            drawn = True
+        if not drawn:
+            f.plt.close(fig)
+            continue
+        grid = np.geomspace(1e-4, 1, 300)
+        if metric == "background_rejection":
+            ax.plot(grid, 1 / grid, color=".5", ls=":", label="Random")
+            ax.set(yscale="log", xlim=(0, 1), ylim=(1, 1e4))
+        else:
+            ax.plot(
+                grid,
+                grid if metric == "roc" else np.sqrt(grid),
+                color=".5",
+                ls=":",
+                label="Random",
+            )
+            ax.set(
+                xscale="log",
+                xlim=(1e-4, 1),
+                ylim=(0, 1.02 if metric == "roc" else None),
+            )
+        f.legend(fig, title=f.SCENARIO_LABELS[scenario] + " | Signal region", ncols=1)
+        f.save(fig, output / ("signal_region_" + metric))
+    return audit
+
+
+def render_physical_scores(records, output, scenario):
+    edges = np.linspace(0, 1, 51)
+    for density in (False, True):
+        fig, ax, _ = f.canvas("Density" if density else "Events / bin", "Score")
+        fig.set_figwidth(9)
+        columns = []
+        for method, record in records.items():
+            label, bg, _, sig = PHYSICAL_STYLES[method]
+            entries = []
+            for truth, color, ls in ((0, bg, "-"), (1, sig, "--")):
+                selected = record["mask"] & (record["labels"] == truth)
+                values = physical_score_coordinate(method, f.fit_scores(record))
+                hist = f.fit_histogram(values, edges, selected).astype(float)
+                if density and hist.sum():
+                    hist /= hist.sum() * np.diff(edges)
+                line = ax.stairs(hist, edges, color=color, ls=ls, baseline=None)
+                entries.append((line, "Background" if truth == 0 else "Signal"))
+            columns.append((label, entries))
+        ax.set_xlim(0, 1)
+        if not density:
+            ax.set_yscale("symlog", linthresh=1)
+        f.population_legend(
+            fig, columns, title=f.SCENARIO_LABELS[scenario] + " | Signal region"
+        )
+        f.save(
+            fig,
+            output
+            / (
+                "signal_region_score_distributions"
+                if density
+                else "signal_region_score_counts"
+            ),
+        )
+
+
+def physical_sr_record(record, sr=None):
+    sr = record.get("is_signal_region") if sr is None else sr
+    if sr is None:
+        sr = (record["mass"] > 3.3) & (record["mass"] < 3.7)
+    result = {k: record[k][sr] for k in ("mass", "labels", "physical", "scores", "mask")}
+    if "fit_scores" in record:
+        result["fit_scores"] = record["fit_scores"][:, sr]
+    return result
+
+
+def render_physical_working_points(validation, test, output):
+    require_same_physical_population(validation)
+    require_same_physical_population(test)
+    validation, test = (
+        {
+            m: physical_sr_record(r, records["ranode"]["is_signal_region"])
+            for m, r in records.items()
+        }
+        for records in (validation, test)
+    )
+    require_same_physical_population(validation)
+    require_same_physical_population(test)
+    base = next(iter(test.values()))
+    edges = np.linspace(3.3, 3.7, 21)
+    inclusive = np.histogram(base["mass"][base["labels"] == 0], edges)[0]
+    audit = []
+    for budget in (0.10, 0.05, 0.01, 0.004):
+        selected, retention = {}, {}
+        for method, val in validation.items():
+            f.validate_fit_counts([val, test[method]])
+            n = int((val["labels"] == 0).sum())
+            scores = np.sort(f.fit_scores(val)[:, (val["labels"] == 0) & val["mask"]], axis=1)
+            allowed = int(np.floor(n * budget))
+            if not scores.shape[1] or allowed < 1:
+                continue
+            cut = (
+                scores[:, -allowed - 1]
+                if allowed < scores.shape[1]
+                else np.nextafter(scores[:, 0], -np.inf)
+            )
+            record = test[method]
+            keep = record["mask"] & (f.fit_scores(record) > cut[:, None])
+            selected[method] = keep
+            retention[method] = []
+            for truth in (0, 1):
+                population = record["labels"] == truth
+                total, passed = int(population.sum()), float((population & keep).sum(axis=1).mean())
+                retention[method].append(passed / total if total else None)
+            audit.append(
+                dict(
+                    method=method,
+                    background_budget=budget,
+                    cut=float(cut[0]) if len(cut) == 1 else cut.tolist(),
+                    fit_count=len(cut),
+                    background_efficiency=retention[method][0],
+                    signal_efficiency=retention[method][1],
+                )
+            )
+        if not selected:
+            continue
+        for shape in (False, True):
+            fig, ax, lower = f.canvas(
+                "Normalized background / bin" if shape else "Events / bin",
+                r"$m_{jj}$ [TeV]",
+                ratio="Selected / inclusive" if shape else "BG retention",
+            )
+            fig.set_figwidth(10)
+            columns = []
+            norm = (
+                inclusive / inclusive.sum() if shape and inclusive.sum() else inclusive
+            )
+            handle = ax.stairs(norm, edges, color=".65", baseline=None)
+            columns.append(("No cut", [(handle, "Background")]))
+            if not shape:
+                signal_hist = np.histogram(base["mass"][base["labels"] == 1], edges)[0]
+                handle = ax.stairs(
+                    signal_hist, edges, color=".45", ls="--", baseline=None
+                )
+                columns[0][1].append((handle, "Signal"))
+            for method, keep in selected.items():
+                label, color, _, signal_color = PHYSICAL_STYLES[method]
+                record = test[method]
+                bg_hist = f.fit_histogram(record["mass"], edges, keep & (record["labels"] == 0))
+                hist = bg_hist / bg_hist.sum() if shape and bg_hist.sum() else bg_hist
+                b, s = retention[method]
+                signal_text = f"{100 * s:.3g}%" if s is not None else "n/a"
+                handle = ax.stairs(hist, edges, color=color, baseline=None)
+                entries = [
+                    (
+                        handle,
+                        f"B: {100 * b:.3g}% | S: {signal_text}"
+                        if b is not None
+                        else f"S: {signal_text}",
+                    )
+                ]
+                if not shape:
+                    shist = f.fit_histogram(record["mass"], edges, keep & (record["labels"] == 1))
+                    handle = ax.stairs(
+                        shist, edges, color=signal_color, ls="--", baseline=None
+                    )
+                    entries.append((handle, f"S: {signal_text}"))
+                columns.append((label, entries))
+                ratio = np.divide(
+                    hist, norm, out=np.full(len(hist), np.nan), where=norm > 0
+                )
+                lower.stairs(ratio, edges, color=color, baseline=None)
+            if shape:
+                lower.axhline(1, color=".5", ls=":")
+            else:
+                ax.set_yscale("symlog", linthresh=1)
+            ax.set_xlim(3.3, 3.7)
+            f.population_legend(
+                fig, columns, title=f"Signal region | B ≤ {100 * budget:g}%"
+            )
+            f.save(
+                fig,
+                output
+                / "04_mass_cuts"
+                / (
+                    ("background_mass_shape_" if shape else "mass_counts_")
+                    + f"{100 * budget:g}".replace(".", "p")
+                    + "pct"
+                ),
+            )
+        if selected:
+            render_physical_features(test, selected, retention, budget, output)
+    return audit
+
+
+def render_physical_features(records, selected, retention, budget, output):
+    fields = (
+        ("m1", r"$m_{J1}$ [TeV]"),
+        ("delta_m", r"$\Delta m_J$ [TeV]"),
+        ("tau21_j1", r"$\tau_{21,J1}$"),
+        ("tau21_j2", r"$\tau_{21,J2}$"),
+    )
+    base = next(iter(records.values()))
+    if base["physical"].shape[1] == 5:
+        fields += (("deltaR", r"$\Delta R_{jj}$"),)
+    for index, (name, xlabel) in enumerate(fields):
+        low, high = base["physical"][:, index].min(), base["physical"][:, index].max()
+        if low == high:
+            high = low + 1
+        edges = np.linspace(low, high, 31)
+        fig, ax, _ = f.canvas("Events / bin", xlabel)
+        fig.set_figwidth(10)
+        columns = []
+        for method, keep in selected.items():
+            record = records[method]
+            label, bg, _, sig = PHYSICAL_STYLES[method]
+            entries = []
+            for truth, color, ls in ((0, bg, "-"), (1, sig, "--")):
+                hist = f.fit_histogram(record["physical"][:, index], edges, keep & (record["labels"] == truth))
+                handle = ax.stairs(hist, edges, color=color, ls=ls, baseline=None)
+                efficiency = retention[method][truth]
+                percent = (
+                    f"{100 * efficiency:.3g}%" if efficiency is not None else "n/a"
+                )
+                entries.append((handle, ("B: " if truth == 0 else "S: ") + percent))
+            columns.append((label, entries))
+        ax.set_yscale("symlog", linthresh=1)
+        f.population_legend(
+            fig, columns, title=f"Signal region | B ≤ {100 * budget:g}%"
+        )
+        tag = f"{100 * budget:g}".replace(".", "p") + "pct"
+        f.save(fig, output / "05_features" / f"{name}_background_{tag}")
+
+
+def render_ranode_training(source, output):
+    root, report = source
+    protocol = read_metadata(root, report, "protocol.json")
+    for stage in ("background", "signal"):
+        attempts = (
+            protocol["signal_attempts"] if stage == "signal" and "signal_attempts" in protocol
+            else [protocol[stage + "_attempt"]]
+        )
+        suffix = "_list" if stage == "background" else ""
+        fig, ax, _ = f.canvas("Negative log likelihood", "Epoch")
+        for kind, color, ls in (
+            ("trainloss", "#8B1A1A", "-"),
+            ("valloss", "#56B4E9", "--"),
+        ):
+            values = []
+            for attempt in attempts:
+                path = attempt + f"/results/upstream/{stage}/fit/" + kind + suffix + ".npy"
+                values.append(np.load(
+                    verify_plot_input(root, report, path), allow_pickle=False,
+                ))
+            values = np.asarray(values)
+            epochs = np.arange(1, values.shape[1] + 1)
+            ax.plot(
+                epochs,
+                values.mean(axis=0),
+                color=color,
+                ls=ls,
+                label="Train" if kind == "trainloss" else "Validation",
+            )
+            if len(values) > 1:
+                low, high = np.quantile(values, [.16, .84], axis=0)
+                ax.fill_between(epochs, low, high, color=color, alpha=.18)
+        f.legend(
+            fig,
+            title="R-ANODE | "
+            + ("Background flow" if stage == "background" else "Signal-mixture flow"),
+        )
+        f.save(fig, output / "R-ANODE" / "02_training" / (stage + "_nll"))
+
+
+def render_physical_comparison(group, output, args, load_scores):
+    reference_inputs = next(iter(group.values()))[1]["contract"]["inputs"]
+    if any(
+        report["contract"]["inputs"].get("files") != reference_inputs.get("files")
+        for _, report in group.values()
+    ):
+        raise ValueError("R-ANODE comparisons require the same prepared input files")
+    records = {
+        m: load_scores(root, report, "signal_region")
+        for m, (root, report) in group.items()
+    }
+    scenario = next(iter(group.values()))[1]["scenario"]
+    audit = {
+        "scope": "strict signal region; independent preprocessing acceptance, common uncut event denominators",
+        "score": "LaCathode classifier score; sigmoid of RIDDLE/R-ANODE log ratios for display only",
+        "methods": render_physical_curves(records, output, scenario, args.min_background),
+    }
+    render_physical_scores(records, output, scenario)
+    validation = {
+        m: load_scores(root, report, "validation")
+        for m, (root, report) in group.items()
+    }
+    test = {m: load_scores(root, report, "test") for m, (root, report) in group.items()}
+    if "lacathode" in group:
+        audit["lacathode_fit_count"] = f.validate_fit_counts(
+            [records["lacathode"], validation["lacathode"], test["lacathode"]]
+        )
+        audit["lacathode_histograms"] = "Mean per-fit counts; separate validation cut per fit; no score averaging"
+    audit["working_points"] = render_physical_working_points(validation, test, output)
+    render_ranode_training(group["ranode"], output)
+    return audit
+
+
+def physical_comparison_summary(groups, output, args, load_scores):
+    audits = {}
+    for scenario in f.SCENARIOS:
+        partitions = {
+            json.dumps(report["contract"]["inputs"].get("files"), sort_keys=True)
+            for (name, _), group in groups.items()
+            if name == scenario and "ranode" in group
+            for _, report in group.values()
+        }
+        if len(partitions) > 1:
+            raise ValueError(
+                "R-ANODE seed bands require a fixed common prepared partition; use scan plots for varied inputs"
+            )
+        curves = {m: [] for m in PHYSICAL_STYLES}
+        native_curves = []
+        grid = np.geomspace(1e-4, 1, 300)
+        for (name, seed), group in groups.items():
+            if name != scenario or "ranode" not in group:
+                continue
+            records = {
+                m: load_scores(root, report, "signal_region")
+                for m, (root, report) in group.items()
+            }
+            require_same_physical_population(records)
+            for method, record in records.items():
+                if len(np.unique(record["labels"][record["mask"]])) != 2:
+                    continue
+                for score in fit_scores(record):
+                    b, s, _ = efficiency_curve(
+                        record["labels"], score, record["mask"], full_pipeline=True,
+                    )
+                    if method == "lacathode":
+                        use = (b >= 1e-4) & (np.rint(b * (record["labels"] == 0).sum()) >= args.min_background)
+                        native_curves.append((b[use], s[use]))
+                    unique, inverse = np.unique(b, return_inverse=True)
+                    maxima = np.zeros(len(unique))
+                    np.maximum.at(maxima, inverse, s)
+                    values = np.interp(grid, unique, maxima)
+                    supported = (
+                        grid >= args.min_background / (record["labels"] == 0).sum()
+                    ) & (grid <= b.max())
+                    values[~supported] = np.nan
+                    curves[method].append(values)
+        for metric in ("roc", "sic"):
+            fig, ax, _ = f.canvas(
+                "Signal efficiency" if metric == "roc" else "Significance improvement",
+                "Background efficiency",
+            )
+            audit = {}
+            for method, cohort in curves.items():
+                if not cohort:
+                    continue
+                label, color, ls, _ = PHYSICAL_STYLES[method]
+                values = np.asarray(cohort) / (1 if metric == "roc" else np.sqrt(grid))
+                audit[method] = (
+                    f.draw_fit_curves(ax, native_curves, metric, label, color, ls)
+                    if method == "lacathode" and len(native_curves) > 1
+                    else f.draw_band(ax, grid, values, label, color, ls)
+                )
+                audit[method]["uncertainty_source"] = (
+                    "classifier_fit_variation_with_shared_background_flow_per_seed"
+                    if method == "lacathode" else "training_seed_variation_on_fixed_data_partition"
+                )
+            if not audit:
+                f.plt.close(fig)
+                continue
+            ax.plot(
+                grid,
+                grid if metric == "roc" else np.sqrt(grid),
+                color=".5",
+                ls=":",
+                label="Random",
+            )
+            ax.set(
+                xscale="log",
+                xlim=(1e-4, 1),
+                ylim=(0, 1.02 if metric == "roc" else None),
+            )
+            f.legend(
+                fig, title=f.SCENARIO_LABELS[scenario] + " | Signal region", ncols=1
+            )
+            f.save(fig, output / scenario / ("signal_region_" + metric))
+            audits[scenario + "/" + metric] = audit
+    return audits
+
+
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Figures from frozen LaCathode/RIDDLE results; no fitting")
+    parser = argparse.ArgumentParser(description="Figures from frozen LaCathode/RIDDLE/R-ANODE results; no fitting")
     parser.add_argument("--results", type=Path, default=Path("results"))
     parser.add_argument("--output", type=Path, default=Path("plots"))
     parser.add_argument(
@@ -751,6 +1334,7 @@ def main(argv=None):
                 raise ValueError("Cannot overwrite a plot directory containing symbolic links")
         args.output.mkdir(parents=True, exist_ok=args.overwrite)
         rows, settings, bundles = [], [], []
+        ranode_audit = {}
         with local_progress("Plots"), f.plt.style.context(f.STYLE), locked(args.output / ".plot.lock"):
             scan_audit = render_injection_scan(scan_groups, args.output / "injection_scan", args) if scan_groups else None
             for (scenario, seed), group in groups.items():
@@ -766,12 +1350,25 @@ def main(argv=None):
                 if missing:
                     colored_status("Using available method; requested counterpart is absent", kind="INFO")
                 target = args.output / scenario / f"seed_{seed:03d}"
+                if "ranode" in group:
+                    comparison = render_physical_comparison(group, target / "comparison_with_ranode", args, load_scores)
+                    ranode_audit[f"{scenario}/{seed}"] = comparison
+                    settings.extend(settings_rows({"ranode": group["ranode"]}))
+                    for method, metrics in comparison["methods"].items():
+                        rows.append({"scenario": scenario, "seed": seed, "scope": "common_physical_signal_region",
+                                     "method": method, **{k: v for k, v in metrics.items() if not isinstance(v, (dict, list))}})
+                    group = {m: entry for m, entry in group.items() if m != "ranode"}
+                    if not group:
+                        continue
                 for individual, bundle in bundles_for_group(group, args.confidence):
                     rows.extend(comparison_rows(bundle, args))
                     settings.extend(settings_rows(bundle["sources"]))
                     render_bundle(bundle, target / individual if individual else target, args)
                     bundles.append(bundle)
             audit = summary_figures([b for b in bundles if not b.get("individual")], args.output, args)
+            if ranode_audit:
+                ranode_audit["summary"] = physical_comparison_summary(groups, args.output / "comparison_with_ranode", args, load_scores)
+                write_json(args.output / "ranode_comparison.json", json_safe(ranode_audit))
             for method in KEYS:
                 individual = [b for b in bundles if b.get("individual") == method]
                 separate = summary_figures(individual, args.output / "individual" / method, args)
@@ -783,6 +1380,7 @@ def main(argv=None):
                 json_safe(
                     {
                         "schema": 1,
+                        "ranode_comparison": "SR-only, unchanged upstream score; independent mapping masks and common uncut denominators" if ranode_audit else None,
                         "uncertainty": audit,
                         "cuts": "Truth-assisted MC benchmark: validation-SR background thresholds; frozen cuts evaluated on independent physical test rows",
                         "injection_scan": scan_audit,
@@ -794,10 +1392,13 @@ def main(argv=None):
                             "retention_denominator": "all physical test events of the corresponding class, before cuts and mapping rejection",
                             "panels_per_page": 6,
                             "individual_directory": "04_mass_cuts/individual_cuts",
-                            "histograms": "unweighted event counts, identical mass bins, no smoothing; B + S is the sum of background and signal counts",
+                            "histograms": "unweighted counts per fit, averaged over LaCathode fits; identical bins, no smoothing or pooled events; B + S is the sum of background and signal counts",
                         },
                         "mass_summary": "BG-Only: test-SR quantiles, 300 equal-occupancy full-range bins, normalized-shape Poisson chi2",
-                        "uncertainty_scope": "SIC/mass bands: 16/50/84 percentiles of training-seed variation on a fixed data partition; not internal fits or statistical pseudoexperiments",
+                        "uncertainty_scope": "SIC/mass bands: 16/50/84 percentiles across training seeds; multi-fit LaCathode uses per-classifier-fit curves conditional on a shared background flow per seed, not independent full-pipeline runs",
+                        "lacathode_event_plots": "Dynamically detected saved fits; mean per-fit histograms with matching per-fit validation cuts; shapes normalize those mean counts; no cross-fit score averaging",
+                        "lacathode_roc_sic": "Median rejection and SIC interpolated at 1000 common signal efficiencies, as upstream, after statistical-support cuts. Bands are parametric 16/84-percentile ribbons at fixed signal efficiency; background-efficiency display axes retained.",
+                        "lacathode_fit_counts": [{"scenario": b["report"]["scenario"], "seed": b["report"]["seed"], "fits": b["classifier_fit_count"]} for b in bundles if "classifier_fit_count" in b],
                         "summary_axes": f.SUMMARY_AXES,
                         "warnings": [w for b in bundles for w in b["warnings"]],
                     }

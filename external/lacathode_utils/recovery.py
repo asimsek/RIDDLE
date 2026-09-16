@@ -1,3 +1,5 @@
+import functools
+import inspect
 import json
 from pathlib import Path
 
@@ -20,6 +22,8 @@ class EpochRecovery:
         self.save_torch = torch.save
         self.done, self.files, self.next_epochs = [], {}, {}
         self.state = None
+        self.resume = resume
+        self.classifier_run = None
         if self.manifest.exists():
             if not resume:
                 raise FileExistsError("Work already started; use --resume")
@@ -76,6 +80,55 @@ class EpochRecovery:
         }
         self.save(phase, "complete")
 
+    def classifier_fits(self, function):
+        signature = inspect.signature(function)
+
+        @functools.wraps(function)
+        def train(*args, **kwargs):
+            values = signature.bind(*args, **kwargs)
+            values.apply_defaults()
+            prefix = Path(values.arguments["save_model"])
+            if prefix.parent.resolve() != self.root.resolve() or not prefix.name.startswith("model_run"):
+                raise ValueError("Unexpected upstream classifier checkpoint prefix")
+            index = int(prefix.name.removeprefix("model_run"))
+            path = self.root / ".resume" / f"classifier_run{index}.pt"
+            previous = self.path, self.state, self.next_epochs, self.classifier_run
+            try:
+                state = None
+                if path.exists():
+                    if not self.resume:
+                        raise FileExistsError("Classifier fit already exists; use --resume")
+                    state = torch.load(path, map_location="cpu", weights_only=False)
+                    verify_artifacts(self.root, state["files"], "Verify classifier fit recovery")
+                    self.files.update(state["files"])
+                elif index == 0 and self.state and self.state["phase"] == "classifier":
+                    state = self.state  # Resume pre-multifit classifier checkpoints.
+                self.path, self.state, self.next_epochs, self.classifier_run = path, state, {}, index
+                if state and state["kind"] == "complete":
+                    restore_rng(state["rng"])
+                    return tuple(np.array(loss, copy=True) for loss in state["losses"])
+                if state and state["kind"] == "start":
+                    restore_rng(state["rng"])
+                elif not state:
+                    self.save("classifier", "start")
+                phase, label = self.progress_identity("classifier")
+                emit_progress(phase, label, total=values.arguments["epochs"], unit="epoch", completed=0)
+                losses = function(*args, **kwargs)
+                self.save("classifier", "complete", losses=losses)
+                return losses
+            finally:
+                self.path, self.state, self.next_epochs, self.classifier_run = previous
+
+        return train
+
+    def progress_identity(self, phase, *, resume=False):
+        action = "Resume" if resume else "Train"
+        if phase == "flow":
+            return phase, action + " background flow"
+        if self.classifier_run is None:
+            return phase, action + " classifier"
+        return f"classifier_run{self.classifier_run}", f"{action} classifier fit {self.classifier_run + 1}"
+
     @staticmethod
     def loaders(phase, values):
         names = (
@@ -108,7 +161,7 @@ class EpochRecovery:
         }
         checkpoint = (
             f"{values['model_file_name']}_epoch_{epoch}.par"
-            if phase == "flow" else f"model_run0_ep{epoch}"
+            if phase == "flow" else f"{Path(values['save_model']).name}_ep{epoch}"
         )
         self.files[checkpoint] = file_digest(self.root / checkpoint)
         self.save(
@@ -122,8 +175,7 @@ class EpochRecovery:
             loaders=loaders,
         )
         emit_progress(
-            phase,
-            "Train background flow" if phase == "flow" else "Train classifier",
+            *self.progress_identity(phase),
             total=values["epochs"],
             completed=epoch + 1,
             unit="epoch",
@@ -150,8 +202,7 @@ class EpochRecovery:
         restore_rng(state["rng"])
         self.next_epochs[phase] = state["next_epoch"]
         emit_progress(
-            phase,
-            "Resume background flow" if phase == "flow" else "Resume classifier",
+            *self.progress_identity(phase, resume=True),
             total=values["epochs"],
             completed=state["next_epoch"],
             initial=state["next_epoch"],
