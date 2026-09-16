@@ -91,8 +91,8 @@ python run.py run --methods lacathode riddle ranode --data data/lhco --output re
 `--io-workers` controls CPU threads per process.<br>
 MPS is optional on Linux NVIDIA GPUs; `auto` falls back to ordinary concurrency, while `on` requires MPS.
 
-`--runs` and `--epochs` control RIDDLE/R-ANODE signal fits and LaCathode classifier fits; background training is unchanged.<br>
-LaCathode retains separate fits, each averaging ten validation-selected checkpoints.
+`--runs` controls RIDDLE/R-ANODE signal fits and independent LaCathode background-flow-plus-classifier runs.<br>
+`--epochs` controls signal/classifier epochs.<br>
 
 For all three methods, to continue compatible checkpoints after an implementation update, add `--resume-across-code-change`.<br>
 To move between CUDA GPUs, add `--resume-across-device-change`.<br>

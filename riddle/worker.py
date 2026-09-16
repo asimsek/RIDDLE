@@ -115,8 +115,12 @@ def main():
         contract["riddle_production_policy"] = PRODUCTION_POLICY
     if args.method == "lacathode":
         from external.lacathode_utils.source import verify, COMMIT
+        from external.lacathode_utils.pipeline import RUN_LAYOUT
 
-        contract.update(source_sha256=verify(args.sources), source_commit=COMMIT)
+        contract.update(source_sha256=verify(args.sources), source_commit=COMMIT,
+                        lacathode_run_layout=RUN_LAYOUT)
+        if getattr(args, "lacathode_replica", False):
+            contract["settings"].update(campaign_seed=args.campaign_seed, run_index=args.run_index)
     path = args.output / "result.json"
     saved, changes = inspect_resume(args.output, contract, resume=args.resume, **policy)
     completed = saved is not None and saved["completed"]
@@ -145,13 +149,18 @@ def main():
         "contract": contract,
         "completed": False,
     }
+    if args.method == "lacathode" and getattr(args, "lacathode_replica", False):
+        report.update(campaign_seed=args.campaign_seed, run_index=args.run_index)
     if saved is not None and (changes or "initial_contract" in saved):
         report["initial_contract"] = saved.get("initial_contract", saved["contract"])
     write_json(path, report)
     if args.method == "riddle":
         from .pipeline import run
     else:
-        from external.lacathode_utils.pipeline import run
+        if getattr(args, "lacathode_replica", False):
+            from external.lacathode_utils.pipeline import run_single as run
+        else:
+            from external.lacathode_utils.pipeline import run
     run(args, contract)
     validate(args.data)
     artifacts = [

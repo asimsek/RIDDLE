@@ -39,9 +39,9 @@ def setup_runtime():
 
 def job(args):
     if "lacathode" in args.methods:
-        from external.lacathode_utils.pipeline import classifier_settings
+        from external.lacathode_utils.pipeline import run_settings
 
-        classifier_settings(getattr(args, "runs", None), getattr(args, "epochs", None))
+        run_settings(getattr(args, "runs", None), getattr(args, "epochs", None))
     if "ranode" in args.methods:
         runs, epochs = getattr(args, "runs", None), getattr(args, "epochs", None)
         if runs is not None and not 1 <= runs <= 20:
@@ -223,7 +223,7 @@ def main(argv=None):
     p.add_argument("--ranode-config", default="external/ranode_utils/ranode.yaml", help="Independent upstream R-ANODE settings")
     p.add_argument("--data", help="Prepared dataset path; defaults to data/lhco or data/injection_scan for scans")
     p.add_argument("--results", help="Result directory; defaults to results or results/injection_scan for scans")
-    p.add_argument("--runs", type=positive, help="Override RIDDLE/R-ANODE fit count and LaCathode classifier fit count")
+    p.add_argument("--runs", type=positive, help="Override RIDDLE/R-ANODE fit count and LaCathode independent flow-plus-classifier run count")
     p.add_argument("--epochs", type=positive, help="Override RIDDLE/R-ANODE signal-fit and LaCathode classifier epochs; background stages are unchanged")
     p.add_argument("--workers", type=positive, default=2)
     p.add_argument("--io-workers", type=positive, default=4)

@@ -5,6 +5,7 @@ external/ranode/
 .cache/
 data/
 results/
+results*/
 figures/
 nrp_jobs/
 __pycache__/
@@ -13,3 +14,8 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .DS_Store
+plots/
+plots*/
+*.tar.gz
+*.zip
+*.lock

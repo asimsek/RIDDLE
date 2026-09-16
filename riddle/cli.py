@@ -78,7 +78,7 @@ def parser():
         )
         run.add_argument("--io-workers", type=positive, default=2)
         run.add_argument("--mps", choices=["auto", "on", "off"], default="auto")
-        run.add_argument("--runs", type=positive, help="Override RIDDLE/R-ANODE fit count and LaCathode classifier fit count")
+        run.add_argument("--runs", type=positive, help="Override RIDDLE/R-ANODE fit count and LaCathode independent flow-plus-classifier run count")
         run.add_argument(
             "--epochs", type=positive, help="Override RIDDLE/R-ANODE signal-fit and LaCathode classifier epochs; background stages are unchanged"
         )
@@ -99,9 +99,9 @@ def run_campaign(args):
     resume_policy(args)
     fit_overrides = {key: getattr(args, key, None) for key in ("runs", "epochs")}
     if "lacathode" in args.methods:
-        from external.lacathode_utils.pipeline import classifier_settings
+        from external.lacathode_utils.pipeline import run_settings
 
-        classifier_settings(**fit_overrides)
+        run_settings(**fit_overrides)
     from .storage import locked
     from .worker_progress import monitor_worker
 

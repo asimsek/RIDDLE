@@ -69,6 +69,11 @@ def fit_scores(record):
     return record.get("fit_scores", record["scores"][None, :])
 
 
+def fit_uncertainty(record):
+    return ("independent_background_flow_and_classifier_runs" if record.get("independent_runs")
+            else "classifier_fit_variation_with_shared_background_flow_per_seed")
+
+
 def sample_fit_scores(sample, key):
     return sample.get(key + "_fit_scores", sample[key + "_scores"][None, :])
 
@@ -105,7 +110,7 @@ def fit_curve_summary(curves):
     return signal, np.percentile(rejection, [16, 50, 84], axis=0), np.percentile(sic, [16, 50, 84], axis=0)
 
 
-def draw_fit_curves(ax, curves, metric, label, color, linestyle):
+def draw_fit_curves(ax, curves, metric, label, color, linestyle, *, uncertainty_source="per_fit_variation"):
     try:
         signal, rejection, sic = fit_curve_summary(curves)
     except ValueError as error:
@@ -140,7 +145,7 @@ def draw_fit_curves(ax, curves, metric, label, color, linestyle):
         "signal_efficiency": signal.tolist(), "background_rejection": rejection.tolist(),
         "sic": sic.tolist(), "display_x": x[1].tolist(), "display_y": y[1].tolist(),
         "percentiles": [16, 50, 84],
-        "uncertainty_source": "classifier_fit_variation_with_shared_background_flow_per_seed",
+        "uncertainty_source": uncertainty_source,
     }
 
 
@@ -409,18 +414,26 @@ def working_point_title(point, scope=None):
     return f"{scope} | B {relation} {100 * point['validation_background_budget']:g}%"
 
 
-def retention_label(truth, passed, total):
+def retention_label(truth, passed, total, *, scenario=None):
+    if truth == 1 and scenario == "background_only":
+        return "S" if total else None
     value = safe_div(passed, total)
     return ("B" if truth == 0 else "S") + (f": {100 * value:.3g}%" if value is not None else ": unavailable")
 
 
-def signal_retention_label(key, passed, total):
+def signal_retention_label(key, passed, total, *, scenario=None):
+    if scenario == "background_only":
+        return METHODS[key][0]
     value = safe_div(passed, total)
     fraction = f"{100 * value:.3g}%" if value is not None else "n/a"
     return f"{METHODS[key][0]} (S: {fraction})"
 
 
 def population_legend(fig, columns, title=None, *, ax=None):
+    columns = [
+        (heading, [(handle, label) for handle, label in entries if label is not None])
+        for heading, entries in columns
+    ]
     rows = 1 + max(len(entries) for _, entries in columns)
     handles, labels = [], []
     for heading, entries in columns:
@@ -594,7 +607,8 @@ def render_roc(bundle, output, args):
                             b, s, _ = roc_curve(labels, score[record["mask"]])
                             use = b > 0 if kind.startswith("roc") else (b >= 1e-4) & (np.rint(b * nb) >= args.min_background)
                             fit_curves.append((b[use], s[use]))
-                        audit[label][kind] = draw_fit_curves(ax, fit_curves, kind, label, color, ls)
+                        audit[label][kind] = draw_fit_curves(ax, fit_curves, kind, label, color, ls,
+                                                           uncertainty_source=fit_uncertainty(record))
                         audit[label].update(fit_count=len(fit_curves),
                                             unique_scores=[int(len(np.unique(v[record["mask"]]))) for v in fit_scores(record)],
                                             interpolation_or_smoothing="linear interpolation on common signal efficiency; no smoothing",
@@ -838,6 +852,7 @@ def finish_ratio(fig, ax, edges, curves):
 
 
 def render_mass(bundle, output):
+    scenario = bundle["metrics"].get("scenario")
     for point in bundle["metrics"]["working_points"]:
         records = mass_histograms(bundle, point)
         if records is None:
@@ -862,7 +877,9 @@ def render_mass(bundle, output):
                     ls="-" if y == 0 else "--",
                     label="No cut: " + ("B" if y == 0 else "S"),
                 )
-                no_cut.append((handle, retention_label(y, nominal[y].sum(), nominal[y].sum())))
+                no_cut.append((handle, retention_label(
+                    y, nominal[y].sum(), nominal[y].sum(), scenario=scenario
+                )))
             columns.append(("No cut", no_cut))
             for key in keys:
                 entries = []
@@ -885,7 +902,8 @@ def render_mass(bundle, output):
                         (
                             handle,
                             retention_label(
-                                y, counts.sum() if counts is not None else None, nominal[y].sum()
+                                y, counts.sum() if counts is not None else None, nominal[y].sum(),
+                                scenario=scenario,
                             ),
                         )
                     )
@@ -919,7 +937,9 @@ def render_mass(bundle, output):
                 for key in keys:
                     if key not in histograms:
                         continue
-                    label = signal_retention_label(key, histograms[key][1].sum(), nominal[1].sum())
+                    label = signal_retention_label(
+                        key, histograms[key][1].sum(), nominal[1].sum(), scenario=scenario
+                    )
                     color, ls = POPULATIONS[key][0]
                     counts = histograms[key][0]
                     rates[key] = bin_ratio(counts, nominal[0])
@@ -999,7 +1019,7 @@ def mass_scan_histograms(sample, keys, cuts=SCORE_CUTS):
     return edges, nominal, records
 
 
-def draw_mass_scan(fig, ax, edges, nominal, histograms, keys, cut):
+def draw_mass_scan(fig, ax, edges, nominal, histograms, keys, cut, *, scenario=None):
     """Draw the same counts and legend in the individual and six-panel exports."""
     keys = tuple(key for key in POPULATIONS if key in keys)
     ax.set(xlabel=r"$m_{jj}$ [TeV]", ylabel="Events / bin")
@@ -1025,7 +1045,9 @@ def draw_mass_scan(fig, ax, edges, nominal, histograms, keys, cut):
                 else POPULATIONS[key][y]
             )
             handle = step(ax, counts[y], edges, color=color, ls=ls, lw=1.35)
-            entries.append((handle, retention_label(y, counts[y].sum(), nominal[y].sum())))
+            entries.append((handle, retention_label(
+                y, counts[y].sum(), nominal[y].sum(), scenario=scenario
+            )))
         columns.append((heading, entries))
     decorate_mass(ax, edges)
     count_scale(ax, max(1, float(np.max(nominal[0] + nominal[1]))) * 1.3)
@@ -1040,6 +1062,7 @@ def render_mass_scan(bundle, output):
     sample = bundle["samples"].get("test")
     if sample is None or not len(sample["mass"]):
         return
+    scenario = bundle["metrics"].get("scenario")
     edges, nominal, records = mass_scan_histograms(sample, tuple(METHODS))
     for view, keys in VIEWS.items():
         destination = output / view / "04_mass_cuts"
@@ -1063,12 +1086,16 @@ def render_mass_scan(bundle, output):
                         try:
                             chunk = records[first : first + 6]
                             for ax, (cut, histograms) in zip(axes.flat, chunk):
-                                draw_mass_scan(page, ax, edges, nominal, histograms, keys, cut)
+                                draw_mass_scan(
+                                    page, ax, edges, nominal, histograms, keys, cut, scenario=scenario
+                                )
                                 fig, single, _ = canvas("Events / bin", r"$m_{jj}$ [TeV]")
                                 if len(keys) == 2:
                                     fig.set_figwidth(7.6)
                                 try:
-                                    draw_mass_scan(fig, single, edges, nominal, histograms, keys, cut)
+                                    draw_mass_scan(
+                                        fig, single, edges, nominal, histograms, keys, cut, scenario=scenario
+                                    )
                                     save(fig, individual / ("mass_score_" + f"{cut:.2f}".replace(".", "p")))
                                 finally:
                                     plt.close(fig)
@@ -1087,6 +1114,7 @@ def render_features(bundle, output):
     records = feature_records(bundle)
     if records is None:
         return
+    scenario = bundle["metrics"].get("scenario")
     for view, keys in VIEWS.items():
         for page in records["pages"]:
             region = "sr" if page["region"].lower() in ("sr", "signal region") else "full"
@@ -1124,9 +1152,12 @@ def render_features(bundle, output):
                                     lw=0.9,
                                     label=f"No cut: {name} {label}",
                                 )
-                                text = retention_label(truth, base.sum(), base.sum())
-                                if is_score and len(keys) > 1:
-                                    text = text.replace(":", f" ({name}):", 1)
+                                text = retention_label(truth, base.sum(), base.sum(), scenario=scenario)
+                                if text is not None and is_score and len(keys) > 1:
+                                    text = (
+                                        text.replace(":", f" ({name}):", 1)
+                                        if ":" in text else f"{text} ({name})"
+                                    )
                                 no_cut.append((handle, text))
                             handle, passed = None, None
                             if cls["selected"] is not None:
@@ -1136,7 +1167,9 @@ def render_features(bundle, output):
                                 passed = kept.sum()
                                 values = kept if kind == "counts" else bin_ratio(kept, base)
                                 handle = step(ax, values, edges, color=color, ls=ls, label=f"{name}: {label}")
-                            entries.append((handle, retention_label(truth, passed, base.sum())))
+                            entries.append((handle, retention_label(
+                                truth, passed, base.sum(), scenario=scenario
+                            )))
                         columns.append((name, entries))
                     ax.set_xlim(edges[0], edges[-1])
                     if kind == "counts":
@@ -1190,13 +1223,14 @@ def render_representation(bundle, output):
     if "latents" in bundle:
         spaces["latent"] = (
             bundle["latents"],
-            tuple(r"$z_{%d}$" % i for i in range(1, bundle["latents"].shape[1] + 1)),
-            tuple("z%d" % i for i in range(1, bundle["latents"].shape[1] + 1)),
+            tuple(r"$z_{%d}$" % i for i in range(1, bundle["latents"].shape[-1] + 1)),
+            tuple("z%d" % i for i in range(1, bundle["latents"].shape[-1] + 1)),
         )
     y, m = sample["labels"][sample["mask"]], sample["mass"][sample["mask"]]
     bundle["representation"] = {
         "event_scope": "same scorable physical test events before and after mapping",
         "latent_reference": "standard normal; not a signal model",
+        "histograms": "Mean per-run densities; no averaging of event latent coordinates",
         "regions": {},
     }
     region_mask = sample_sr(sample, next(iter(METHODS)))[sample["mask"]]
@@ -1208,12 +1242,13 @@ def render_representation(bundle, output):
             if not mask.any():
                 continue
             edges = []
-            dimensions = values.shape[1]
+            dimensions = values.shape[-1]
+            cohort = values if values.ndim == 3 else values[None, :, :]
             for i in range(dimensions):
                 low, high = (
                     (-5.0, 5.0)
                     if space == "latent"
-                    else (float(values[mask, i].min()), float(values[mask, i].max()))
+                    else (float(cohort[:, mask, i].min()), float(cohort[:, mask, i].max()))
                 )
                 if high == low:
                     low, high = low - 0.5, high + 0.5
@@ -1222,7 +1257,8 @@ def render_representation(bundle, output):
                 "ranges": [[e[0], e[-1]] for e in edges],
                 "out_of_range": {
                     group: [
-                        int(np.count_nonzero(pop & ((values[:, i] < e[0]) | (values[:, i] > e[-1]))))
+                        float(np.mean([np.count_nonzero(pop & ((v[:, i] < e[0]) | (v[:, i] > e[-1])))
+                                       for v in cohort]))
                         for i, e in enumerate(edges)
                     ]
                     for group, pop in groups.items()
@@ -1230,7 +1266,8 @@ def render_representation(bundle, output):
             }
             for i in range(dimensions):
                 densities = {
-                    group: feature_density(values[pop, i], edges[i]) for group, pop in groups.items()
+                    group: np.mean([feature_density(v[pop, i], edges[i]) for v in cohort], axis=0)
+                    for group, pop in groups.items()
                 }
                 top = max(0.4 if space == "latent" else 0, *[max(v) for v in densities.values()]) * 1.25
                 for view in VIEWS:
@@ -1251,7 +1288,8 @@ def render_representation(bundle, output):
                 histograms = {}
                 for group, pop in groups.items():
                     if pop.any():
-                        h = np.histogram2d(values[pop, i], values[pop, j], bins=(edges[i], edges[j]))[0]
+                        h = np.mean([np.histogram2d(v[pop, i], v[pop, j], bins=(edges[i], edges[j]))[0]
+                                     for v in cohort], axis=0)
                         histograms[group] = h / (
                             pop.sum() * np.diff(edges[i])[:, None] * np.diff(edges[j])[None, :]
                         )
@@ -1284,9 +1322,9 @@ def render_representation(bundle, output):
                             / f"{group}_{names[i]}_{names[j]}",
                         )
             for group, pop in groups.items():
-                if pop.sum() < 3 or np.any(np.std(values[pop], axis=0) == 0):
+                if pop.sum() < 3 or any(np.any(np.std(v[pop], axis=0) == 0) for v in cohort):
                     continue
-                matrix = np.corrcoef(values[pop], rowvar=False)
+                matrix = np.mean([np.corrcoef(v[pop], rowvar=False) for v in cohort], axis=0)
                 for view in VIEWS:
                     fig, ax, _ = canvas("", "")
                     art = ax.imshow(matrix, vmin=-1, vmax=1, cmap="RdBu_r")

@@ -7,10 +7,9 @@ import re
 
 
 def contract_settings(runs=None, epochs=None):
-    from .pipeline import DEFAULTS, classifier_settings
+    from .pipeline import run_settings
 
-    # Legacy contracts implicitly used one classifier fit and 100 epochs.
-    return {k: v for k, v in classifier_settings(runs, epochs).items() if v != DEFAULTS[k]}
+    return run_settings(runs, epochs)
 
 
 def add_resume_options(parser, *, always_resume=False):

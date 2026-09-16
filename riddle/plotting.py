@@ -53,6 +53,8 @@ def discover(root, requested, *, scan=False):
         method = report.get("method")
         if method not in requested or not report.get("completed"):
             continue
+        if method == "lacathode" and "run_index" in report and path.parent != root:
+            continue
         point = report.get("contract", {}).get("inputs", {}).get("injection_scan")
         if bool(point) != scan:
             continue
@@ -88,6 +90,9 @@ def load_scores(root, report, name):
         data = {k: archive[k] for k in fields}
         if report["method"] == "lacathode" and "fit_scores" in archive:
             data["fit_scores"] = archive["fit_scores"]
+            if report.get("contract", {}).get("lacathode_run_layout"):
+                data["fit_latents"] = archive["fit_latents"]
+                data["run_seeds"] = archive["run_seeds"]
         if report["method"] == "ranode":
             data["is_signal_region"] = archive["is_signal_region"]
             region = data["is_signal_region"]
@@ -124,7 +129,9 @@ def load_scores(root, report, name):
     ):
         raise ValueError("Scores disagree with the mapping mask")
     if report["method"] == "lacathode":
-        runs = report.get("contract", {}).get("settings", {}).get("classifier_runs")
+        settings = report.get("contract", {}).get("settings", {})
+        independent = bool(report.get("contract", {}).get("lacathode_run_layout"))
+        runs = settings.get("pipeline_runs") if independent else settings.get("classifier_runs")
         fits = data.get("fit_scores", data["scores"][None, :])
         if (
             fits.ndim != 2 or fits.shape[1:] != (n,) or len(fits) < 1
@@ -134,11 +141,34 @@ def load_scores(root, report, name):
             or not np.array_equal(fits[0], data["scores"], equal_nan=True)
         ):
             raise ValueError("Invalid or incomplete LaCathode per-fit scores")
+        data["independent_runs"] = independent
+        if independent and "run_index" not in report:
+            members = read_metadata(root, report, "runs.json")["runs"]
+            if (data["fit_latents"].shape != (len(fits), *data["latent"].shape)
+                    or not np.isfinite(data["fit_latents"]).all()
+                    or not np.array_equal(data["fit_latents"][0], data["latent"])
+                    or not np.array_equal(data["run_seeds"], [m["seed"] for m in members])
+                    or len(set(data["run_seeds"].tolist())) != len(fits)):
+                raise ValueError("Invalid independent LaCathode run identities or latents")
     return data
 
 
 def fit_scores(record):
     return f.fit_scores(record)
+
+
+def fit_identity(bundle, key, fit):
+    record = bundle["evaluation"]["signal_region"][key]
+    seed = bundle["report"]["seed"]
+    return dict(seed=seed, fit=fit,
+                run_seed=int(record["run_seeds"][fit]) if "run_seeds" in record else seed,
+                independent=key != "raw" or record.get("independent_runs", False))
+
+
+def fit_uncertainty(identities):
+    if identities and all(item.get("independent", False) for item in identities):
+        return "independent_background_flow_and_classifier_runs"
+    return "classifier_fit_variation_with_shared_background_flow_per_seed"
 
 
 def make_bundle(group, confidence):
@@ -179,7 +209,7 @@ def make_bundle(group, confidence):
             bundle["samples"][partition] = sample
         if partition == "test":
             bundle["feature_values"] = np.column_stack((base["mass"], base["physical"]))
-            bundle["latents_by_method"] = {k: r["latent"] for k, r in records.items()}
+            bundle["latents_by_method"] = {k: r.get("fit_latents", r["latent"]) for k, r in records.items()}
     report = next(iter(group.values()))[1]
     if "lacathode" in group:
         bundle["classifier_fit_count"] = f.validate_fit_counts(
@@ -258,7 +288,8 @@ def render_full_pipeline(bundle, output, args):
                     curves.append((b[use], s[use]))
                     metrics.append(oracle_metrics(record["labels"], score, record["mask"], min_background=args.min_background))
                 label, color, ls = STYLES[key]
-                summary = f.draw_fit_curves(ax, curves, metric, label, color, ls)
+                summary = f.draw_fit_curves(ax, curves, metric, label, color, ls,
+                                            uncertainty_source=f.fit_uncertainty(record))
                 audit.setdefault(label, {}).update(f.aggregate_fit_metrics(metrics))
                 audit[label][metric] = summary
                 drawn = True
@@ -661,7 +692,7 @@ def training_figures(group, output):
             for name, label in zip(names, ("Train", "Validation")):
                 verify_plot_input(root, report, str((directory / name).relative_to(root)))
                 values = np.load(directory / name)
-                histories = values if stage == "classifier" else values.reshape(1, -1)
+                histories = np.atleast_2d(values)
                 epochs = np.arange(histories.shape[1])
                 line, = ax.plot(epochs, histories.mean(axis=0), label=label)
                 if len(histories) > 1:
@@ -689,16 +720,16 @@ def method_band(ax, x, values, key, scenario, metric, seeds, classifier_fits=Non
     summary.update(uncertainty_source="training_seed_variation_on_fixed_data_partition", seeds=seeds)
     if classifier_fits and any(fit["fit"] > 0 for fit in classifier_fits):
         summary.update(
-            uncertainty_source="classifier_fit_variation_with_shared_background_flow_per_seed",
+            uncertainty_source=fit_uncertainty(classifier_fits),
             classifier_fits=classifier_fits,
-            fit_count=len(classifier_fits), independent_runs=len(set(seeds)),
+            fit_count=len(classifier_fits),
+            independent_runs=len({fit.get("run_seed", fit["seed"]) for fit in classifier_fits}),
         )
     if not summary["band_drawn"]:
         colored_status(
             f"{name} | {f.SCENARIO_LABELS[scenario]} | {metric}: "
             "uncertainty band unavailable with only one independent run; "
-            "include additional training seeds or saved LaCathode classifier fits. "
-            "Internal fits and checkpoints are not independent full runs.",
+            "include additional independent training runs.",
             kind="WARNING",
         )
     return summary
@@ -734,7 +765,7 @@ def summary_figures(bundles, output, args):
                     native_curves.append((b[supported], s[supported]))
                     if key == "raw":
                         seeds.append(bundle["report"]["seed"])
-                        classifier_fits.append(dict(seed=seeds[-1], fit=fit))
+                        classifier_fits.append(fit_identity(bundle, key, fit))
                     if supported.sum() < 2:
                         continue
                     values.append(
@@ -747,11 +778,12 @@ def summary_figures(bundles, output, args):
                     )
                     if key != "raw":
                         seeds.append(bundle["report"]["seed"])
-                        classifier_fits.append(dict(seed=seeds[-1], fit=fit))
+                        classifier_fits.append(fit_identity(bundle, key, fit))
             if values:
                 name = STYLES[key][0]
                 if key == "raw" and len(native_curves) > 1:
-                    summary = f.draw_fit_curves(ax, native_curves, "sic", *STYLES[key])
+                    summary = f.draw_fit_curves(ax, native_curves, "sic", *STYLES[key],
+                                                uncertainty_source=fit_uncertainty(classifier_fits))
                     summary.update(classifier_fits=classifier_fits, seeds=seeds)
                 else:
                     summary = method_band(ax, f.GRID, values, key, scenario, "SIC", seeds, classifier_fits)
@@ -800,7 +832,7 @@ def summary_figures(bundles, output, args):
                         ]
                     )
                     seeds.append(bundle["report"]["seed"])
-                    classifier_fits.append(dict(seed=seeds[-1], fit=fit))
+                    classifier_fits.append(fit_identity(bundle, key, fit))
             if curves:
                 name = STYLES[key][0]
                 audit[scenario + "/" + name + "/mass_flatness"] = method_band(
@@ -883,7 +915,8 @@ def render_physical_curves(records, output, scenario, minimum):
                     use = b > 0 if metric == "roc" else (b >= 1e-4) & (np.rint(b * (record["labels"] == 0).sum()) >= minimum)
                     curves.append((b[use], s[use]))
                     diagnostics.append(oracle_metrics(record["labels"], score, record["mask"], min_background=minimum))
-                f.draw_fit_curves(ax, curves, metric, *PHYSICAL_STYLES[method][:3])
+                f.draw_fit_curves(ax, curves, metric, *PHYSICAL_STYLES[method][:3],
+                                  uncertainty_source=f.fit_uncertainty(record))
                 audit[method] = f.aggregate_fit_metrics(diagnostics)
                 drawn = True
                 continue
@@ -980,7 +1013,7 @@ def physical_sr_record(record, sr=None):
     return result
 
 
-def render_physical_working_points(validation, test, output):
+def render_physical_working_points(validation, test, output, *, scenario=None):
     require_same_physical_population(validation)
     require_same_physical_population(test)
     validation, test = (
@@ -1048,7 +1081,9 @@ def render_physical_working_points(validation, test, output):
                 handle = ax.stairs(
                     signal_hist, edges, color=".45", ls="--", baseline=None
                 )
-                columns[0][1].append((handle, "Signal"))
+                columns[0][1].append((
+                    handle, "Signal" if scenario != "background_only" or signal_hist.sum() else None
+                ))
             for method, keep in selected.items():
                 label, color, _, signal_color = PHYSICAL_STYLES[method]
                 record = test[method]
@@ -1065,12 +1100,18 @@ def render_physical_working_points(validation, test, output):
                         else f"S: {signal_text}",
                     )
                 ]
+                if scenario == "background_only":
+                    entries = [(handle, f"B: {100 * b:.3g}%" if b is not None else "Background")]
                 if not shape:
                     shist = f.fit_histogram(record["mass"], edges, keep & (record["labels"] == 1))
                     handle = ax.stairs(
                         shist, edges, color=signal_color, ls="--", baseline=None
                     )
-                    entries.append((handle, f"S: {signal_text}"))
+                    signal_label = (
+                        f.retention_label(1, s, int((record["labels"] == 1).sum()), scenario=scenario)
+                        if scenario == "background_only" else f"S: {signal_text}"
+                    )
+                    entries.append((handle, signal_label))
                 columns.append((label, entries))
                 ratio = np.divide(
                     hist, norm, out=np.full(len(hist), np.nan), where=norm > 0
@@ -1095,11 +1136,11 @@ def render_physical_working_points(validation, test, output):
                 ),
             )
         if selected:
-            render_physical_features(test, selected, retention, budget, output)
+            render_physical_features(test, selected, retention, budget, output, scenario=scenario)
     return audit
 
 
-def render_physical_features(records, selected, retention, budget, output):
+def render_physical_features(records, selected, retention, budget, output, *, scenario=None):
     fields = (
         ("m1", r"$m_{J1}$ [TeV]"),
         ("delta_m", r"$\Delta m_J$ [TeV]"),
@@ -1128,7 +1169,12 @@ def render_physical_features(records, selected, retention, budget, output):
                 percent = (
                     f"{100 * efficiency:.3g}%" if efficiency is not None else "n/a"
                 )
-                entries.append((handle, ("B: " if truth == 0 else "S: ") + percent))
+                text = ("B: " if truth == 0 else "S: ") + percent
+                if truth == 1 and scenario == "background_only":
+                    text = f.retention_label(
+                        truth, efficiency, int((record["labels"] == truth).sum()), scenario=scenario
+                    )
+                entries.append((handle, text))
             columns.append((label, entries))
         ax.set_yscale("symlog", linthresh=1)
         f.population_legend(
@@ -1206,7 +1252,7 @@ def render_physical_comparison(group, output, args, load_scores):
             [records["lacathode"], validation["lacathode"], test["lacathode"]]
         )
         audit["lacathode_histograms"] = "Mean per-fit counts; separate validation cut per fit; no score averaging"
-    audit["working_points"] = render_physical_working_points(validation, test, output)
+    audit["working_points"] = render_physical_working_points(validation, test, output, scenario=scenario)
     render_ranode_training(group["ranode"], output)
     return audit
 
@@ -1226,6 +1272,7 @@ def physical_comparison_summary(groups, output, args, load_scores):
             )
         curves = {m: [] for m in PHYSICAL_STYLES}
         native_curves = []
+        lacathode_sources = set()
         grid = np.geomspace(1e-4, 1, 300)
         for (name, seed), group in groups.items():
             if name != scenario or "ranode" not in group:
@@ -1243,6 +1290,7 @@ def physical_comparison_summary(groups, output, args, load_scores):
                         record["labels"], score, record["mask"], full_pipeline=True,
                     )
                     if method == "lacathode":
+                        lacathode_sources.add(f.fit_uncertainty(record))
                         use = (b >= 1e-4) & (np.rint(b * (record["labels"] == 0).sum()) >= args.min_background)
                         native_curves.append((b[use], s[use]))
                     unique, inverse = np.unique(b, return_inverse=True)
@@ -1271,7 +1319,7 @@ def physical_comparison_summary(groups, output, args, load_scores):
                     else f.draw_band(ax, grid, values, label, color, ls)
                 )
                 audit[method]["uncertainty_source"] = (
-                    "classifier_fit_variation_with_shared_background_flow_per_seed"
+                    (next(iter(lacathode_sources)) if len(lacathode_sources) == 1 else "mixed_run_structures")
                     if method == "lacathode" else "training_seed_variation_on_fixed_data_partition"
                 )
             if not audit:
@@ -1395,7 +1443,7 @@ def main(argv=None):
                             "histograms": "unweighted counts per fit, averaged over LaCathode fits; identical bins, no smoothing or pooled events; B + S is the sum of background and signal counts",
                         },
                         "mass_summary": "BG-Only: test-SR quantiles, 300 equal-occupancy full-range bins, normalized-shape Poisson chi2",
-                        "uncertainty_scope": "SIC/mass bands: 16/50/84 percentiles across training seeds; multi-fit LaCathode uses per-classifier-fit curves conditional on a shared background flow per seed, not independent full-pipeline runs",
+                        "uncertainty_scope": "SIC/mass bands: 16/50/84 percentiles across saved runs; new LaCathode campaigns retrain the flow and classifier independently per run; legacy shared-flow fits retain their recorded scope",
                         "lacathode_event_plots": "Dynamically detected saved fits; mean per-fit histograms with matching per-fit validation cuts; shapes normalize those mean counts; no cross-fit score averaging",
                         "lacathode_roc_sic": "Median rejection and SIC interpolated at 1000 common signal efficiencies, as upstream, after statistical-support cuts. Bands are parametric 16/84-percentile ribbons at fixed signal efficiency; background-efficiency display axes retained.",
                         "lacathode_fit_counts": [{"scenario": b["report"]["scenario"], "seed": b["report"]["seed"], "fits": b["classifier_fit_count"]} for b in bundles if "classifier_fit_count" in b],

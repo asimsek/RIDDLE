@@ -5,23 +5,149 @@ import json
 import os
 from pathlib import Path
 import pickle
+import subprocess
 import sys
 
 FLOW_PREFIX = "lacathode_model"
-DEFAULTS = {"classifier_runs": 1, "classifier_epochs": 100}
+RUN_LAYOUT = "independent_background_classifier_v1"
+DEFAULTS = {"pipeline_runs": 1, "classifier_epochs": 100}
 
 
-def classifier_settings(runs=None, epochs=None):
+def run_settings(runs=None, epochs=None):
     values = {
-        "classifier_runs": DEFAULTS["classifier_runs"] if runs is None else runs,
+        "pipeline_runs": DEFAULTS["pipeline_runs"] if runs is None else runs,
+        "classifier_runs": 1,
         "classifier_epochs": DEFAULTS["classifier_epochs"] if epochs is None else epochs,
     }
-    if type(values["classifier_runs"]) is not int or values["classifier_runs"] < 1:
+    if type(values["pipeline_runs"]) is not int or not 1 <= values["pipeline_runs"] < 2**32:
         raise ValueError("LaCathode --runs must be a positive integer")
     # The pinned selector uses argpartition(losses, 10), requiring more than ten epochs.
     if type(values["classifier_epochs"]) is not int or values["classifier_epochs"] < 11:
         raise ValueError("LaCathode --epochs must be at least 11 for its upstream ten-checkpoint selector")
     return values
+
+
+def run_seeds(seed, count):
+    import numpy as np
+
+    if type(seed) is not int or not 0 <= seed < 2**32:
+        raise ValueError("Invalid LaCathode campaign seed")
+    seeds = [seed] + [int(np.random.SeedSequence([seed, i]).generate_state(1)[0]) for i in range(1, count)]
+    if len(set(seeds)) != count:
+        raise ValueError("LaCathode run seeds collided; choose another campaign seed")
+    return seeds
+
+
+def launch_run(options, index, count):
+    from .worker_progress import EVENT_PREFIX
+
+    output = Path(options["output"])
+    output.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    framework = str(Path(__file__).resolve().parents[2])
+    env.update(PYTHONHASHSEED=str(options["seed"]), PYTHONUNBUFFERED="1",
+               PYTHONDONTWRITEBYTECODE="1", RIDDLE_WORKER_PROGRESS="1",
+               PYTHONPATH=os.pathsep.join(filter(None, (framework, env.get("PYTHONPATH")))))
+    command = [sys.executable, "-m", "riddle.worker", json.dumps(options, default=str)]
+    with (output / "training.log").open("a" if options["resume"] else "w") as log:
+        with subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              text=True, bufsize=1, errors="replace") as process:
+            try:
+                for line in process.stdout:
+                    log.write(line)
+                    log.flush()
+                    if line.startswith(EVENT_PREFIX):
+                        event = json.loads(line[len(EVENT_PREFIX):])
+                        if "phase" in event:
+                            event["phase"] = f"run_{index:03d}/" + event["phase"]
+                            event["label"] = f"Run {index + 1}/{count} | " + event["label"]
+                        elif "message" in event:
+                            event["message"] = f"Run {index + 1}/{count} | " + event["message"]
+                        line = EVENT_PREFIX + json.dumps(event) + "\n"
+                    print(line, end="", flush=True)
+                if process.wait():
+                    raise RuntimeError(f"LaCathode run {index} failed; inspect {output / 'training.log'}")
+            except BaseException:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                raise
+
+
+def collect_runs(args, members):
+    import numpy as np
+    from .storage import atomic_write, save_npz, save_array, write_json, verify_artifacts
+
+    roots = [args.output / member["directory"] for member in members]
+    reports = [json.loads((root / "result.json").read_text()) for root in roots]
+    for root, report, member in zip(roots, reports, members):
+        if (not report.get("completed") or report.get("method") != "lacathode"
+                or report.get("seed") != member["seed"]
+                or report.get("run_index") != member["run"]):
+            raise ValueError("Missing or misidentified independent LaCathode run")
+        verify_artifacts(root, report["artifacts_sha256"])
+    for partition in ("validation", "test", "signal_region"):
+        records = []
+        for root in roots:
+            with np.load(root / f"{partition}_scores.npz", allow_pickle=False) as archive:
+                records.append({key: archive[key] for key in archive.files})
+        first = records[0]
+        for other in records[1:]:
+            if any(not np.array_equal(first[key], other[key])
+                   for key in ("mass", "labels", "mask", "physical")):
+                raise ValueError("Independent LaCathode runs have different event populations or masks")
+        fits = np.stack([record["scores"] for record in records])
+        if not np.isfinite(fits[:, first["mask"]]).all():
+            raise ValueError("Nonfinite independent LaCathode scores")
+        atomic_write(args.output / f"{partition}_scores.npz", lambda p: save_npz(
+            p, **{key: first[key] for key in ("mass", "labels", "mask", "physical", "scores", "latent")},
+            fit_scores=fits, fit_latents=np.stack([record["latent"] for record in records]),
+            run_seeds=np.array([member["seed"] for member in members], dtype=np.uint32)))
+    summary = args.output / "training"
+    summary.mkdir(exist_ok=True)
+    for name in (f"{FLOW_PREFIX}_train_losses.npy", f"{FLOW_PREFIX}_val_losses.npy",
+                 "loss_matris.npy", "val_loss_matris.npy"):
+        histories = [np.load(root / "training" / name).reshape(-1) for root in roots]
+        save_array(summary / name, np.stack(histories))
+    checks = [json.loads((root / "training/flow_checkpoint_selection.json").read_text()) for root in roots]
+    write_json(args.output / "flow_checkpoint_selection.json", {
+        "runs": [{**member, **check} for member, check in zip(members, checks)],
+        "mismatched_runs": [m["run"] for m, check in zip(members, checks) if check["mismatch"]],
+    })
+    protocol = json.loads((roots[0] / "protocol.json").read_text())
+    protocol.update(run_layout=RUN_LAYOUT, pipeline_runs=len(members), runs=members,
+                    classifier_runs_per_pipeline=1,
+                    score="Ten validation-selected classifier checkpoints per independent run; no cross-run score averaging",
+                    fit_scores="One score row per independent background-flow-plus-classifier run",
+                    primary_classifier_fit=0)
+    write_json(args.output / "protocol.json", protocol)
+    write_json(args.output / "mapping_acceptance.json",
+               json.loads((roots[0] / "mapping_acceptance.json").read_text()))
+
+
+def run(args, contract):
+    from .storage import write_json
+    from .worker_progress import emit_message
+
+    count = run_settings(getattr(args, "runs", None), getattr(args, "epochs", None))["pipeline_runs"]
+    members = [dict(run=i, seed=seed, directory=f"runs/run_{i:03d}")
+               for i, seed in enumerate(run_seeds(args.seed, count))]
+    write_json(args.output / "runs.json", {
+        "schema": 1, "run_layout": RUN_LAYOUT, "campaign_seed": args.seed,
+        "seed_rule": "run 0: campaign seed; run i>0: SeedSequence([campaign_seed, i])",
+        "runs": members,
+    })
+    for member in members:
+        emit_message(f"Independent LaCathode run {member['run'] + 1}/{count}; seed={member['seed']}")
+        options = {**vars(args), "output": str(args.output / member["directory"]),
+                   "seed": member["seed"], "runs": 1, "lacathode_replica": True,
+                   "campaign_seed": args.seed, "run_index": member["run"]}
+        launch_run(options, member["run"], count)
+    collect_runs(args, members)
 
 
 @contextmanager
@@ -64,7 +190,7 @@ def device_masks(module):
     module.load_dataset = namespace["load_dataset"]
 
 
-def run(args, contract):
+def run_single(args, contract):
     import numpy as np
     import torch
 
@@ -76,7 +202,9 @@ def run(args, contract):
     from .source import verify, COMMIT
     from .resume import resume_policy
 
-    settings = classifier_settings(getattr(args, "runs", None), getattr(args, "epochs", None))
+    settings = run_settings(getattr(args, "runs", None), getattr(args, "epochs", None))
+    if settings["pipeline_runs"] != 1:
+        raise ValueError("Each independent LaCathode run must contain exactly one classifier")
     config_file = (
         "DE_MAF_model_deltaR.yml" if contract["inputs"].get("variant") == "deltaR" else "DE_MAF_model.yml"
     )
@@ -150,6 +278,14 @@ def run(args, contract):
             creation.ANODE_models = run_all.find_best_epochs(de, 10)
             if any(Path(p).name.endswith("_epoch_-1.par") for p in creation.ANODE_models):
                 raise ValueError("Upstream selected the untrained flow entry")
+            from .storage import file_digest
+
+            write_json(root / "flow_checkpoint_selection.json", {
+                "training_checkpoint": Path(creation.ANODE_models[0]).name,
+                "training_sha256": file_digest(creation.ANODE_models[0]),
+                "ordered_training_candidates": [Path(p).name for p in creation.ANODE_models],
+                "training_selection": "upstream first entry of argpartition best-ten list",
+            })
             run_all.create_data(creation)
 
     recovery.stage("creation", create)
@@ -197,8 +333,8 @@ def evaluate(args, root, data_handler, *, config_file="DE_MAF_model.yml", classi
     import numpy as np
     import torch
 
-    from .storage import atomic_write, save_npz, seed_start, write_json
-    from .worker_progress import ProgressStage
+    from .storage import atomic_write, save_npz, seed_start, write_json, file_digest
+    from .worker_progress import ProgressStage, emit_message
     from riddle.metrics import acceptance_report
 
     from classifier import Classifier
@@ -208,6 +344,12 @@ def evaluate(args, root, data_handler, *, config_file="DE_MAF_model.yml", classi
     from sklearn.metrics import roc_curve
 
     captured = []
+    evaluation_checkpoints = []
+
+    def evaluation_estimator(*a, **kw):
+        if kw.get("load_path") is not None:
+            evaluation_checkpoints.append(Path(kw["load_path"]))
+        return DensityEstimator(*a, **kw)
 
     def capture(labels, scores):
         captured.append(dict(labels=labels, scores=scores))
@@ -229,7 +371,7 @@ def evaluate(args, root, data_handler, *, config_file="DE_MAF_model.yml", classi
         "join": os.path.join,
         "pickle": pickle,
         "load_dataset": data_handler.load_dataset,
-        "DensityEstimator": DensityEstimator,
+        "DensityEstimator": evaluation_estimator,
         "minimum_validation_loss_models": minimum_validation_loss_models,
         "roc_curve": capture,
     }
@@ -251,6 +393,25 @@ def evaluate(args, root, data_handler, *, config_file="DE_MAF_model.yml", classi
             num_DE_models=1,
             num_clsf_models=10,
             multirun=True,
+        )
+    selection_path = root / "flow_checkpoint_selection.json"
+    flow_selection = json.loads(selection_path.read_text())
+    if len(evaluation_checkpoints) != classifier_runs or len(set(evaluation_checkpoints)) != 1:
+        raise ValueError("Unexpected upstream evaluation checkpoint selection")
+    evaluation_checkpoint = evaluation_checkpoints[0]
+    flow_selection.update(
+        evaluation_checkpoint=evaluation_checkpoint.name,
+        evaluation_sha256=file_digest(evaluation_checkpoint),
+        evaluation_selection="upstream single minimum-validation-loss checkpoint",
+        mismatch=flow_selection["training_checkpoint"] != evaluation_checkpoint.name,
+        upstream_selection_unchanged=True,
+    )
+    write_json(selection_path, flow_selection)
+    if flow_selection["mismatch"]:
+        emit_message(
+            f"Background-flow checkpoint mismatch: training={flow_selection['training_checkpoint']}; "
+            f"evaluation={evaluation_checkpoint.name}. Original upstream selections are unchanged.",
+            kind="WARNING", level=0,
         )
     losses = np.load(root / f"{FLOW_PREFIX}_val_losses.npy")
     epoch = int(np.argpartition(losses, 1)[0]) - 1
