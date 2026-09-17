@@ -2059,6 +2059,7 @@ def main(argv=None):
                             "lacathode_roc_sic": "Median rejection and SIC interpolated at 1000 common signal efficiencies, as upstream, after statistical-support cuts. Bands are parametric 16/84-percentile ribbons at fixed signal efficiency; background-efficiency display axes retained.",
                             "lacathode_fit_counts": [{"scenario": b["report"]["scenario"], "seed": b["report"]["seed"], "fits": b["classifier_fit_count"]} for b in bundles if "classifier_fit_count" in b],
                             "summary_axes": f.SUMMARY_AXES,
+                            "publication_y_ranges": f.PUBLICATION_Y_RANGES,
                             "warnings": [w for b in bundles for w in b["warnings"]],
                         }
                     ),

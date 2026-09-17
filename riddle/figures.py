@@ -20,6 +20,7 @@ from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.collections import LineCollection, PathCollection, PolyCollection
 from matplotlib.colors import LogNorm
 from matplotlib.lines import Line2D
+from matplotlib.ticker import LogFormatterSciNotation, LogLocator, MaxNLocator, NullFormatter
 from matplotlib.transforms import Bbox
 from mplhep import style as hep_style
 import numpy as np
@@ -40,8 +41,33 @@ MASS_TARGETS = (0.20, 0.15, 0.10, 0.075, 0.05, 0.025, 0.01, 0.005, 0.004)
 EFFICIENCIES = np.arange(0.01, 0.21, 0.01)[::-1]
 GRID = np.logspace(-4, 0, 500)
 SUMMARY_AXES = {
-    "sic": dict(xscale="log", xlim=(1e-4, 1), yscale="linear", ylim=(0, 17)),
-    "mass_flatness": dict(xscale="linear", xlim=(0.20, 0.01), yscale="log", ylim=(0.5, 350)),
+    "sic": dict(xscale="log", xlim=(1e-4, 1), yscale="linear"),
+    "mass_flatness": dict(xscale="linear", xlim=(0.20, 0.01), yscale="log"),
+}
+# Shared by individual, comparison and summary panels, including new methods.
+# These are minimum display ranges; data and drawn bands can always expand them.
+PUBLICATION_Y_RANGES = {
+    "mass_flatness": (0.5, 350.0),
+    "sic": (0.0, 2.0),
+    "ratio": (0.5, 1.5),
+    "classification_loss_min_span": 0.05,
+    "headroom": 0.15,
+}
+_Y_AXIS_KINDS = {
+    r"$\chi^2/n_{\mathrm{dof}}$": "mass_flatness",
+    "Significance improvement": "sic",
+    "Classification loss": "classification_loss",
+    "Fitted mixture fraction": "nonnegative",
+    "Normalized background / bin": "nonnegative",
+    "Density": "nonnegative",
+    "Density (unit area per class)": "nonnegative",
+    "Probability density": "nonnegative",
+    r"Normalized density [TeV$^{-1}$]": "nonnegative",
+    "Events / bin": "nonnegative",
+    "Background events / bin": "nonnegative",
+    "Background efficiency": "nonnegative",
+    "Background efficiency [%]": "nonnegative",
+    "Background kept / all": "nonnegative",
 }
 SCENARIOS = ("signal_injection", "background_only")
 SCENARIO_LABELS = {"signal_injection": "Signal-Injected", "background_only": "BG-Only"}
@@ -543,6 +569,7 @@ def canvas(ylabel, xlabel, ratio=None):
         lower.tick_params(labelsize=9)
         lower.yaxis.label.set_size(10)
         lower.minorticks_on()
+        lower._publication_yaxis = "nonnegative" if ratio == "BG retention" else "ratio"
         ax.tick_params(labelbottom=False)
     else:
         fig, ax = plt.subplots(figsize=(6.5, 5.5))
@@ -551,6 +578,7 @@ def canvas(ylabel, xlabel, ratio=None):
         ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     ax.minorticks_on()
+    ax._publication_yaxis = _Y_AXIS_KINDS.get(ylabel)
     fig._publication_axis = ax
     fig._publication_ratio_axis = lower
     return fig, ax, lower
@@ -710,8 +738,56 @@ def place_axis_legend(fig, ax, spec):
     raise ValueError(f"Cannot fit an internal legend in the {ax.get_ylabel()!r} panel without covering data")
 
 
+def publication_ylim(ax, kind):
+    """Widen tight axes without altering, clipping or recomputing plotted data."""
+    low, high = ax.dataLim.intervaly
+    if not np.isfinite([low, high]).all():
+        return
+    margin = PUBLICATION_Y_RANGES["headroom"]
+    if kind == "mass_flatness":
+        positive = ax.dataLim.minposy
+        if not np.isfinite(positive) or high <= 0:
+            return
+        low = min(PUBLICATION_Y_RANGES[kind][0], positive / (1 + margin))
+        high = max(PUBLICATION_Y_RANGES[kind][1], high * (1 + margin))
+        ax.set(yscale="log", ylim=(low, high))
+        ax.yaxis.set_major_locator(LogLocator(base=10, subs=(1.,)))
+        ax.yaxis.set_major_formatter(LogFormatterSciNotation(base=10, labelOnlyBase=True))
+        ax.yaxis.set_minor_locator(LogLocator(base=10, subs=np.arange(2., 10.)))
+        ax.yaxis.set_minor_formatter(NullFormatter())
+        return
+    if kind in {"nonnegative", "sic"}:
+        low, high = min(0., low), max(high * (1 + margin), np.finfo(float).tiny)
+        if kind == "sic":
+            high = max(PUBLICATION_Y_RANGES["sic"][1], high)
+        elif high <= np.finfo(float).tiny:
+            high = 1.
+    elif kind == "ratio":
+        minimum = PUBLICATION_Y_RANGES["ratio"]
+        span = max(1 - minimum[0], minimum[1] - 1,
+                   (1 + margin) * max(abs(low - 1), abs(high - 1)))
+        low, high = min(low, max(0., 1 - span)), max(high, 1 + span)
+    elif kind == "classification_loss":
+        center = (low + high) / 2
+        span = max(PUBLICATION_Y_RANGES[kind + "_min_span"], (high - low) * (1 + 2 * margin))
+        low, high = center - span / 2, center + span / 2
+    else:
+        raise ValueError(f"Unknown publication y-axis kind: {kind}")
+    locator = MaxNLocator(nbins=4 if kind == "ratio" else 5,
+                         steps=[1, 2, 2.5, 5, 10], min_n_ticks=3)
+    ticks = locator.tick_values(low, high)
+    ax.set_ylim(ticks[0], ticks[-1])
+    if ax.get_yscale() == "linear":
+        ax.yaxis.set_major_locator(locator)
+        ax.ticklabel_format(axis="y", style="plain", useOffset=False)
+
+
 def _save_figure(fig, path):
     path.parent.mkdir(parents=True, exist_ok=True)
+    for ax in fig.axes:
+        kind = getattr(ax, "_publication_yaxis", None)
+        if kind is not None:
+            publication_ylim(ax, kind)
     place_legend(fig)
     fig.savefig(path.with_suffix(".pdf"), bbox_inches="tight", pad_inches=0.06)
     fig.savefig(path.with_suffix(".png"), bbox_inches="tight", pad_inches=0.06)
@@ -1594,7 +1670,7 @@ def central68(values):
 
 def summary_axes(ax, metric):
     ax.set(**SUMMARY_AXES[metric])
-    ax._publication_fixed_ylim = True
+    ax._publication_yaxis = metric
 
 
 def draw_band(ax, x, values, label, color, linestyle, *, band=True):
