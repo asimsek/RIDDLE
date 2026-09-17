@@ -1,3 +1,6 @@
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import asdict, dataclass
 import itertools
 import math
 import re
@@ -65,6 +68,91 @@ STYLE = {
 }
 
 
+@dataclass(frozen=True)
+class SICBandGuard:
+    enabled: bool = True
+    asymmetry_ratio: float = 4.
+    relative_width: float = .5
+    consecutive_points: int = 3
+    transition_fraction: float = .2
+
+    def __post_init__(self):
+        if (not np.isfinite(self.asymmetry_ratio) or self.asymmetry_ratio <= 1
+                or not np.isfinite(self.relative_width) or self.relative_width <= 0
+                or type(self.consecutive_points) is not int or self.consecutive_points < 1
+                or not np.isfinite(self.transition_fraction) or self.transition_fraction <= 0):
+            raise ValueError("SIC band guard requires ratio > 1, relative width > 0 and positive consecutive points")
+
+
+_SIC_GUARD = ContextVar("sic_band_guard", default=SICBandGuard())
+
+
+@contextmanager
+def sic_band_guard_policy(policy):
+    token = _SIC_GUARD.set(policy)
+    try:
+        yield
+    finally:
+        _SIC_GUARD.reset(token)
+
+
+def _sustained(mask, minimum):
+    result = np.zeros_like(mask)
+    edges = np.flatnonzero(np.diff(np.r_[False, mask, False]))
+    for start, end in zip(edges[::2], edges[1::2]):
+        if end - start >= minimum:
+            result[start:end] = True
+    return result
+
+
+def guard_sic_band(low, median, high, *, policy=None):
+    """Mirror the smaller width only for a sustained, large one-sided excursion.
+
+    This is a configurable rendering heuristic, not an outlier test or a new
+    confidence interval. A zero/numerically negligible smaller width cannot be
+    used: collapsing an uncertain interval to a line would conceal variation.
+    Nonfinite (unsupported) points break runs, and ordinary asymmetry is retained.
+    """
+    policy = _SIC_GUARD.get() if policy is None else policy
+    low, median, high = (np.asarray(v, float) for v in (low, median, high))
+    if low.ndim != 1 or low.shape != median.shape or low.shape != high.shape:
+        raise ValueError("Band guard needs aligned one-dimensional percentile curves")
+    finite = np.isfinite(low) & np.isfinite(median) & np.isfinite(high)
+    if np.any(finite & ((low > median) | (median > high))):
+        raise ValueError("Band percentiles are out of order")
+    lower, upper = median - low, high - median
+    tolerance = 32 * np.finfo(float).eps * np.maximum(1., np.abs(median))
+    sizable = np.maximum(lower, upper) > policy.relative_width * np.abs(median)
+    usable = finite & (np.minimum(lower, upper) > tolerance)
+    lower_large = usable & sizable & (lower > policy.asymmetry_ratio * upper)
+    upper_large = usable & sizable & (upper > policy.asymmetry_ratio * lower)
+    lower_adjusted = _sustained(lower_large, policy.consecutive_points) & policy.enabled
+    upper_adjusted = _sustained(upper_large, policy.consecutive_points) & policy.enabled
+    changed = lower_adjusted | upper_adjusted
+    # Ramp over the next 20% beyond both thresholds. Without this transition,
+    # a smooth underlying percentile can acquire a sharp artificial step.
+    ratio_strength = np.divide(np.maximum(lower, upper), policy.asymmetry_ratio * np.minimum(lower, upper),
+                               out=np.zeros_like(median), where=usable)
+    relative_strength = np.maximum(lower, upper) / (policy.relative_width * np.maximum(np.abs(median), tolerance))
+    t = np.clip((np.minimum(ratio_strength, relative_strength) - 1) / policy.transition_fraction, 0, 1)
+    weight = np.where(changed, t * t * (3 - 2 * t), 0.)
+    display_low, display_high = low.copy(), high.copy()
+    display_low[lower_adjusted] += weight[lower_adjusted] * (lower - upper)[lower_adjusted]
+    display_high[upper_adjusted] -= weight[upper_adjusted] * (upper - lower)[upper_adjusted]
+    audit = {
+        **asdict(policy),
+        "scope": "SIC shading only; original 16/50/84 percentiles and metrics retained",
+        "rule": "larger width > ratio * smaller AND > relative_width * abs(median), sustained on adjacent supported points",
+        "applied": bool(changed.any()),
+        "adjusted_points": int(changed.sum()),
+        "transition_weights": weight.tolist(),
+        "lower_adjusted_indices": np.flatnonzero(lower_adjusted).tolist(),
+        "upper_adjusted_indices": np.flatnonzero(upper_adjusted).tolist(),
+        "skipped_zero_width_indices": np.flatnonzero(finite & sizable & ~usable).tolist(),
+    }
+    return display_low, display_high, audit
+
+
 def fit_scores(record):
     return record.get("fit_scores", record["scores"][None, :])
 
@@ -118,7 +206,9 @@ def draw_fit_curves(ax, curves, metric, label, color, linestyle, *, uncertainty_
         for b, s in curves:
             if not len(b):
                 continue
-            if metric in ("rejection", "background_rejection"):
+            if metric == "sic_signal":
+                x, y = s, s / np.sqrt(b)
+            elif metric in ("rejection", "background_rejection"):
                 x, y = s, 1 / b
             else:
                 x, y = b, s if metric.startswith("roc") else s / np.sqrt(b)
@@ -127,18 +217,31 @@ def draw_fit_curves(ax, curves, metric, label, color, linestyle, *, uncertainty_
             drawn = True
         return {"fit_count": len(curves), "band_drawn": False,
                 "band_status": str(error), "aggregation": "unavailable; individual supported fit curves only"}
-    if metric in ("rejection", "background_rejection"):
+    if metric == "sic_signal":
+        x, y = np.broadcast_to(signal, sic.shape), sic
+    elif metric in ("rejection", "background_rejection"):
         x, y = np.broadcast_to(signal, rejection.shape), rejection
     elif metric.startswith("roc"):
         x, y = 1 / rejection, np.broadcast_to(signal, rejection.shape)
     else:
         x, y = 1 / rejection, sic
+    band_x, band_y, guard = x.copy(), y.copy(), None
+    if len(curves) > 1 and metric.startswith("sic"):
+        band_y[0], band_y[2], guard = guard_sic_band(sic[0], sic[1], sic[2])
+        if guard["applied"]:
+            if metric != "sic_signal":
+                # Preserve fixed-signal-efficiency geometry: B = (S / SIC)^2.
+                # Change only the affected boundary; keep the median path intact.
+                for boundary, name in ((0, "lower"), (2, "upper")):
+                    indices = guard[name + "_adjusted_indices"]
+                    band_x[boundary, indices] = (signal[indices] / band_y[boundary, indices]) ** 2
+            mark_guarded_band(ax, x, y, color)
     if len(curves) > 1:
         # A parametric ribbon at fixed signal efficiency, not a vertical band
         # at fixed background efficiency. Keep the publication's displayed axes.
-        ax.fill(np.r_[x[0], x[2, ::-1]], np.r_[y[0], y[2, ::-1]],
+        ax.fill(np.r_[band_x[0], band_x[2, ::-1]], np.r_[band_y[0], band_y[2, ::-1]],
                 color=color, alpha=.18, linewidth=0)
-    ax.plot(x[1], y[1], label=label, color=color, ls=linestyle)
+    ax.plot(x[1], y[1], label=label + ("*" if guard and guard["applied"] else ""), color=color, ls=linestyle)
     return {
         "fit_count": len(curves), "band_drawn": len(curves) > 1,
         "aggregation": "upstream common signal-efficiency interpolation; median rejection and SIC",
@@ -146,6 +249,8 @@ def draw_fit_curves(ax, curves, metric, label, color, linestyle, *, uncertainty_
         "sic": sic.tolist(), "display_x": x[1].tolist(), "display_y": y[1].tolist(),
         "percentiles": [16, 50, 84],
         "uncertainty_source": uncertainty_source,
+        "display_band_x": band_x.tolist(), "display_band_y": band_y.tolist(),
+        "band_guard": guard,
     }
 
 
@@ -442,8 +547,8 @@ def population_legend(fig, columns, title=None, *, ax=None):
         for handle, label in entries:
             handles.append(handle if handle is not None else Line2D([], [], linestyle="none"))
             labels.append(label)
-    if len(columns) == 3 and ax is None:
-        fig.set_figwidth(7.6)
+    if len(columns) >= 3 and ax is None:
+        fig.set_figwidth(max(fig.get_figwidth(), 2.5 * len(columns)))
     legend(
         fig,
         handles,
@@ -1063,7 +1168,7 @@ def render_mass_scan(bundle, output):
     if sample is None or not len(sample["mass"]):
         return
     scenario = bundle["metrics"].get("scenario")
-    edges, nominal, records = mass_scan_histograms(sample, tuple(METHODS))
+    edges, nominal, records = mass_scan_histograms(sample, tuple(METHODS), cuts=SCORE_CUTS)
     for view, keys in VIEWS.items():
         destination = output / view / "04_mass_cuts"
         individual = destination / "individual_cuts"
@@ -1389,16 +1494,35 @@ def summary_axes(ax, metric):
     ax._publication_fixed_ylim = True
 
 
-def draw_band(ax, x, values, label, color, linestyle, *, band=True):
+def mark_guarded_band(ax, raw_x, raw_y, color):
+    """Keep the original limits visible and identify adjusted shading on the figure."""
+    for boundary in (0, 2):
+        ax.plot(raw_x[boundary], raw_y[boundary], color=color, ls=":", lw=.9, alpha=.65,
+                label="_original_percentile_limit")
+    fig = ax.get_figure()
+    if not getattr(fig, "_sic_guard_note", False):
+        fig.text(.5, .015, "* Guarded display band; dotted lines: original 16–84% limits.",
+                 ha="center", va="top", fontsize=8)
+        fig._sic_guard_note = True
+
+
+def draw_band(ax, x, values, label, color, linestyle, *, band=True, guard_sic=False):
     low, median, high = central68(values)
     drawn = bool(band and len(values) >= 2 and np.isfinite(median).any())
+    display_low, display_high, guard = low, high, None
+    if drawn and guard_sic:
+        display_low, display_high, guard = guard_sic_band(low, median, high)
+        if guard["applied"]:
+            mark_guarded_band(ax, np.broadcast_to(x, (3, len(x))), np.array([low, median, high]), color)
     if drawn:
-        ax.fill_between(x, low, high, color=color, alpha=0.18, linewidth=0)
-    ax.plot(x, median, color=color, ls=linestyle, label=label)
+        ax.fill_between(x, display_low, display_high, color=color, alpha=0.18, linewidth=0)
+    ax.plot(x, median, color=color, ls=linestyle, label=label + ("*" if guard and guard["applied"] else ""))
     return {
         "low": low.tolist(),
         "median": median.tolist(),
         "high": high.tolist(),
+        "display_low": display_low.tolist(), "display_high": display_high.tolist(),
+        "band_guard": guard,
         "independent_runs": len(values),
         "band_drawn": drawn,
         "band_status": "drawn"

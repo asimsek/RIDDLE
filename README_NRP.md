@@ -273,9 +273,10 @@ kubectl delete job ranode-bg-seed42 -n cua-asimsek --ignore-not-found --wait=tru
 ```bash
 cd /shared/work/RIDDLE
 python scripts/nrp_runtime.py
-python plot.py --results results --output plots --methods lacathode riddle ranode --verbose 1 --io-workers 16 --overwrite
+python plot.py --results results --output plots --verbose 1 --io-workers 16 --overwrite
 ```
 
+All completed methods are discovered automatically.<br>
 Request either method alone with `--methods lacathode`, `--methods riddle`, or `--methods ranode`.<br>
 Add `--overwrite` to regenerate matching plots and tables in an existing output directory without removing other files.
 
@@ -327,7 +328,7 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
 In Jupyter, plot completed scan results:
 
 ```bash
-python plot.py --results results_injection_scan --output plots_injection_scan --methods lacathode riddle ranode --verbose 1 --overwrite
+python plot.py --results results_injection_scan --output plots_injection_scan --verbose 1  --io-workers 16 --overwrite
 ```
 
 

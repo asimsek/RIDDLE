@@ -105,7 +105,7 @@ To run a control, change both the data and results locations, for example:
 python run.py run --methods lacathode riddle ranode --data data/lhco_deltaR \
   --output results_deltaR --scenarios signal_injection --seeds 42 \
   --device cuda:0 --workers 2 --io-workers 8 --mps auto --resume
-python plot.py --results results_deltaR --output plots_deltaR --methods lacathode riddle ranode
+python plot.py --results results_deltaR --output plots_deltaR --io-workers 8 --verbose 1 --overwrite
 ```
 
 Use the corresponding `shifted` locations for the shifted control.
@@ -113,12 +113,13 @@ Use the corresponding `shifted` locations for the shifted control.
 ## Plot
 
 ```bash
-python plot.py --results results --output plots --methods lacathode riddle ranode --verbose 1 --overwrite
+python plot.py --results results --output plots --io-workers 8 --verbose 1 --overwrite
 ```
 
 Plotting uses CPU by default; add `--device cuda:0 --io-workers 8` to accelerate RIDDLE checkpoint inference.<br>
 
-Request either method alone with `--methods lacathode` or `--methods riddle`.<br>
+All completed methods are discovered automatically.<br>
+Request either method alone with `--methods lacathode`, `--methods riddle`, or `--methods ranode`.<br>
 Add `--overwrite` to regenerate matching plots and tables in an existing output directory without removing other files.
 
 
@@ -136,5 +137,5 @@ python run.py scan --methods lacathode riddle ranode --config config/settings.ya
 ```
 
 ```bash
-python plot.py --results results_injection_scan --output plots_injection_scan --methods lacathode riddle ranode --verbose 1 --overwrite
+python plot.py --results results_injection_scan --output plots_injection_scan --io-workers 8 --verbose 1 --overwrite
 ```
