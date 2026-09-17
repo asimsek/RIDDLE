@@ -97,7 +97,7 @@ MPS is optional on Linux NVIDIA GPUs; `auto` falls back to ordinary concurrency,
 `--lacathode-background fixed` shares same LaCathode background flow across `--runs` classifiers; default = `independent`.
 
 For all three methods, to continue compatible checkpoints after an implementation update, add `--resume-across-code-change`.<br>
-To move between CUDA GPUs, add `--resume-across-device-change`.<br>
+To continue unfinished training on a different CUDA GPU, add `--resume-across-device-change`.<br>
 Both require `--resume` and can be combined.
 
 To run a control, change both the data and results locations, for example:

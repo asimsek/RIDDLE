@@ -459,7 +459,8 @@ def run(args):
             "background_protocol": BACKGROUND_PROTOCOL,
         },
         "code": {**{p.name: digest(p) for p in sorted(Path(__file__).parent.glob("*.py"))},
-                 "framework/production.py": digest(ROOT / "riddle/production.py")},
+                 "framework/production.py": digest(ROOT / "riddle/production.py"),
+                 "framework/resume.py": digest(ROOT / "riddle/resume.py")},
     }
     args.output.mkdir(parents=True, exist_ok=True)
     with lock(args.output / ".ranode.lock"):
@@ -483,7 +484,8 @@ def run(args):
                 raise FileExistsError(
                     "R-ANODE result exists; use --resume or a new output"
                 )
-            changes = check_contract(saved["contract"], contract, **resume_options)
+            changes = check_contract(saved["contract"], contract,
+                                     reuse_completed=saved.get("completed") is True, **resume_options)
             if saved["completed"]:
                 check_files(args.output, saved["artifacts_sha256"])
                 validate_result_normalization(args.output, saved)

@@ -1,4 +1,5 @@
 from __future__ import annotations
+from collections import deque
 import hashlib
 import json
 import os
@@ -353,6 +354,7 @@ class WorkerDisplay:
 
 def monitor_worker(command, env, log, label, *, resume=False):
     messages = queue.Queue()
+    recent_output = deque(maxlen=30)
     with (
         log.open("a" if resume else "w") as stream,
         subprocess.Popen(
@@ -392,10 +394,16 @@ def monitor_worker(command, env, log, label, *, resume=False):
                         raise line
                     stream.write(line)
                     stream.flush()
+                    if line.strip() and not line.startswith(EVENT_PREFIX):
+                        recent_output.append(line.rstrip())
                     display.line(line)
                     display.tick()
                 if process.wait():
-                    raise RuntimeError(f"Worker failed (exit {process.returncode}); inspect {log}")
+                    details = "\n".join(recent_output)[-8000:]
+                    raise RuntimeError(
+                        f"Worker failed (exit {process.returncode}); inspect {log}"
+                        + (f"\nRecent worker output:\n{details}" if details else "")
+                    )
         except BaseException:
             if process.poll() is None:
                 process.terminate()

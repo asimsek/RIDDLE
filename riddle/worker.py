@@ -147,7 +147,10 @@ def main():
             args.output / ".resume/resume_history.json", saved["contract"], contract, changes,
             action="reuse_completed_result" if completed else "resume_requested",
         )
-    if changes:
+    if changes and completed:
+        emit_message("Completed-result reuse differences recorded: "
+                     + ", ".join(c["field"] for c in changes))
+    elif changes:
         kinds = "/".join(sorted({c["kind"] for c in changes}))
         emit_message(
             f"Permitted resume across {kinds} changes recorded; bitwise reproducibility is not guaranteed",

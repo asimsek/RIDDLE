@@ -46,8 +46,23 @@ def _differences(previous, current, path=()):
         yield path, {"previous": previous, "current": current}
 
 
-def check_contract(previous, current, *, allow_code_change=False, allow_device_change=False):
-    """Validate first, returning only explicitly permitted differences."""
+def _linux_runtime(platform):
+    """Separate the host kernel from the container architecture and C runtime."""
+    if not isinstance(platform, str):
+        return None
+    match = re.fullmatch(
+        r"Linux-[0-9][\w.+-]*-(x86_64|aarch64)-with-(glibc[0-9.]+)", platform
+    )
+    return match.groups() if match else None
+
+
+def check_contract(previous, current, *, allow_code_change=False, allow_device_change=False,
+                   reuse_completed=False):
+    """Check scientific compatibility separately from reusing finished artifacts.
+
+    Callers must still verify all artifact hashes before reusing a completed result.
+    Thread changes remain protected when training will actually continue.
+    """
     if not isinstance(previous, dict) or not isinstance(current, dict):
         raise ValueError("Invalid resume contract")
     cuda_only = all(
@@ -56,13 +71,27 @@ def check_contract(previous, current, *, allow_code_change=False, allow_device_c
         and bool(c["environment"]["gpu"])
         for c in (previous, current)
     )
+    thread_fields = {("environment", "threads"), ("environment", "torch_threads")}
+    if current.get("method") == "ranode":
+        thread_fields.add(("settings", "io_workers"))
     changes, protected, required = [], [], set()
     for path, values in _differences(previous, current):
         field = ".".join(path)
         if len(path) == 2 and path[0] == "code" and path[1].endswith(".py"):
             kind, allowed = "code", allow_code_change
+        elif path == ("environment", "platform") and (
+            _linux_runtime(values["previous"]) is not None
+            and _linux_runtime(values["previous"]) == _linux_runtime(values["current"])
+        ):
+            # Containers share their node's kernel; rescheduling must not reject
+            # an otherwise identical runtime. Keep the full strings in history.
+            kind, allowed = "host", True
+        elif reuse_completed and path in thread_fields and all(
+            type(values[key]) is int and values[key] > 0 for key in ("previous", "current")
+        ):
+            kind, allowed = "reuse_host", True
         elif cuda_only and path in {("environment", "gpu"), ("settings", "device")}:
-            kind, allowed = "device", allow_device_change
+            kind, allowed = ("reuse_host", True) if reuse_completed else ("device", allow_device_change)
         else:
             protected.append(field)
             continue
@@ -72,8 +101,10 @@ def check_contract(previous, current, *, allow_code_change=False, allow_device_c
     if protected:
         raise ValueError(
             "Resume contract has protected changes: " + ", ".join(protected)
-            + ". Data, scientific settings, pinned sources, software, platform and precision "
-            "must match; device migration is CUDA-to-CUDA only. Use a new output."
+            + ". Data, scientific settings, pinned sources, software, architecture and precision "
+            "must match. Continuing unfinished training also requires the original CPU thread "
+            "count (--io-workers); device migration is CUDA-to-CUDA only. Restore the saved "
+            "settings or use a new output."
         )
     if required:
         raise ValueError(
@@ -97,7 +128,8 @@ def record_transition(path, previous, current, changes, *, action):
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "action": action,
         "changes": changes,
-        "approved_options": sorted({f"--resume-across-{c['kind']}-change" for c in changes}),
+        "approved_options": sorted({f"--resume-across-{c['kind']}-change" for c in changes
+                                    if c["kind"] in {"code", "device"}}),
         "previous_contract": previous,
         "current_contract": current,
     })
@@ -113,7 +145,12 @@ def inspect_resume(output, contract, *, resume=False, **policy):
     if saved is not None:
         if not resume:
             raise FileExistsError("Result exists; use --resume or a new output")
-        changes = check_contract(saved["contract"], contract, **policy)
+        changes = check_contract(saved["contract"], contract,
+                                 reuse_completed=saved.get("completed") is True, **policy)
+        if saved.get("completed") is True:
+            # Completed artifacts, not obsolete training recovery state, are
+            # verified by the caller before it returns without running training.
+            return saved, changes
     stage = "background" if contract["method"] == "riddle" else "training"
     stage_path = output / stage / ".resume/contract.json"
     if stage_path.exists():

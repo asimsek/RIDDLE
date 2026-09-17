@@ -140,6 +140,7 @@ def job(args):
                             "name": "campaign",
                             "image": image,
                             "imagePullPolicy": "IfNotPresent",
+                            "terminationMessagePolicy": "FallbackToLogsOnError",
                             "command": ["/bin/bash", "-lc"],
                             "args": [script],
                             "env": [

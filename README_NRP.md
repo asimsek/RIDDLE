@@ -170,16 +170,16 @@ Add `--lacathode-background fixed` to a LaCathode submission to share one backgr
 kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --name ranode-seed42 --methods ranode --scenarios signal_injection \
-  --runs 10 --fits 10 --epochs 100 --seeds 42 --workers 4 --io-workers 16 | \
-  kubectl apply -n cua-asimsek -f -
+  --runs 10 --fits 10 --epochs 100 --seeds 42 --workers 4 --io-workers 16 \
+  | kubectl apply -n cua-asimsek -f -
 ```
 
 ```bash
 kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --name ranode-bg-seed42 --methods ranode --scenarios background_only \
-  --runs 10 --fits 10 --epochs 100 --seeds 42 --workers 4 --io-workers 16 | \
-  kubectl apply -n cua-asimsek -f -
+  --runs 10 --fits 10 --epochs 100 --seeds 42 --workers 4 --io-workers 16 \
+  | kubectl apply -n cua-asimsek -f -
 ```
 
 For RIDDLE/R-ANODE, `--fits 10` trains one ensemble with ten signal fits.<br>
@@ -193,8 +193,8 @@ To submit one later, add `--data data/lhco_shifted --results results_shifted` or
 Each control still requests only one A100 per job.
 
 To continue compatible checkpoints after an implementation update, add `--resume-across-code-change`.<br>
-To move between CUDA GPUs, add `--resume-across-device-change`.<br>
-Both require `--resume` and can be combined.
+To continue unfinished training on a different CUDA GPU, add `--resume-across-device-change`.<br>
+Both require `--resume` (already enabled by `nrp.py`) and can be combined.
 
 Add `--gpu l40` or `--gpu l40s` to any `nrp.py` submission, including injection scans and either method. Omitting `--gpu` keeps the existing A100 request.<br>
 Supported values (case-insensitive): `a100`, `l40`, `l40s`, `l4`, `a40`, `rtxa6000`, `rtx8000`, `rtx3090`, `rtx4090`, `h100`, `h200`.
