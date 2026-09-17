@@ -1,9 +1,10 @@
 import argparse
-from contextlib import contextmanager, nullcontext
-from dataclasses import asdict, dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass
 import csv
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import threading
@@ -22,6 +23,12 @@ from .worker_progress import ProgressStage, local_progress
 from .metrics import acceptance_report, efficiency_curve, oracle_metrics
 
 
+# Physical comparisons, per-method figures and summaries share numerical work.
+efficiency_curve = f.cached_plot_calculation(efficiency_curve)
+oracle_metrics = f.cached_plot_calculation(oracle_metrics)
+roc_curve = f.cached_plot_calculation(roc_curve)
+
+
 # Presentation metadata; result discovery, not this registry, defines the cohort.
 #
 # New methods use result.json plus checksum-protected signal_region, validation
@@ -29,7 +36,8 @@ from .metrics import acceptance_report, efficiency_curve, oracle_metrics
 # Higher scores must mean more signal-like; unscored rows contain NaN. Latents are
 # optional. Optional fit_scores retain the same fit order across partitions.
 # Optional result.json['plotting'] sets label, color, linestyle, signal_color and
-# score_transform ('identity' or 'sigmoid', for display only). No method list in
+# score_transform ('identity' or 'sigmoid', for display only), and score_scope
+# ('full_region' by default, or 'signal_region'). No method list in
 # the comparison renderers needs editing to include a new compatible result.
 @dataclass(frozen=True)
 class PlotMethod:
@@ -38,6 +46,7 @@ class PlotMethod:
     linestyle: str
     signal_color: str
     score_transform: str = "identity"
+    score_scope: str = "full_region"
 
     @property
     def style(self):
@@ -47,7 +56,7 @@ class PlotMethod:
 BUILTINS = {
     "lacathode": PlotMethod("LaCathode", "#0072B2", "-", "#CC79A7"),
     "riddle": PlotMethod("RIDDLE", "#D55E00", "--", "#009E73", "sigmoid"),
-    "ranode": PlotMethod("R-ANODE", "#8B1A1A", "-.", "#56B4E9", "sigmoid"),
+    "ranode": PlotMethod("R-ANODE", "#8B1A1A", "-.", "#56B4E9", "sigmoid", "signal_region"),
 }
 METHOD_SPECS = dict(BUILTINS)
 
@@ -69,13 +78,15 @@ def register_method(report):
         meta.get("linestyle", ("-", "--", "-.", ":")[(index // len(palette)) % 4]),
         meta.get("signal_color", palette[(index + 1) % len(palette)]),
         meta.get("score_transform", "identity"),
+        meta.get("score_scope", "full_region"),
     )
     if (not isinstance(spec.label, str) or not spec.label.strip()
             or spec.label.casefold() in (".", "..", "comparison", "full_mass", "injection_scan", "background_only", "signal_injection")
             or "/" in spec.label or "\\" in spec.label
             or not is_color_like(spec.color) or not is_color_like(spec.signal_color)
             or spec.linestyle not in ("-", "--", "-.", ":")
-            or spec.score_transform not in ("identity", "sigmoid")):
+            or spec.score_transform not in ("identity", "sigmoid")
+            or spec.score_scope not in ("signal_region", "full_region")):
         raise ValueError(f"Invalid plotting metadata for {method}")
     if method in METHOD_SPECS and METHOD_SPECS[method] != spec:
         raise ValueError(f"Inconsistent plotting metadata for {method}")
@@ -103,8 +114,23 @@ def plot_group_label(scenario, seed, group):
 
 
 def plot_task_count(groups, scan_groups):
-    return (1 + bool(scan_groups) + bool(groups)
+    return (1 + bool(scan_groups) + bool(summary_groups(groups))
             + sum(1 + len(group) for group in groups.values()))
+
+
+def summary_groups(groups, *, method=None, scope="signal_region"):
+    """Only combine scenarios with multiple result directories in this view."""
+    eligible = {}
+    counts = {}
+    for identity, group in groups.items():
+        cohort = scope_group(group, scope)
+        if method is not None:
+            cohort = {method: cohort[method]} if method in cohort else {}
+        if cohort:
+            eligible[identity] = cohort
+            scenario = identity[0]
+            counts[scenario] = counts.get(scenario, 0) + 1
+    return {identity: group for identity, group in eligible.items() if counts[identity[0]] > 1}
 
 
 class PlotProgress:
@@ -240,7 +266,7 @@ def discover(root, requested=None, *, scan=False):
         scenario, seed = report["scenario"], report["seed"]
         if scenario not in f.SCENARIOS or type(seed) is not int:
             raise ValueError("Invalid result identity")
-        identity = (point["signal_events"], point["replica"]) if scan else (scenario, seed)
+        identity = (point["signal_events"], point["replica"], report.get("run_index", 0)) if scan else (scenario, seed)
         group = groups.setdefault(identity, {})
         if method in group:
             raise ValueError("Duplicate method/scenario/seed results; choose a narrower input directory")
@@ -333,105 +359,33 @@ def load_scores(root, report, name):
                     or not np.array_equal(data["run_seeds"], [m["seed"] for m in members])
                     or len(set(data["run_seeds"].tolist())) != len(fits)):
                 raise ValueError("Invalid independent LaCathode run identities or latents")
+    if report["method"] in ("riddle", "ranode"):
+        data.pop("fit_scores", None)
     return data
 
 
-class FitScoreLoader:
-    """Read-only member evaluation for SIC/sculpting; never replace ensemble scores."""
+class ScoreLoader:
+    """Load saved method predictions once; ensemble members are not repeat runs."""
 
-    def __init__(self, *, mode="members", device="cpu", io_workers=2, progress=None):
-        self.mode, self.device, self.io_workers = mode, device, io_workers
-        self.progress = progress
+    def __init__(self):
         self.cache = {}
-        self.runtime_ready = False
 
     def __call__(self, root, report, partition):
         key = (str(root.resolve()), partition)
-        if key in self.cache:
-            return self.cache[key]
-        record = load_scores(root, report, partition)
-        needed = partition in ("signal_region", "test")
-        if self.mode != "members" or not needed or report["method"] not in ("riddle", "ranode"):
-            self.cache[key] = record
-            return record
-        method = report["method"]
-        if method == "ranode":
-            protocol = read_metadata(root, report, "protocol.json")
-            members = protocol["members"]
-            count = protocol["requested_runs"]
-            if type(count) is not int or count < 1 or len(members) != count or protocol["valid_runs"] != count:
-                raise ValueError("R-ANODE fit-band inputs do not contain every requested fit")
-            ids = [member["fit_index"] for member in members]
-            scores = []
-            for member in members:
-                name = str(Path(member["attempt"]) / f"{partition}_scores.npz")
-                with np.load(verify_plot_input(root, report, name), allow_pickle=False) as data:
-                    if any(not np.array_equal(data[field], record[field]) for field in
-                           ("mass", "physical", "labels", "mask", "is_signal_region")):
-                        raise ValueError("R-ANODE member score events or acceptance differ from the ensemble")
-                    scores.append(data["scores"])
-        else:
-            from .production import require_complete_ensemble
-
-            selection = read_metadata(root, report, "density/ensemble_selection.json")
-            require_complete_ensemble(selection)
-            members = selection["members"]
-            ids = [member["directory"] for member in members]
-            if not self.runtime_ready:
-                import torch
-
-                torch.set_num_threads(self.io_workers)
-                torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False
-                if self.device != "cpu" and not torch.cuda.is_available():
-                    raise ValueError("Plot inference requested CUDA but CUDA is unavailable; use --device cpu")
-                self.runtime_ready = True
-            from .training import residual_scores
-
-            scores = []
-            for i, member in enumerate(members):
-                directory = Path("density") / member["directory"]
-                label = (f"RIDDLE | {partition} | fit {i + 1}/{len(members)} "
-                         f"(inference only, {len(member['epochs'])} checkpoints)")
-                colored_status(f"{plot_group_label(report['scenario'], report['seed'], ['riddle'])} | "
-                               f"{partition} | Evaluate saved fit {i + 1}/{len(members)} (inference only)",
-                               kind="WORK", level=2 if self.progress else 1)
-                with self.progress.detail(label) if self.progress else nullcontext():
-                    try:
-                        verify_plot_input(root, report, str(directory / "residual_training_inputs.json"))
-                        for epoch in member["epochs"]:
-                            verify_plot_input(root, report, str(directory / f"residual_epoch_{epoch}.pt"))
-                    except (ValueError, OSError) as error:
-                        raise ValueError(
-                            f"RIDDLE fit-band checkpoint inputs are missing or changed: {directory}. "
-                            "Restore the original saved files, or use --fit-bands seeds to plot saved ensemble scores."
-                        ) from error
-                    values = residual_scores(root / directory, member["epochs"], record["latent"], self.device)
-                aligned = np.full(record["scores"].shape, np.nan, dtype=values.dtype)
-                aligned[record["mask"]] = values
-                scores.append(aligned)
-        if len(set(ids)) != len(ids):
-            raise ValueError("Duplicate member identities in fit-band inputs")
-        scores = np.asarray(scores)
-        mask = record["mask"]
-        if (scores.shape != (len(ids), len(mask)) or not np.isfinite(scores[:, mask]).all()
-                or not np.isnan(scores[:, ~mask]).all()):
-            raise ValueError("Invalid member scores for fit bands")
-        combined = scores[0, mask].astype(np.float64)
-        for score in scores[1:, mask]:
-            combined = np.logaddexp(combined, score)
-        combined -= np.log(len(scores))
-        difference = np.max(np.abs(combined - record["scores"][mask]), initial=0.)
-        if not np.allclose(combined, record["scores"][mask], rtol=1e-5, atol=5e-4):
-            raise ValueError(f"{method} per-fit scores do not reproduce the saved ensemble (max difference {difference:g})")
-        record.update(uncertainty_scores=scores, uncertainty_member_ids=ids,
-                      uncertainty_source="signal_fit_variation_with_fixed_background_per_seed",
-                      ensemble_reconstruction_max_abs_difference=float(difference))
-        self.cache[key] = record
-        return record
+        if key not in self.cache:
+            self.cache[key] = load_scores(root, report, partition)
+        return self.cache[key]
 
 
-def uncertainty_scores(record):
-    return record.get("uncertainty_scores", fit_scores(record))
+def run_scores(record):
+    """One ensemble prediction per full run, or saved independent LaCathode runs."""
+    return fit_scores(record) if record.get("independent_runs", False) else record["scores"][None, :]
+
+
+def run_score_groups(method, record):
+    if method == "lacathode" and not record.get("independent_runs", False):
+        return [fit_scores(record)]
+    return [[score] for score in run_scores(record)]
 
 
 def sic_on_grid(background, signal):
@@ -443,24 +397,6 @@ def sic_on_grid(background, signal):
     return np.interp(f.GRID, unique, maximum / np.sqrt(unique), left=np.nan, right=np.nan)
 
 
-def member_sic_band(ax, record, style, minimum, *, physical=False):
-    curves = []
-    background_count = int((record["labels"] == 0).sum() if physical
-                           else ((record["labels"] == 0) & record["mask"]).sum())
-    for score in uncertainty_scores(record):
-        b, s, _ = efficiency_curve(record["labels"], score, record["mask"], full_pipeline=physical)
-        use = (b >= 1e-4) & (np.rint(b * background_count) >= minimum)
-        curves.append(sic_on_grid(b[use], s[use]))
-    summary = f.draw_band(ax, f.GRID, curves, *style, guard_sic=True)
-    summary.update(percentiles=[16, 50, 84], fit_count=len(curves),
-                   aggregation="median of individual SIC curves at fixed background efficiency",
-                   uncertainty_source=record["uncertainty_source"],
-                   member_ids=record["uncertainty_member_ids"],
-                   ensemble_reconstruction_max_abs_difference=record["ensemble_reconstruction_max_abs_difference"])
-    summary.pop("independent_runs", None)
-    return summary
-
-
 def fit_scores(record):
     return f.fit_scores(record)
 
@@ -470,10 +406,7 @@ def fit_identity(bundle, key, fit):
     seed = bundle["report"]["seed"]
     return dict(seed=seed, fit=fit,
                 run_seed=int(record["run_seeds"][fit]) if "run_seeds" in record else seed,
-                member_id=record.get("uncertainty_member_ids", list(range(len(uncertainty_scores(record)))))[fit],
-                independent=record.get("independent_runs", key != "raw" and "uncertainty_scores" not in record),
-                source=record.get("uncertainty_source", f.fit_uncertainty(record) if key == "raw"
-                                  else "training_seed_variation_on_fixed_data_partition"))
+                independent=True, source="independent_complete_method_runs")
 
 
 def fit_uncertainty(identities):
@@ -483,6 +416,12 @@ def fit_uncertainty(identities):
     if identities and all(item.get("independent", False) for item in identities):
         return "independent_background_flow_and_classifier_runs"
     return "classifier_fit_variation_with_shared_background_flow_per_seed"
+
+
+def require_independent_run_ids(identities):
+    seeds = [item.get("run_seed", item["seed"]) for item in identities]
+    if len(seeds) != len(set(seeds)):
+        raise ValueError("Repeated training seeds cannot be counted as independent uncertainty runs")
 
 
 def make_bundle(group, confidence, score_loader=None):
@@ -581,11 +520,6 @@ def render_full_pipeline(bundle, output, args):
         for key, record in records.items():
             if len(np.unique(record["labels"][record["mask"]])) != 2:
                 continue
-            if metric == "sic" and "uncertainty_scores" in record:
-                audit.setdefault(STYLES[key][0], {})[metric] = member_sic_band(
-                    ax, record, STYLES[key], args.min_background, physical=True)
-                drawn = True
-                continue
             if len(fit_scores(record)) > 1:
                 curves, metrics = [], []
                 for score in fit_scores(record):
@@ -595,7 +529,9 @@ def render_full_pipeline(bundle, output, args):
                     metrics.append(oracle_metrics(record["labels"], score, record["mask"], min_background=args.min_background))
                 label, color, ls = STYLES[key]
                 summary = f.draw_fit_curves(ax, curves, metric, label, color, ls,
-                                            uncertainty_source=f.fit_uncertainty(record))
+                                            uncertainty_source=f.fit_uncertainty(record),
+                                            band=record.get("independent_runs", False),
+                    run_groups=None if record.get("independent_runs", False) else [0] * len(curves))
                 audit.setdefault(label, {}).update(f.aggregate_fit_metrics(metrics))
                 audit[label][metric] = summary
                 drawn = True
@@ -619,9 +555,11 @@ def render_full_pipeline(bundle, output, args):
     bundle["metrics"]["oracle_benchmarks"] = audit
 
 
-def render_injection_scan(groups, output, args):
+def render_injection_scan(groups, output, args, score_loader=None):
+    score_loader = load_scores if score_loader is None else score_loader
     rows, cohorts, classifier_fits = [], {}, []
-    for (count, replica), group in sorted(groups.items()):
+    for identity, group in sorted(groups.items()):
+        count, replica = identity[:2]
         reference = None
         for method, (root, report) in group.items():
             inputs = report["contract"]["inputs"]
@@ -635,12 +573,16 @@ def render_injection_scan(groups, output, args):
             if method in BUILTINS and report["contract"].get("scientific_version") != expected_protocol:
                 raise ValueError(f"Injection scans require protocol {expected_protocol!r} for {method}")
             point = inputs["injection_scan"]
-            if report["seed"] != point["training_seed"]:
+            from .cli import independent_run_seeds
+
+            run_index = report.get("run_index", 0)
+            expected_seed = independent_run_seeds(point["training_seed"], run_index + 1)[-1]
+            if report["seed"] != expected_seed:
                 raise ValueError("Scan result has an incompatible training seed")
             if reference is not None and inputs != reference:
                 raise ValueError("Scan methods must share identical prepared data at each point")
             reference = inputs
-            data = load_scores(root, report, "signal_region")
+            data = score_loader(root, report, "signal_region")
             values = oracle_metrics(data["labels"], data["scores"], data["mask"],
                                     min_background=args.min_background)
             if "fit_scores" in data:
@@ -649,7 +591,7 @@ def render_injection_scan(groups, output, args):
                     for score in fit_scores(data)
                 ]
                 classifier_fits.append(dict(method=method, signal_events=count, replica=replica,
-                                            training_seed=point["training_seed"], fits=fit_values))
+                                            training_seed=report["seed"], fits=fit_values))
                 for field in ("conditional_auc", "conditional_max_sic", "full_pipeline_max_sic"):
                     finite = [v[field] for v in fit_values if v[field] is not None and np.isfinite(v[field])]
                     values[field] = float(np.median(finite)) if finite else None
@@ -660,8 +602,8 @@ def render_injection_scan(groups, output, args):
             maximum = values["full_pipeline_max_sic"]
             fixed = [sic_at_background(data, score, 1e-3, args.min_background) for score in fit_scores(data)]
             fixed_sic = float(np.median(fixed)) if all(v is not None for v in fixed) else None
-            row = dict(method=method, signal_events=count, replica=replica,
-                       training_seed=point["training_seed"], preparation_seed=point["preparation_seed"],
+            row = dict(method=method, signal_events=count, replica=replica, run_index=run_index,
+                       training_seed=report["seed"], preparation_seed=point["preparation_seed"],
                        sr_background=b0, sr_signal=s0, signal_to_background_percent=100*s0/b0,
                        uncut_nominal_significance=s0/np.sqrt(b0),
                        conditional_mapped_auc=values["conditional_auc"],
@@ -757,20 +699,20 @@ def sic_at_background(record, scores, efficiency, minimum):
     return float(np.interp(efficiency, unique, maxima) / np.sqrt(efficiency))
 
 
-def comparison_rows(audit, scenario, seed):
+def comparison_rows(audit, scenario, seed, *, scope="signal_region"):
     """Long-form tables have no fixed method columns or privileged pair."""
     rows = []
     def add(method, metric, value, selection="all"):
         if value is None or isinstance(value, (int, float, np.number)):
-            rows.append(dict(scenario=scenario, seed=seed, scope="common_physical_signal_region",
+            rows.append(dict(scenario=scenario, seed=seed, scope="common_physical_" + scope,
                              method=method, selection=selection, metric=metric, value=f.scalar(value)))
-    for method, metrics in audit["methods"].items():
+    for method, metrics in audit.get("methods", {}).items():
         for metric, value in metrics.items():
             add(method, metric, value)
         for truth, values in metrics["acceptance"].items():
             for field, value in values.items():
                 add(method, truth + "_" + field, value)
-    for point in audit["working_points"]:
+    for point in audit.get("working_points", []):
         selection = "validation_background_" + str(point["background_budget"])
         for metric in ("background_efficiency", "signal_efficiency", "fit_count"):
             add(point["method"], metric, point[metric], selection)
@@ -924,7 +866,8 @@ def training_figures(group, output):
                 histories = np.atleast_2d(values)
                 epochs = np.arange(histories.shape[1])
                 line, = ax.plot(epochs, histories.mean(axis=0), label=label)
-                if len(histories) > 1:
+                if (len(histories) > 1 and method == "lacathode"
+                        and report.get("contract", {}).get("lacathode_run_layout") == "independent_background_classifier_v1"):
                     low, high = np.quantile(histories, [.16, .84], axis=0)
                     ax.fill_between(epochs, low, high, color=line.get_color(), alpha=.18)
             f.legend(fig)
@@ -945,7 +888,7 @@ def read_metadata(root, report, name):
 
 def method_band(ax, x, values, key, scenario, metric, seeds, classifier_fits=None):
     name, color, ls = STYLES[key]
-    summary = f.draw_band(ax, x, values, name, color, ls, guard_sic=metric.lower() == "sic")
+    summary = f.draw_band(ax, x, values, name, color, ls)
     summary.update(uncertainty_source="training_seed_variation_on_fixed_data_partition", seeds=seeds)
     summary.update(percentiles=[16, 50, 84], aggregation="median of individual metric curves")
     if classifier_fits:
@@ -958,13 +901,13 @@ def method_band(ax, x, values, key, scenario, metric, seeds, classifier_fits=Non
     if not summary["band_drawn"]:
         colored_status(
             f"{name} | {f.SCENARIO_LABELS[scenario]} | {metric}: "
-            "uncertainty band unavailable; requires multiple fits/runs with common statistical support.",
+            "uncertainty band unavailable; requires multiple independent runs with common statistical support.",
             kind="WARNING",
         )
     return summary
 
 
-def summary_figures(bundles, output, args):
+def summary_figures(bundles, output, args, *, view="comparison"):
     audit = {}
     for scenario in f.SCENARIOS:
         cohort = [b for b in bundles if b["report"]["scenario"] == scenario]
@@ -981,6 +924,7 @@ def summary_figures(bundles, output, args):
         for key in STYLES:
             values = []
             native_curves = []
+            curve_groups = []
             seeds = []
             classifier_fits = []
             for bundle in cohort:
@@ -988,18 +932,24 @@ def summary_figures(bundles, output, args):
                 if key not in scores or len(np.unique(labels)) != 2:
                     continue
                 record = bundle["evaluation"]["signal_region"][key]
-                for fit, score in enumerate(uncertainty_scores(record)):
-                    b, s, _ = roc_curve(labels, score[record["mask"]])
-                    supported = (b >= 1e-4) & (np.rint(b * (labels == 0).sum()) >= args.min_background)
-                    native_curves.append((b[supported], s[supported]))
-                    values.append(sic_on_grid(b[supported], s[supported]))
+                method = "lacathode" if key == "raw" else "riddle"
+                for fit, score_group in enumerate(run_score_groups(method, record)):
+                    per_fit = []
+                    for score in score_group:
+                        b, s, _ = roc_curve(labels, score[record["mask"]])
+                        supported = (b >= 1e-4) & (np.rint(b * (labels == 0).sum()) >= args.min_background)
+                        native_curves.append((b[supported], s[supported]))
+                        curve_groups.append(len(classifier_fits))
+                        per_fit.append(sic_on_grid(b[supported], s[supported]))
+                    values.append(np.median(per_fit, axis=0))
                     seeds.append(bundle["report"]["seed"])
                     classifier_fits.append(fit_identity(bundle, key, fit))
             if values:
+                require_independent_run_ids(classifier_fits)
                 name = STYLES[key][0]
                 if key == "raw" and len(native_curves) > 1:
                     summary = f.draw_fit_curves(ax, native_curves, "sic", *STYLES[key],
-                                                uncertainty_source=fit_uncertainty(classifier_fits))
+                                                uncertainty_source=fit_uncertainty(classifier_fits), run_groups=curve_groups)
                     summary.update(classifier_fits=classifier_fits, seeds=seeds)
                 else:
                     summary = method_band(ax, f.GRID, values, key, scenario, "SIC", seeds, classifier_fits)
@@ -1009,7 +959,7 @@ def summary_figures(bundles, output, args):
             ax.plot(f.GRID, np.sqrt(f.GRID), color=".5", ls=":", label="Random")
             f.summary_axes(ax, "sic")
             f.legend(fig, title=f.SCENARIO_LABELS[scenario])
-            f.save(fig, output / scenario / "signal_region_sic")
+            f.save(fig, output / scenario / "summary" / view / "full_mass" / "signal_region_sic")
         else:
             f.plt.close(fig)
         if scenario != "background_only":
@@ -1035,21 +985,20 @@ def summary_figures(bundles, output, args):
                 if np.any(full == 0):
                     continue
                 record = bundle["evaluation"]["test"][key]
-                for fit, scores in enumerate(uncertainty_scores(record)):
-                    score = scores[pop]
-                    curves.append(
-                        [
-                            f.shape_chi2(
-                                full,
-                                np.histogram(mass[mask & (score > np.quantile(score[region], 1 - e))], edges)[0],
-                                e,
-                            )
+                method = "lacathode" if key == "raw" else "riddle"
+                for fit, score_group in enumerate(run_score_groups(method, record)):
+                    per_fit = []
+                    for scores in score_group:
+                        score = scores[pop]
+                        per_fit.append([
+                            f.shape_chi2(full, np.histogram(mass[mask & (score > np.quantile(score[region], 1 - e))], edges)[0], e)
                             for e in f.EFFICIENCIES
-                        ]
-                    )
+                        ])
+                    curves.append(np.median(np.asarray(per_fit, dtype=float), axis=0))
                     seeds.append(bundle["report"]["seed"])
                     classifier_fits.append(fit_identity(bundle, key, fit))
             if curves:
+                require_independent_run_ids(classifier_fits)
                 name = STYLES[key][0]
                 audit[scenario + "/" + name + "/mass_flatness"] = method_band(
                     ax, f.EFFICIENCIES, curves, key, scenario, "mass flatness", seeds, classifier_fits
@@ -1067,12 +1016,13 @@ def summary_figures(bundles, output, args):
             audit[scenario + "/random/mass_flatness"] = random_summary
             f.summary_axes(ax, "mass_flatness")
             f.legend(fig, title="BG-Only")
-            f.save(fig, output / scenario / "mass_flatness_vs_selection")
+            f.save(fig, output / scenario / "summary" / view / "full_mass" / "mass_flatness_vs_selection")
         else:
             f.plt.close(fig)
     return audit
 
 
+@f.cached_plot_calculation
 def random_reference(mass, trials=100, *, mode="bootstrap"):
     if mode not in ("bootstrap", "subset"):
         raise ValueError("Random reference must be bootstrap or subset")
@@ -1105,13 +1055,9 @@ def physical_score_coordinate(method, values):
     return expit(values) if METHOD_SPECS[method].score_transform == "sigmoid" else values
 
 
-def score_variation_source(method, record, *, members=False):
-    if members and "uncertainty_source" in record:
-        return record["uncertainty_source"]
-    if method == "lacathode":
-        return f.fit_uncertainty(record)
-    return ("saved_fit_variation" if len(fit_scores(record)) > 1
-            else "training_seed_variation_on_fixed_data_partition")
+def score_variation_source(method, record):
+    return (f.fit_uncertainty(record) if record.get("independent_runs", False)
+            else "independent_complete_method_runs")
 
 
 def common_signal_region(records):
@@ -1125,7 +1071,22 @@ def common_signal_region(records):
     return region
 
 
-def render_physical_curves(records, output, scenario, minimum):
+def scope_label(scope):
+    return {"signal_region": "Signal region", "full_region": "Full region"}[scope]
+
+
+def scope_group(group, scope):
+    return {method: source for method, source in group.items()
+            if scope == "signal_region" or METHOD_SPECS[method].score_scope == "full_region"}
+
+
+def scope_region(records, scope):
+    if scope == "signal_region":
+        return common_signal_region(records)
+    return np.ones(len(next(iter(records.values()))["mass"]), dtype=bool)
+
+
+def render_physical_curves(records, output, scenario, minimum, *, scope="signal_region"):
     require_same_physical_population(records)
     audit = {m: f.aggregate_fit_metrics([
         oracle_metrics(r["labels"], s, r["mask"], min_background=minimum) for s in fit_scores(r)
@@ -1147,12 +1108,7 @@ def render_physical_curves(records, output, scenario, minimum):
         for method, record in records.items():
             if len(np.unique(record["labels"][record["mask"]])) != 2:
                 continue
-            if metric == "sic" and "uncertainty_scores" in record:
-                summary = member_sic_band(ax, record, PHYSICAL_STYLES[method][:3], minimum, physical=True)
-                audit.setdefault(method, {})["sic_fit_band"] = summary
-                drawn = True
-                continue
-            score_curves = uncertainty_scores(record) if metric.startswith("sic") else fit_scores(record)
+            score_curves = fit_scores(record)
             if len(score_curves) > 1:
                 curves = []
                 for score in score_curves:
@@ -1161,7 +1117,9 @@ def render_physical_curves(records, output, scenario, minimum):
                     curves.append((b[use], s[use]))
                 audit[method][metric + "_fit_band"] = f.draw_fit_curves(
                     ax, curves, metric, *PHYSICAL_STYLES[method][:3],
-                    uncertainty_source=score_variation_source(method, record, members=metric.startswith("sic")))
+                    uncertainty_source=score_variation_source(method, record),
+                    band=record.get("independent_runs", False),
+                    run_groups=None if record.get("independent_runs", False) else [0] * len(curves))
                 drawn = True
                 continue
             b, s, _ = efficiency_curve(
@@ -1211,12 +1169,12 @@ def render_physical_curves(records, output, scenario, minimum):
                 xlim=(1e-4, 1),
                 ylim=(0, 1.02 if metric == "roc" else None),
             )
-        f.legend(fig, title=f.SCENARIO_LABELS[scenario] + " | Signal region", ncols=1)
-        f.save(fig, output / ("signal_region_" + metric))
+        f.legend(fig, title=f.SCENARIO_LABELS[scenario] + " | " + scope_label(scope), ncols=1)
+        f.save(fig, output / (scope + "_" + metric))
     return audit
 
 
-def render_physical_scores(records, output, scenario):
+def render_physical_scores(records, output, scenario, *, scope="signal_region"):
     displayed = {m: physical_score_coordinate(m, f.fit_scores(r)) for m, r in records.items()}
     finite = [v[:, records[m]["mask"]] for m, v in displayed.items() if records[m]["mask"].any()]
     low = min([0.] + [float(v.min()) for v in finite])
@@ -1242,15 +1200,15 @@ def render_physical_scores(records, output, scenario):
         if not density:
             ax.set_yscale("symlog", linthresh=1)
         f.population_legend(
-            fig, columns, title=f.SCENARIO_LABELS[scenario] + " | Signal region"
+            fig, columns, title=f.SCENARIO_LABELS[scenario] + " | " + scope_label(scope)
         )
         f.save(
             fig,
             output
             / (
-                "signal_region_score_density"
+                scope + "_score_density"
                 if density
-                else "signal_region_score_counts"
+                else scope + "_score_counts"
             ),
         )
 
@@ -1262,10 +1220,7 @@ def physical_sr_record(record, sr=None):
     result = {k: record[k][sr] for k in ("mass", "labels", "physical", "scores", "mask")}
     if "fit_scores" in record:
         result["fit_scores"] = record["fit_scores"][:, sr]
-    if "uncertainty_scores" in record:
-        result["uncertainty_scores"] = record["uncertainty_scores"][:, sr]
-    for key in ("uncertainty_member_ids", "uncertainty_source", "independent_runs", "run_seeds",
-                "ensemble_reconstruction_max_abs_difference"):
+    for key in ("independent_runs", "run_seeds"):
         if key in record:
             result[key] = record[key]
     return result
@@ -1273,21 +1228,28 @@ def physical_sr_record(record, sr=None):
 
 def background_cut(record, budget):
     """Strict threshold with an uncut BG denominator, including mapping failures."""
+    return background_cuts(record, [budget])[0]
+
+
+def background_cuts(record, budgets):
+    """Sort once for all requested working points; retain strict tie handling."""
     n = int((record["labels"] == 0).sum())
     scores = np.sort(fit_scores(record)[:, (record["labels"] == 0) & record["mask"]], axis=1)
-    allowed = int(np.floor(n * budget))
-    if not scores.shape[1] or allowed < 1:
-        return None
-    return (scores[:, -allowed - 1] if allowed < scores.shape[1]
-            else np.nextafter(scores[:, 0], -np.inf))
+    cuts = []
+    for budget in budgets:
+        allowed = int(np.floor(n * budget))
+        cuts.append(None if not scores.shape[1] or allowed < 1 else
+                    scores[:, -allowed - 1] if allowed < scores.shape[1] else
+                    np.nextafter(scores[:, 0], -np.inf))
+    return cuts
 
 
-def render_physical_working_points(validation, test, output, *, scenario=None):
+def render_physical_working_points(validation, test, output, *, scenario=None, scope="signal_region"):
     require_same_physical_population(validation)
     require_same_physical_population(test)
     validation, test = (
         {
-            m: physical_sr_record(r, common_signal_region(records))
+            m: physical_sr_record(r, scope_region(records, scope))
             for m, r in records.items()
         }
         for records in (validation, test)
@@ -1295,14 +1257,17 @@ def render_physical_working_points(validation, test, output, *, scenario=None):
     require_same_physical_population(validation)
     require_same_physical_population(test)
     base = next(iter(test.values()))
-    edges = np.linspace(3.3, 3.7, 21)
+    edges = (np.linspace(3.3, 3.7, 21) if scope == "signal_region" else
+             np.linspace(min(1., base["mass"].min()), max(9., base["mass"].max()), 81))
     inclusive = np.histogram(base["mass"][base["labels"] == 0], edges)[0]
     audit = []
-    for budget in (0.10, 0.05, 0.01, 0.004):
+    budgets = (0.10, 0.05, 0.01, 0.004)
+    cuts = {method: background_cuts(record, budgets) for method, record in validation.items()}
+    for index, budget in enumerate(budgets):
         selected, retention = {}, {}
         for method, val in validation.items():
             f.validate_fit_counts([val, test[method]])
-            cut = background_cut(val, budget)
+            cut = cuts[method][index]
             if cut is None:
                 continue
             record = test[method]
@@ -1383,9 +1348,9 @@ def render_physical_working_points(validation, test, output, *, scenario=None):
                 lower.axhline(1, color=".5", ls=":")
             else:
                 ax.set_yscale("symlog", linthresh=1)
-            ax.set_xlim(3.3, 3.7)
+            ax.set_xlim(edges[0], edges[-1])
             f.population_legend(
-                fig, columns, title=f"Signal region | B ≤ {100 * budget:g}%"
+                fig, columns, title=f"{scope_label(scope)} | B ≤ {100 * budget:g}%"
             )
             f.save(
                 fig,
@@ -1398,13 +1363,13 @@ def render_physical_working_points(validation, test, output, *, scenario=None):
                 ),
             )
         if selected:
-            render_physical_efficiency(test, selected, edges, budget, output)
+            render_physical_efficiency(test, selected, edges, budget, output, scope=scope)
             for density in (False, True):
-                render_physical_features(test, selected, retention, budget, output, scenario=scenario, density=density)
+                render_physical_features(test, selected, retention, budget, output, scenario=scenario, density=density, scope=scope)
     return audit
 
 
-def render_physical_efficiency(records, selected, edges, budget, output):
+def render_physical_efficiency(records, selected, edges, budget, output, *, scope="signal_region"):
     fig, ax, _ = f.canvas("Background efficiency", r"$m_{jj}$ [TeV]")
     for method, keep in selected.items():
         record = records[method]
@@ -1416,12 +1381,12 @@ def render_physical_efficiency(records, selected, edges, budget, output):
         ax.stairs(values, edges, label=label, color=color, ls=ls, baseline=None)
     ax.axhline(budget, color=".5", ls=":", label="Validation target")
     ax.set(xlim=(edges[0], edges[-1]), ylim=(0, None))
-    f.legend(fig, title=f"Signal region | B ≤ {100 * budget:g}%")
+    f.legend(fig, title=f"{scope_label(scope)} | B ≤ {100 * budget:g}%")
     tag = f"{100 * budget:g}".replace(".", "p") + "pct"
     f.save(fig, output / "03_mass_sculpting" / ("background_efficiency_" + tag))
 
 
-def render_physical_features(records, selected, retention, budget, output, *, scenario=None, density=False):
+def render_physical_features(records, selected, retention, budget, output, *, scenario=None, density=False, scope="signal_region"):
     fields = (
         ("m1", r"$m_{J1}$ [TeV]"),
         ("delta_m", r"$\Delta m_J$ [TeV]"),
@@ -1462,7 +1427,7 @@ def render_physical_features(records, selected, retention, budget, output, *, sc
         if not density:
             ax.set_yscale("symlog", linthresh=1)
         f.population_legend(
-            fig, columns, title=f"Signal region | B ≤ {100 * budget:g}%"
+            fig, columns, title=f"{scope_label(scope)} | B ≤ {100 * budget:g}%"
         )
         tag = f"{100 * budget:g}".replace(".", "p") + "pct"
         f.save(fig, output / "05_features" / f"{name}_{'density' if density else 'counts'}_background_{tag}")
@@ -1497,9 +1462,6 @@ def render_ranode_training(source, output):
                 ls=ls,
                 label="Train" if kind == "trainloss" else "Validation",
             )
-            if len(values) > 1:
-                low, high = np.quantile(values, [.16, .84], axis=0)
-                ax.fill_between(epochs, low, high, color=color, alpha=.18)
         f.legend(
             fig,
             title="R-ANODE | "
@@ -1508,7 +1470,13 @@ def render_ranode_training(source, output):
         f.save(fig, output / "R-ANODE" / "02_training" / (stage + "_nll"))
 
 
-def render_physical_comparison(group, output, args, load_scores):
+def render_physical_comparison(group, output, args, load_scores, *, scope="signal_region"):
+    excluded = {m: "Saved method scores cover the signal region only" for m in group if m not in scope_group(group, scope)}
+    group = scope_group(group, scope)
+    if not group:
+        return {"scope": scope, "status": "no_methods_with_scores_in_scope", "excluded_methods": excluded}
+    label = scope_label(scope)
+    partition = "signal_region" if scope == "signal_region" else "test"
     reference_inputs = next(iter(group.values()))[1]["contract"]["inputs"]
     if any(
         report["contract"]["inputs"].get("files") != reference_inputs.get("files")
@@ -1516,18 +1484,20 @@ def render_physical_comparison(group, output, args, load_scores):
     ):
         raise ValueError("Comparisons require the same prepared input files")
     records = {
-        m: load_scores(root, report, "signal_region")
+        m: load_scores(root, report, partition)
         for m, (root, report) in group.items()
     }
     scenario = next(iter(group.values()))[1]["scenario"]
-    with ProgressStage("physical_curves", "Plot signal-region ROC, SIC and rejection"):
+    with ProgressStage("physical_curves", f"Plot {label.lower()} ROC, SIC and rejection"):
         audit = {
-            "scope": "strict signal region; independent preprocessing acceptance, common uncut event denominators",
+            "scope": scope,
+            "population": "Common physical events, independent acceptance and uncut denominators",
+            "excluded_methods": excluded,
             "score_transforms": {m: METHOD_SPECS[m].score_transform for m in group},
-            "methods": render_physical_curves(records, output / "01_performance", scenario, args.min_background),
+            "methods": render_physical_curves(records, output / "01_performance", scenario, args.min_background, scope=scope),
         }
-    with ProgressStage("physical_scores", "Plot signal-region scores"):
-        render_physical_scores(records, output / "01_performance", scenario)
+    with ProgressStage("physical_scores", f"Plot {label.lower()} scores"):
+        render_physical_scores(records, output / "01_performance", scenario, scope=scope)
     validation = {
         m: load_scores(root, report, "validation")
         for m, (root, report) in group.items()
@@ -1540,19 +1510,24 @@ def render_physical_comparison(group, output, args, load_scores):
             [records["lacathode"], validation["lacathode"], test["lacathode"]]
         )
         audit["lacathode_histograms"] = "Mean per-fit counts; separate validation cut per fit; no score averaging"
-    with ProgressStage("physical_cuts", "Plot signal-region mass cuts and features"):
-        audit["working_points"] = render_physical_working_points(validation, test, output, scenario=scenario)
-    with ProgressStage("mass_flatness", "Plot signal-region background chi-squared"):
+    with ProgressStage("physical_cuts", f"Plot {label.lower()} mass cuts and features"):
+        audit["working_points"] = render_physical_working_points(validation, test, output, scenario=scenario, scope=scope)
+    with ProgressStage("mass_flatness", f"Plot {label.lower()} background chi-squared"):
         seed = next(iter(group.values()))[1]["seed"]
         audit["mass_flatness"] = physical_mass_summary(
-            {(scenario, seed): group}, output / "03_mass_sculpting", args, load_scores, scenario=scenario)
+            {(scenario, seed): group}, output / "03_mass_sculpting", args, load_scores, scenario=scenario, scope=scope)
     write_json(output / "metrics.json", json_safe(audit))
     return audit
 
 
-def physical_comparison_summary(groups, output, args, load_scores):
+def physical_comparison_summary(groups, output, args, load_scores, *, scope="signal_region", view="comparison"):
+    groups = {identity: scope_group(group, scope) for identity, group in groups.items() if scope_group(group, scope)}
+    partition = "signal_region" if scope == "signal_region" else "test"
     audits = {}
     for scenario in f.SCENARIOS:
+        destination = output / scenario / "summary" / view
+        if scope == "full_region":
+            destination /= "full_region"
         partitions = {
             json.dumps(report["contract"]["inputs"].get("files"), sort_keys=True)
             for (name, _), group in groups.items()
@@ -1567,13 +1542,14 @@ def physical_comparison_summary(groups, output, args, load_scores):
                   for metric in ("roc", "sic", "sic_signal", "background_rejection")}
         identities = {metric: {m: [] for m in PHYSICAL_STYLES} for metric in curves}
         native_curves = {metric: {m: [] for m in PHYSICAL_STYLES} for metric in curves}
+        curve_groups = {metric: {m: [] for m in PHYSICAL_STYLES} for metric in curves}
         reference_records = None
         grid = np.geomspace(1e-4, 1, 300)
         for (name, seed), group in groups.items():
             if name != scenario:
                 continue
             records = {
-                m: load_scores(root, report, "signal_region")
+                m: load_scores(root, report, partition)
                 for m, (root, report) in group.items()
             }
             require_same_physical_population(records)
@@ -1584,24 +1560,26 @@ def physical_comparison_summary(groups, output, args, load_scores):
                 if len(np.unique(record["labels"][record["mask"]])) != 2:
                     continue
                 for metric in curves:
-                    scores = uncertainty_scores(record) if metric.startswith("sic") else fit_scores(record)
-                    for fit, score in enumerate(scores):
-                        b, s, _ = efficiency_curve(record["labels"], score, record["mask"], full_pipeline=True)
-                        use = b > 0 if metric == "roc" else (b >= 1e-4) & (
-                            np.rint(b * (record["labels"] == 0).sum()) >= args.min_background)
-                        native_curves[metric][method].append((b[use], s[use]))
-                        unique, inverse = np.unique(b, return_inverse=True)
-                        maxima = np.zeros(len(unique))
-                        np.maximum.at(maxima, inverse, s)
-                        values = np.interp(grid, unique, maxima, left=np.nan, right=np.nan)
-                        supported = grid >= (0 if metric == "roc" else args.min_background / (record["labels"] == 0).sum())
-                        values[~supported] = np.nan
-                        curves[metric][method].append(values)
-                        source = score_variation_source(method, record, members=metric.startswith("sic"))
+                    for run, score_group in enumerate(run_score_groups(method, record)):
+                        fixed_background_curves = []
+                        for score in score_group:
+                            b, s, _ = efficiency_curve(record["labels"], score, record["mask"], full_pipeline=True)
+                            use = b > 0 if metric == "roc" else (b >= 1e-4) & (
+                                np.rint(b * (record["labels"] == 0).sum()) >= args.min_background)
+                            native_curves[metric][method].append((b[use], s[use]))
+                            curve_groups[metric][method].append(len(identities[metric][method]))
+                            unique, inverse = np.unique(b, return_inverse=True)
+                            maxima = np.zeros(len(unique))
+                            np.maximum.at(maxima, inverse, s)
+                            values = np.interp(grid, unique, maxima, left=np.nan, right=np.nan)
+                            supported = grid >= (0 if metric == "roc" else args.min_background / (record["labels"] == 0).sum())
+                            values[~supported] = np.nan
+                            fixed_background_curves.append(values)
+                        curves[metric][method].append(np.median(fixed_background_curves, axis=0))
                         identities[metric][method].append(dict(
-                            seed=seed, fit=fit, source=source,
-                            member_id=record.get("uncertainty_member_ids", list(range(len(scores))))[fit],
-                            run_seed=int(record["run_seeds"][fit]) if "run_seeds" in record else seed,
+                            seed=seed, fit=run, source=score_variation_source(method, record),
+                            member_id=run,
+                            run_seed=int(record["run_seeds"][run]) if "run_seeds" in record else seed,
                         ))
         for metric in curves:
             fig, ax, _ = f.canvas(
@@ -1613,15 +1591,17 @@ def physical_comparison_summary(groups, output, args, load_scores):
             for method, cohort in curves[metric].items():
                 if not cohort:
                     continue
+                require_independent_run_ids(identities[metric][method])
                 label, color, ls, _ = PHYSICAL_STYLES[method]
                 values = np.asarray(cohort) / (1 if metric == "roc" else np.sqrt(grid))
                 audit[method] = (
-                    f.draw_fit_curves(ax, native_curves[metric][method], metric, label, color, ls)
-                    if (method == "lacathode" and len(cohort) > 1) or metric in ("sic_signal", "background_rejection")
-                    else f.draw_band(ax, grid, values, label, color, ls, guard_sic=metric == "sic")
+                    f.draw_fit_curves(ax, native_curves[metric][method], metric, label, color, ls,
+                                      run_groups=curve_groups[metric][method])
+                    if (method == "lacathode" and len(native_curves[metric][method]) > 1) or metric in ("sic_signal", "background_rejection")
+                    else f.draw_band(ax, grid, values, label, color, ls)
                 )
                 audit[method].update(uncertainty_source=fit_uncertainty(identities[metric][method]),
-                                     percentiles=[16, 50, 84], fit_count=len(cohort),
+                                     percentiles=[16, 50, 84], fit_count=len(cohort), run_count=len(cohort),
                                      members=identities[metric][method])
                 audit[method].pop("independent_runs", None)
             if not audit:
@@ -1641,18 +1621,31 @@ def physical_comparison_summary(groups, output, args, load_scores):
                 ylim=(1 if metric == "background_rejection" else 0, 1.02 if metric == "roc" else None),
             )
             f.legend(
-                fig, title=f.SCENARIO_LABELS[scenario] + " | Signal region", ncols=1
+                fig, title=f.SCENARIO_LABELS[scenario] + " | " + scope_label(scope), ncols=1
             )
-            f.save(fig, output / scenario / "01_performance" / ("signal_region_" + metric))
+            f.save(fig, destination / "01_performance" / (scope + "_" + metric))
             audits[scenario + "/" + metric] = audit
         if any(name == scenario for name, _ in groups):
             audits[scenario + "/mass_flatness"] = physical_mass_summary(
-                groups, output / scenario / "03_mass_sculpting", args, load_scores, scenario=scenario)
+                groups, destination / "03_mass_sculpting", args, load_scores, scenario=scenario, scope=scope)
     return audits
 
 
-def physical_mass_summary(groups, output, args, score_loader, *, scenario="background_only"):
-    """Common SR background sculpting, irrespective of which methods are present."""
+@f.cached_plot_calculation
+def physical_mass_values(mass, mask, score, edges, full, efficiencies):
+    """One sort and one cumulative histogram for all mass-flatness thresholds."""
+    cuts = background_cuts(dict(labels=np.zeros(len(mass)), mask=mask, scores=score), efficiencies)
+    thresholds = np.asarray([cut[0] if cut is not None else np.inf for cut in cuts])
+    counts = f.strict_cut_histograms(mass, edges, score, mask, thresholds)
+    achieved = [float(count.sum() / len(mass)) for count in counts]
+    values = [f.shape_chi2(full, count, actual) if actual > 0 else np.nan
+              for count, actual in zip(counts, achieved)]
+    return values, achieved
+
+
+def physical_mass_summary(groups, output, args, score_loader, *, scenario="background_only", scope="signal_region"):
+    """Background sculpting across independent full runs on a common population."""
+    groups = {identity: scope_group(group, scope) for identity, group in groups.items() if scope_group(group, scope)}
     curves = {m: [] for m in PHYSICAL_STYLES}
     identities = {m: [] for m in PHYSICAL_STYLES}
     efficiencies = {m: [] for m in PHYSICAL_STYLES}
@@ -1662,12 +1655,12 @@ def physical_mass_summary(groups, output, args, score_loader, *, scenario="backg
             continue
         records = {m: score_loader(root, report, "test") for m, (root, report) in group.items()}
         require_same_physical_population(records)
-        region = common_signal_region(records)
+        region = scope_region(records, scope)
         base = next(iter(records.values()))
         pop = region & (base["labels"] == 0)
         mass = base["mass"][pop]
         if len(mass) < 300:
-            colored_status("SR-only mass-flatness bands need at least 300 background events", kind="WARNING")
+            colored_status(f"{scope_label(scope)} mass flatness needs at least 300 background events", kind="WARNING")
             continue
         edges = f.equal_occupancy(mass)
         full = np.histogram(mass, edges)[0]
@@ -1678,45 +1671,39 @@ def physical_mass_summary(groups, output, args, score_loader, *, scenario="backg
             mask = record["mask"][pop]
             if not mask.any():
                 continue
-            for i, scores in enumerate(uncertainty_scores(record)):
-                score = scores[pop]
-                values, achieved = [], []
-                for efficiency in f.EFFICIENCIES:
-                    cut = background_cut(dict(labels=np.zeros(len(mass)), mask=mask, scores=score), efficiency)
-                    keep = mask & (score > cut[0]) if cut is not None else np.zeros(len(mass), bool)
-                    # Quantiles among mapped events bias the target when acceptance differs.
-                    # Normalize the shape statistic with the actual physical selection rate.
-                    actual = keep.mean()
-                    achieved.append(float(actual))
-                    values.append(f.shape_chi2(full, np.histogram(mass[keep], edges)[0], actual)
-                                  if actual > 0 else np.nan)
-                curves[method].append(values)
-                efficiencies[method].append(achieved)
-                source = score_variation_source(method, record, members=True)
+            for i, score_group in enumerate(run_score_groups(method, record)):
+                per_fit = [physical_mass_values(mass, mask, scores[pop], edges, full, f.EFFICIENCIES)
+                           for scores in score_group]
+                # Reduce shared-background classifier fits within each complete
+                # run; the outer bands then contain only independent runs.
+                curves[method].append(np.median([v for v, _ in per_fit], axis=0).tolist())
+                efficiencies[method].append(np.median([e for _, e in per_fit], axis=0).tolist())
+                source = score_variation_source(method, record)
                 identities[method].append(dict(
                     seed=seed, fit=i, source=source,
-                    member_id=record.get("uncertainty_member_ids", list(range(len(uncertainty_scores(record)))))[i],
+                    member_id=i,
                     run_seed=int(record["run_seeds"][i]) if "run_seeds" in record else seed,
                 ))
     if not any(curves.values()):
-        return {"scope": "signal_region_only", "status": "insufficient_background_events"}
-    fig, ax, _ = f.canvas(r"$\chi^2/n_{\mathrm{dof}}$", "Target SR background efficiency")
-    audit = {"scope": "signal_region_only", "bins": 300, "methods": {},
-             "selection": "Truth-assisted test-SR thresholds; strict cut, common uncut denominator",
+        return {"scope": scope, "status": "insufficient_background_events"}
+    fig, ax, _ = f.canvas(r"$\chi^2/n_{\mathrm{dof}}$", "Target " + ("SR " if scope == "signal_region" else "full-region ") + "background efficiency")
+    audit = {"scope": scope, "bins": 300, "methods": {},
+             "selection": "Truth-assisted test thresholds in " + scope + "; strict cut, common uncut denominator",
              "normalization": "Achieved background efficiency, including acceptance and ties"}
     for method, values in curves.items():
         if not values:
             continue
+        require_independent_run_ids(identities[method])
         summary = f.draw_band(ax, f.EFFICIENCIES, values, *PHYSICAL_STYLES[method][:3])
         summary.update(uncertainty_source=fit_uncertainty(identities[method]), percentiles=[16, 50, 84],
-                       fit_count=len(values), members=identities[method],
+                       fit_count=len(values), run_count=len(values), members=identities[method],
                        target_efficiencies=f.EFFICIENCIES.tolist(), achieved_efficiencies=efficiencies[method])
         summary.pop("independent_runs", None)
         audit["methods"][method] = summary
     audit["random"] = f.draw_band(ax, f.EFFICIENCIES, random_reference(reference_mass, mode=args.random_reference),
                                   "Random", ".5", ":")
     ax.set(xlim=(.20, .01), yscale="log")
-    f.legend(fig, title=f.SCENARIO_LABELS[scenario] + " | Background in signal region")
+    f.legend(fig, title=f.SCENARIO_LABELS[scenario] + " | Background in " + scope_label(scope).lower())
     f.save(fig, output / "mass_flatness_vs_selection")
     return audit
 
@@ -1724,24 +1711,32 @@ def physical_mass_summary(groups, output, args, score_loader, *, scenario="backg
 def refresh_plot_scopes(output, groups, scan_groups):
     """Replace generated figures in requested scopes, preserving notes and other runs."""
     manifest = output / "plot_manifest.json"
-    if not manifest.is_file() or json.loads(manifest.read_text()).get("schema") not in (1, 2):
+    if not manifest.is_file() or json.loads(manifest.read_text()).get("schema") not in (1, 2, 3):
         return
     scopes = set()
     for (scenario, seed), group in groups.items():
         target = output / scenario / f"seed_{seed:03d}"
         scopes.update((target / "comparison", target / "comparison_with_ranode",
+                       output / scenario / "summary" / "comparison",
                        output / "comparison" / scenario, output / "comparison_with_ranode" / scenario))
         for method in group:
             label = METHOD_SPECS[method].label
-            scopes.update((target / label, output / label / scenario))
+            scopes.update((target / label, output / scenario / "summary" / label,
+                           output / label / scenario, output / label / "full_mass" / scenario))
         for filename in ("signal_region_sic", "mass_flatness_vs_selection"):
             for suffix in (".pdf", ".png"):
                 (output / scenario / (filename + suffix)).unlink(missing_ok=True)
     if scan_groups:
         scopes.add(output / "comparison" / "injection_scan")
-        scopes.add(output / "injection_scan")
+        scopes.add(output / "injection_scan" / "comparison")
+        # Older scan files lived directly here; do not recurse into other methods.
+        for path in (output / "injection_scan").glob("*"):
+            if path.is_file() and (path.suffix in (".pdf", ".png") or path.name in (
+                    "injection_scan.json", "injection_scan.csv")):
+                path.unlink()
         for group in scan_groups.values():
             scopes.update(output / METHOD_SPECS[m].label / "injection_scan" for m in group)
+            scopes.update(output / "injection_scan" / METHOD_SPECS[m].label for m in group)
     for scope in sorted(scopes):
         if not scope.is_dir():
             continue
@@ -1754,6 +1749,12 @@ def refresh_plot_scopes(output, groups, scan_groups):
                 path.rmdir()
         if not any(scope.iterdir()):
             scope.rmdir()
+        # Remove empty containers from the obsolete method-first layout as well.
+        for parent in scope.parents:
+            if parent == output or not parent.is_relative_to(output):
+                break
+            if parent.is_dir() and not any(parent.iterdir()):
+                parent.rmdir()
     legacy = output / "comparison_with_ranode"
     if legacy.is_dir() and not any(legacy.iterdir()):
         legacy.rmdir()
@@ -1770,33 +1771,26 @@ def main(argv=None):
     )
     parser.add_argument("--methods", nargs="+", default=None,
                         help="Optional method IDs to include; default: discover every completed method")
-    parser.add_argument("--fit-bands", choices=("members", "seeds"), default="members",
-                        help="RIDDLE/R-ANODE SIC/chi2: saved fits (default) or ensemble scores across seeds; LaCathode retains its saved fits")
-    parser.add_argument("--sic-band-guard", choices=("asymmetric", "off"), default="asymmetric",
-                        help="Guard extreme one-sided SIC shading (default); retain raw limits as dotted lines and in diagnostics")
-    parser.add_argument("--band-guard-ratio", type=float, default=f.SICBandGuard.asymmetry_ratio,
-                        help="SIC guard: larger width must exceed this multiple of the smaller width (default: 4)")
-    parser.add_argument("--band-guard-relative-width", type=float, default=f.SICBandGuard.relative_width,
-                        help="SIC guard: larger width must also exceed this fraction of the median for 3 adjacent points (default: 0.5)")
-    parser.add_argument("--device", default="cpu", help="Device for RIDDLE saved-checkpoint inference only")
-    parser.add_argument("--io-workers", type=int, default=2, help="CPU threads for RIDDLE plotting inference")
+    parser.add_argument("--io-workers", type=int, default=2, help="CPU threads for numerical libraries; plotting uses saved scores")
+    parser.add_argument("--plot-workers", type=int, default=min(8, max(1, (os.cpu_count() or 1) // 2)),
+                        help="Parallel PDF/PNG export processes (default: half the CPUs, capped at 8); use 1 for serial export")
+    parser.add_argument("--plot-cache-mb", type=int, default=1024,
+                        help="Memory limit in MiB for repeated numerical calculations (default: 1024); 0 disables caching")
     parser.add_argument("--confidence", type=float, default=0.95)
     parser.add_argument("--min-background", type=int, default=10)
     parser.add_argument("--random-reference", choices=("bootstrap", "subset"), default="bootstrap")
     parser.add_argument("--allow-smoke", action="store_true", help="Permit synthetic QA fixtures")
     parser.add_argument("--verbose", type=int, choices=(0, 1, 2), default=1,
-                        help="0: warnings and result; 1: compact task/fit progress; 2: detailed inference progress")
+                        help="0: warnings and result; 1: compact task progress; 2: detailed plotting progress")
     args = parser.parse_args(argv)
+    from threadpoolctl import threadpool_limits
     args.population_summary = True
     set_verbosity(args.verbose)
     try:
-        band_guard = f.SICBandGuard(enabled=args.sic_band_guard != "off",
-                                    asymmetry_ratio=args.band_guard_ratio,
-                                    relative_width=args.band_guard_relative_width)
         if not 0 < args.confidence < 1 or args.min_background < 1 or args.io_workers < 1:
             raise ValueError("Invalid confidence level or background support")
-        if args.device != "cpu" and not re.fullmatch(r"cuda:\d+", args.device):
-            raise ValueError("Plot inference device must be cpu or cuda:<index>")
+        if args.plot_workers < 1 or args.plot_cache_mb < 0:
+            raise ValueError("Plot workers must be positive and plot cache size nonnegative")
         groups = discover(args.results, args.methods)
         scan_groups = discover(args.results, args.methods, scan=True)
         if not groups and not scan_groups:
@@ -1817,23 +1811,27 @@ def main(argv=None):
         comparisons = {}
         available = set().union(*(set(g) for g in [*groups.values(), *scan_groups.values()]))
         progress = PlotProgress(plot_task_count(groups, scan_groups))
-        score_loader = FitScoreLoader(mode=args.fit_bands, device=args.device,
-                                      io_workers=args.io_workers, progress=progress)
+        score_loader = ScoreLoader()
         colored_status(f"Plot plan: {progress.total} task groups | {len(groups)} scenario/seed groups | "
-                       f"{len(scan_groups)} injection-scan points | saved results only, no training",
+                       f"{len(scan_groups)} injection-scan points | {args.plot_workers} export workers | "
+                       f"{args.plot_cache_mb} MiB calculation cache | saved results only, no training",
                        kind="INFO", level=1)
         with local_progress("Plots", display=progress if args.verbose < 2 else None), \
-                f.plt.style.context(f.STYLE), f.sic_band_guard_policy(band_guard), locked(args.output / ".plot.lock"):
+                f.plt.style.context(f.STYLE), threadpool_limits(limits=args.io_workers), locked(args.output / ".plot.lock"), \
+                f.plot_resources(workers=args.plot_workers, cache_mb=args.plot_cache_mb) as exporter:
             if args.overwrite:
                 refresh_plot_scopes(args.output, groups, scan_groups)
             scan_audit = None
             if scan_groups:
                 with progress.task("Injection scan | discrimination and significance"):
-                    scan_audit = render_injection_scan(scan_groups, args.output / "comparison" / "injection_scan", args)
+                    # Scans use saved ensemble scores, not member re-inference.
+                    scan_loader = ScoreLoader()
+                    scan_audit = render_injection_scan(scan_groups, args.output / "injection_scan" / "comparison", args, scan_loader)
                     for method in sorted(available):
                         cohort = {identity: {method: group[method]} for identity, group in scan_groups.items() if method in group}
                         if cohort:
-                            render_injection_scan(cohort, args.output / METHOD_SPECS[method].label / "injection_scan", args)
+                            render_injection_scan(cohort, args.output / "injection_scan" / METHOD_SPECS[method].label, args, scan_loader)
+                    del scan_loader
             for (scenario, seed), group in groups.items():
                 if (
                     any(
@@ -1853,14 +1851,18 @@ def main(argv=None):
                 label = plot_group_label(scenario, seed, group)
                 with progress.task(f"{label} | shared comparison plots"):
                     comparison = render_physical_comparison(group, target / "comparison", args, score_loader)
+                    comparison["full_region"] = render_physical_comparison(
+                        group, target / "comparison" / "full_region", args, score_loader, scope="full_region")
                 comparisons[f"{scenario}/{seed}"] = comparison
                 settings.extend(settings_rows(group))
                 rows.extend(comparison_rows(comparison, scenario, seed))
+                rows.extend(comparison_rows(comparison["full_region"], scenario, seed, scope="full_region"))
                 for method, source in group.items():
                     with progress.task(f"{label} | {METHOD_SPECS[method].label} individual plots"):
                         individual = {method: source}
                         destination = target / METHOD_SPECS[method].label
                         render_physical_comparison(individual, destination, args, score_loader)
+                        render_physical_comparison(individual, destination / "full_region", args, score_loader, scope="full_region")
                         training_figures(individual, target)
                         if method in ("lacathode", "riddle"):
                             bundle = make_bundle(individual, args.confidence, score_loader)
@@ -1868,21 +1870,30 @@ def main(argv=None):
                             render_bundle(bundle, destination / "full_mass", args)
                             bundles.append(bundle)
             audit = {}
-            if groups:
+            if summary_groups(groups):
                 with progress.task("Summary plots | SIC and mass-flatness uncertainty bands"):
-                    audit["comparison"] = physical_comparison_summary(groups, args.output / "comparison", args, score_loader)
+                    audit["comparison"] = physical_comparison_summary(
+                        summary_groups(groups), args.output, args, score_loader)
+                    audit["comparison"]["full_region"] = physical_comparison_summary(
+                        summary_groups(groups, scope="full_region"), args.output, args, score_loader, scope="full_region")
                     for method in sorted(available):
-                        cohort = {identity: {method: group[method]} for identity, group in groups.items() if method in group}
+                        cohort = summary_groups(groups, method=method)
                         if not cohort:
                             continue
                         with ProgressStage("individual_summary", f"Summarize {METHOD_SPECS[method].label}"):
+                            view = METHOD_SPECS[method].label
                             audit[method] = physical_comparison_summary(
-                                cohort, args.output / METHOD_SPECS[method].label, args, score_loader)
-                            individual = [b for b in bundles if b.get("individual") == method]
+                                cohort, args.output, args, score_loader, view=view)
+                            audit[method]["full_region"] = physical_comparison_summary(
+                                summary_groups(cohort, scope="full_region"), args.output, args, score_loader,
+                                scope="full_region", view=view)
+                            individual = [b for b in bundles if b.get("individual") == method
+                                          and (b["report"]["scenario"], b["report"]["seed"]) in cohort]
                             if individual:
                                 audit[method]["full_mass"] = summary_figures(
-                                    individual, args.output / METHOD_SPECS[method].label / "full_mass", args)
+                                    individual, args.output, args, view=view)
             with progress.task("Export comparison tables, configuration and plot manifest"):
+                exporter.flush()
                 csv_write(args.output / "comparison.csv", rows)
                 csv_write(args.output / "configuration.csv", settings)
                 write_json(args.output / "comparison.json", json_safe(comparisons))
@@ -1890,16 +1901,13 @@ def main(argv=None):
                     args.output / "plot_manifest.json",
                     json_safe(
                         {
-                            "schema": 2,
-                            "methods": {m: dict(label=METHOD_SPECS[m].label, score_transform=METHOD_SPECS[m].score_transform)
+                            "schema": 3,
+                            "methods": {m: dict(label=METHOD_SPECS[m].label, score_transform=METHOD_SPECS[m].score_transform, score_scope=METHOD_SPECS[m].score_scope)
                                         for m in sorted(available)},
-                            "comparison": "All available methods; common physical SR events; independent acceptance and uncut denominators",
-                            "layout": "<scenario>/seed_<seed>/{comparison,<method label>}/; summaries in {comparison,<method label>}/<scenario>/",
+                            "comparison": "All available methods in their supported scope: signal region and full region; independent acceptance and uncut denominators",
+                            "layout": "<scenario>/seed_<seed>/{comparison,<method label>}/; summaries in <scenario>/summary/{comparison,<method label>}/ only when combining multiple result directories; full-region panels in full_region/; injection_scan/{comparison,<method label>}/",
                             "uncertainty": audit,
-                            "sic_band_guard": {**asdict(band_guard),
-                                               "scope": "SIC curve shading only; heuristic display adjustment, not a confidence interval",
-                                               "raw_limits": "Original percentiles retained in diagnostics and drawn dotted whenever adjusted"},
-                            "cuts": "Truth-assisted MC benchmark: validation-SR background thresholds; frozen cuts evaluated on independent physical test rows",
+                            "cuts": "Truth-assisted MC benchmark: validation thresholds in the plotted region; frozen cuts evaluated on independent physical test rows",
                             "injection_scan": scan_audit,
                             "mass_cut_scan": {
                                 "thresholds": list(f.SCORE_CUTS),
@@ -1911,10 +1919,9 @@ def main(argv=None):
                                 "individual_directory": "04_mass_cuts/individual_cuts",
                                 "histograms": "unweighted counts per fit, averaged over LaCathode fits; identical bins, no smoothing or pooled events; B + S is the sum of background and signal counts",
                             },
-                            "mass_summary": "Common SR background: 300 equal-occupancy bins, test-derived cuts with uncut denominators; shape chi2 normalized by achieved efficiency. Individual full_mass summaries retain full-range diagnostics.",
-                            "uncertainty_scope": "SIC/mass bands: 16/50/84 percentiles of per-fit metric curves, not uncertainty in an averaged ensemble; fixed-background fits exclude background-training variation; independent LaCathode runs retain their scope",
-                            "fit_bands": args.fit_bands,
-                            "fit_inference": {"device": args.device, "training": False, "result_files_modified": False},
+                            "mass_summary": "Common background in each plotted region: 300 equal-occupancy bins, test-derived cuts with uncut denominators; shape chi2 normalized by achieved efficiency.",
+                            "uncertainty_scope": "16/50/84 percentiles across independent full method runs on fixed evaluation events; one saved ensemble score per RIDDLE/R-ANODE run; no within-ensemble fit bands",
+                            "score_inputs": "Saved predictions only; no checkpoint inference or modification of results",
                             "lacathode_event_plots": "Dynamically detected saved fits; mean per-fit histograms with matching per-fit validation cuts; shapes normalize those mean counts; no cross-fit score averaging",
                             "lacathode_roc_sic": "Median rejection and SIC interpolated at 1000 common signal efficiencies, as upstream, after statistical-support cuts. Bands are parametric 16/84-percentile ribbons at fixed signal efficiency; background-efficiency display axes retained.",
                             "lacathode_fit_counts": [{"scenario": b["report"]["scenario"], "seed": b["report"]["seed"], "fits": b["classifier_fit_count"]} for b in bundles if "classifier_fit_count" in b],

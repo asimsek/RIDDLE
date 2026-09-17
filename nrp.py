@@ -44,9 +44,9 @@ def job(args):
         run_settings(getattr(args, "runs", None), getattr(args, "epochs", None),
                      getattr(args, "lacathode_background", "independent"))
     if "ranode" in args.methods:
-        runs, epochs = getattr(args, "runs", None), getattr(args, "epochs", None)
-        if runs is not None and not 1 <= runs <= 20:
-            raise ValueError("R-ANODE --runs must be between 1 and 20")
+        fits, epochs = getattr(args, "fits", None), getattr(args, "epochs", None)
+        if fits is not None and not 1 <= fits <= 20:
+            raise ValueError("R-ANODE --fits must be between 1 and 20")
         if epochs is not None and epochs < 10:
             raise ValueError("R-ANODE --epochs must be at least 10 for checkpoint ensembling")
     default_image, default_secrets, default_region = setup_runtime()
@@ -91,7 +91,7 @@ def job(args):
     for option in ("resume_across_code_change", "resume_across_device_change"):
         if getattr(args, option, False):
             command.append("--" + option.replace("_", "-"))
-    for key in ("runs", "epochs"):
+    for key in ("runs", "fits", "epochs"):
         value = getattr(args, key, None)
         if value is not None:
             command.extend(["--" + key, str(value)])
@@ -212,7 +212,8 @@ def pin_image(image):
 
 
 def main(argv=None):
-    p = argparse.ArgumentParser(description="Generate an NRP GPU job or pin its runtime image; does not submit jobs")
+    p = argparse.ArgumentParser(description="Generate an NRP GPU job or pin its runtime image; does not submit jobs",
+                                allow_abbrev=False)
     action = p.add_mutually_exclusive_group(required=True)
     action.add_argument("--name")
     action.add_argument("--pin-image", help="Save a built image digest in config/nrp/jupyter.yaml")
@@ -226,7 +227,8 @@ def main(argv=None):
     p.add_argument("--ranode-config", default="external/ranode_utils/ranode.yaml", help="Independent upstream R-ANODE settings")
     p.add_argument("--data", help="Prepared dataset path; defaults to data/lhco or data/injection_scan for scans")
     p.add_argument("--results", help="Result directory; defaults to results or results/injection_scan for scans")
-    p.add_argument("--runs", "--run", type=positive, help="Override RIDDLE/R-ANODE fit count and LaCathode run count")
+    p.add_argument("--runs", type=positive, help="Complete independent runs per seed (default: 1)")
+    p.add_argument("--fits", type=positive, help="Signal ensemble fits per RIDDLE/R-ANODE run; does not change LaCathode")
     p.add_argument("--lacathode-background", choices=("independent", "fixed"), default="independent",
                    help="Retrain each LaCathode background flow (default), or share one flow across classifier fits")
     p.add_argument("--epochs", type=positive, help="Override RIDDLE/R-ANODE signal-fit and LaCathode classifier epochs; background stages are unchanged")

@@ -1,5 +1,5 @@
 background_epochs: 100
 signal_epochs: 300
-runs: 20
+fits: 20
 fit_index: 0
 split_mode: resample_training

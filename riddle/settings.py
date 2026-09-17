@@ -29,8 +29,12 @@ def number(value, label, minimum=0, maximum=math.inf, *, strict=True):
 
 def validate_residual(value):
     value = deepcopy(value)
+    if isinstance(value, dict) and "fits" in value:
+        if "runs" in value:
+            raise ValueError("Use fits, or the legacy runs key, not both")
+        value["runs"] = value.pop("fits")
     keys(value, "runs epochs fractions initialization flow training", "RIDDLE")
-    integer(value["runs"], "runs")
+    integer(value["runs"], "fits")
     integer(value["epochs"], "epochs")
     if value["initialization"] not in ("background", "random"):
         raise ValueError("Initialization must be background or random")
@@ -158,11 +162,11 @@ def resolve(args):
     effective = load_settings(args.config)
     if "riddle" in args.methods:
         for key in ("runs", "epochs", "fractions"):
-            override = getattr(args, key, None)
+            override = getattr(args, "fits" if key == "runs" else key, None)
             if override is not None:
                 effective["riddle"][key] = override
         effective["riddle"] = validate_residual(effective["riddle"])
-    args.runs = effective["riddle"]["runs"]
+    args.fits = effective["riddle"]["runs"]
     args.epochs = effective["riddle"]["epochs"]
     args.fractions = effective["riddle"]["fractions"]
     args.settings = effective

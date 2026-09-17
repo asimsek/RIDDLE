@@ -60,7 +60,8 @@ def parser():
     prep_scan.add_argument("--signal-events", type=seeds, help="Subset of configured total signal counts")
     prep_scan.add_argument("--replicas", type=seeds, help="Zero-based replica indices, e.g. 0-9")
     for command in ("run", "scan"):
-        run = subs.add_parser(command, help="Run independent methods" if command == "run" else "Run the optional injection scan")
+        run = subs.add_parser(command, allow_abbrev=False,
+                              help="Run independent methods" if command == "run" else "Run the optional injection scan")
         run.add_argument("--methods", nargs="+", choices=METHODS, default=list(DEFAULT_METHODS))
         run.add_argument("--data", type=Path, default=Path("data/lhco"))
         run.add_argument("--output", type=Path, default=Path("results"))
@@ -78,7 +79,10 @@ def parser():
         )
         run.add_argument("--io-workers", type=positive, default=2)
         run.add_argument("--mps", choices=["auto", "on", "off"], default="auto")
-        run.add_argument("--runs", "--run", type=positive, help="Override RIDDLE/R-ANODE fit count and LaCathode run count")
+        run.add_argument("--runs", type=positive,
+                         help="Complete independent runs per seed (default: 1); retrain background and signal models")
+        run.add_argument("--fits", type=positive,
+                         help="Signal ensemble fits per RIDDLE/R-ANODE run (default: method YAML); does not change LaCathode")
         run.add_argument("--lacathode-background", choices=("independent", "fixed"), default="independent",
                          help="Retrain each LaCathode background flow (default), or share one flow across classifier fits")
         run.add_argument(
@@ -97,13 +101,43 @@ def parser():
     return p
 
 
+def independent_run_seeds(seed, count):
+    """Stable complete-run seeds; run zero preserves existing result locations."""
+    import numpy as np
+
+    if type(seed) is not int or not 0 <= seed < 2**32 or type(count) is not int or not 1 <= count < 2**32:
+        raise ValueError("Independent runs require a 32-bit seed and a positive run count")
+    values = [seed] + [int(np.random.SeedSequence([seed, i]).generate_state(1)[0]) for i in range(1, count)]
+    if len(set(values)) != len(values):
+        raise ValueError("Independent run seeds collided; choose another base seed")
+    return values
+
+
+def campaign_runs(args):
+    """LaCathode manages its own runs; other methods repeat the whole pipeline."""
+    requests, used = [], set()
+    for base in args.seeds:
+        for index, seed in enumerate(independent_run_seeds(base, getattr(args, "runs", None) or 1)):
+            for method in args.methods:
+                identity = (method, seed)
+                if identity in used:
+                    raise ValueError("Requested seeds overlap independent method runs; choose distinct base seeds")
+                used.add(identity)
+                if method == "lacathode" and index:
+                    continue
+                requests.append((method, base, index, seed))
+    return requests
+
+
 def run_campaign(args):
     resume_policy(args)
-    fit_overrides = {key: getattr(args, key, None) for key in ("runs", "epochs")}
+    run_overrides = {key: getattr(args, key, None) for key in ("runs", "epochs")}
+    fit_overrides = dict(runs=getattr(args, "fits", None), epochs=getattr(args, "epochs", None))
+    requests = campaign_runs(args)
     if "lacathode" in args.methods:
         from external.lacathode_utils.pipeline import run_settings
 
-        run_settings(**fit_overrides, background=getattr(args, "lacathode_background", "independent"))
+        run_settings(**run_overrides, background=getattr(args, "lacathode_background", "independent"))
     from .storage import locked
     from .worker_progress import monitor_worker
 
@@ -148,71 +182,79 @@ def run_campaign(args):
         if args.methods == ["ranode"] and getattr(args, "fractions", None) is not None:
             raise ValueError("R-ANODE retains its upstream learned fraction; --fractions is RIDDLE-only")
     for scenario in args.scenarios:
-        for seed in args.seeds:
-            for method in args.methods:
-                output = args.output / method / scenario / f"seed_{seed:03d}"
-                if output.exists() and not args.resume:
-                    raise FileExistsError("Result exists; use --resume or a new output")
-                output.mkdir(parents=True, exist_ok=True)
-                options = {
-                    **vars(args),
-                    "method": method,
-                    "seed": seed,
-                    "scenario": scenario,
-                    "output": str(output),
-                    "data": str(args.data / scenario),
-                    "sources": str(args.sources),
-                }
-                if method == "lacathode":
-                    options.update(fit_overrides)
-                env = os.environ.copy()
-                if args.device == "cpu":
-                    env["CUDA_VISIBLE_DEVICES"] = ""
-                else:
-                    index = int(args.device.split(":")[1])
-                    visible = env.get("CUDA_VISIBLE_DEVICES")
-                    tokens = visible.split(",") if visible is not None else None
-                    if tokens is not None and (
-                        index >= len(tokens) or not tokens[index].strip() or tokens[index].strip() == "-1"
-                    ):
-                        raise ValueError("Requested CUDA device is outside the visible device set")
-                    env["CUDA_VISIBLE_DEVICES"] = tokens[index].strip() if tokens else str(index)
-                    options["device"] = "cuda:0"
-                env.update(
-                    PYTHONHASHSEED=str(seed),
-                    PYTHONUNBUFFERED="1",
-                    PYTHONDONTWRITEBYTECODE="1",
-                    MPLBACKEND="Agg",
-                    RIDDLE_WORKER_PROGRESS="1",
-                    PYTHONPATH=os.pathsep.join(filter(None, (str(ROOT), env.get("PYTHONPATH")))),
+        for method, base_seed, run_index, seed in requests:
+            output = args.output / method / scenario / f"seed_{seed:03d}"
+            if output.exists() and not args.resume:
+                raise FileExistsError("Result exists; use --resume or a new output")
+            output.mkdir(parents=True, exist_ok=True)
+            options = {
+                **vars(args),
+                "method": method,
+                "seed": seed,
+                "scenario": scenario,
+                "output": str(output),
+                "data": str(args.data / scenario),
+                "sources": str(args.sources),
+                "campaign_seed": base_seed,
+                "run_index": run_index,
+                "independent_run_count": run_overrides["runs"] or 1,
+            }
+            if method == "lacathode":
+                options.update(run_overrides)
+            elif method == "riddle":
+                # Internal training/contract keys retain their historical
+                # spelling so existing ensemble checkpoints stay readable.
+                options["runs"] = args.fits
+            env = os.environ.copy()
+            if args.device == "cpu":
+                env["CUDA_VISIBLE_DEVICES"] = ""
+            else:
+                index = int(args.device.split(":")[1])
+                visible = env.get("CUDA_VISIBLE_DEVICES")
+                tokens = visible.split(",") if visible is not None else None
+                if tokens is not None and (
+                    index >= len(tokens) or not tokens[index].strip() or tokens[index].strip() == "-1"
+                ):
+                    raise ValueError("Requested CUDA device is outside the visible device set")
+                env["CUDA_VISIBLE_DEVICES"] = tokens[index].strip() if tokens else str(index)
+                options["device"] = "cuda:0"
+            env.update(
+                PYTHONHASHSEED=str(seed),
+                PYTHONUNBUFFERED="1",
+                PYTHONDONTWRITEBYTECODE="1",
+                MPLBACKEND="Agg",
+                RIDDLE_WORKER_PROGRESS="1",
+                PYTHONPATH=os.pathsep.join(filter(None, (str(ROOT), env.get("PYTHONPATH")))),
+            )
+            for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+                env[key] = str(args.io_workers)
+            if method == "ranode":
+                command = [sys.executable, "-m", "external.ranode_utils.runner",
+                           "--sources", str(args.ranode_sources), "--data", options["data"],
+                           "--output", str(output), "--config", str(args.ranode_config),
+                           "--scenario", scenario, "--seed", str(seed), "--device", options["device"],
+                           "--io-workers", str(args.io_workers), "--workers", str(args.workers),
+                           "--mps", args.mps]
+                for key, value in fit_overrides.items():
+                    if value is not None:
+                        command.extend(["--fits" if key == "runs" else "--" + key, str(value)])
+                command.extend(["--campaign-seed", str(base_seed), "--run-index", str(run_index),
+                                "--independent-run-count", str(run_overrides["runs"] or 1)])
+                if args.resume:
+                    command.append("--resume")
+                for key in ("resume_across_code_change", "resume_across_device_change"):
+                    if getattr(args, key, False):
+                        command.append("--" + key.replace("_", "-"))
+            else:
+                command = [sys.executable, "-m", "riddle.worker", json.dumps(options, default=str)]
+            with locked(output / ".resume/command.lock"):
+                monitor_worker(
+                    command,
+                    env,
+                    output / "training.log",
+                    f"{method} | {scenario}",
+                    resume=args.resume,
                 )
-                for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
-                    env[key] = str(args.io_workers)
-                if method == "ranode":
-                    command = [sys.executable, "-m", "external.ranode_utils.runner",
-                               "--sources", str(args.ranode_sources), "--data", options["data"],
-                               "--output", str(output), "--config", str(args.ranode_config),
-                               "--scenario", scenario, "--seed", str(seed), "--device", options["device"],
-                               "--io-workers", str(args.io_workers), "--workers", str(args.workers),
-                               "--mps", args.mps]
-                    for key, value in fit_overrides.items():
-                        if value is not None:
-                            command.extend(["--" + key, str(value)])
-                    if args.resume:
-                        command.append("--resume")
-                    for key in ("resume_across_code_change", "resume_across_device_change"):
-                        if getattr(args, key, False):
-                            command.append("--" + key.replace("_", "-"))
-                else:
-                    command = [sys.executable, "-m", "riddle.worker", json.dumps(options, default=str)]
-                with locked(output / ".resume/command.lock"):
-                    monitor_worker(
-                        command,
-                        env,
-                        output / "training.log",
-                        f"{method} | {scenario}",
-                        resume=args.resume,
-                    )
 
 
 def main(argv=None):

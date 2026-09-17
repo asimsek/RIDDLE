@@ -131,7 +131,7 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --name riddle-seed42 --methods riddle --scenarios signal_injection \
   --seeds 42 --config config/settings.yaml --workers 2 --io-workers 8 \
-  --runs 10 --epochs 100 | kubectl apply -n cua-asimsek -f -
+  --runs 10 --fits 10 --epochs 100 | kubectl apply -n cua-asimsek -f -
 ```
 
 ```bash
@@ -139,7 +139,7 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --name riddle-bg-seed42 --methods riddle --scenarios background_only \
   --seeds 42 --config config/settings.yaml --workers 2 --io-workers 8 \
-  --runs 10 --epochs 100 | kubectl apply -n cua-asimsek -f -
+  --runs 10 --fits 10 --epochs 100 | kubectl apply -n cua-asimsek -f -
 ```
 
 **LaCathode:**
@@ -170,7 +170,7 @@ Add `--lacathode-background fixed` to a LaCathode submission to share one backgr
 kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --name ranode-seed42 --methods ranode --scenarios signal_injection \
-  --runs 10 --epochs 100 --seeds 42 --workers 2 --io-workers 8 | \
+  --runs 10 --fits 10 --epochs 100 --seeds 42 --workers 2 --io-workers 8 | \
   kubectl apply -n cua-asimsek -f -
 ```
 
@@ -178,10 +178,12 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
 kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --name ranode-bg-seed42 --methods ranode --scenarios background_only \
-  --runs 10 --epochs 100 --seeds 42 --workers 2 --io-workers 8 | \
+  --runs 10 --fits 10 --epochs 100 --seeds 42 --workers 2 --io-workers 8 | \
   kubectl apply -n cua-asimsek -f -
 ```
 
+For RIDDLE/R-ANODE, `--fits 10` trains one ensemble with ten signal fits.<br>
+Add `--runs 10` to retrain the complete method three times, including separate background models; method uncertainty bands use these independent runs.<br>
 
 For one combined job instead, request `--methods lacathode riddle ranode` with a different job name.<br>
 Do not submit that alongside these three jobs for the same result identities.
@@ -278,7 +280,7 @@ python plot.py --results results --output plots --verbose 1 --io-workers 16 --ov
 
 All completed methods are discovered automatically.<br>
 Request either method alone with `--methods lacathode`, `--methods riddle`, or `--methods ranode`.<br>
-Add `--overwrite` to regenerate matching plots and tables in an existing output directory without removing other files.
+Add `--overwrite` to regenerate matching plots and tables.
 
 
 ## Optional injection scan
@@ -299,7 +301,7 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --workflow scan --name riddle-injection-scan --methods riddle \
   --config config/settings.yaml --data data/injection_scan --results results_injection_scan \
-  --runs 10 --epochs 100 --workers 2 --io-workers 4 | \
+  --runs 10 --fits 10 --epochs 100 --workers 2 --io-workers 4 | \
   kubectl apply -n cua-asimsek -f -
 ```
 
@@ -321,7 +323,7 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --workflow scan --name ranode-injection-scan --methods ranode \
   --data data/injection_scan --results results_injection_scan \
-  --runs 10 --epochs 100 --workers 1 --io-workers 8 | \
+  --runs 10 --fits 10 --epochs 100 --workers 1 --io-workers 8 | \
   kubectl apply -n cua-asimsek -f -
 ```
 

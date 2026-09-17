@@ -91,7 +91,7 @@ def run(args, contract):
             },
             "reference_samples": settings["background"]["reference_samples"],
             "epochs": args.epochs,
-            "runs": args.runs,
+            "fits": args.runs,
             "initialization": settings["riddle"]["initialization"],
             "fractions": args.fractions,
             "selected_checkpoints": result["selected_checkpoints"],

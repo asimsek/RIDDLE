@@ -1,4 +1,5 @@
 import argparse
+from copy import copy
 import fcntl
 import importlib.metadata
 import json
@@ -103,6 +104,10 @@ def lock(path):
 
 def settings(path, *, runs=None, epochs=None):
     value = yaml.safe_load(Path(path).read_text())
+    if isinstance(value, dict) and "fits" in value:
+        if "runs" in value:
+            raise ValueError("Use fits, or the legacy runs key, not both")
+        value["runs"] = value.pop("fits")
     required = {"background_epochs", "signal_epochs", "fit_index"}
     if (
         not isinstance(value, dict)
@@ -110,7 +115,7 @@ def settings(path, *, runs=None, epochs=None):
         or set(value) - required - {"runs", "split_mode"}
     ):
         raise ValueError(
-            "R-ANODE config requires background_epochs, signal_epochs, fit_index and optional runs/split_mode"
+            "R-ANODE config requires background_epochs, signal_epochs, fit_index and optional fits/split_mode"
         )
     value.setdefault("runs", 1)  # Older single-fit configuration files retain their meaning.
     value.setdefault("split_mode", "fixed")
@@ -130,7 +135,7 @@ def settings(path, *, runs=None, epochs=None):
     if not 0 <= value["fit_index"] < 20:
         raise ValueError("R-ANODE fit_index must be 0–19, as in the upstream launcher")
     if value["runs"] < 1 or value["fit_index"] + value["runs"] > 20:
-        raise ValueError("R-ANODE requires runs >= 1 and fit_index + runs <= 20")
+        raise ValueError("R-ANODE requires fits >= 1 and fit_index + fits <= 20")
     return value
 
 
@@ -411,7 +416,7 @@ def run(args):
     ):
         raise ValueError("Keep R-ANODE data, upstream sources and results separate")
     config = settings(
-        args.config, runs=getattr(args, "runs", None), epochs=getattr(args, "epochs", None)
+        args.config, runs=getattr(args, "fits", None), epochs=getattr(args, "epochs", None)
     )
     checks = ProgressStage("ranode_checks", "Verify inputs, upstream sources and runtime", 3)
     inputs, _ = validate(args.data)
@@ -500,6 +505,10 @@ def run(args):
             "schema": 1,
             "method": "ranode",
             "seed": args.seed,
+            "campaign_seed": getattr(args, "campaign_seed", None) if getattr(args, "campaign_seed", None) is not None else args.seed,
+            "run_index": getattr(args, "run_index", 0),
+            "independent_run_count": getattr(args, "independent_run_count", 1),
+            "ensemble_fits": config["runs"],
             "scenario": args.scenario,
             "variant": inputs.get("variant", "default"),
             "completed": False,
@@ -594,15 +603,37 @@ def run(args):
         emit_message("Independent upstream R-ANODE result verified", kind="PASS")
 
 
+def run_repetitions(args):
+    """The direct adapter CLI also distinguishes whole runs from signal fits."""
+    from riddle.cli import independent_run_seeds
+
+    count = getattr(args, "runs", None) or 1
+    for index, seed in enumerate(independent_run_seeds(args.seed, count)):
+        options = copy(args)
+        if count > 1:
+            options.output = args.output / f"seed_{seed:03d}"
+            options.campaign_seed, options.run_index = args.seed, index
+            options.independent_run_count = count
+        options.seed = seed
+        run(options)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Run original R-ANODE on matched physical LHCO partitions"
+        description="Run original R-ANODE on matched physical LHCO partitions", allow_abbrev=False
     )
     parser.add_argument("--sources", type=Path, default=ROOT / "external/ranode")
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--config", type=Path, default=ROOT / "external/ranode_utils/ranode.yaml")
-    parser.add_argument("--runs", type=int, help="Override YAML signal-fit count")
+    from riddle.cli import positive
+
+    parser.add_argument("--fits", type=positive, help="Override YAML signal-fit count per complete run")
+    parser.add_argument("--runs", type=positive, default=1,
+                        help="Complete independent runs including background retraining (default: 1)")
+    parser.add_argument("--campaign-seed", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--run-index", type=int, default=0, help=argparse.SUPPRESS)
+    parser.add_argument("--independent-run-count", type=positive, default=1, help=argparse.SUPPRESS)
     parser.add_argument("--epochs", type=int, help="Override YAML signal epochs; background_epochs is unchanged")
     parser.add_argument(
         "--scenario", choices=("signal_injection", "background_only"), required=True
@@ -635,14 +666,14 @@ def main(argv=None):
         os.environ[key] = str(args.io_workers)
     try:
         if os.environ.get("RIDDLE_WORKER_PROGRESS") == "1":
-            run(args)
+            run_repetitions(args)
         else:
             from riddle.progress import set_verbosity
             from riddle.worker_progress import local_progress
 
             set_verbosity(int(os.environ.get("RIDDLE_VERBOSE", "1")))
             with local_progress(f"ranode | {args.scenario}"):
-                run(args)
+                run_repetitions(args)
     except (ValueError, OSError, RuntimeError, subprocess.SubprocessError) as error:
         parser.exit(1, f"[ERROR] {error}\n")
 

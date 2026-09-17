@@ -5,7 +5,7 @@ inputs:
   mass_column: mjj
   label_column: label
 riddle:
-  runs: 20
+  fits: 20
   epochs: 300
   fractions: [learned]
   initialization: background

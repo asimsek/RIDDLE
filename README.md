@@ -56,8 +56,8 @@ python run.py prepare --variant deltaR --output data/lhco_deltaR --io-workers 8
 
 ```bash
 python run.py run --methods riddle --data data/lhco --output results \
-  --scenarios signal_injection --seeds 42 --device cuda:0 --runs 10 --epochs 100 \
-  --workers 2 --io-workers 8 --mps auto --resume
+  --scenarios signal_injection --seeds 42 --device cuda:0 --fits 10 --epochs 100 \
+  --runs 10 --workers 2 --io-workers 8 --mps auto --resume
 ```
 
 **LaCathode:**
@@ -73,7 +73,7 @@ python run.py run --methods lacathode --data data/lhco --output results \
 ```bash
 python run.py run --methods ranode --data data/lhco --output results \
   --scenarios signal_injection background_only --seeds 42 --device cuda:0 \
-  --runs 10 --epochs 100 \
+  --runs 10 --fits 10 --epochs 100 \
   --io-workers 8 --resume
 ```
 
@@ -82,7 +82,7 @@ Run all three methods and both scenarios (`signal_injection`, `background_only`)
 ```bash
 python run.py run --methods lacathode riddle ranode --data data/lhco --output results \
   --scenarios signal_injection background_only --seeds 42 \
-  --runs 10 --epochs 100 \
+  --runs 10 --fits 10 --epochs 100 \
   --device cuda:0 --workers 2 --io-workers 8 --mps auto --resume
 ```
 
@@ -91,7 +91,8 @@ python run.py run --methods lacathode riddle ranode --data data/lhco --output re
 `--io-workers` controls CPU threads per process.<br>
 MPS is optional on Linux NVIDIA GPUs; `auto` falls back to ordinary concurrency, while `on` requires MPS.
 
-`--runs` controls RIDDLE/R-ANODE signal fits and independent LaCathode background-flow-plus-classifier runs.<br>
+`--fits` controls the signal fits inside each RIDDLE/R-ANODE ensemble.<br>
+`--runs` controls complete independent method runs per base seed; default = 1.<br>
 `--epochs` controls signal/classifier epochs.<br>
 `--lacathode-background fixed` shares same LaCathode background flow across `--runs` classifiers; default = `independent`.
 
@@ -116,11 +117,10 @@ Use the corresponding `shifted` locations for the shifted control.
 python plot.py --results results --output plots --io-workers 8 --verbose 1 --overwrite
 ```
 
-Plotting uses CPU by default; add `--device cuda:0 --io-workers 8` to accelerate RIDDLE checkpoint inference.<br>
-
 All completed methods are discovered automatically.<br>
 Request either method alone with `--methods lacathode`, `--methods riddle`, or `--methods ranode`.<br>
-Add `--overwrite` to regenerate matching plots and tables in an existing output directory without removing other files.
+`--plot-workers` controls parallel PDF/PNG export; `--io-workers` controls numerical CPU threads.<br>
+Add `--overwrite` to regenerate matching plots and tables.
 
 
 ## Optional signal-strength scan
@@ -132,7 +132,7 @@ python run.py prepare-scan --config config/settings.yaml --output data/injection
 ```bash
 python run.py scan --methods lacathode riddle ranode --config config/settings.yaml \
   --data data/injection_scan --output results_injection_scan \
-  --runs 10 --epochs 100 \
+  --runs 10 --fits 10 --epochs 100 \
   --device cuda:0 --workers 2 --io-workers 8 --mps auto --resume
 ```
 

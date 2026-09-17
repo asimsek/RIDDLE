@@ -1,9 +1,17 @@
+from collections import OrderedDict, deque
+from concurrent.futures import ProcessPoolExecutor
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import asdict, dataclass
+from copy import deepcopy
+from functools import wraps
+import gc
+import hashlib
 import itertools
 import math
+import multiprocessing
+import pickle
 import re
+import sys
 import matplotlib
 
 matplotlib.use("Agg")
@@ -68,89 +76,144 @@ STYLE = {
 }
 
 
-@dataclass(frozen=True)
-class SICBandGuard:
-    enabled: bool = True
-    asymmetry_ratio: float = 4.
-    relative_width: float = .5
-    consecutive_points: int = 3
-    transition_fraction: float = .2
-
-    def __post_init__(self):
-        if (not np.isfinite(self.asymmetry_ratio) or self.asymmetry_ratio <= 1
-                or not np.isfinite(self.relative_width) or self.relative_width <= 0
-                or type(self.consecutive_points) is not int or self.consecutive_points < 1
-                or not np.isfinite(self.transition_fraction) or self.transition_fraction <= 0):
-            raise ValueError("SIC band guard requires ratio > 1, relative width > 0 and positive consecutive points")
+_PLOT_CACHE = ContextVar("plot_calculation_cache", default=None)
+_FIGURE_EXPORTER = ContextVar("figure_exporter", default=None)
 
 
-_SIC_GUARD = ContextVar("sic_band_guard", default=SICBandGuard())
+def _calculation_key(value):
+    if isinstance(value, np.ndarray):
+        data = np.ascontiguousarray(value)
+        return value.dtype.str, value.shape, hashlib.sha256(data).digest()
+    if isinstance(value, (tuple, list)):
+        return tuple(_calculation_key(item) for item in value)
+    if isinstance(value, dict):
+        return tuple((key, _calculation_key(item)) for key, item in sorted(value.items()))
+    return value
+
+
+def _calculation_bytes(value):
+    if isinstance(value, np.ndarray):
+        return value.nbytes + 128
+    if isinstance(value, dict):
+        return sys.getsizeof(value) + sum(_calculation_bytes(k) + _calculation_bytes(v) for k, v in value.items())
+    if isinstance(value, (tuple, list)):
+        return sys.getsizeof(value) + sum(map(_calculation_bytes, value))
+    return sys.getsizeof(value)
+
+
+def cached_plot_calculation(function):
+    """Reuse exact numerical inputs within one plot run, with an LRU memory limit.
+
+    Hash contents rather than array identities: slices and copied SR records can
+    share results, while changed masks/scores never reuse a stale calculation.
+    Copies isolate callers that normalize histograms or annotate metric dicts.
+    """
+    @wraps(function)
+    def calculate(*args, **kwargs):
+        cache = _PLOT_CACHE.get()
+        if cache is None or cache["limit"] == 0:
+            return function(*args, **kwargs)
+        key = (function.__module__, function.__qualname__, _calculation_key(args), _calculation_key(kwargs))
+        entries = cache["entries"]
+        if key in entries:
+            entries.move_to_end(key)
+            return deepcopy(entries[key][0])
+        result = function(*args, **kwargs)
+        size = _calculation_bytes(key) + _calculation_bytes(result)
+        if size <= cache["limit"]:
+            while entries and (cache["bytes"] + size > cache["limit"] or len(entries) >= 4096):
+                _, (_, old_size) = entries.popitem(last=False)
+                cache["bytes"] -= old_size
+            entries[key] = (deepcopy(result), size)
+            cache["bytes"] += size
+        return result
+    return calculate
+
+
+# The same saved fits appear in ROC, SIC, rejection and individual plots.
+roc_curve = cached_plot_calculation(roc_curve)
+roc_auc_score = cached_plot_calculation(roc_auc_score)
+
+
+def _export_worker_init():
+    # Export workers do no inference; avoid multiplying BLAS threads by workers.
+    from threadpoolctl import threadpool_limits
+
+    threadpool_limits(limits=1)
+
+
+def _export_figure(payload, path, style):
+    with matplotlib.rc_context(style):
+        fig = pickle.loads(payload)
+        try:
+            _save_figure(fig, path)
+        finally:
+            plt.close(fig)
+            gc.collect()
+
+
+class FigureExporter:
+    """Bound in-flight figures and propagate worker failures before completion."""
+
+    def __init__(self, workers):
+        self.pool = (ProcessPoolExecutor(workers, mp_context=multiprocessing.get_context("spawn"),
+                                         initializer=_export_worker_init) if workers > 1 else None)
+        self.pending = deque()
+        self.max_pending = 2 * workers
+        self.pending_bytes = 0
+
+    def _finish_one(self):
+        future, path, size = self.pending.popleft()
+        self.pending_bytes -= size
+        try:
+            future.result()
+        except Exception as error:
+            raise RuntimeError(f"Figure export failed for {path}: {error}") from error
+
+    def save(self, fig, path):
+        if self.pool is None:
+            _save_figure(fig, path)
+            return
+        # Snapshot before closing/reusing artists; workers receive no score data
+        # or inference runtime and never access the parent pyplot globals.
+        try:
+            payload = pickle.dumps(fig, protocol=pickle.HIGHEST_PROTOCOL)
+        except (pickle.PicklingError, AttributeError, TypeError):
+            # Custom axes may contain local callbacks. Preserve their original
+            # renderer instead of making serialization a plotting requirement.
+            _save_figure(fig, path)
+            return
+        while self.pending and (len(self.pending) >= self.max_pending
+                                or self.pending_bytes + len(payload) > 256 * 1024**2):
+            self._finish_one()
+        future = self.pool.submit(_export_figure, payload, path, dict(matplotlib.rcParams))
+        self.pending.append((future, path, len(payload)))
+        self.pending_bytes += len(payload)
+
+    def flush(self):
+        while self.pending:
+            self._finish_one()
+
+    def close(self):
+        if self.pool is not None:
+            self.pool.shutdown(wait=True, cancel_futures=True)
 
 
 @contextmanager
-def sic_band_guard_policy(policy):
-    token = _SIC_GUARD.set(policy)
+def plot_resources(*, workers=1, cache_mb=1024):
+    """Caches and export processes live only for this plotting invocation."""
+    if workers < 1 or cache_mb < 0:
+        raise ValueError("Plot workers must be positive and cache size nonnegative")
+    exporter = FigureExporter(workers)
+    cache_token = _PLOT_CACHE.set(dict(entries=OrderedDict(), bytes=0, limit=cache_mb * 1024**2))
+    export_token = _FIGURE_EXPORTER.set(exporter)
     try:
-        yield
+        yield exporter
+        exporter.flush()
     finally:
-        _SIC_GUARD.reset(token)
-
-
-def _sustained(mask, minimum):
-    result = np.zeros_like(mask)
-    edges = np.flatnonzero(np.diff(np.r_[False, mask, False]))
-    for start, end in zip(edges[::2], edges[1::2]):
-        if end - start >= minimum:
-            result[start:end] = True
-    return result
-
-
-def guard_sic_band(low, median, high, *, policy=None):
-    """Mirror the smaller width only for a sustained, large one-sided excursion.
-
-    This is a configurable rendering heuristic, not an outlier test or a new
-    confidence interval. A zero/numerically negligible smaller width cannot be
-    used: collapsing an uncertain interval to a line would conceal variation.
-    Nonfinite (unsupported) points break runs, and ordinary asymmetry is retained.
-    """
-    policy = _SIC_GUARD.get() if policy is None else policy
-    low, median, high = (np.asarray(v, float) for v in (low, median, high))
-    if low.ndim != 1 or low.shape != median.shape or low.shape != high.shape:
-        raise ValueError("Band guard needs aligned one-dimensional percentile curves")
-    finite = np.isfinite(low) & np.isfinite(median) & np.isfinite(high)
-    if np.any(finite & ((low > median) | (median > high))):
-        raise ValueError("Band percentiles are out of order")
-    lower, upper = median - low, high - median
-    tolerance = 32 * np.finfo(float).eps * np.maximum(1., np.abs(median))
-    sizable = np.maximum(lower, upper) > policy.relative_width * np.abs(median)
-    usable = finite & (np.minimum(lower, upper) > tolerance)
-    lower_large = usable & sizable & (lower > policy.asymmetry_ratio * upper)
-    upper_large = usable & sizable & (upper > policy.asymmetry_ratio * lower)
-    lower_adjusted = _sustained(lower_large, policy.consecutive_points) & policy.enabled
-    upper_adjusted = _sustained(upper_large, policy.consecutive_points) & policy.enabled
-    changed = lower_adjusted | upper_adjusted
-    # Ramp over the next 20% beyond both thresholds. Without this transition,
-    # a smooth underlying percentile can acquire a sharp artificial step.
-    ratio_strength = np.divide(np.maximum(lower, upper), policy.asymmetry_ratio * np.minimum(lower, upper),
-                               out=np.zeros_like(median), where=usable)
-    relative_strength = np.maximum(lower, upper) / (policy.relative_width * np.maximum(np.abs(median), tolerance))
-    t = np.clip((np.minimum(ratio_strength, relative_strength) - 1) / policy.transition_fraction, 0, 1)
-    weight = np.where(changed, t * t * (3 - 2 * t), 0.)
-    display_low, display_high = low.copy(), high.copy()
-    display_low[lower_adjusted] += weight[lower_adjusted] * (lower - upper)[lower_adjusted]
-    display_high[upper_adjusted] -= weight[upper_adjusted] * (upper - lower)[upper_adjusted]
-    audit = {
-        **asdict(policy),
-        "scope": "SIC shading only; original 16/50/84 percentiles and metrics retained",
-        "rule": "larger width > ratio * smaller AND > relative_width * abs(median), sustained on adjacent supported points",
-        "applied": bool(changed.any()),
-        "adjusted_points": int(changed.sum()),
-        "transition_weights": weight.tolist(),
-        "lower_adjusted_indices": np.flatnonzero(lower_adjusted).tolist(),
-        "upper_adjusted_indices": np.flatnonzero(upper_adjusted).tolist(),
-        "skipped_zero_width_indices": np.flatnonzero(finite & sizable & ~usable).tolist(),
-    }
-    return display_low, display_high, audit
+        _PLOT_CACHE.reset(cache_token)
+        _FIGURE_EXPORTER.reset(export_token)
+        exporter.close()
 
 
 def fit_scores(record):
@@ -166,6 +229,7 @@ def sample_fit_scores(sample, key):
     return sample.get(key + "_fit_scores", sample[key + "_scores"][None, :])
 
 
+@cached_plot_calculation
 def fit_histogram(values, edges, mask):
     """Mean counts per fit, retaining event denominators rather than pooling fits."""
     values, mask = np.broadcast_arrays(np.atleast_2d(values), np.atleast_2d(mask))
@@ -180,7 +244,7 @@ def validate_fit_counts(records):
     return counts[0]
 
 
-def fit_curve_summary(curves):
+def fit_curve_summary(curves, run_groups=None):
     """Upstream interpolation of rejection and SIC at 1000 common signal efficiencies.
 
     The caller applies its statistical-support cut before interpolation. Every
@@ -195,12 +259,21 @@ def fit_curve_summary(curves):
     signal = np.linspace(low, high, 1000)
     rejection = np.asarray([interp1d(s, 1 / b)(signal) for b, s in curves])
     sic = np.asarray([interp1d(s, s / np.sqrt(b))(signal) for b, s in curves])
+    if run_groups is not None:
+        groups = np.asarray(run_groups)
+        if groups.shape != (len(curves),):
+            raise ValueError("Each curve needs a complete-run identity")
+        # Shared-background LaCathode classifier fits retain their median
+        # prediction, but only complete runs enter the uncertainty percentiles.
+        rejection = np.asarray([np.median(rejection[groups == key], axis=0) for key in np.unique(groups)])
+        sic = np.asarray([np.median(sic[groups == key], axis=0) for key in np.unique(groups)])
     return signal, np.percentile(rejection, [16, 50, 84], axis=0), np.percentile(sic, [16, 50, 84], axis=0)
 
 
-def draw_fit_curves(ax, curves, metric, label, color, linestyle, *, uncertainty_source="per_fit_variation"):
+def draw_fit_curves(ax, curves, metric, label, color, linestyle, *, uncertainty_source="independent_run_variation", band=True, run_groups=None):
+    run_count = len(curves) if run_groups is None else len(set(run_groups))
     try:
-        signal, rejection, sic = fit_curve_summary(curves)
+        signal, rejection, sic = fit_curve_summary(curves, run_groups)
     except ValueError as error:
         drawn = False
         for b, s in curves:
@@ -225,32 +298,19 @@ def draw_fit_curves(ax, curves, metric, label, color, linestyle, *, uncertainty_
         x, y = 1 / rejection, np.broadcast_to(signal, rejection.shape)
     else:
         x, y = 1 / rejection, sic
-    band_x, band_y, guard = x.copy(), y.copy(), None
-    if len(curves) > 1 and metric.startswith("sic"):
-        band_y[0], band_y[2], guard = guard_sic_band(sic[0], sic[1], sic[2])
-        if guard["applied"]:
-            if metric != "sic_signal":
-                # Preserve fixed-signal-efficiency geometry: B = (S / SIC)^2.
-                # Change only the affected boundary; keep the median path intact.
-                for boundary, name in ((0, "lower"), (2, "upper")):
-                    indices = guard[name + "_adjusted_indices"]
-                    band_x[boundary, indices] = (signal[indices] / band_y[boundary, indices]) ** 2
-            mark_guarded_band(ax, x, y, color)
-    if len(curves) > 1:
-        # A parametric ribbon at fixed signal efficiency, not a vertical band
-        # at fixed background efficiency. Keep the publication's displayed axes.
-        ax.fill(np.r_[band_x[0], band_x[2, ::-1]], np.r_[band_y[0], band_y[2, ::-1]],
+    if band and run_count > 1:
+        # Parametric ribbon at fixed signal efficiency, retaining upstream axes.
+        ax.fill(np.r_[x[0], x[2, ::-1]], np.r_[y[0], y[2, ::-1]],
                 color=color, alpha=.18, linewidth=0)
-    ax.plot(x[1], y[1], label=label + ("*" if guard and guard["applied"] else ""), color=color, ls=linestyle)
+    ax.plot(x[1], y[1], label=label, color=color, ls=linestyle)
     return {
-        "fit_count": len(curves), "band_drawn": len(curves) > 1,
+        "fit_count": len(curves), "run_count": run_count, "band_drawn": bool(band and run_count > 1),
         "aggregation": "upstream common signal-efficiency interpolation; median rejection and SIC",
         "signal_efficiency": signal.tolist(), "background_rejection": rejection.tolist(),
         "sic": sic.tolist(), "display_x": x[1].tolist(), "display_y": y[1].tolist(),
         "percentiles": [16, 50, 84],
         "uncertainty_source": uncertainty_source,
-        "display_band_x": band_x.tolist(), "display_band_y": band_y.tolist(),
-        "band_guard": guard,
+        "display_band_x": x.tolist(), "display_band_y": y.tolist(),
     }
 
 
@@ -650,12 +710,22 @@ def place_axis_legend(fig, ax, spec):
     raise ValueError(f"Cannot fit an internal legend in the {ax.get_ylabel()!r} panel without covering data")
 
 
-def save(fig, path):
+def _save_figure(fig, path):
     path.parent.mkdir(parents=True, exist_ok=True)
     place_legend(fig)
     fig.savefig(path.with_suffix(".pdf"), bbox_inches="tight", pad_inches=0.06)
     fig.savefig(path.with_suffix(".png"), bbox_inches="tight", pad_inches=0.06)
-    plt.close(fig)
+
+
+def save(fig, path):
+    try:
+        exporter = _FIGURE_EXPORTER.get()
+        if exporter is None:
+            _save_figure(fig, path)
+        else:
+            exporter.save(fig, path)
+    finally:
+        plt.close(fig)
 
 
 def decorate_mass(ax, edges):
@@ -713,7 +783,9 @@ def render_roc(bundle, output, args):
                             use = b > 0 if kind.startswith("roc") else (b >= 1e-4) & (np.rint(b * nb) >= args.min_background)
                             fit_curves.append((b[use], s[use]))
                         audit[label][kind] = draw_fit_curves(ax, fit_curves, kind, label, color, ls,
-                                                           uncertainty_source=fit_uncertainty(record))
+                                                           uncertainty_source=fit_uncertainty(record),
+                                                           band=record.get("independent_runs", False),
+                                                           run_groups=None if record.get("independent_runs", False) else [0] * len(fit_curves))
                         audit[label].update(fit_count=len(fit_curves),
                                             unique_scores=[int(len(np.unique(v[record["mask"]]))) for v in fit_scores(record)],
                                             interpolation_or_smoothing="linear interpolation on common signal efficiency; no smoothing",
@@ -845,7 +917,7 @@ def render_efficiency(bundle, output, args):
                     lw=1,
                     label=label,
                 )
-                if "fits" in row:
+                if "fits" in row and bundle["evaluation"]["test"][key].get("independent_runs", False):
                     ax.vlines(centers, low * 100, high * 100, color=color, lw=1)
             decorate_mass(ax, edges)
             ax.set_ylim(0, ymax)
@@ -1095,6 +1167,31 @@ def render_mass(bundle, output):
                 save(fig, output / view / "03_mass_sculpting" / f"background_mass_{kind}_{name}")
 
 
+def strict_cut_histograms(values, edges, scores, mask, thresholds):
+    """Exact unweighted histograms for many strict cuts, in one event pass.
+
+    Bucket by the number of thresholds passed, then accumulate from high to
+    low. Match numpy.histogram's closed final bin, and exclude NaN scores just
+    as a direct score > cut comparison does. Preserve unsorted/repeated cuts.
+    """
+    thresholds = np.asarray(thresholds)
+    bins = len(edges) - 1
+    if not len(thresholds):
+        return np.zeros((0, bins), dtype=np.int64)
+    order = np.argsort(thresholds, kind="stable")
+    bin_id = np.searchsorted(edges, values, side="right") - 1
+    bin_id[values == edges[-1]] = bins - 1
+    valid = mask & ~np.isnan(scores) & (bin_id >= 0) & (bin_id < bins)
+    passed = np.searchsorted(thresholds[order], scores[valid], side="left")
+    counts = np.bincount(passed * bins + bin_id[valid], minlength=(len(thresholds) + 1) * bins)
+    cumulative = np.cumsum(counts.reshape(-1, bins)[::-1], axis=0)[::-1][1:]
+    result = np.empty_like(cumulative)
+    result[order] = cumulative
+    # A NaN threshold never passes, irrespective of its sorted position.
+    result[np.isnan(thresholds)] = 0
+    return result
+
+
 def mass_scan_histograms(sample, keys, cuts=SCORE_CUTS):
     """Histogram strict cuts in each method's displayed 0--1 score coordinate.
 
@@ -1107,20 +1204,26 @@ def mass_scan_histograms(sample, keys, cuts=SCORE_CUTS):
     mass, labels = sample["mass"], sample["labels"]
     edges = np.linspace(min(1.0, float(mass.min())), max(9.0, float(mass.max())), 81)
     nominal = {y: np.histogram(mass[labels == y], edges)[0] for y in (0, 1)}
-    records = []
+    cuts = tuple(cuts)
     for cut in cuts:
         if not np.isfinite(cut) or not 0 < cut < 1:
             raise ValueError("Mass-scan score thresholds must be strictly between zero and one")
-        histograms = {}
-        for key in keys:
-            # Match the stored array precision so events exactly at a cut fail.
-            threshold = logit(cut) if key == "residual" else cut
-            threshold = np.asarray(threshold, dtype=sample[key + "_scores"].dtype)
-            keep = selected(sample, key, threshold)
-            histograms[key] = {
-                y: fit_histogram(mass, edges, keep & (labels == y)) for y in (0, 1)
-            }
-        records.append((cut, histograms))
+    histograms = {}
+    for key in keys:
+        # Retain the scalar logit calculation and stored-array precision, so
+        # events exactly at a cut fail identically to selected().
+        thresholds = np.asarray([logit(cut) if key == "residual" else cut for cut in cuts],
+                                dtype=sample[key + "_scores"].dtype)
+        fits = sample_fit_scores(sample, key)
+        if len(fits) == 1:
+            fits = sample[key + "_scores"][None, :]
+        histograms[key] = {}
+        for y in (0, 1):
+            counts = np.asarray([strict_cut_histograms(mass, edges, score, sample["mask"] & (labels == y),
+                                                      thresholds) for score in fits])
+            histograms[key][y] = counts[0] if len(counts) == 1 else counts.mean(axis=0)
+    records = [(cut, {key: {y: histograms[key][y][i] for y in (0, 1)} for key in keys})
+               for i, cut in enumerate(cuts)]
     return edges, nominal, records
 
 
@@ -1494,35 +1597,17 @@ def summary_axes(ax, metric):
     ax._publication_fixed_ylim = True
 
 
-def mark_guarded_band(ax, raw_x, raw_y, color):
-    """Keep the original limits visible and identify adjusted shading on the figure."""
-    for boundary in (0, 2):
-        ax.plot(raw_x[boundary], raw_y[boundary], color=color, ls=":", lw=.9, alpha=.65,
-                label="_original_percentile_limit")
-    fig = ax.get_figure()
-    if not getattr(fig, "_sic_guard_note", False):
-        fig.text(.5, .015, "* Guarded display band; dotted lines: original 16–84% limits.",
-                 ha="center", va="top", fontsize=8)
-        fig._sic_guard_note = True
-
-
-def draw_band(ax, x, values, label, color, linestyle, *, band=True, guard_sic=False):
+def draw_band(ax, x, values, label, color, linestyle, *, band=True):
     low, median, high = central68(values)
     drawn = bool(band and len(values) >= 2 and np.isfinite(median).any())
-    display_low, display_high, guard = low, high, None
-    if drawn and guard_sic:
-        display_low, display_high, guard = guard_sic_band(low, median, high)
-        if guard["applied"]:
-            mark_guarded_band(ax, np.broadcast_to(x, (3, len(x))), np.array([low, median, high]), color)
     if drawn:
-        ax.fill_between(x, display_low, display_high, color=color, alpha=0.18, linewidth=0)
-    ax.plot(x, median, color=color, ls=linestyle, label=label + ("*" if guard and guard["applied"] else ""))
+        ax.fill_between(x, low, high, color=color, alpha=0.18, linewidth=0)
+    ax.plot(x, median, color=color, ls=linestyle, label=label)
     return {
         "low": low.tolist(),
         "median": median.tolist(),
         "high": high.tolist(),
-        "display_low": display_low.tolist(), "display_high": display_high.tolist(),
-        "band_guard": guard,
+
         "independent_runs": len(values),
         "band_drawn": drawn,
         "band_status": "drawn"

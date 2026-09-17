@@ -164,6 +164,11 @@ def main():
     }
     if args.method == "lacathode" and getattr(args, "lacathode_replica", False):
         report.update(campaign_seed=args.campaign_seed, run_index=args.run_index)
+    if args.method == "riddle":
+        report.update(campaign_seed=getattr(args, "campaign_seed", args.seed),
+                      run_index=getattr(args, "run_index", 0),
+                      independent_run_count=getattr(args, "independent_run_count", 1),
+                      ensemble_fits=args.runs)
     if saved is not None and (changes or "initial_contract" in saved):
         report["initial_contract"] = saved.get("initial_contract", saved["contract"])
     write_json(path, report)
