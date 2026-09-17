@@ -21,6 +21,7 @@ from .storage import atomic_write, file_digest, locked, write_json
 from .progress import set_verbosity, colored_status, verbosity, _duration
 from .worker_progress import ProgressStage, local_progress
 from .metrics import acceptance_report, efficiency_curve, oracle_metrics
+from .production import validate_score_record
 
 
 # Physical comparisons, per-method figures and summaries share numerical work.
@@ -326,17 +327,7 @@ def load_scores(root, report, name):
         np.isfinite(data[k]).all() for k in ("mass", "physical", "latent") if k in data
     ):
         raise ValueError("Invalid event features or labels")
-    if (
-        not np.isfinite(data["scores"][data["mask"]]).all()
-        or np.isfinite(data["scores"][~data["mask"]]).any()
-    ):
-        raise ValueError("Scores disagree with the mapping mask")
-    if "fit_scores" in data:
-        fits = data["fit_scores"]
-        if (fits.ndim != 2 or fits.shape[1:] != (n,) or not len(fits)
-                or not np.isfinite(fits[:, data["mask"]]).all()
-                or np.isfinite(fits[:, ~data["mask"]]).any()):
-            raise ValueError("Invalid saved per-fit scores")
+    validate_score_record(data, method=report["method"], stage=f"{root}/{name}")
     if report["method"] == "lacathode":
         settings = report.get("contract", {}).get("settings", {})
         independent = report.get("contract", {}).get("lacathode_run_layout") == "independent_background_classifier_v1"
@@ -346,7 +337,7 @@ def load_scores(root, report, name):
             fits.ndim != 2 or fits.shape[1:] != (n,) or len(fits) < 1
             or (runs is not None and (type(runs) is not int or len(fits) != runs))
             or not np.isfinite(fits[:, data["mask"]]).all()
-            or np.isfinite(fits[:, ~data["mask"]]).any()
+            or not np.isnan(fits[:, ~data["mask"]]).all()
             or not np.array_equal(fits[0], data["scores"], equal_nan=True)
         ):
             raise ValueError("Invalid or incomplete LaCathode per-fit scores")
@@ -369,12 +360,39 @@ class ScoreLoader:
 
     def __init__(self):
         self.cache = {}
+        self.validated = set()
 
     def __call__(self, root, report, partition):
+        identity = str(root.resolve())
+        if identity not in self.validated:
+            if report["method"] == "ranode":
+                from external.ranode_utils.ensemble import validate_result_normalization
+
+                validate_result_normalization(root, report)
+            if "density/normalization_check.json" in report.get("artifacts_sha256", {}):
+                audit = read_metadata(root, report, "density/normalization_check.json")
+                if audit.get("status") != "passed":
+                    raise ValueError(f"{root}: failed density normalization check")
+            self.validated.add(identity)
         key = (str(root.resolve()), partition)
         if key not in self.cache:
             self.cache[key] = load_scores(root, report, partition)
         return self.cache[key]
+
+
+def preflight_scores(groups, loader, *, allow_smoke=False):
+    """Finish scientific input checks before --overwrite removes any figures."""
+    seen = set()
+    for group in groups:
+        for root, report in group.values():
+            identity = str(root.resolve())
+            if identity in seen:
+                continue
+            seen.add(identity)
+            if report.get("contract", {}).get("inputs", {}).get("synthetic_smoke_fixture") and not allow_smoke:
+                raise ValueError("Synthetic fixtures require --allow-smoke for QA")
+            for partition in ("validation", "test", "signal_region"):
+                loader(root, report, partition)
 
 
 def run_scores(record):
@@ -1806,12 +1824,15 @@ def main(argv=None):
                 raise FileExistsError("Plot output exists; use --overwrite or choose a new output directory")
             if any(path.is_symlink() for path in args.output.rglob("*")):
                 raise ValueError("Cannot overwrite a plot directory containing symbolic links")
+        score_loader = ScoreLoader()
+        colored_status("Validate saved score artifacts and method normalization before plotting", kind="INFO", level=1)
+        with threadpool_limits(limits=args.io_workers):
+            preflight_scores([*groups.values(), *scan_groups.values()], score_loader, allow_smoke=args.allow_smoke)
         args.output.mkdir(parents=True, exist_ok=args.overwrite)
         rows, settings, bundles = [], [], []
         comparisons = {}
         available = set().union(*(set(g) for g in [*groups.values(), *scan_groups.values()]))
         progress = PlotProgress(plot_task_count(groups, scan_groups))
-        score_loader = ScoreLoader()
         colored_status(f"Plot plan: {progress.total} task groups | {len(groups)} scenario/seed groups | "
                        f"{len(scan_groups)} injection-scan points | {args.plot_workers} export workers | "
                        f"{args.plot_cache_mb} MiB calculation cache | saved results only, no training",
@@ -1825,7 +1846,7 @@ def main(argv=None):
             if scan_groups:
                 with progress.task("Injection scan | discrimination and significance"):
                     # Scans use saved ensemble scores, not member re-inference.
-                    scan_loader = ScoreLoader()
+                    scan_loader = score_loader
                     scan_audit = render_injection_scan(scan_groups, args.output / "injection_scan" / "comparison", args, scan_loader)
                     for method in sorted(available):
                         cohort = {identity: {method: group[method]} for identity, group in scan_groups.items() if method in group}

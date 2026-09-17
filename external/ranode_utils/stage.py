@@ -13,6 +13,7 @@ import torch
 
 from .data import BACKGROUND_PROTOCOL, MatchedPartitions, evaluation, export_scores, input_features, region, validate
 from .source import digest, verify
+from .ensemble import validate_mass_normalization, validate_upstream_likelihood
 from .variants import background_diagnostics, extend_delta_r, model_config
 from riddle.worker_progress import emit_progress as stage_progress
 
@@ -257,6 +258,10 @@ def main():
         training=adapter.split_indices[0], validation=adapter.split_indices[1],
     )
     if stage == "signal":
+        stage_progress("normalization", "Validate sampled signal-mass normalization")
+        health = validate_mass_normalization(attempt)
+        validate_upstream_likelihood(namespace)
+        (attempt / "mass_normalization.json").write_text(json.dumps(health, indent=2) + "\n")
         stage_progress("export", "Export validation, test and signal-region scores")
         export_scores(namespace, arrays, attempt)
         np.save(attempt / "upstream_likelihood.npy", namespace["likelihood"])

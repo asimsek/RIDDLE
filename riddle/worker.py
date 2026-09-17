@@ -11,6 +11,7 @@ from .data import validate
 from .worker_progress import emit_message
 from .resume import inspect_resume, record_transition, resume_policy
 from .integrity import SCIENTIFIC_VERSION
+from .production import validate_result_scores
 
 
 def runtime_code(method, root=None):
@@ -25,6 +26,7 @@ def runtime_code(method, root=None):
         raise ValueError("Unknown method")
     framework = (
         "integrity.py",
+        "production.py",
         "metrics.py",
         "scan.py",
         "cli.py",
@@ -139,6 +141,7 @@ def main():
     completed = saved is not None and saved["completed"]
     if completed:
         verify_artifacts(args.output, saved["artifacts_sha256"])
+        validate_result_scores(args.output, args.method)
     if saved is not None:
         record_transition(
             args.output / ".resume/resume_history.json", saved["contract"], contract, changes,
@@ -181,6 +184,7 @@ def main():
             from external.lacathode_utils.pipeline import run
     run(args, contract)
     validate(args.data)
+    write_json(args.output / "score_health.json", validate_result_scores(args.output, args.method))
     artifacts = [
         p
         for p in args.output.rglob("*")

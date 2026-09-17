@@ -359,6 +359,38 @@ def train_campaign(
     return result
 
 
+def validate_normalization(output, features, device):
+    """Check every selected density before evaluating data; preserve training RNG."""
+    import torch
+    from .production import validate_density_ratio
+
+    root = Path(output)
+    selection = json.loads((root / "ensemble_selection.json").read_text())
+    require_complete_ensemble(selection)
+    seed, count = 3407, 8192
+    reference = np.random.default_rng(seed).standard_normal((count, features)).astype(np.float32)
+    members = selection["members"]
+    tests = sum(len(m["epochs"]) + 1 for m in members)
+    audit = dict(schema=1, status="checking", reference="independent standard normal",
+                 reference_seed=seed, reference_samples=count, features=features,
+                 familywise_false_rejection_bound=1e-12, members=[])
+    try:
+        with torch.random.fork_rng(devices=[] if str(device) == "cpu" else None):
+            for member in members:
+                checkpoints = []
+                scores = residual_scores(root / member["directory"], member["epochs"], reference, device,
+                                         normalization_checks=checkpoints, normalization_tests=tests)
+                audit["members"].append(dict(directory=member["directory"], checkpoints=checkpoints,
+                    ensemble=validate_density_ratio(scores, stage=f"RIDDLE {member['directory']} ensemble", tests=tests)))
+    except (ValueError, FloatingPointError) as error:
+        audit.update(status="failed", error=str(error))
+        write_json(root / "normalization_check.json", audit)
+        raise
+    audit["status"] = "passed"
+    write_json(root / "normalization_check.json", audit)
+    return audit
+
+
 def ensemble_predict(output, z, device):
     root = Path(output)
     selection = json.loads((root / "ensemble_selection.json").read_text())

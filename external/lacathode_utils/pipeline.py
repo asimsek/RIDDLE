@@ -197,6 +197,7 @@ def launch_runs(args, requests):
 def collect_runs(args, members):
     import numpy as np
     from .storage import atomic_write, save_npz, save_array, write_json, verify_artifacts
+    from riddle.production import validate_result_scores
 
     roots = [args.output / member["directory"] for member in members]
     reports = [json.loads((root / "result.json").read_text()) for root in roots]
@@ -206,6 +207,7 @@ def collect_runs(args, members):
                 or report.get("run_index") != member["run"]):
             raise ValueError("Missing or misidentified independent LaCathode run")
         verify_artifacts(root, report["artifacts_sha256"])
+        validate_result_scores(root, "lacathode")
     for partition in ("validation", "test", "signal_region"):
         records = []
         for root in roots:
@@ -280,6 +282,7 @@ def run(args, contract):
 def classifier_prediction_device(classifier_type):
     """Match prediction inputs to the loaded model, only during SR evaluation."""
     import torch
+    from riddle.production import score_diagnostics
 
     original = classifier_type.predict
 
@@ -288,7 +291,9 @@ def classifier_prediction_device(classifier_type):
         with torch.no_grad():
             self.eval()
             x = torch.tensor(x, device=device)
-            return self.forward(x).detach().cpu().numpy()
+            result = self.forward(x).detach().cpu().numpy()
+            score_diagnostics(result.ravel(), stage="LaCathode SR classifier checkpoint", probability=True, summarize=False)
+            return result
 
     classifier_type.predict = predict
     try:
@@ -398,6 +403,10 @@ def run_single(args, contract):
         run_all.train_DE(de)
 
     recovery.stage("flow", flow)
+    for name in (f"{FLOW_PREFIX}_train_losses.npy", f"{FLOW_PREFIX}_val_losses.npy"):
+        losses = np.load(root / name, allow_pickle=False)
+        if not losses.size or not np.isfinite(losses).all():
+            raise ValueError(f"LaCathode: invalid flow losses in {root / name}; refusing checkpoint selection")
 
     def create():
         with ProgressStage("creation", "Build latent/reference datasets"):
@@ -421,6 +430,10 @@ def run_single(args, contract):
         run_all.train_classifier(run_all.create_namespace_classifier_training(parsed))
 
     recovery.stage("classifier", classify)
+    for name in ("loss_matris.npy", "val_loss_matris.npy"):
+        losses = np.load(root / name, allow_pickle=False)
+        if not losses.size or not np.isfinite(losses).all():
+            raise ValueError(f"LaCathode: invalid classifier losses in {root / name}; refusing checkpoint selection")
     rows = np.load(root / "X_test.npy")
     if len(np.unique(rows[rows[:, -2] == 1, -1])) > 1:
         run_all.full_single_evaluation(
@@ -459,6 +472,7 @@ def run_single(args, contract):
 
 
 def evaluate(args, root, data_handler, *, config_file="DE_MAF_model.yml", classifier_runs=1):
+    from riddle.production import score_diagnostics
     import numpy as np
     import torch
 
@@ -481,6 +495,7 @@ def evaluate(args, root, data_handler, *, config_file="DE_MAF_model.yml", classi
         return DensityEstimator(*a, **kw)
 
     def capture(labels, scores):
+        score_diagnostics(np.asarray(scores), stage="LaCathode SR classifier ensemble", probability=True, summarize=False)
         captured.append(dict(labels=labels, scores=scores))
         return roc_curve(labels, scores)
 
@@ -599,6 +614,8 @@ def evaluate(args, root, data_handler, *, config_file="DE_MAF_model.yml", classi
                                 ]
                             )
                         )
+                        score_diagnostics(predictions[-1], stage=f"LaCathode {partition} checkpoint {path}",
+                                          probability=True, summarize=False)
                         completed += 1
                         progress.update(completed)
                     fit_predictions.append(np.mean(np.stack(predictions), axis=0))

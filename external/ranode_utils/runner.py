@@ -16,7 +16,7 @@ from pathlib import Path
 import yaml
 
 from .data import BACKGROUND_PROTOCOL, input_features, scientific_version, validate
-from .ensemble import combine_fits, selected_epochs
+from .ensemble import combine_fits, selected_epochs, validate_mass_normalization, validate_result_normalization
 from .resume import check_contract, policy, transition_history
 from .source import COMMIT, REPOSITORY, digest, verify
 from riddle.worker_progress import EVENT_PREFIX, ProgressStage, emit_message, emit_progress
@@ -248,6 +248,8 @@ def prepare_stage(args, stage, config, background=None):
         emit_progress("reuse", "Verify saved stage artifacts", stream=label, completed=0)
         saved = json.loads(receipt.read_text())
         check_files(args.output, saved["files"])
+        if stage == "signal":
+            validate_mass_normalization(args.output / saved["attempt"])
         emit_progress("reuse", "Verify saved stage artifacts", stream=label, completed=1)
         emit_message(f"{label}: reuse verified R-ANODE {stage} stage", kind="PASS")
         return args.output / saved["attempt"]
@@ -288,6 +290,8 @@ def complete_stage(args, options):
     label = "Background" if options["stage"] == "background" else f"Fit {options['fit_index']:03d}"
     emit_progress("receipt", "Verify and record stage artifacts", stream=label, completed=0)
     attempt = Path(options["attempt"])
+    if options["stage"] == "signal":
+        validate_mass_normalization(attempt)
     relative = attempt.relative_to(args.output)
     hashes = {
         str(relative / name): value for name, value in fingerprint(attempt).items()
@@ -454,7 +458,8 @@ def run(args):
             "ensemble": "mean_upstream_ratios_v1",
             "background_protocol": BACKGROUND_PROTOCOL,
         },
-        "code": {p.name: digest(p) for p in sorted(Path(__file__).parent.glob("*.py"))},
+        "code": {**{p.name: digest(p) for p in sorted(Path(__file__).parent.glob("*.py"))},
+                 "framework/production.py": digest(ROOT / "riddle/production.py")},
     }
     args.output.mkdir(parents=True, exist_ok=True)
     with lock(args.output / ".ranode.lock"):
@@ -481,6 +486,10 @@ def run(args):
             changes = check_contract(saved["contract"], contract, **resume_options)
             if saved["completed"]:
                 check_files(args.output, saved["artifacts_sha256"])
+                validate_result_normalization(args.output, saved)
+                from riddle.production import validate_result_scores
+
+                validate_result_scores(args.output, "ranode")
             else:
                 receipts = [args.output / "background_complete.json"] + [
                     stage_root(args, "signal", {"fit_index": index}) / "signal_complete.json"
@@ -551,7 +560,7 @@ def run(args):
             "input_adapter": "Sideband-only background pool; signal fits use upstream 80/20 ShuffleSplit within prepared training rows only" if config["split_mode"] == "resample_training" else "Sideband-only background pool; signal fits retain prepared train/validation membership",
             "optimizer": "Upstream AdamW unchanged, including decay on the learned fraction logit",
             "ensemble": "Equal-weight arithmetic mean of upstream per-fit density ratios; ten original validation-selected checkpoints per fit; all requested fits required; no manual exclusions",
-            "score": "Each fit retains scripts/r_anode.py likelihood, including its sampled signal-mass normalization and nan_to_num; final score is log(mean(exp(per-fit log ratio)))",
+            "score": "Unmodified upstream likelihood; require sampled signal-mass support in every SR bin and finite likelihood before nan_to_num; final score is log(mean(exp(per-fit log ratio)))",
             "seed": "Upstream seed controls data ordering; fit_index selects the split and fraction initialization. Upstream does not seed Torch",
             "restart": "Reuse completed stages; restart interrupted stage from saved initial RNG, without changing upstream checkpoint format",
             "background_attempt": str(background.relative_to(args.output)),
@@ -575,6 +584,13 @@ def run(args):
                 "unchanged": "Upstream flow classes, preprocessing, likelihood, optimization, split rules, checkpoint selection and score definition",
             }
         write_json(args.output / "protocol.json", protocol)
+        from riddle.production import validate_result_scores
+
+        health = validate_result_scores(args.output, "ranode")
+        health["mass_normalization"] = {
+            member["attempt"]: validate_mass_normalization(fit) for member, fit in zip(members, fits)
+        }
+        write_json(args.output / "score_health.json", health)
         final_progress = ProgressStage("ranode_final", "Verify inputs, sources and final result artifacts", 3)
         validate(args.data)
         final_progress.update(1, force=True)

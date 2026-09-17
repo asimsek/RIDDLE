@@ -4,7 +4,7 @@ from riddle.storage import atomic_write, save_npz, write_json
 from riddle.recovery import EpochRecovery
 from riddle.acceleration import install_tensor_batches, execution_report
 from .latent import prepare, Mapper
-from .campaign import train_campaign, ensemble_predict, fractions, PROTOCOL
+from .campaign import train_campaign, ensemble_predict, fractions, PROTOCOL, validate_normalization
 from .runtime import ordered_map
 from .settings import input_features
 from .resume import resume_policy
@@ -42,6 +42,7 @@ def run(args, contract):
         settings=settings["riddle"],
     )
     mapper = Mapper(args.data, latent_root, selection["inference_mapping_epoch"], args.device)
+    validate_normalization(output / "density", training.shape[1] - 3, args.device)
     acceptance = {}
     for partition, suffix in (("validation", "val"), ("test", "test"), ("signal_region", None)):
         names = (

@@ -8,6 +8,72 @@ from pathlib import Path
 import numpy as np
 
 
+MASS_BINS = np.linspace(3.3, 3.7, 50)  # Pinned scripts/r_anode.py mass marginal.
+
+
+def validate_upstream_likelihood(namespace):
+    raw = np.asarray(namespace["likelihood_"])
+    if raw.ndim != 1 or not raw.size or not np.isfinite(raw).all():
+        raise ValueError("Nonfinite or malformed upstream R-ANODE likelihood before nan_to_num; refusing sanitized scores")
+    if not np.array_equal(raw, namespace["likelihood"]):
+        raise ValueError("Upstream R-ANODE likelihood was modified by sanitization")
+
+
+def validate_mass_normalization(attempt):
+    """The sampled mass denominator must have support throughout the scored SR.
+
+    An empty bin invokes upstream's 1e-31 floor: finite but unphysical ratios
+    which can dominate every other fit. Never smooth, clip or omit that fit.
+    """
+    attempt = Path(attempt)
+    path = attempt / "results/upstream/signal/fit/samples.npy"
+    samples = np.load(path, mmap_mode="r", allow_pickle=False)
+    if samples.ndim != 2 or samples.shape[1] < 1 or not len(samples) or not np.isfinite(samples).all():
+        raise ValueError(f"R-ANODE {attempt}: invalid generated signal samples")
+    counts, _ = np.histogram(samples[:, 0], bins=MASS_BINS)
+    empty = np.flatnonzero(counts == 0)
+    if len(empty):
+        raise ValueError(
+            f"R-ANODE {attempt}: unsupported signal-mass normalization: "
+            f"{len(empty)}/{len(counts)} empty SR bins, {counts.sum()}/{len(samples)} samples in SR. "
+            "The upstream density floor would create artificial likelihood ratios. "
+            "Result rejected; inspect this fit's samples and training before rerunning. "
+            "All requested fits must pass; none are silently excluded."
+        )
+    return dict(status="passed", samples=len(samples), samples_in_sr=int(counts.sum()),
+                edges=MASS_BINS.tolist(), counts=counts.tolist(),
+                minimum_bin_count=int(counts.min()))
+
+
+def validate_result_normalization(root, report):
+    """Recheck saved samples too, including results made before this safeguard."""
+    import json
+    from riddle.storage import file_digest
+
+    root = Path(root).resolve()
+
+    def verified(name):
+        path = (root / name).resolve()
+        expected = report.get("artifacts_sha256", {}).get(name)
+        if not path.is_relative_to(root) or not expected or file_digest(path) != expected:
+            raise ValueError(f"R-ANODE normalization input missing or changed: {path}")
+        return path
+
+    protocol = json.loads(verified("protocol.json").read_text())
+    attempts = protocol.get("signal_attempts", [])
+    # Older single-fit adapter releases used signal_attempt.
+    if not attempts and protocol.get("signal_attempt"):
+        attempts = [protocol["signal_attempt"]]
+    requested = protocol.get("requested_runs", 1)
+    if len(attempts) != requested or not attempts or len(set(attempts)) != len(attempts):
+        raise ValueError(f"R-ANODE {root}: incomplete signal-fit normalization evidence")
+    diagnostics = {}
+    for name in attempts:
+        verified(str(Path(name) / "results/upstream/signal/fit/samples.npy"))
+        diagnostics[name] = validate_mass_normalization(root / name)
+    return diagnostics
+
+
 def selected_epochs(attempt, epochs):
     root = Path(attempt) / "results/upstream/signal/fit"
     losses = np.load(root / "valloss.npy", allow_pickle=False)
@@ -22,6 +88,9 @@ def selected_epochs(attempt, epochs):
 def combine_fits(attempts, output, *, requested_runs):
     if not attempts or len(attempts) != requested_runs or len(set(attempts)) != requested_runs:
         raise ValueError("All requested R-ANODE fits must complete before ensembling")
+    # Validate every denominator before writing any ensemble partition.
+    for attempt in attempts:
+        validate_mass_normalization(attempt)
     fields = ("mass", "physical", "labels", "scores", "mask", "is_signal_region")
     for name in ("validation", "test", "signal_region"):
         base, combined = None, None

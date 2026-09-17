@@ -198,7 +198,7 @@ def train_residual(
     return order, history
 
 
-def residual_scores(output, order, z, device):
+def residual_scores(output, order, z, device, *, normalization_checks=None, normalization_tests=1):
     if not len(order):
         raise ValueError("Residual scoring requires at least one checkpoint")
     inputs = json.loads((output / "residual_training_inputs.json").read_text())
@@ -207,6 +207,7 @@ def residual_scores(output, order, z, device):
     if inputs["features"] != z.shape[1]:
         raise ValueError("Scoring feature count differs from training")
     model = build_signal_flow(device, features=z.shape[1], settings=inputs["settings"]).eval()
+    log_background = background_log_prob(torch.from_numpy(z)).numpy()
     log_sum = None
     with ProgressStage(
         "residual_scoring", "Score residual density ensemble", len(order) * len(z), "prediction"
@@ -229,9 +230,14 @@ def residual_scores(output, order, z, device):
                 log_density = np.concatenate(chunks).astype(np.float64)
                 if not np.isfinite(log_density).all():
                     raise FloatingPointError("Nonfinite residual checkpoint density")
+                if normalization_checks is not None:
+                    from .production import validate_density_ratio
+
+                    normalization_checks.append(dict(epoch=epoch, **validate_density_ratio(
+                        log_density - log_background.astype(np.float64),
+                        stage=f"RIDDLE {output}, checkpoint {epoch}", tests=normalization_tests)))
                 log_sum = log_density if log_sum is None else np.logaddexp(log_sum, log_density)
     log_signal = log_sum - np.log(len(order))
-    log_background = background_log_prob(torch.from_numpy(z)).numpy()
     scores = log_signal.astype(np.float64) - log_background.astype(np.float64)
     if not np.isfinite(scores).all():
         raise FloatingPointError("Nonfinite residual ensemble scores")
