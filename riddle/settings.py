@@ -33,7 +33,13 @@ def validate_residual(value):
         if "runs" in value:
             raise ValueError("Use fits, or the legacy runs key, not both")
         value["runs"] = value.pop("fits")
-    keys(value, "runs epochs fractions initialization flow training", "RIDDLE")
+    # Older configuration files acquire the current, recorded recovery policy.
+    value.setdefault("fit_recovery", {"max_retries": 2, "validation_sigma": 2.0})
+    keys(value, "runs epochs fractions initialization flow training fit_recovery", "RIDDLE")
+    recovery = value["fit_recovery"]
+    keys(recovery, "max_retries validation_sigma", "fit recovery")
+    integer(recovery["max_retries"], "max_retries", 0)
+    number(recovery["validation_sigma"], "validation_sigma", strict=False)
     integer(value["runs"], "fits")
     integer(value["epochs"], "epochs")
     if value["initialization"] not in ("background", "random"):

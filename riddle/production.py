@@ -4,7 +4,7 @@ import numpy as np
 
 SR_BOUNDS = (3.3, 3.7)
 PRODUCTION_POLICY = {
-    "ensemble": "all_requested_runs",
+    "ensemble": "accepted_fits_after_bounded_retries_v1",
     "signal_region": "strict_prepared_input_membership",
     "signal_region_bounds": list(SR_BOUNDS),
 }
@@ -14,13 +14,45 @@ class IncompleteEnsembleError(RuntimeError):
     pass
 
 
+class NumericalFitError(ValueError):
+    """A model output is unusable; input corruption is not a fit failure."""
+
+
+def validation_improvement(log_mixture_ratios, *, sigma):
+    """Paired validation gain against the fixed background, without truth labels.
+
+    This is an optimization/selection rule, not a calibrated discovery test.
+    The threshold and retry budget are part of the scientific run contract.
+    """
+    values = np.asarray(log_mixture_ratios, dtype=np.float64)
+    if values.ndim != 1 or len(values) < 2:
+        raise ValueError("Fit validation requires at least two reserved events")
+    if not np.isfinite(values).all():
+        raise NumericalFitError("Nonfinite reserved-validation mixture likelihood")
+    if not np.isfinite(sigma) or sigma < 0:
+        raise ValueError("Invalid validation improvement threshold")
+    gain = float(values.mean())
+    error = float(values.std(ddof=1) / np.sqrt(len(values)))
+    margin = gain - sigma * error
+    if not np.isfinite([gain, error, margin]).all():
+        raise NumericalFitError("Nonfinite validation improvement statistics")
+    tolerance = 10 * np.finfo(np.float32).eps
+    return dict(status="passed" if margin > tolerance else "insufficient_validation_improvement",
+                events=len(values), mean_log_likelihood_gain=gain,
+                standard_error=error, sigma=float(sigma), lower_margin=margin, numerical_tolerance=float(tolerance),
+                baseline="standard-normal background", truth_labels_used=False,
+                interpretation="validation selection only; not evidence of a physical signal")
+
+
 def score_diagnostics(scores, *, stage, probability=False, summarize=True):
     """Check numerical validity, not discrimination; a weak classifier is valid."""
     scores = np.asarray(scores)
-    if scores.ndim != 1 or not scores.size or not np.isfinite(scores).all():
-        raise ValueError(f"{stage}: empty, nonfinite or malformed accepted scores")
+    if scores.ndim != 1 or not scores.size:
+        raise ValueError(f"{stage}: empty or malformed accepted scores")
+    if not np.isfinite(scores).all():
+        raise NumericalFitError(f"{stage}: nonfinite accepted scores")
     if probability and ((scores < 0).any() or (scores > 1).any()):
-        raise ValueError(f"{stage}: classifier probabilities outside [0, 1]")
+        raise NumericalFitError(f"{stage}: classifier probabilities outside [0, 1]")
     if not summarize:
         return None
     summary = dict(events=len(scores), minimum=float(scores.min()), maximum=float(scores.max()),
@@ -95,9 +127,9 @@ def validate_density_ratio(log_ratios, *, stage, tests=1):
         checks.append(dict(ratio_threshold=threshold, exceedances=count,
                            log_p_upper_bound=log_p if np.isfinite(log_p) else None))
         if log_p < cutoff:
-            raise ValueError(f"{stage}: density-ratio normalization failed on independent Gaussian reference "
+            raise NumericalFitError(f"{stage}: density-ratio normalization failed on independent Gaussian reference "
                              f"draws ({count}/{len(log_ratios)} ratios >= {threshold:g}). "
-                             "Inspect the flow/checkpoint; scores are not clipped or excluded.")
+                             "Inspect the flow/checkpoint; this density cannot be used for scoring.")
     summary["normalization_checks"] = checks
     return summary
 
@@ -139,15 +171,16 @@ def region_acceptance(labels, mask, region):
     }
 
 
-def require_complete_members(members, requested, checkpoints, *, configuration):
+def require_complete_members(members, requested, checkpoints, *, configuration, allow_excluded=False):
     if type(requested) is not int or requested < 1 or type(checkpoints) is not int or checkpoints < 1:
         raise IncompleteEnsembleError("Missing RIDDLE ensemble size/checkpoint requirements")
     directories = [m.get("directory") for m in members]
-    if (len(members) != requested or any(not isinstance(d, str) or not d for d in directories)
-            or len(set(directories)) != requested):
+    if (not 0 < len(members) <= requested or (not allow_excluded and len(members) != requested)
+            or any(not isinstance(d, str) or not d for d in directories)
+            or len(set(directories)) != len(members)):
         raise IncompleteEnsembleError(
             f"RIDDLE configuration {configuration}: {len(members)}/{requested} valid fits; "
-            "all requested fits are required. Checkpoints and failure records are preserved; "
+            "no usable ensemble can be finalized. Checkpoints and failure records are preserved; "
             "diagnose failed fits before finalizing production."
         )
     for member in members:
@@ -163,20 +196,34 @@ def require_complete_members(members, requested, checkpoints, *, configuration):
 
 
 def require_complete_ensemble(selection):
-    if selection.get("status") != "completed" or selection.get("production_policy") != PRODUCTION_POLICY:
-        raise IncompleteEnsembleError("RIDDLE ensemble is not finalized under the all-fits production policy")
+    policy = selection.get("production_policy")
+    legacy = policy == {**PRODUCTION_POLICY, "ensemble": "all_requested_runs"}
+    if selection.get("status") != "completed" or (not legacy and policy != PRODUCTION_POLICY):
+        raise IncompleteEnsembleError("RIDDLE ensemble is not finalized under a recognized production policy")
     requested = selection.get("requested_runs")
     checkpoints = selection.get("checkpoints_per_run")
     configs = selection.get("configurations", [])
-    if not configs or selection.get("failures"):
+    if not configs or (legacy and selection.get("failures")):
         raise IncompleteEnsembleError("RIDDLE ensemble has failed or missing configurations")
     for config in configs:
-        require_complete_members(config.get("members", []), requested, checkpoints,
-                                 configuration=config.get("name"))
-        if config.get("valid_runs") != requested:
-            raise IncompleteEnsembleError("RIDDLE configuration has an inconsistent valid-fit count")
+        members = config.get("members", [])
+        if members or legacy:
+            require_complete_members(members, requested, checkpoints,
+                                     configuration=config.get("name"), allow_excluded=not legacy)
+        if config.get("valid_runs") != len(members):
+            raise IncompleteEnsembleError("RIDDLE configuration has an inconsistent accepted-fit count")
+        if not legacy:
+            excluded = config.get("excluded_fits", [])
+            indices = [m.get("fit_index") for m in [*members, *excluded]]
+            if (type(requested) is not int or any(type(i) is not int for i in indices)
+                    or sorted(indices) != list(range(requested))
+                    or any(m.get("status") != "excluded" for m in excluded)
+                    or any(m.get("quality", {}).get("status") != "passed" for m in members)
+                    or any(m.get("normalization", {}).get("status") != "passed" for m in members)):
+                raise IncompleteEnsembleError("RIDDLE fit acceptance/exclusion inventory is inconsistent")
     chosen = [c for c in configs if c.get("name") == selection.get("selected_configuration")]
-    if (len(chosen) != 1 or selection.get("members") != chosen[0]["members"]
-            or selection.get("valid_runs") != requested
-            or selection.get("selected_checkpoints") != requested * checkpoints):
+    members = selection.get("members", [])
+    if (len(chosen) != 1 or not members or members != chosen[0]["members"]
+            or selection.get("valid_runs") != len(members)
+            or selection.get("selected_checkpoints") != len(members) * checkpoints):
         raise IncompleteEnsembleError("RIDDLE ensemble selection is incomplete or inconsistent")

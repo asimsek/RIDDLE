@@ -244,10 +244,13 @@ def main():
     )
     for name in loss_names:
         loss = np.load(output / (name + ".npy"), allow_pickle=False)
-        if loss.shape != (options["epochs"],) or not np.isfinite(loss).all():
+        if loss.shape != (options["epochs"],):
             raise ValueError(
-                "Incomplete or nonfinite upstream R-ANODE losses; refusing this result"
+                "Incomplete upstream R-ANODE losses; refusing this result"
             )
+        if not np.isfinite(loss).all():
+            from riddle.production import NumericalFitError
+            raise NumericalFitError("Nonfinite upstream R-ANODE losses")
     if adapter.split_audit is None:
         raise ValueError("The pinned script did not use the matched partitions")
     (attempt / "partition_audit.json").write_text(
@@ -271,4 +274,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    from riddle.production import NumericalFitError
+    from riddle.storage import write_json
+    request = json.loads(sys.argv[1])
+    try:
+        main()
+    except (NumericalFitError, FloatingPointError) as error:
+        write_json(Path(request["attempt"]) / "fit_failure.json", dict(
+            kind="numerical", stage=request["stage"], fit_index=request["fit_index"],
+            error=str(error), error_type=type(error).__name__))
+        raise SystemExit(86) from error

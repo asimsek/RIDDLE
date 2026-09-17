@@ -4,7 +4,8 @@ from riddle.storage import atomic_write, save_npz, write_json
 from riddle.recovery import EpochRecovery
 from riddle.acceleration import install_tensor_batches, execution_report
 from .latent import prepare, Mapper
-from .campaign import train_campaign, ensemble_predict, fractions, PROTOCOL, validate_normalization
+from .campaign import (train_campaign, ensemble_predict, fractions, PROTOCOL, validate_normalization,
+                       MemberScoreError, reject_scoring_member)
 from .runtime import ordered_map
 from .settings import input_features
 from .resume import resume_policy
@@ -27,23 +28,8 @@ def run(args, contract):
         [latent_root / name for name in ("training_latents.npy", "validation_latents.npy")],
         args.io_workers,
     )
-    result = train_campaign(
-        training,
-        validation,
-        output / "density",
-        epochs=args.epochs,
-        runs=args.runs,
-        seed=args.seed,
-        device=args.device,
-        fraction_values=fraction_values,
-        initialization=settings["riddle"]["initialization"],
-        workers=args.workers,
-        io_workers=args.io_workers,
-        settings=settings["riddle"],
-    )
     mapper = Mapper(args.data, latent_root, selection["inference_mapping_epoch"], args.device)
-    validate_normalization(output / "density", training.shape[1] - 3, args.device)
-    acceptance = {}
+    acceptance, mapped = {}, {}
     for partition, suffix in (("validation", "val"), ("test", "test"), ("signal_region", None)):
         names = (
             (f"innerdata_{suffix}.npy", f"outerdata_{suffix}.npy")
@@ -54,20 +40,52 @@ def run(args, contract):
             ordered_map(np.load, [args.data / name for name in names], args.io_workers), names
         )
         z, mask = mapper.map(rows)
-        scores = ensemble_predict(output / "density", z, args.device)
-        require_finite(scores, "RIDDLE ensemble scores")
-        acceptance[partition] = region_acceptance(rows[:, -1], mask, region)
-        aligned = np.full(len(rows), np.nan, dtype=scores.dtype)
-        aligned[mask] = scores
-        arrays = dict(
-            mass=rows[:, 0],
-            is_signal_region=region,
-            labels=rows[:, -1].astype(np.int8),
-            mask=mask,
-            scores=aligned,
-            physical=rows[:, 1:-1],
-            latent=z,
+        mapped[partition] = (rows, region, z, mask)
+    while True:
+        result = train_campaign(
+            training,
+            validation,
+            output / "density",
+            epochs=args.epochs,
+            runs=args.runs,
+            seed=args.seed,
+            device=args.device,
+            fraction_values=fraction_values,
+            initialization=settings["riddle"]["initialization"],
+            workers=args.workers,
+            io_workers=args.io_workers,
+            settings=settings["riddle"],
         )
+        validate_normalization(output / "density", training.shape[1] - 3, args.device)
+        exports = {}
+        try:
+            for partition, (rows, region, z, mask) in mapped.items():
+                scores, fit_scores = ensemble_predict(output / "density", z, args.device, return_members=True)
+                require_finite(scores, "RIDDLE ensemble scores")
+                acceptance[partition] = region_acceptance(rows[:, -1], mask, region)
+                aligned = np.full(len(rows), np.nan, dtype=scores.dtype)
+                aligned[mask] = scores
+                aligned_fits = np.full((len(fit_scores), len(rows)), np.nan, dtype=fit_scores.dtype)
+                aligned_fits[:, mask] = fit_scores
+                arrays = dict(
+                    mass=rows[:, 0],
+                    is_signal_region=region,
+                    labels=rows[:, -1].astype(np.int8),
+                    mask=mask,
+                    scores=aligned,
+                    physical=rows[:, 1:-1],
+                    latent=z,
+                    fit_scores=aligned_fits,
+                    fit_indices=np.array([m["fit_index"] for m in result["members"]], dtype=np.int64),
+                    fit_seeds=np.array([m["seed"] for m in result["members"]], dtype=np.uint32),
+                    fit_directories=np.array([m["directory"] for m in result["members"]]),
+                )
+                exports[partition] = arrays
+        except MemberScoreError as error:
+            reject_scoring_member(output / "density", error.member, error)
+            continue
+        break
+    for partition, arrays in exports.items():
         atomic_write(output / f"{partition}_scores.npz", lambda p: save_npz(p, **arrays))
     write_json(output / "mapping_acceptance.json", acceptance)
     write_json(
@@ -82,7 +100,7 @@ def run(args, contract):
             "hidden_features": settings["riddle"]["flow"]["hidden_features"],
             **settings["riddle"]["training"],
             "gradient_clip": f"flow parameters only; norm {settings['riddle']['training']['gradient_clip_norm']}",
-            "ensemble": f"equal-weight mean signal density over all requested fits and {settings['riddle']['training']['selected_checkpoints']} validation-selected epochs per fit",
+            "ensemble": f"equal-weight mean signal density over accepted fits and {settings['riddle']['training']['selected_checkpoints']} validation-selected epochs per fit",
             "settings": settings,
             "flow_selection": selection,
             "background_epochs": settings["background"]["epochs"],
@@ -93,6 +111,9 @@ def run(args, contract):
             "reference_samples": settings["background"]["reference_samples"],
             "epochs": args.epochs,
             "fits": args.runs,
+            "accepted_fits": result["valid_runs"],
+            "excluded_fits": args.runs - result["valid_runs"],
+            "fit_recovery": settings["riddle"]["fit_recovery"],
             "initialization": settings["riddle"]["initialization"],
             "fractions": args.fractions,
             "selected_checkpoints": result["selected_checkpoints"],

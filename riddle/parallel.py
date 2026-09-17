@@ -11,111 +11,40 @@ from riddle.progress import _duration, _short_value
 from riddle.worker_progress import _LOCAL_SINK, emit_message
 
 
-def _fit_worker(events, job, rows, options):
+def _fit_worker(events, job, rows, validation, options):
     from contextlib import redirect_stderr, redirect_stdout
-    import numpy as np
     import torch
-    from riddle.storage import save_npz, verify_artifacts
-    from riddle.storage import atomic_write, locked, write_json
-    from .campaign import member_split
-    from .runtime import fingerprints
-    from .training import train_residual
+    from .storage import write_json
+    from .campaign import train_member
     from riddle.acceleration import install_tensor_batches
 
     directory = Path(job["directory"])
-    directory.mkdir(parents=True, exist_ok=True)
     recovery = directory / ".resume"
-    recovery.mkdir(exist_ok=True)
-    fit = job["fit"]
-    started = time.monotonic()
+    recovery.mkdir(parents=True, exist_ok=True)
+    fit, started = job["fit"], time.monotonic()
     label = f"RIDDLE fit {fit}/{options['total']}"
+    already_finished = (directory / "fit.json").exists()
     with (recovery / "worker.log").open("a") as log, redirect_stdout(log), redirect_stderr(log):
-
         def publish(event):
             log.write(json.dumps(event) + "\n")
             log.flush()
             events.put((fit, "progress", event))
-
         token = _LOCAL_SINK.set(publish)
         try:
             torch.set_num_threads(options["io_workers"])
             install_tensor_batches()
             torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False
-            with locked(recovery / "fit.lock"):
-                a, b, seed = member_split(
-                    len(rows),
-                    options["seed"],
-                    job["index"],
-                    batch_size=options["settings"]["training"]["batch_size"],
-                )
-                split_path = directory / "split.npz"
-                if split_path.exists():
-                    with np.load(split_path) as split:
-                        if not np.array_equal(split["training"], a) or not np.array_equal(
-                            split["validation"], b
-                        ):
-                            raise ValueError("Saved residual split changed")
-                else:
-                    atomic_write(split_path, lambda p: save_npz(p, training=a, validation=b))
-                checkpoint_path = recovery / "latest.pt"
-                checkpoint = (
-                    torch.load(checkpoint_path, map_location=options["device"], weights_only=False)
-                    if checkpoint_path.exists()
-                    else None
-                )
-                initial = checkpoint["epoch"] + 1 if checkpoint is not None else 0
-                if checkpoint is not None:
-                    verify_artifacts(directory, checkpoint["files"], f"{label} | Verify epoch checkpoints")
-                clock = {}
-                try:
-                    order, history = train_residual(
-                        rows[a],
-                        rows[b],
-                        directory,
-                        epochs=options["epochs"],
-                        seed=seed,
-                        device=options["device"],
-                        checkpoint=checkpoint,
-                        fraction=job["fraction"],
-                        initialization=options["initialization"],
-                        progress_label=f"{label} | Train residual mixture",
-                        on_training_start=lambda: clock.update(start=time.monotonic()),
-                        settings=options["settings"],
-                    )
-                    training_finished = time.monotonic()
-                    saved = {
-                        "status": "completed",
-                        "epochs": order,
-                        "signal_fractions": [history[i]["signal_fraction"] for i in order],
-                    }
-                except FloatingPointError as error:
-                    training_finished = time.monotonic()
-                    saved = {
-                        "status": "numerical_failure",
-                        "error": str(error),
-                        "error_type": type(error).__name__,
-                    }
-                paths = [p for p in directory.iterdir() if p.is_file() and p.name != "fit.json"]
-                saved.update(
-                    directory=job["relative"],
-                    seed=seed,
-                    artifacts_sha256={
-                        p.name: v for p, v in fingerprints(paths, options["io_workers"]).items()
-                    },
-                )
-                write_json(directory / "fit.json", saved)
-                result = {
-                    "status": saved["status"],
-                    "initial_epoch": initial,
-                    "new_epochs": options["epochs"] - initial if saved["status"] == "completed" else 0,
-                    "training_seconds": training_finished - clock.get("start", training_finished),
-                    "finalization_seconds": time.monotonic() - training_finished,
-                    "worker_started": started,
-                    "worker_finished": time.monotonic(),
-                    "pid": os.getpid(),
-                }
-                write_json(recovery / "execution.json", result)
-                events.put((fit, "result", result))
+            saved = train_member(rows, validation, directory.parents[1],
+                relative=job["relative"], index=job["index"], fraction=job["fraction"],
+                epochs=options["epochs"], seed=options["seed"], device=options["device"],
+                initialization=options["initialization"], settings=options["settings"],
+                label=label, normalization_tests=options["normalization_tests"])
+            result = dict(status=saved["status"], initial_epoch=0,
+                          new_epochs=0 if already_finished else options["epochs"],
+                          training_seconds=time.monotonic() - started, finalization_seconds=0,
+                          worker_started=started, worker_finished=time.monotonic(), pid=os.getpid())
+            write_json(recovery / "execution.json", result)
+            events.put((fit, "result", result))
         except BaseException as error:
             traceback.print_exc()
             events.put((fit, "error", f"{type(error).__name__}: {error}"))
@@ -137,7 +66,7 @@ def fitting_eta(mean_fit, epochs, active, queued, workers):
 
 
 def run_fits(
-    rows, jobs, *, epochs, seed, device, initialization, workers, io_workers, total, started=None, settings
+    rows, jobs, *, validation, epochs, seed, device, initialization, workers, io_workers, total, started=None, settings, normalization_tests
 ):
     if not jobs:
         return
@@ -156,6 +85,7 @@ def run_fits(
         io_workers=io_workers,
         total=total,
         settings=settings,
+        normalization_tests=normalization_tests,
     )
     previous_handler = signal.getsignal(signal.SIGTERM)
 
@@ -167,7 +97,7 @@ def run_fits(
         while waiting or active:
             while waiting and len(active) < workers:
                 job = waiting.pop(0)
-                process = context.Process(target=_fit_worker, args=(events, job, rows, options))
+                process = context.Process(target=_fit_worker, args=(events, job, rows, validation, options))
                 process.start()
                 active[job["fit"]] = {
                     "process": process,
@@ -225,9 +155,14 @@ def run_fits(
                     f"RIDDLE fitting estimate after completed fit {completed}/{total}: elapsed={_duration(elapsed)}; mean_fit={duration(mean)}; estimated_total={duration(elapsed + eta if eta is not None else None)}; fitting_ETA={duration(eta)}; active fits={len(active)}/{workers}"
                 )
             elif kind == "progress" and fit in active:
+                if "message" in event:
+                    emit_message(event["message"], kind=event.get("kind", "INFO"), level=event.get("level", 1))
                 state = active[fit]
                 if event.get("unit") == "epoch":
-                    state["epoch"] = event.get("completed") or state["epoch"]
+                    if state.get("attempt_label") != event.get("label"):
+                        state.update(epoch=0, initial=0, printed_epoch=-1,
+                                     training_started=time.monotonic(), attempt_label=event.get("label"))
+                    state["epoch"] = event.get("completed") if event.get("completed") is not None else state["epoch"]
                     state["initial"] = event.get("initial", 0)
                     state["metrics"] = event.get("metrics", {})
                     if "training_started" not in state:

@@ -11,7 +11,7 @@ from .data import validate
 from .worker_progress import emit_message
 from .resume import inspect_resume, record_transition, resume_policy
 from .integrity import SCIENTIFIC_VERSION
-from .production import validate_result_scores
+from .production import validate_result_scores, NumericalFitError
 
 
 def runtime_code(method, root=None):
@@ -131,9 +131,11 @@ def main():
         from external.lacathode_utils.source import verify, COMMIT
         from external.lacathode_utils.pipeline import RUN_LAYOUT, FIXED_RUN_LAYOUT
 
-        contract.update(source_sha256=verify(args.sources), source_commit=COMMIT,
-                        lacathode_run_layout=(FIXED_RUN_LAYOUT
-                            if getattr(args, "lacathode_background", "independent") == "fixed" else RUN_LAYOUT))
+        fixed_background = getattr(args, "lacathode_background", "independent") == "fixed"
+        contract.update(fit_failure_policy=("fail_closed_fixed_background_v1" if fixed_background
+                                           else "exclude_numerically_invalid_independent_runs_v1"),
+                        source_sha256=verify(args.sources), source_commit=COMMIT,
+                        lacathode_run_layout=FIXED_RUN_LAYOUT if fixed_background else RUN_LAYOUT)
         if getattr(args, "lacathode_replica", False):
             contract["settings"].update(campaign_seed=args.campaign_seed, run_index=args.run_index)
     path = args.output / "result.json"
@@ -185,9 +187,15 @@ def main():
             from external.lacathode_utils.pipeline import run_single as run
         else:
             from external.lacathode_utils.pipeline import run
-    run(args, contract)
-    validate(args.data)
-    write_json(args.output / "score_health.json", validate_result_scores(args.output, args.method))
+    try:
+        run(args, contract)
+        validate(args.data)
+        write_json(args.output / "score_health.json", validate_result_scores(args.output, args.method))
+    except (FloatingPointError, NumericalFitError) as error:
+        report["failure"] = dict(kind="numerical", error=str(error), error_type=type(error).__name__,
+                                 execution_token=getattr(args, "execution_token", None))
+        write_json(path, report)
+        raise
     artifacts = [
         p
         for p in args.output.rglob("*")

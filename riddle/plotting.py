@@ -343,6 +343,13 @@ def load_scores(root, report, name, *, attempt=None):
         settings = report.get("contract", {}).get("settings", {})
         independent = report.get("contract", {}).get("lacathode_run_layout") == "independent_background_classifier_v1"
         runs = settings.get("pipeline_runs") if independent else settings.get("classifier_runs")
+        if independent and "run_selection.json" in report.get("artifacts_sha256", {}):
+            selection = read_metadata(root, report, "run_selection.json")
+            if (selection.get("status") != "completed" or selection.get("requested_runs") != runs
+                    or len(selection["members"]) + len(selection["excluded_runs"]) != runs
+                    or selection.get("accepted_runs") != len(selection["members"])):
+                raise ValueError("Invalid LaCathode run exclusion inventory")
+            runs = selection["accepted_runs"]
         fits = data.get("fit_scores", data["scores"][None, :])
         if (
             fits.ndim != 2 or fits.shape[1:] != (n,) or len(fits) < 1
@@ -374,31 +381,39 @@ def ranode_plot_ensemble(root, report):
     errors still stop plotting rather than being mistaken for failed training.
     """
     from external.ranode_utils.ensemble import validate_mass_normalization
+    from .production import NumericalFitError
 
     protocol = read_metadata(root, report, "protocol.json")
     attempts = protocol.get("signal_attempts") or [protocol.get("signal_attempt")]
     requested = protocol.get("requested_runs", 1)
-    if (not isinstance(attempts, list) or type(requested) is not int or requested < 1 or len(attempts) != requested
+    producer_excluded = protocol.get("excluded_fits", [])
+    if (not isinstance(attempts, list) or type(requested) is not int or requested < 1
+            or len(attempts) + len(producer_excluded) != requested
             or any(not isinstance(a, str) or not a for a in attempts)
-            or len(set(attempts)) != requested):
+            or len(set(attempts)) != len(attempts)):
         raise ValueError(f"R-ANODE {root}: incomplete signal-fit normalization evidence")
     indices = {m["attempt"]: m["fit_index"] for m in protocol.get("members", [])}
     partitions = ("validation", "test", "signal_region")
     fields = ("mass", "physical", "labels", "mask", "is_signal_region")
-    accepted, excluded, base, combined = [], [], {}, {}
+    accepted, excluded, base, combined = [], [dict(
+        fit_index=m["fit_index"], attempt=m["attempt"], reason=m["error"], check="producer_numerical_validity")
+        for m in producer_excluded], {}, {}
+    additional_exclusions = False
     for index, attempt in enumerate(attempts):
         member = {"fit_index": indices.get(attempt, index), "attempt": attempt}
         # Integrity errors are intentionally outside the numerical-failure catch.
         verify_plot_input(root, report, str(Path(attempt) / "results/upstream/signal/fit/samples.npy"))
         try:
             validate_mass_normalization(root / attempt)
-        except ValueError as error:
+        except NumericalFitError as error:
             excluded.append({**member, "reason": str(error), "check": "mass_normalization"})
+            additional_exclusions = True
             continue
         try:
             records = {p: load_scores(root, report, p, attempt=attempt) for p in partitions}
         except InvalidFitScores as error:
             excluded.append({**member, "reason": str(error), "check": "score_validity"})
+            additional_exclusions = True
             continue
         for partition, record in records.items():
             mask = record["mask"]
@@ -413,13 +428,13 @@ def ranode_plot_ensemble(root, report):
     audit = {
         "method": "ranode", "source": str(root.resolve()), "scenario": report["scenario"], "seed": report["seed"],
         "requested_fits": requested, "used_fits": len(accepted), "used_members": accepted, "excluded_members": excluded,
-        "status": "rebuilt_from_valid_fits" if excluded and accepted else "saved_ensemble" if accepted else "no_valid_fits",
+        "status": "rebuilt_from_valid_fits" if additional_exclusions and accepted else "saved_ensemble" if accepted else "no_valid_fits",
         "selection": "Numerical validity only; no selection on AUC, SIC or signal labels",
         "ensemble": "log(mean(exp(per-fit log ratio))) with equal weights over used fits",
         "partitions": list(partitions), "independent_runs": 1,
         "source_artifacts_modified": False,
     }
-    if excluded:
+    if additional_exclusions:
         for partition, record in base.items():
             if len(accepted) > 1:
                 record["scores"] = record["scores"].copy()
@@ -454,7 +469,22 @@ class ScoreLoader:
                     indices = ", ".join(f"{m['fit_index']:03d}" for m in audit["excluded_members"])
                     colored_status(f"R-ANODE {report['scenario']}/seed_{report['seed']:03d}: "
                                    f"using {audit['used_fits']}/{audit['requested_fits']} saved fits; "
-                                   f"excluded invalid fits {indices}; ensemble rebuilt for plotting", kind="INFO", level=0)
+                                   f"excluded invalid fits {indices}; accepted ensemble verified", kind="INFO", level=0)
+            if report["method"] == "riddle" and report.get("contract", {}).get("scientific_version", 1) >= 3:
+                from .production import require_complete_ensemble
+                selection = read_metadata(root, report, "density/ensemble_selection.json")
+                require_complete_ensemble(selection)
+                chosen = next(c for c in selection["configurations"] if c["name"] == selection["selected_configuration"])
+                self.fit_audit[identity] = dict(method="riddle", source=identity, status="producer_selection",
+                    requested_fits=selection["requested_runs"], used_fits=selection["valid_runs"],
+                    used_members=selection["members"], excluded_members=chosen["excluded_fits"],
+                    fit_recovery=selection["fit_recovery"], selection=selection["selection"], independent_runs=1)
+            if report["method"] == "lacathode" and "run_selection.json" in report.get("artifacts_sha256", {}):
+                selection = read_metadata(root, report, "run_selection.json")
+                self.fit_audit[identity] = dict(method="lacathode", source=identity, status="producer_selection",
+                    requested_fits=selection["requested_runs"], used_fits=selection["accepted_runs"],
+                    used_members=selection["members"], excluded_members=selection["excluded_runs"],
+                    selection=selection["selection"], independent_runs=selection["accepted_runs"])
             if "density/normalization_check.json" in report.get("artifacts_sha256", {}):
                 audit = read_metadata(root, report, "density/normalization_check.json")
                 if audit.get("status") != "passed":
@@ -463,6 +493,8 @@ class ScoreLoader:
         key = (str(root.resolve()), partition)
         if key not in self.cache:
             self.cache[key] = load_scores(root, report, partition)
+        if identity in self.fit_audit:
+            self.cache[key]["plot_ensemble"] = self.fit_audit[identity]
         return self.cache[key]
 
 
@@ -677,13 +709,14 @@ def render_injection_scan(groups, output, args, score_loader=None):
             inputs = report["contract"]["inputs"]
             if inputs.get("synthetic_smoke_fixture") and not args.allow_smoke:
                 raise ValueError("Synthetic scan requires --allow-smoke for QA")
-            expected_protocol = 2 if method == "riddle" else "pinned_upstream"
+            expected_protocol = "pinned_upstream"
             if method == "ranode":
                 from external.ranode_utils.data import scientific_version
 
                 expected_protocol = scientific_version(inputs.get("variant", "default"))
-            if method in BUILTINS and report["contract"].get("scientific_version") != expected_protocol:
-                raise ValueError(f"Injection scans require protocol {expected_protocol!r} for {method}")
+            allowed_protocols = (2, 3) if method == "riddle" else (expected_protocol,)
+            if method in BUILTINS and report["contract"].get("scientific_version") not in allowed_protocols:
+                raise ValueError(f"Injection scans require protocol in {allowed_protocols!r} for {method}")
             point = inputs["injection_scan"]
             from .cli import independent_run_seeds
 
@@ -2054,7 +2087,7 @@ def main(argv=None):
                             "uncertainty_scope": "16/50/84 percentiles across independent full method runs on fixed evaluation events; one saved ensemble score per RIDDLE/R-ANODE run; no within-ensemble fit bands",
                             "score_inputs": "Saved predictions only; no checkpoint inference or modification of results",
                             "score_ensembles": list(score_loader.fit_audit.values()),
-                            "invalid_fit_policy": "R-ANODE: exclude numerically invalid saved fits consistently across all partitions; rebuild equal-weight density-ratio ensemble for plotting; skip results with no valid fits. Integrity/alignment errors remain fatal. No selection on discrimination performance.",
+                            "invalid_fit_policy": "Honor producer acceptance inventories across partitions. RIDDLE v3 retries/excludes numerical and reserved-validation failures before export. R-ANODE and independent LaCathode exclude numerical failures in helpers; legacy R-ANODE ensembles can be rebuilt for plotting. Integrity/alignment errors remain fatal. No test-truth/AUC/SIC selection.",
                             "lacathode_event_plots": "Dynamically detected saved fits; mean per-fit histograms with matching per-fit validation cuts; shapes normalize those mean counts; no cross-fit score averaging",
                             "lacathode_roc_sic": "Median rejection and SIC interpolated at 1000 common signal efficiencies, as upstream, after statistical-support cuts. Bands are parametric 16/84-percentile ribbons at fixed signal efficiency; background-efficiency display axes retained.",
                             "lacathode_fit_counts": [{"scenario": b["report"]["scenario"], "seed": b["report"]["seed"], "fits": b["classifier_fit_count"]} for b in bundles if "classifier_fit_count" in b],

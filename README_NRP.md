@@ -183,7 +183,7 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
 ```
 
 For RIDDLE/R-ANODE, `--fits 10` trains one ensemble with ten signal fits.<br>
-Add `--runs 10` to retrain the complete method three times, including separate background models; method uncertainty bands use these independent runs.<br>
+Add `--runs 10` to retrain the complete method ten times, including separate background models; method uncertainty bands use these independent runs.<br>
 
 For one combined job instead, request `--methods lacathode riddle ranode` with a different job name.<br>
 Do not submit that alongside these three jobs for the same result identities.

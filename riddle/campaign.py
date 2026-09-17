@@ -1,13 +1,11 @@
 import json
 from pathlib import Path
-import time
 import numpy as np
 import torch
 from copy import deepcopy
 from .settings import DEFAULTS, validate_residual
 from riddle.storage import verify_artifacts
-from riddle.progress import _duration
-from riddle.worker_progress import ProgressStage, emit_message
+from riddle.worker_progress import emit_message
 from riddle.storage import atomic_write, write_json
 from riddle.storage import digest, file_digest
 from .model import PROTOCOL as SINGLE_PROTOCOL, background_log_prob, real_sr_latents
@@ -19,45 +17,40 @@ PROTOCOL = {
     **SINGLE_PROTOCOL,
     "name": "RIDDLE",
     "campaign_version": SCIENTIFIC_VERSION,
-    "ensemble": "equal-weight mean signal density over all requested runs and ten validation-selected epochs per run",
+    "ensemble": "equal-weight mean signal density over accepted fits and ten validation-selected epochs per fit",
     "splits": "80/20 resamples of development training rows; reserved validation reserved for configuration/cuts",
-    "failures": "record numerical failures and reject incomplete production; retain finite near-zero-fraction fits",
+    "failures": "bounded fresh retries for numerical or reserved-validation failures; exclude exhausted fits",
 }
 
 
-class FitTiming:
-    def __init__(self, epochs, *, started=None):
-        self.epochs = epochs
-        self.started = time.monotonic() if started is None else started
-        self.seconds = self.measured_epochs = 0
-        self.finalization_seconds = self.fits = 0
-        self.fit_started = None
+class MemberScoreError(FloatingPointError):
+    def __init__(self, member, error):
+        self.member = member
+        super().__init__(str(error))
 
-    def start_fit(self):
-        self.fit_started = time.monotonic()
 
-    def finish_fit(self, new_epochs, *, training_finished=None):
-        if self.fit_started is not None and new_epochs > 0:
-            finished = time.monotonic()
-            training_finished = finished if training_finished is None else training_finished
-            self.seconds += training_finished - self.fit_started
-            self.finalization_seconds += finished - training_finished
-            self.measured_epochs += new_epochs
-            self.fits += 1
-        self.fit_started = None
+def reject_scoring_member(output, member, error):
+    """A numerical export failure spends the same persisted fit attempt budget."""
+    from .storage import locked
 
-    def report(self, fit, total, pending):
-        elapsed = time.monotonic() - self.started
-        mean = (
-            self.epochs * self.seconds / self.measured_epochs + self.finalization_seconds / self.fits
-            if self.measured_epochs
-            else None
-        )
-        eta = pending * mean if mean is not None else 0 if not pending else None
-        formatted = lambda value: "unknown" if value is None else _duration(value)
-        emit_message(
-            f"RIDDLE fitting estimate after fit {fit}/{total}: elapsed={_duration(elapsed)}; mean_fit={formatted(mean)}; estimated_total={formatted(elapsed + eta if eta is not None else None)}; ETA={formatted(eta)}"
-        )
+    output = Path(output)
+    root = (output / member["directory"]).parents[1]
+    with locked(root / ".resume/fit.lock"):
+        state = json.loads((root / "attempts.json").read_text())
+        attempt = state["attempts"][member["attempt"]]
+        if attempt["status"] != "completed" or attempt["directory"] != member["directory"]:
+            raise ValueError("Cannot revoke an unrecognized accepted fit")
+        attempt.update(status="numerical_failure", error=str(error), stage="score_export",
+                       error_type=type(error).__name__)
+        state["invalidated_receipt"] = True
+        write_json(root / "attempts.json", state)
+        # The ledger is authoritative if a process is interrupted between these writes.
+        (root / "fit.json").unlink(missing_ok=True)
+    selection = json.loads((output / "ensemble_selection.json").read_text())
+    selection["status"] = "incomplete"
+    write_json(output / "ensemble_selection.json", selection)
+    emit_message(f"RIDDLE fit {member['fit_index']:03d}: numerical scoring failure; "
+                 "retry within the original attempt budget", kind="WARNING", level=0)
 
 
 def fractions(values):
@@ -85,277 +78,235 @@ def member_split(n, seed, index, *, batch_size=256):
     return (order[:count], order[count:], seeds[1])
 
 
-def heldout_nll(root, members, z, device, failures, configuration):
-    background = background_log_prob(torch.from_numpy(z)).numpy().astype(np.float64)
-    combined = None
-    count = 0
-    for member in list(members):
-        densities = []
-        try:
-            for epoch, weight in zip(member["epochs"], member["signal_fractions"]):
-                ratio = residual_scores(root / member["directory"], [epoch], z, device)
-                log_weight = np.log(weight) if weight > 0 else -np.inf
-                log_rest = np.log1p(-weight) if weight < 1 else -np.inf
-                density = background + np.logaddexp(log_rest, log_weight + ratio)
-                if not np.isfinite(density).all():
-                    raise FloatingPointError("Nonfinite member validation density")
-                densities.append(density)
-        except FloatingPointError as error:
-            member.update(
-                status="numerical_failure",
-                stage="configuration_validation",
-                error=str(error),
-                error_type=type(error).__name__,
-            )
-            write_json(root / member["directory"] / "fit.json", member)
-            failures.append({"configuration": configuration, **member})
-            write_json(root / "numerical_failures.json", {"failures": failures})
-            members.remove(member)
-            continue
-        for density in densities:
-            combined = density if combined is None else np.logaddexp(combined, density)
-            count += 1
-    if not count:
-        return None
-    value = -float(np.mean(combined - np.log(count)))
-    if not np.isfinite(value):
-        raise FloatingPointError("Nonfinite configuration validation likelihood")
-    return value
+def assess_fit(directory, epochs, fractions, validation, device, *, sigma, normalization_tests):
+    """Validate selected checkpoints before any physical/test score is exported."""
+    from .production import validate_density_ratio, validation_improvement
+
+    reference = np.random.default_rng(3407).standard_normal((8192, validation.shape[1])).astype(np.float32)
+    rows = np.concatenate((validation, reference))
+    mixture, reference_sum, checks = None, None, []
+    with torch.random.fork_rng(devices=[] if str(device) == "cpu" else None):
+        for epoch, weight in zip(epochs, fractions):
+            ratio = residual_scores(directory, [epoch], rows, device)
+            valid, normal = ratio[:len(validation)], ratio[len(validation):]
+            checks.append(dict(epoch=epoch, **validate_density_ratio(
+                normal, stage=f"{directory} checkpoint {epoch}", tests=normalization_tests)))
+            reference_sum = normal if reference_sum is None else np.logaddexp(reference_sum, normal)
+            weighted = np.logaddexp(np.log1p(-weight) if weight < 1 else -np.inf,
+                                    (np.log(weight) if weight > 0 else -np.inf) + valid)
+            mixture = weighted if mixture is None else np.logaddexp(mixture, weighted)
+    mixture -= np.log(len(epochs))
+    normalization = dict(status="passed", reference="independent standard normal",
+                         reference_seed=3407, reference_samples=len(reference), checkpoints=checks,
+                         ensemble=validate_density_ratio(reference_sum - np.log(len(epochs)),
+                             stage=f"{directory} ensemble", tests=normalization_tests))
+    quality = validation_improvement(mixture, sigma=sigma)
+    write_json(directory / "fit_health.json", dict(quality=quality, normalization=normalization))
+    return quality, normalization, mixture
+
+
+def train_member(rows, validation, output, *, relative, index, fraction, epochs, seed,
+                 device, initialization, settings, label, normalization_tests):
+    """One persisted attempt budget shared by sequential and spawned workers."""
+    from .production import NumericalFitError
+    from .storage import locked, save_npz
+
+    root = Path(output) / relative
+    root.mkdir(parents=True, exist_ok=True)
+    policy = settings["fit_recovery"]
+    a, b, first_seed = member_split(len(rows), seed, index,
+                                   batch_size=settings["training"]["batch_size"])
+    seeds = [first_seed] + [int(np.random.SeedSequence([seed, index, 1380275289, i]).generate_state(1)[0])
+                           for i in range(1, policy["max_retries"] + 1)]
+    if len(set(seeds)) != len(seeds):
+        raise ValueError("Fit retry seeds collided")
+    identity = dict(schema=1, scientific_version=SCIENTIFIC_VERSION, seed=seed, fit_index=index,
+                    attempt_seeds=seeds, settings=settings, fraction=fraction,
+                    training_sha256=digest(rows), validation_sha256=digest(validation),
+                    normalization_tests=normalization_tests)
+    state_path = root / "attempts.json"
+    with locked(root / ".resume/fit.lock"):
+        if state_path.exists():
+            state = json.loads(state_path.read_text())
+            if state["identity"] != identity:
+                raise ValueError("Fit inputs or retry policy changed; use a new output directory")
+            attempts = state.get("attempts")
+            if (not isinstance(attempts, list) or len(attempts) > len(seeds)
+                    or any(a.get("attempt") != i or a.get("seed") != seeds[i]
+                           or a.get("directory") != str(Path(relative) / "attempts" / f"attempt_{i:03d}")
+                           or a.get("status") not in ("running", "completed", "numerical_failure", "validation_failure")
+                           or (i < len(attempts) - 1 and a.get("status") in ("running", "completed"))
+                           for i, a in enumerate(attempts))):
+                raise ValueError("Invalid persisted fit attempt inventory")
+        else:
+            if any(root.glob("residual_epoch_*.pt")) or (root / "fit.json").exists():
+                raise ValueError("Legacy fit cannot acquire a new selection policy through resume")
+            state = dict(identity=identity, attempts=[])
+            write_json(state_path, state)
+        split_path = root / "split.npz"
+        if split_path.exists():
+            with np.load(split_path, allow_pickle=False) as saved:
+                if not np.array_equal(saved["training"], a) or not np.array_equal(saved["validation"], b):
+                    raise ValueError("Saved residual split changed")
+        else:
+            atomic_write(split_path, lambda p: save_npz(p, training=a, validation=b))
+        terminal = root / "fit.json"
+        if state.pop("invalidated_receipt", False):
+            terminal.unlink(missing_ok=True)
+            write_json(state_path, state)
+        # Verify every recorded attempt, including rejected evidence, on resume.
+        for attempt in state["attempts"]:
+            directory = Path(output) / attempt["directory"]
+            if attempt.get("artifacts_sha256") is not None:
+                verify_artifacts(directory, attempt["artifacts_sha256"], f"{label} | Verify attempt")
+        if terminal.exists():
+            saved = json.loads(terminal.read_text())
+            accepted = next((a for a in state["attempts"] if a["status"] == "completed"), None)
+            expected = ({**accepted, "fit_index": index, "attempts": state["attempts"]}
+                        if accepted else dict(status="excluded", fit_index=index, directory=str(relative),
+                                              reason="retry_budget_exhausted", attempts=state["attempts"]))
+            if saved != expected:
+                raise ValueError("Fit receipt disagrees with the persisted attempt inventory")
+            return saved
+        for number, training_seed in enumerate(seeds):
+            attempt_relative = Path(relative) / "attempts" / f"attempt_{number:03d}"
+            directory = Path(output) / attempt_relative
+            if number < len(state["attempts"]):
+                attempt = state["attempts"][number]
+                if attempt["status"] == "completed":
+                    break
+                if attempt["status"] != "running":
+                    continue
+            else:
+                attempt = dict(attempt=number, seed=training_seed, status="running",
+                               directory=str(attempt_relative))
+                state["attempts"].append(attempt)
+                write_json(state_path, state)
+            directory.mkdir(parents=True, exist_ok=True)
+            emit_message(f"{label} | Attempt {number + 1}/{len(seeds)}; seed={training_seed}", kind="WORK")
+            checkpoint_path = directory / ".resume/latest.pt"
+            checkpoint = (torch.load(checkpoint_path, map_location=device, weights_only=False)
+                          if checkpoint_path.exists() else None)
+            if checkpoint is not None:
+                verify_artifacts(directory, checkpoint["files"], f"{label} | Verify epoch checkpoints")
+            try:
+                order, history = train_residual(
+                    rows[a], rows[b], directory, epochs=epochs, seed=training_seed, device=device,
+                    checkpoint=checkpoint, fraction=fraction, initialization=initialization,
+                    progress_label=f"{label} | Attempt {number + 1}/{len(seeds)}", settings=settings)
+                weights = [history[e]["signal_fraction"] for e in order]
+                quality, normalization, mixture = assess_fit(
+                    directory, order, weights, validation, device,
+                    sigma=policy["validation_sigma"], normalization_tests=normalization_tests)
+                # Kept alongside the selected density for configuration selection, never test labels.
+                from .storage import save_array
+                atomic_write(directory / "validation_log_mixture_ratio.npy", lambda p: save_array(p, mixture))
+                attempt.update(status="completed" if quality["status"] == "passed" else "validation_failure",
+                               epochs=order, signal_fractions=weights, quality=quality,
+                               normalization=normalization)
+                if attempt["status"] != "completed":
+                    attempt["error"] = "Insufficient reserved-validation improvement over background"
+            except (FloatingPointError, NumericalFitError) as error:
+                attempt.update(status="numerical_failure", error=str(error), error_type=type(error).__name__)
+            attempt["artifacts_sha256"] = {
+                p.name: file_digest(p) for p in directory.iterdir() if p.is_file()
+            }
+            write_json(state_path, state)
+            if attempt["status"] == "completed":
+                break
+            emit_message(f"{label} | Attempt {number + 1}: {attempt['status']}: {attempt['error']}; "
+                         + ("restart this fit from epoch zero" if number + 1 < len(seeds)
+                            else "retry budget exhausted; exclude this fit"), kind="WARNING", level=0)
+        accepted = next((a for a in state["attempts"] if a["status"] == "completed"), None)
+        if accepted:
+            saved = {**accepted, "fit_index": index, "attempts": state["attempts"]}
+        else:
+            saved = dict(status="excluded", fit_index=index, directory=str(relative),
+                         reason="retry_budget_exhausted", attempts=state["attempts"])
+        write_json(terminal, saved)
+        return saved
 
 
 def train_campaign(
-    train,
-    validation,
-    output,
-    *,
-    epochs=DEFAULTS["riddle"]["epochs"],
-    runs=DEFAULTS["riddle"]["runs"],
-    seed=0,
-    device="cpu",
-    fraction_values=(None,),
-    initialization="background",
-    started=None,
-    workers=1,
-    io_workers=2,
-    settings=None,
+    train, validation, output, *, epochs=DEFAULTS["riddle"]["epochs"],
+    runs=DEFAULTS["riddle"]["runs"], seed=0, device="cpu", fraction_values=(None,),
+    initialization="background", started=None, workers=1, io_workers=2, settings=None,
 ):
     settings = deepcopy(DEFAULTS["riddle"] if settings is None else settings)
     settings.update(epochs=epochs, runs=runs, initialization=initialization)
     settings = validate_residual(settings)
-    timing = FitTiming(epochs, started=started)
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     if min(runs, workers, io_workers) < 1:
         raise ValueError("Require positive runs/workers/io_workers")
-    ztrain, zval = (real_sr_latents(train), real_sr_latents(validation))
-    rows = np.column_stack(
-        (np.full(len(ztrain), 3.5), ztrain, np.ones(len(ztrain)), np.zeros(len(ztrain)))
-    ).astype(np.float32)
-    identity = {
-        "scientific_version": SCIENTIFIC_VERSION,
-        "production_policy": PRODUCTION_POLICY,
-        "training_sha256": digest(ztrain),
-        "selection_sha256": digest(zval),
-        "epochs": epochs,
-        "runs": runs,
-        "seed": seed,
-        "fractions": list(fraction_values),
-        "initialization": initialization,
-        "settings": settings,
-    }
+    ztrain, zval = real_sr_latents(train), real_sr_latents(validation)
+    rows = np.column_stack((np.full(len(ztrain), 3.5), ztrain,
+                            np.ones(len(ztrain)), np.zeros(len(ztrain)))).astype(np.float32)
+    identity = dict(scientific_version=SCIENTIFIC_VERSION, production_policy=PRODUCTION_POLICY,
+                    training_sha256=digest(ztrain), selection_sha256=digest(zval),
+                    epochs=epochs, runs=runs, seed=seed, fractions=list(fraction_values),
+                    initialization=initialization, settings=settings)
     identity_path = output / "ensemble_inputs.json"
     if identity_path.exists() and json.loads(identity_path.read_text()) != identity:
         raise ValueError("Residual ensemble inputs/settings changed; use a new output")
     write_json(identity_path, identity)
-    configs, failures = ([], [])
-    total_fits = runs * len(fraction_values)
     tags = ["learned" if f is None else "fraction_" + str(f).replace(".", "p") for f in fraction_values]
-    pending = {
-        (c, i)
-        for c, tag in enumerate(tags)
-        for i in range(runs)
-        if not (output / tag / f"run_{i:03d}" / "fit.json").exists()
-    }
+    total = runs * len(tags)
+    checkpoints = settings["training"]["selected_checkpoints"]
+    tests = total * (settings["fit_recovery"]["max_retries"] + 1) * (checkpoints + 1)
+    jobs = [dict(fit=c * runs + i + 1, index=i, fraction=fraction_values[c],
+                 relative=str(Path(tag) / f"run_{i:03d}"),
+                 directory=str(output / tag / f"run_{i:03d}"))
+            for c, tag in enumerate(tags) for i in range(runs)]
     if workers > 1:
         from .parallel import run_fits
-
-        for c, tag in enumerate(tags):
-            for i in range(runs):
-                if (c, i) not in pending:
-                    directory = output / tag / f"run_{i:03d}"
-                    saved = json.loads((directory / "fit.json").read_text())
-                    verify_artifacts(
-                        directory,
-                        saved["artifacts_sha256"],
-                        f"RIDDLE fit {c * runs + i + 1}/{total_fits} | Verify saved fit",
-                    )
-        jobs = [
-            {
-                "fit": c * runs + i + 1,
-                "index": i,
-                "fraction": fraction_values[c],
-                "relative": str(Path(tag) / f"run_{i:03d}"),
-                "directory": str(output / tag / f"run_{i:03d}"),
-            }
-            for c, tag in enumerate(tags)
-            for i in range(runs)
-            if (c, i) in pending
-        ]
-        run_fits(
-            rows,
-            jobs,
-            epochs=epochs,
-            seed=seed,
-            device=device,
-            initialization=initialization,
-            workers=workers,
-            io_workers=io_workers,
-            total=total_fits,
-            started=timing.started,
-            settings=settings,
-        )
-    for config_index, fraction in enumerate(fraction_values):
-        tag = tags[config_index]
-        members, histories = ([], [])
-        for index in range(runs):
-            fit_label = f"RIDDLE fit {config_index * runs + index + 1}/{total_fits}"
-            with ProgressStage("residual_member_prepare", f"{fit_label} | Prepare"):
-                relative = Path(tag) / f"run_{index:03d}"
-                directory = output / relative
-                directory.mkdir(parents=True, exist_ok=True)
-                a, b, training_seed = member_split(
-                    len(rows), seed, index, batch_size=settings["training"]["batch_size"]
-                )
-                split = {"training": a, "validation": b}
-                split_path = directory / "split.npz"
-                if split_path.exists():
-                    with np.load(split_path) as saved:
-                        if any((not np.array_equal(saved[k], v) for k, v in split.items())):
-                            raise ValueError("Saved residual split changed")
-                else:
-                    from riddle.storage import save_npz
-
-                    atomic_write(split_path, lambda p: save_npz(p, **split))
-                status_path = directory / "fit.json"
-                saved = json.loads(status_path.read_text()) if status_path.exists() else None
-            if saved:
-                verify_artifacts(directory, saved["artifacts_sha256"], f"{fit_label} | Verify saved fit")
-            trained = saved is None
-            if saved is None:
-                try:
-                    checkpoint_path = directory / ".resume/latest.pt"
-                    checkpoint = (
-                        torch.load(checkpoint_path, map_location=device, weights_only=False)
-                        if checkpoint_path.exists()
-                        else None
-                    )
-                    if checkpoint is not None:
-                        verify_artifacts(
-                            directory, checkpoint["files"], f"{fit_label} | Verify epoch checkpoints"
-                        )
-                    order, history = train_residual(
-                        rows[a],
-                        rows[b],
-                        directory,
-                        epochs=epochs,
-                        seed=training_seed,
-                        device=device,
-                        checkpoint=checkpoint,
-                        fraction=fraction,
-                        initialization=initialization,
-                        progress_label=f"{fit_label} | Train residual mixture",
-                        on_training_start=timing.start_fit,
-                        settings=settings,
-                    )
-                    training_finished = time.monotonic()
-                    saved = {
-                        "status": "completed",
-                        "epochs": order,
-                        "signal_fractions": [history[i]["signal_fraction"] for i in order],
-                    }
-                except FloatingPointError as error:
-                    timing.finish_fit(0)
-                    saved = {
-                        "status": "numerical_failure",
-                        "error": str(error),
-                        "error_type": type(error).__name__,
-                    }
-                saved.update(
-                    directory=str(relative),
-                    seed=training_seed,
-                    artifacts_sha256={
-                        p.name: file_digest(p)
-                        for p in directory.iterdir()
-                        if p.is_file() and p != status_path
-                    },
-                )
-                write_json(status_path, saved)
-            if saved["status"] == "completed":
-                members.append(saved)
-                histories.append(json.loads((directory / "residual_losses.json").read_text())["history"])
-            else:
-                failures.append({"configuration": tag, **saved})
-                write_json(output / "numerical_failures.json", {"failures": failures})
-            pending.discard((config_index, index))
-            if trained:
-                if saved["status"] == "completed":
-                    timing.finish_fit(
-                        epochs - (checkpoint["epoch"] + 1 if checkpoint is not None else 0),
-                        training_finished=training_finished,
-                    )
-                timing.report(config_index * runs + index + 1, total_fits, len(pending))
-        checkpoints = settings["training"]["selected_checkpoints"]
-        current = {"name": tag, "fraction": fraction, "members": members, "valid_runs": len(members)}
-        pending_selection = {
-            "status": "incomplete", "production_policy": PRODUCTION_POLICY,
-            "requested_runs": runs, "checkpoints_per_run": checkpoints,
-            "configurations": [*configs, current], "failures": failures,
-        }
-        write_json(output / "ensemble_selection.json", pending_selection)
-        require_complete_members(members, runs, checkpoints, configuration=tag)
-        histories = {member["directory"]: history for member, history in zip(members, histories)}
-        nll = heldout_nll(output, members, zval, device, failures, tag)
-        current["valid_runs"] = len(members)
-        write_json(output / "ensemble_selection.json", pending_selection)
-        require_complete_members(members, runs, checkpoints, configuration=tag)
-        histories = [histories[member["directory"]] for member in members]
-        config = {"name": tag, "fraction": fraction, "members": members, "valid_runs": len(members)}
+        run_fits(rows, jobs, validation=zval, epochs=epochs, seed=seed, device=device,
+                 initialization=initialization, workers=workers, io_workers=io_workers,
+                 total=total, started=started, settings=settings, normalization_tests=tests)
+    else:
+        for job in jobs:
+            train_member(rows, zval, output, relative=job["relative"], index=job["index"],
+                         fraction=job["fraction"], epochs=epochs, seed=seed, device=device,
+                         initialization=initialization, settings=settings,
+                         label=f"RIDDLE fit {job['fit']}/{total}", normalization_tests=tests)
+    configs, failures = [], []
+    for tag in tags:
+        receipts = [json.loads((output / tag / f"run_{i:03d}" / "fit.json").read_text()) for i in range(runs)]
+        members = [m for m in receipts if m["status"] == "completed"]
+        excluded = [m for m in receipts if m["status"] == "excluded"]
+        failures.extend(dict(configuration=tag, fit_index=m["fit_index"], **attempt)
+                        for m in receipts for attempt in m["attempts"] if attempt["status"] != "completed")
+        config = dict(name=tag, fraction=fraction_values[tags.index(tag)], members=members,
+                      excluded_fits=excluded, valid_runs=len(members))
         if members:
-            config["selection_nll"] = nll
-            config["history"] = [
-                {
-                    "epoch": e,
-                    **{
-                        key: float(np.mean([h[e][key] for h in histories]))
-                        for key in ("train_nll", "validation_nll", "signal_fraction")
-                    },
-                }
-                for e in range(epochs)
-            ]
+            require_complete_members(members, runs, checkpoints, configuration=tag, allow_excluded=True)
+            mixtures = [np.load(output / m["directory"] / "validation_log_mixture_ratio.npy") for m in members]
+            combined = np.logaddexp.reduce(mixtures, axis=0) - np.log(len(members))
+            config["selection_nll"] = -float(np.mean(
+                background_log_prob(torch.from_numpy(zval)).numpy().astype(np.float64) + combined))
+            histories = [json.loads((output / m["directory"] / "residual_losses.json").read_text())["history"]
+                         for m in members]
+            config["history"] = [dict(epoch=e, **{key: float(np.mean([h[e][key] for h in histories]))
+                for key in ("train_nll", "validation_nll", "signal_fraction")}) for e in range(epochs)]
         configs.append(config)
-        write_json(output / "ensemble_selection.json", {
-            **pending_selection, "status": "in_progress", "configurations": configs,
-        })
-    chosen = min(configs, key=lambda c: c["selection_nll"])
-    result = {
-        "status": "completed",
-        "production_policy": PRODUCTION_POLICY,
-        "checkpoints_per_run": settings["training"]["selected_checkpoints"],
-        "configurations": configs,
-        "selected_configuration": chosen["name"],
-        "members": chosen["members"],
-        "failures": failures,
-        "requested_runs": runs,
-        "valid_runs": chosen["valid_runs"],
-        "selected_checkpoints": sum((len(m["epochs"]) for m in chosen["members"])),
-        "selection": "held-out reserved validation mixture NLL; no signal truth",
-    }
+    usable = [c for c in configs if c["members"]]
+    result = dict(status="completed" if usable else "no_accepted_fits", production_policy=PRODUCTION_POLICY,
+                  requested_runs=runs, checkpoints_per_run=checkpoints, configurations=configs,
+                  failures=failures, fit_recovery=settings["fit_recovery"],
+                  selection="reserved-validation mixture likelihood; no truth or test-score selection")
+    write_json(output / "numerical_failures.json", {"failures": failures})
+    if not usable:
+        write_json(output / "ensemble_selection.json", result)
+        from .production import IncompleteEnsembleError
+        raise IncompleteEnsembleError("RIDDLE: no fits passed after bounded retries; no physics result was produced. "
+                                      "Inspect density/ensemble_selection.json and the fit attempt records.")
+    chosen = min(usable, key=lambda c: c["selection_nll"])
+    result.update(selected_configuration=chosen["name"], members=chosen["members"],
+                  valid_runs=len(chosen["members"]), selected_checkpoints=len(chosen["members"]) * checkpoints)
     require_complete_ensemble(result)
     write_json(output / "ensemble_selection.json", result)
-    write_json(output / "numerical_failures.json", {"failures": failures})
-    write_json(
-        output / "residual_losses.json", {"history": chosen["history"], "aggregation": "mean over valid runs"}
-    )
+    write_json(output / "residual_losses.json", dict(history=chosen["history"], aggregation="mean over accepted fits"))
+    emit_message(f"RIDDLE: {result['valid_runs']}/{runs} fits accepted; saved ensemble excludes exhausted fits", level=0)
     return result
 
 
@@ -367,6 +318,19 @@ def validate_normalization(output, features, device):
     root = Path(output)
     selection = json.loads((root / "ensemble_selection.json").read_text())
     require_complete_ensemble(selection)
+    if selection["production_policy"] == PRODUCTION_POLICY:
+        members = []
+        for member in selection["members"]:
+            directory = root / member["directory"]
+            verify_artifacts(directory, member["artifacts_sha256"], "Verify accepted RIDDLE density")
+            health = json.loads((directory / "fit_health.json").read_text())
+            if health != dict(quality=member["quality"], normalization=member["normalization"]):
+                raise ValueError("Selected RIDDLE fit health disagrees with its acceptance receipt")
+            members.append(dict(directory=member["directory"], **health["normalization"]))
+        audit = dict(schema=1, status="passed", features=features, members=members,
+                     source="per-attempt checks before acceptance; verified artifact hashes")
+        write_json(root / "normalization_check.json", audit)
+        return audit
     seed, count = 3407, 8192
     reference = np.random.default_rng(seed).standard_normal((count, features)).astype(np.float32)
     members = selection["members"]
@@ -391,12 +355,20 @@ def validate_normalization(output, features, device):
     return audit
 
 
-def ensemble_predict(output, z, device):
+def ensemble_predict(output, z, device, *, return_members=False):
     root = Path(output)
     selection = json.loads((root / "ensemble_selection.json").read_text())
     require_complete_ensemble(selection)
     combined = None
+    predictions = []
     for member in selection["members"]:
-        ratio = residual_scores(root / member["directory"], member["epochs"], z, device)
+        from .production import NumericalFitError
+        try:
+            ratio = residual_scores(root / member["directory"], member["epochs"], z, device)
+        except (FloatingPointError, NumericalFitError) as error:
+            raise MemberScoreError(member, error) from error
         combined = ratio if combined is None else np.logaddexp(combined, ratio)
-    return combined - np.log(len(selection["members"]))
+        if return_members:
+            predictions.append(ratio)
+    scores = combined - np.log(len(selection["members"]))
+    return (scores, np.stack(predictions)) if return_members else scores

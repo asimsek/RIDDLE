@@ -9,6 +9,9 @@ riddle:
   epochs: 300
   fractions: [learned]
   initialization: background
+  fit_recovery:
+    max_retries: 2
+    validation_sigma: 2.0
   flow:
     layers: 6
     hidden_features: 64

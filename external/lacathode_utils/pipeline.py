@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 
 FLOW_PREFIX = "lacathode_model"
 RUN_LAYOUT = "independent_background_classifier_v1"
@@ -46,6 +47,7 @@ def run_seeds(seed, count):
 
 
 def run_command(options):
+    options["execution_token"] = uuid.uuid4().hex
     output = Path(options["output"])
     output.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
@@ -55,6 +57,21 @@ def run_command(options):
                PYTHONPATH=os.pathsep.join(filter(None, (framework, env.get("PYTHONPATH")))))
     command = [sys.executable, "-m", "riddle.worker", json.dumps(options, default=str)]
     return command, env
+
+
+def numerical_run_failure(options):
+    """Only a failure receipt from this worker invocation can justify exclusion."""
+    path = Path(options["output"]) / "result.json"
+    if not path.exists():
+        return False
+    report = json.loads(path.read_text())
+    failure = report.get("failure", {})
+    return (report.get("completed") is False and report.get("method") == "lacathode"
+            and report.get("seed") == options["seed"]
+            and report.get("run_index") == options["run_index"]
+            and failure.get("kind") == "numerical"
+            and options.get("execution_token") is not None
+            and failure.get("execution_token") == options["execution_token"])
 
 
 def launch_run(options, index, count):
@@ -78,7 +95,7 @@ def launch_run(options, index, count):
                             event["message"] = f"Run {index + 1}/{count} | " + event["message"]
                         line = EVENT_PREFIX + json.dumps(event) + "\n"
                     print(line, end="", flush=True)
-                if process.wait():
+                if process.wait() and not numerical_run_failure(options):
                     raise RuntimeError(f"LaCathode run {index} failed; inspect {output / 'training.log'}")
             except BaseException:
                 if process.poll() is None:
@@ -172,7 +189,7 @@ def launch_runs(args, requests):
                         continue
                     state["timing"].update(finished=time.time(), returncode=code)
                     concurrent_log(state, count, final=True)
-                    if code:
+                    if code and not numerical_run_failure(requests[index]):
                         raise RuntimeError(f"LaCathode run {index} failed (exit {code}); inspect {requests[index]['output']}/training.log")
                     completed += 1
                     progress.update(completed, force=True)
@@ -199,15 +216,35 @@ def collect_runs(args, members):
     from .storage import atomic_write, save_npz, save_array, write_json, verify_artifacts
     from riddle.production import validate_result_scores
 
+    requested = len(members)
     roots = [args.output / member["directory"] for member in members]
     reports = [json.loads((root / "result.json").read_text()) for root in roots]
+    accepted, excluded = [], []
     for root, report, member in zip(roots, reports, members):
-        if (not report.get("completed") or report.get("method") != "lacathode"
+        if (report.get("method") != "lacathode"
                 or report.get("seed") != member["seed"]
                 or report.get("run_index") != member["run"]):
             raise ValueError("Missing or misidentified independent LaCathode run")
+        if not report.get("completed"):
+            failure = report.get("failure", {})
+            if failure.get("kind") != "numerical":
+                raise ValueError("Incomplete LaCathode run without a numerical failure receipt")
+            excluded.append(dict(**member, failure=failure))
+            continue
         verify_artifacts(root, report["artifacts_sha256"])
         validate_result_scores(root, "lacathode")
+        accepted.append(member)
+    write_json(args.output / "run_selection.json", dict(
+        status="completed" if accepted else "no_accepted_runs", requested_runs=requested,
+        accepted_runs=len(accepted), members=accepted, excluded_runs=excluded,
+        selection="numerical validity only; weak but valid classifiers retained"))
+    if not accepted:
+        raise RuntimeError("LaCathode: no numerically valid runs; no physics result was produced")
+    members = accepted
+    roots = [args.output / member["directory"] for member in members]
+    inventory = json.loads((args.output / "runs.json").read_text())
+    inventory.update(runs=members, requested_runs=requested, excluded_runs=excluded)
+    write_json(args.output / "runs.json", inventory)
     for partition in ("validation", "test", "signal_region"):
         records = []
         for root in roots:
@@ -237,7 +274,8 @@ def collect_runs(args, members):
         "mismatched_runs": [m["run"] for m, check in zip(members, checks) if check["mismatch"]],
     })
     protocol = json.loads((roots[0] / "protocol.json").read_text())
-    protocol.update(run_layout=RUN_LAYOUT, pipeline_runs=len(members), runs=members,
+    protocol.update(run_layout=RUN_LAYOUT, pipeline_runs=len(members), requested_runs=requested,
+                    excluded_runs=excluded, runs=members,
                     classifier_runs_per_pipeline=1,
                     score="Ten validation-selected classifier checkpoints per independent run; no cross-run score averaging",
                     fit_scores="One score row per independent background-flow-plus-classifier run",
@@ -405,8 +443,11 @@ def run_single(args, contract):
     recovery.stage("flow", flow)
     for name in (f"{FLOW_PREFIX}_train_losses.npy", f"{FLOW_PREFIX}_val_losses.npy"):
         losses = np.load(root / name, allow_pickle=False)
-        if not losses.size or not np.isfinite(losses).all():
-            raise ValueError(f"LaCathode: invalid flow losses in {root / name}; refusing checkpoint selection")
+        if not losses.size:
+            raise ValueError(f"LaCathode: missing flow losses in {root / name}")
+        if not np.isfinite(losses).all():
+            from riddle.production import NumericalFitError
+            raise NumericalFitError(f"LaCathode: nonfinite flow losses in {root / name}")
 
     def create():
         with ProgressStage("creation", "Build latent/reference datasets"):
@@ -432,8 +473,11 @@ def run_single(args, contract):
     recovery.stage("classifier", classify)
     for name in ("loss_matris.npy", "val_loss_matris.npy"):
         losses = np.load(root / name, allow_pickle=False)
-        if not losses.size or not np.isfinite(losses).all():
-            raise ValueError(f"LaCathode: invalid classifier losses in {root / name}; refusing checkpoint selection")
+        if not losses.size:
+            raise ValueError(f"LaCathode: missing classifier losses in {root / name}")
+        if not np.isfinite(losses).all():
+            from riddle.production import NumericalFitError
+            raise NumericalFitError(f"LaCathode: nonfinite classifier losses in {root / name}")
     rows = np.load(root / "X_test.npy")
     if len(np.unique(rows[rows[:, -2] == 1, -1])) > 1:
         run_all.full_single_evaluation(

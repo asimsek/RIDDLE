@@ -20,6 +20,7 @@ from .ensemble import combine_fits, selected_epochs, validate_mass_normalization
 from .resume import check_contract, policy, transition_history
 from .source import COMMIT, REPOSITORY, digest, verify
 from riddle.worker_progress import EVENT_PREFIX, ProgressStage, emit_message, emit_progress
+from riddle.production import NumericalFitError
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -211,6 +212,29 @@ def stop_processes(processes):
             process.wait()
 
 
+def stage_failure(options):
+    path = Path(options["attempt"]) / "fit_failure.json"
+    if not path.exists():
+        return None
+    report = json.loads(path.read_text())
+    if (report.get("kind") != "numerical" or report.get("stage") != options["stage"]
+            or report.get("fit_index") != options["fit_index"]):
+        raise ValueError("Invalid upstream numerical failure receipt")
+    error = NumericalFitError(report["error"])
+    error.attempt = options["attempt"]
+    return error
+
+
+def reject_signal_fit(args, index, error):
+    attempt = Path(error.attempt)
+    relative = attempt.relative_to(args.output)
+    receipt = dict(fit_index=index, status="excluded", check="numerical_validity",
+                   attempt=str(relative), error=str(error),
+                   files={str(relative / name): value for name, value in fingerprint(attempt).items()})
+    write_json(stage_root(args, "signal", {"fit_index": index}) / "fit_failure.json", receipt)
+    emit_message(f"R-ANODE fit {index:03d}: excluded numerical failure: {error}", kind="WARNING", level=0)
+
+
 def execute(options, env):
     reporter = StageReporter(options)
     log_path = Path(options["attempt"]) / "stage.log"
@@ -226,6 +250,9 @@ def execute(options, env):
                 stream.flush()
                 reporter.line(line)
             if process.wait() != 0:
+                failure = stage_failure(options)
+                if failure is not None:
+                    raise failure
                 raise RuntimeError(
                     f"Upstream R-ANODE {options['stage']} stage failed; artifacts retained in {options['attempt']}; see {log_path}"
                 )
@@ -249,7 +276,11 @@ def prepare_stage(args, stage, config, background=None):
         saved = json.loads(receipt.read_text())
         check_files(args.output, saved["files"])
         if stage == "signal":
-            validate_mass_normalization(args.output / saved["attempt"])
+            try:
+                validate_mass_normalization(args.output / saved["attempt"])
+            except NumericalFitError as error:
+                error.attempt = str(args.output / saved["attempt"])
+                raise
         emit_progress("reuse", "Verify saved stage artifacts", stream=label, completed=1)
         emit_message(f"{label}: reuse verified R-ANODE {stage} stage", kind="PASS")
         return args.output / saved["attempt"]
@@ -291,7 +322,11 @@ def complete_stage(args, options):
     emit_progress("receipt", "Verify and record stage artifacts", stream=label, completed=0)
     attempt = Path(options["attempt"])
     if options["stage"] == "signal":
-        validate_mass_normalization(attempt)
+        try:
+            validate_mass_normalization(attempt)
+        except NumericalFitError as error:
+            error.attempt = str(attempt)
+            raise
     relative = attempt.relative_to(args.output)
     hashes = {
         str(relative / name): value for name, value in fingerprint(attempt).items()
@@ -327,11 +362,26 @@ def run_signal_fits(args, config, background):
     indices = list(range(config["fit_index"], config["fit_index"] + config["runs"]))
     workers = min(getattr(args, "workers", 1), len(indices))
     progress = ProgressStage("ranode_fits", "Train and evaluate signal fits", len(indices), "fit", report_every=1)
+    previously_excluded = {}
+    for index in indices:
+        receipt = stage_root(args, "signal", {"fit_index": index}) / "fit_failure.json"
+        if receipt.exists():
+            saved = json.loads(receipt.read_text())
+            if saved.get("fit_index") != index or saved.get("status") != "excluded":
+                raise ValueError("Invalid R-ANODE fit exclusion receipt")
+            check_files(args.output, saved["files"])
+            previously_excluded[index] = None
     if workers == 1:
         fits = []
         for index in indices:
             emit_message(f"Fit {len(fits) + 1}/{len(indices)} (fit_{index:03d}): starting")
-            fits.append(run_stage(args, "signal", {**config, "fit_index": index}, background))
+            try:
+                fit = (None if index in previously_excluded else
+                       run_stage(args, "signal", {**config, "fit_index": index}, background))
+            except NumericalFitError as error:
+                reject_signal_fit(args, index, error)
+                fit = None
+            fits.append(fit)
             progress.update(len(fits), force=True)
         return fits
     from .runtime import concurrent_environment
@@ -341,13 +391,21 @@ def run_signal_fits(args, config, background):
     execution = {"workers": workers, "device": args.device, "mps": mps, "fits": [], "completed": False}
     execution_path = args.output / ".resume" / f"concurrency_{time.time_ns()}.json"
     write_json(execution_path, execution)
-    active, completed, cursor = {}, {}, 0
+    active, completed, cursor = {}, dict(previously_excluded), 0
     try:
         while cursor < len(indices) or active:
             while cursor < len(indices) and len(active) < workers:
                 index = indices[cursor]
-                request = prepare_stage(args, "signal", {**config, "fit_index": index}, background)
                 cursor += 1
+                if index in previously_excluded:
+                    continue
+                try:
+                    request = prepare_stage(args, "signal", {**config, "fit_index": index}, background)
+                except NumericalFitError as error:
+                    reject_signal_fit(args, index, error)
+                    completed[index] = None
+                    progress.update(len(completed), force=True)
+                    continue
                 if isinstance(request, Path):
                     completed[index] = request
                     execution["fits"].append({"fit_index": index, "reused": True})
@@ -378,13 +436,20 @@ def run_signal_fits(args, config, background):
                     continue
                 state["timing"].update(finished=time.time(), returncode=code)
                 fit_log(state, final=True)
-                if code:
+                if code and stage_failure(state["options"]) is None:
                     raise RuntimeError(f"R-ANODE fit {index} failed (exit {code}); see {state['options']['attempt']}/stage.log")
                 state["stream"].close()
                 state["reader"].close()
-                completed[index] = complete_stage(args, state["options"])
+                try:
+                    if code:
+                        raise stage_failure(state["options"])
+                    completed[index] = complete_stage(args, state["options"])
+                except NumericalFitError as error:
+                    reject_signal_fit(args, index, error)
+                    completed[index] = None
                 finished.append(index)
-                emit_message(f"Fit {index:03d}: completed", kind="PASS")
+                emit_message(f"Fit {index:03d}: " + ("completed" if completed[index] is not None else "excluded"),
+                             kind="PASS" if completed[index] is not None else "WARNING")
                 progress.update(len(completed), force=True)
             for index in finished:
                 del active[index]
@@ -457,6 +522,7 @@ def run(args):
             "io_workers": args.io_workers,
             "ensemble": "mean_upstream_ratios_v1",
             "background_protocol": BACKGROUND_PROTOCOL,
+            "fit_failure_policy": "exclude_numerically_invalid_fits_v1",
         },
         "code": {**{p.name: digest(p) for p in sorted(Path(__file__).parent.glob("*.py"))},
                  "framework/production.py": digest(ROOT / "riddle/production.py"),
@@ -532,9 +598,13 @@ def run(args):
         with ProgressStage("ranode_background", "Train and evaluate shared background"):
             background = run_stage(args, "background", config)
         fits = run_signal_fits(args, config, background)
-        members = []
+        members, excluded = [], []
         ensemble_progress = ProgressStage("ranode_ensemble", "Select checkpoints and combine fit scores", config["runs"] + 1)
         for index, fit in zip(range(config["fit_index"], config["fit_index"] + config["runs"]), fits):
+            if fit is None:
+                receipt = stage_root(args, "signal", {"fit_index": index}) / "fit_failure.json"
+                excluded.append(json.loads(receipt.read_text()))
+                continue
             epochs = selected_epochs(fit, config["signal_epochs"])
             members.append({
                 "fit_index": index,
@@ -542,7 +612,14 @@ def run(args):
                 "epochs": epochs,
             })
             ensemble_progress.update(len(members), force=True)
-        combine_fits(fits, args.output, requested_runs=config["runs"])
+        write_json(args.output / "fit_selection.json", dict(
+            status="completed" if members else "no_accepted_fits", requested_fits=config["runs"],
+            accepted_fits=len(members), members=members, excluded_fits=excluded,
+            selection="numerical validity only; no AUC, SIC, truth or validation-performance selection"))
+        fits = [fit for fit in fits if fit is not None]
+        if not fits:
+            raise RuntimeError("R-ANODE: no numerically valid fits; no physics result was produced")
+        combine_fits(fits, args.output, requested_runs=len(fits))
         ensemble_progress.update(config["runs"] + 1, force=True)
         protocol = {
             "repository": REPOSITORY,
@@ -561,13 +638,14 @@ def run(args):
             "evaluation_scope": "signal region only",
             "input_adapter": "Sideband-only background pool; signal fits use upstream 80/20 ShuffleSplit within prepared training rows only" if config["split_mode"] == "resample_training" else "Sideband-only background pool; signal fits retain prepared train/validation membership",
             "optimizer": "Upstream AdamW unchanged, including decay on the learned fraction logit",
-            "ensemble": "Equal-weight arithmetic mean of upstream per-fit density ratios; ten original validation-selected checkpoints per fit; all requested fits required; no manual exclusions",
+            "ensemble": "Equal-weight arithmetic mean of upstream per-fit density ratios; ten original validation-selected checkpoints per accepted fit; numerical failures excluded and recorded",
             "score": "Unmodified upstream likelihood; require sampled signal-mass support in every SR bin and finite likelihood before nan_to_num; final score is log(mean(exp(per-fit log ratio)))",
             "seed": "Upstream seed controls data ordering; fit_index selects the split and fraction initialization. Upstream does not seed Torch",
             "restart": "Reuse completed stages; restart interrupted stage from saved initial RNG, without changing upstream checkpoint format",
             "background_attempt": str(background.relative_to(args.output)),
             "signal_attempts": [member["attempt"] for member in members],
             "members": members,
+            "excluded_fits": excluded,
             "requested_runs": config["runs"],
             "valid_runs": len(members),
             "selected_checkpoints": sum(len(member["epochs"]) for member in members),
@@ -598,7 +676,7 @@ def run(args):
         final_progress.update(1, force=True)
         verify(args.sources)
         final_progress.update(2, force=True)
-        # Only successful attempts enter the published receipt; partial attempts remain recoverable.
+        # Accepted predictions and exclusion evidence are fingerprinted separately.
         artifacts = [
             p
             for p in args.output.iterdir()
@@ -610,6 +688,8 @@ def run(args):
             stage_root(args, "signal", {"fit_index": member["fit_index"]}) / "signal_complete.json"
             for member in members
         ]
+        receipts += [stage_root(args, "signal", {"fit_index": m["fit_index"]}) / "fit_failure.json"
+                     for m in excluded]
         for receipt in receipts:
             hashes[str(receipt.relative_to(args.output))] = digest(receipt)
             hashes.update(
