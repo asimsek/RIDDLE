@@ -283,7 +283,7 @@ class NoValidFits(ValueError):
     """A result cannot be plotted, but other method/run results can continue."""
 
 
-def load_scores(root, report, name, *, attempt=None):
+def load_scores(root, report, name, *, attempt=None, for_rebuild=False):
     relative = Path(name + "_scores.npz")
     if attempt is not None:
         relative = Path(attempt) / relative
@@ -335,6 +335,16 @@ def load_scores(root, report, name, *, attempt=None):
         np.isfinite(data[k]).all() for k in ("mass", "physical", "latent") if k in data
     ):
         raise ValueError("Invalid event features or labels")
+    if for_rebuild:
+        if report["method"] != "riddle":
+            raise ValueError("Only RIDDLE checkpoint reconstruction may defer score validation")
+        # Validate all event identities/features, even when an old ensemble's
+        # predictions are unusable. Actual rebuilt predictions are checked below.
+        evidence = {**data, "scores": np.where(data["mask"], 0., np.nan)}
+        evidence.pop("fit_scores", None)
+        validate_score_record(evidence, method="riddle", stage=str(path))
+        data.pop("fit_scores", None)
+        return data
     if (not data["mask"].any() or not np.isfinite(data["scores"][data["mask"]]).all()
             or not np.isnan(data["scores"][~data["mask"]]).all()):
         raise InvalidFitScores(f"{path}: empty/nonfinite accepted scores or invalid rejected-event scores")
@@ -433,6 +443,7 @@ def ranode_plot_ensemble(root, report):
         "ensemble": "log(mean(exp(per-fit log ratio))) with equal weights over used fits",
         "partitions": list(partitions), "independent_runs": 1,
         "source_artifacts_modified": False,
+        "safeguard_filtering": True,
     }
     if additional_exclusions:
         for partition, record in base.items():
@@ -448,44 +459,219 @@ def ranode_plot_ensemble(root, report):
     return base, audit
 
 
+def riddle_plot_predictions(root, report, member, groups):
+    """Read-only v2/v3 inference; production training/resume version rules stay strict."""
+    import torch
+    from .model import build_signal_flow, background_log_prob
+
+    relative = Path("density") / member["directory"]
+    inputs = read_metadata(root, report, str(relative / "residual_training_inputs.json"))
+    version = report["contract"]["scientific_version"]
+    if version not in (2, 3) or inputs.get("scientific_version") != version:
+        raise ValueError("Unsupported or inconsistent RIDDLE checkpoint protocol")
+    paths = [verify_plot_input(root, report, str(relative / f"residual_epoch_{e}.pt"))
+             for e in member["epochs"]]
+    for z in groups.values():
+        if z.ndim != 2 or z.shape[1] != inputs["features"] or not len(z) or not np.isfinite(z).all():
+            raise ValueError("Invalid RIDDLE inference latents")
+    model = build_signal_flow("cpu", features=inputs["features"], settings=inputs["settings"]).eval()
+    backgrounds = {key: background_log_prob(torch.from_numpy(z)).numpy().astype(np.float64)
+                   for key, z in groups.items()}
+    sums, mixture = {}, None
+    total = len(paths) * sum(len(z) for z in groups.values())
+    completed = 0
+    with torch.no_grad(), ProgressStage("plot_riddle_inference", "Evaluate saved RIDDLE fit", total, "prediction") as progress:
+        for path, epoch, weight in zip(paths, member["epochs"], member["signal_fractions"]):
+            checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+            if checkpoint.get("scientific_version") != version or checkpoint.get("epoch") != epoch:
+                raise ValueError("RIDDLE checkpoint identity differs from saved selection")
+            model.load_state_dict(checkpoint["model"])
+            for key, z in groups.items():
+                chunks = []
+                for offset in range(0, len(z), 8192):
+                    batch = z[offset:offset + 8192]
+                    chunks.append(model.log_prob(torch.from_numpy(batch)).numpy())
+                    completed += len(batch)
+                    progress.update(completed)
+                ratio = np.concatenate(chunks).astype(np.float64) - backgrounds[key]
+                if not np.isfinite(ratio).all():
+                    raise FloatingPointError(f"Nonfinite RIDDLE {key} scores at checkpoint {epoch}")
+                if key == "reference":
+                    from .production import validate_density_ratio
+                    validate_density_ratio(ratio, stage=f"{member['directory']} checkpoint {epoch}",
+                                           tests=member["normalization_tests"])
+                sums[key] = ratio if key not in sums else np.logaddexp(sums[key], ratio)
+                if key == "reserved_validation":
+                    weighted = np.logaddexp(np.log1p(-weight) if weight < 1 else -np.inf,
+                                            (np.log(weight) if weight > 0 else -np.inf) + ratio)
+                    mixture = weighted if mixture is None else np.logaddexp(mixture, weighted)
+    count = len(paths)
+    return {key: value - np.log(count) for key, value in sums.items()}, (
+        None if mixture is None else mixture - np.log(count))
+
+
+def riddle_plot_ensemble(root, report, *, io_workers=2):
+    """Filter legacy fits using reserved validation, then rebuild all score partitions."""
+    import torch
+    from .model import real_sr_latents
+    from .production import (NumericalFitError, require_complete_ensemble,
+                             validate_density_ratio, validation_improvement)
+    from .storage import digest
+
+    selection = read_metadata(root, report, "density/ensemble_selection.json")
+    require_complete_ensemble(selection)
+    inputs = read_metadata(root, report, "density/ensemble_inputs.json")
+    path = verify_plot_input(root, report, "background/validation_latents.npy")
+    validation = real_sr_latents(np.load(path, allow_pickle=False))
+    if digest(validation) != inputs.get("selection_sha256"):
+        raise ValueError("Reserved RIDDLE validation events differ from the training selection")
+    reference = np.random.default_rng(3407).standard_normal((8192, validation.shape[1])).astype(np.float32)
+    # Match the production validation rule; legacy runs predate this setting.
+    policy = inputs.get("settings", {}).get("fit_recovery", {})
+    sigma = policy.get("validation_sigma", 2.0)
+    members = [dict(m, fit_index=m.get("fit_index", i)) for i, m in enumerate(selection["members"])]
+    tests = sum(len(m["epochs"]) + 1 for m in members)
+    for member in members:
+        member["normalization_tests"] = tests
+    accepted, excluded, combined, base = [], [], {}, {}
+    audit = dict(method="riddle", source=str(root.resolve()), scenario=report["scenario"], seed=report["seed"],
+                 requested_fits=selection["requested_runs"], used_fits=0, used_members=[], excluded_members=excluded,
+                 status="no_valid_fits", selection="Numerical validity and reserved-validation mixture improvement; no truth/AUC/SIC selection",
+                 validation_sigma=sigma, reference_seed=3407, reference_samples=len(reference),
+                 ensemble="log(mean(exp(per-fit log ratio))) with equal weights over used fits",
+                 partitions=["validation", "test", "signal_region"], independent_runs=1,
+                 source_artifacts_modified=False, safeguard_filtering=True, checkpoint_inference=True)
+    previous_threads = torch.get_num_threads()
+    try:
+        torch.set_num_threads(io_workers)
+        with torch.random.fork_rng(devices=[]):
+            for member in members:
+                colored_status(f"RIDDLE fit {member['fit_index']:03d}: check saved checkpoints on reserved validation",
+                               kind="WORK", level=1)
+                try:
+                    scores, mixture = riddle_plot_predictions(root, report, member,
+                        {"reserved_validation": validation, "reference": reference})
+                    validate_density_ratio(scores["reference"], stage=f"{member['directory']} ensemble", tests=tests)
+                    quality = validation_improvement(mixture, sigma=sigma)
+                except (NumericalFitError, FloatingPointError) as error:
+                    excluded.append(dict(member, check="numerical_validity", reason=str(error)))
+                    continue
+                if quality["status"] != "passed":
+                    excluded.append(dict(member, check="validation_improvement", quality=quality,
+                                         reason="Insufficient reserved-validation improvement over background"))
+                    continue
+                accepted.append(dict(member, quality=quality))
+            if accepted:
+                base = {p: load_scores(root, report, p, for_rebuild=True) for p in audit["partitions"]}
+                # Keep the saved prediction exactly when no fit was rejected and it is usable.
+                valid_saved_scores = all(np.isfinite(r["scores"][r["mask"]]).all()
+                                         and np.isnan(r["scores"][~r["mask"]]).all() for r in base.values())
+                if excluded or not valid_saved_scores:
+                    surviving = []
+                    for member in accepted:
+                        colored_status(f"RIDDLE fit {member['fit_index']:03d}: rebuild scores for all plot regions",
+                                       kind="WORK", level=1)
+                        try:
+                            predictions, _ = riddle_plot_predictions(root, report, member,
+                                {p: r["latent"] for p, r in base.items()})
+                        except (NumericalFitError, FloatingPointError) as error:
+                            excluded.append(dict(member, check="score_validity", reason=str(error)))
+                            continue
+                        for p, values in predictions.items():
+                            combined[p] = values if p not in combined else np.logaddexp(combined[p], values)
+                        surviving.append(member)
+                    accepted = surviving
+                    for p, record in base.items():
+                        if accepted:
+                            record["scores"] = np.full(len(record["mask"]), np.nan)
+                            record["scores"][record["mask"]] = combined[p] - np.log(len(accepted))
+                if accepted:
+                    audit["status"] = "rebuilt_from_valid_fits" if excluded or not valid_saved_scores else "saved_ensemble"
+    finally:
+        torch.set_num_threads(previous_threads)
+    audit.update(used_fits=len(accepted), used_members=accepted)
+    if not accepted:
+        return {}, audit
+    for p, record in base.items():
+        validate_score_record(record, method="riddle", stage=f"RIDDLE plot ensemble {root}/{p}")
+        record["plot_ensemble"] = audit
+    return base, audit
+
+
+def unfiltered_plot_ensemble(root, report):
+    """Opt out of plot-time selection, without undoing production exclusions."""
+    if report["method"] == "riddle":
+        selection = read_metadata(root, report, "density/ensemble_selection.json")
+        members = [dict(m, fit_index=m.get("fit_index", i)) for i, m in enumerate(selection["members"])]
+        config = next(c for c in selection["configurations"] if c["name"] == selection["selected_configuration"])
+        excluded = config.get("excluded_fits", [])
+        requested = selection["requested_runs"]
+    else:
+        selection = read_metadata(root, report, "protocol.json")
+        attempts = selection.get("signal_attempts") or [selection["signal_attempt"]]
+        members = selection.get("members", [dict(fit_index=i, attempt=a) for i, a in enumerate(attempts)])
+        excluded, requested = selection.get("excluded_fits", []), selection.get("requested_runs", 1)
+    records = {p: load_scores(root, report, p) for p in ("validation", "test", "signal_region")}
+    audit = dict(method=report["method"], source=str(root.resolve()), scenario=report["scenario"], seed=report["seed"],
+                 status="filtering_disabled", safeguard_filtering=False, checkpoint_inference=False,
+                 requested_fits=requested, used_fits=len(members), used_members=members, excluded_members=excluded,
+                 selection="Exact saved ensemble; plot-time filtering disabled; production exclusions retained",
+                 independent_runs=1, source_artifacts_modified=False)
+    for record in records.values():
+        record["plot_ensemble"] = audit
+    return records, audit
+
+
 class ScoreLoader:
     """Load saved method predictions once; ensemble members are not repeat runs."""
 
-    def __init__(self):
+    def __init__(self, *, safeguard_filtering=True, io_workers=2):
         self.cache = {}
         self.validated = set()
         self.fit_audit = {}
+        self.safeguard_filtering = safeguard_filtering
+        self.io_workers = io_workers
 
     def __call__(self, root, report, partition):
         identity = str(root.resolve())
         if identity not in self.validated:
-            if report["method"] == "ranode":
-                records, audit = ranode_plot_ensemble(root, report)
+            method = report["method"]
+            legacy_riddle = method == "riddle" and report.get("contract", {}).get("scientific_version", 1) < 3
+            if method in ("riddle", "ranode") and (not self.safeguard_filtering or legacy_riddle or method == "ranode"):
+                if not self.safeguard_filtering:
+                    records, audit = unfiltered_plot_ensemble(root, report)
+                elif legacy_riddle:
+                    records, audit = riddle_plot_ensemble(root, report, io_workers=self.io_workers)
+                else:
+                    records, audit = ranode_plot_ensemble(root, report)
                 self.fit_audit[identity] = audit
                 if not records:
-                    raise NoValidFits(f"R-ANODE {root}: no numerically valid saved fits; skipping this result")
+                    raise NoValidFits(f"{BUILTINS[method].label} {root}: no saved fits passed safeguards; skipping this result")
                 self.cache.update({(identity, p): record for p, record in records.items()})
-                if audit["excluded_members"]:
+                if self.safeguard_filtering and audit["excluded_members"]:
                     indices = ", ".join(f"{m['fit_index']:03d}" for m in audit["excluded_members"])
-                    colored_status(f"R-ANODE {report['scenario']}/seed_{report['seed']:03d}: "
+                    colored_status(f"{BUILTINS[method].label} {report['scenario']}/seed_{report['seed']:03d}: "
                                    f"using {audit['used_fits']}/{audit['requested_fits']} saved fits; "
-                                   f"excluded invalid fits {indices}; accepted ensemble verified", kind="INFO", level=0)
-            if report["method"] == "riddle" and report.get("contract", {}).get("scientific_version", 1) >= 3:
+                                   f"excluded fits {indices}; accepted ensemble verified", kind="INFO", level=0)
+            if self.safeguard_filtering and method == "riddle" and not legacy_riddle:
                 from .production import require_complete_ensemble
                 selection = read_metadata(root, report, "density/ensemble_selection.json")
                 require_complete_ensemble(selection)
                 chosen = next(c for c in selection["configurations"] if c["name"] == selection["selected_configuration"])
                 self.fit_audit[identity] = dict(method="riddle", source=identity, status="producer_selection",
+                    scenario=report["scenario"], seed=report["seed"], source_artifacts_modified=False,
                     requested_fits=selection["requested_runs"], used_fits=selection["valid_runs"],
                     used_members=selection["members"], excluded_members=chosen["excluded_fits"],
-                    fit_recovery=selection["fit_recovery"], selection=selection["selection"], independent_runs=1)
+                    fit_recovery=selection["fit_recovery"], selection=selection["selection"], independent_runs=1,
+                    safeguard_filtering=True, checkpoint_inference=False)
             if report["method"] == "lacathode" and "run_selection.json" in report.get("artifacts_sha256", {}):
                 selection = read_metadata(root, report, "run_selection.json")
                 self.fit_audit[identity] = dict(method="lacathode", source=identity, status="producer_selection",
                     requested_fits=selection["requested_runs"], used_fits=selection["accepted_runs"],
                     used_members=selection["members"], excluded_members=selection["excluded_runs"],
                     selection=selection["selection"], independent_runs=selection["accepted_runs"])
-            if "density/normalization_check.json" in report.get("artifacts_sha256", {}):
+            if (self.safeguard_filtering and not legacy_riddle
+                    and "density/normalization_check.json" in report.get("artifacts_sha256", {})):
                 audit = read_metadata(root, report, "density/normalization_check.json")
                 if audit.get("status") != "passed":
                     raise ValueError(f"{root}: failed density normalization check")
@@ -941,7 +1127,18 @@ def training_figures(group, output, score_loader=None):
             continue
         destination = output / STYLES[KEYS[method]][0] / "02_training"
         if method == "riddle":
+            members = read_metadata(root, report, "density/ensemble_selection.json")["members"]
+            audit = score_loader.fit_audit.get(str(root.resolve())) if score_loader is not None else None
+            if audit:
+                members = audit["used_members"]
             history = read_metadata(root, report, "density/residual_losses.json")["history"]
+            histories = [read_metadata(root, report, "density/" + m["directory"] + "/residual_losses.json")["history"]
+                         for m in members]
+            if audit and audit["status"] == "rebuilt_from_valid_fits":
+                if not histories or any(len(h) != len(histories[0]) for h in histories):
+                    raise ValueError("Inconsistent accepted RIDDLE training histories")
+                history = [dict(epoch=e, **{key: float(np.mean([h[e][key] for h in histories]))
+                    for key in ("train_nll", "validation_nll", "signal_fraction")}) for e in range(len(histories[0]))]
             for kind, ylabel in (
                 ("nll", "Mixture negative log likelihood"),
                 ("fraction", "Fitted mixture fraction"),
@@ -957,41 +1154,38 @@ def training_figures(group, output, score_loader=None):
                     ax.plot(x, [r[field] for r in history], label=label)
                 f.legend(fig)
                 f.save(fig, destination / kind)
-            members = read_metadata(root, report, "density/ensemble_selection.json")["members"]
             if members:
+                positions = [m.get("fit_index", i) + 1 for i, m in enumerate(members)]
                 fig, ax, _ = f.canvas("Fit", "Selected epoch")
-                for i, member in enumerate(members, 1):
+                for i, member in zip(positions, members):
                     epochs = np.asarray(member["epochs"]) + 1
                     ax.scatter(
                         epochs,
                         np.full(len(epochs), i),
                         s=12,
                         color=STYLES["residual"][1],
-                        label="RIDDLE" if i == 1 else None,
+                        label="RIDDLE" if i == positions[0] else None,
                     )
-                ax.set(yticks=range(1, len(members) + 1), ylim=(0.3, len(members) + 0.7))
+                ax.set(yticks=positions, ylim=(min(positions) - .7, max(positions) + .7))
                 f.legend(fig)
                 f.save(fig, destination / "selected_epochs_by_fit")
                 fig, ax, _ = f.canvas("Validation mixture NLL", "Fit")
-                for i, member in enumerate(members, 1):
-                    history = read_metadata(
-                        root, report, "density/" + member["directory"] + "/residual_losses.json"
-                    )["history"]
+                for i, member, history in zip(positions, members, histories):
                     ax.plot(
                         [i],
                         [history[-1]["validation_nll"]],
                         "x",
                         color=".6",
-                        label="Final epoch" if i == 1 else None,
+                        label="Final epoch" if i == positions[0] else None,
                     )
                     ax.scatter(
                         np.full(len(member["epochs"]), i),
                         [history[e]["validation_nll"] for e in member["epochs"]],
                         s=12,
                         color=STYLES["residual"][1],
-                        label="Selected" if i == 1 else None,
+                        label="Selected" if i == positions[0] else None,
                     )
-                ax.set(xticks=range(1, len(members) + 1))
+                ax.set(xticks=positions)
                 f.legend(fig)
                 f.save(fig, destination / "selected_vs_final_validation")
         for stage in ("background", "classifier") if method == "lacathode" else ("background",):
@@ -1923,7 +2117,10 @@ def main(argv=None):
     )
     parser.add_argument("--methods", nargs="+", default=None,
                         help="Optional method IDs to include; default: discover every completed method")
-    parser.add_argument("--io-workers", type=int, default=2, help="CPU threads for numerical libraries; plotting uses saved scores")
+    parser.add_argument("--io-workers", type=int, default=2, help="CPU threads for numerical calculations and legacy RIDDLE checkpoint inference")
+    parser.add_argument("--no-safeguard-filtering", action="store_true",
+                        help="Disable plot-time RIDDLE/R-ANODE fit filtering and use saved ensemble scores; "
+                             "does not undo production exclusions or disable artifact/finite-score validation")
     parser.add_argument("--plot-workers", type=int, default=min(8, max(1, (os.cpu_count() or 1) // 2)),
                         help="Parallel PDF/PNG export processes (default: half the CPUs, capped at 8); use 1 for serial export")
     parser.add_argument("--plot-cache-mb", type=int, default=1024,
@@ -1958,12 +2155,14 @@ def main(argv=None):
                 raise FileExistsError("Plot output exists; use --overwrite or choose a new output directory")
             if any(path.is_symlink() for path in args.output.rglob("*")):
                 raise ValueError("Cannot overwrite a plot directory containing symbolic links")
-        score_loader = ScoreLoader()
+        score_loader = ScoreLoader(safeguard_filtering=not args.no_safeguard_filtering, io_workers=args.io_workers)
         # Retain requested scopes so obsolete figures for skipped results are
         # removed too; do not leave an old invalid curve behind on --overwrite.
         requested_groups = {key: dict(group) for key, group in groups.items()}
         requested_scan_groups = {key: dict(group) for key, group in scan_groups.items()}
-        colored_status("Validate saved score artifacts and method normalization before plotting", kind="INFO", level=1)
+        colored_status("Validate plot inputs | RIDDLE/R-ANODE safeguard filtering "
+                       + ("disabled: use saved ensembles" if args.no_safeguard_filtering
+                          else "active: check fits before plotting"), kind="INFO", level=1)
         with threadpool_limits(limits=args.io_workers):
             preflight_scores([*groups.values(), *scan_groups.values()], score_loader, allow_smoke=args.allow_smoke)
         groups = {key: group for key, group in groups.items() if group}
@@ -2085,9 +2284,13 @@ def main(argv=None):
                             },
                             "mass_summary": "Common background in each plotted region: 300 equal-occupancy bins, test-derived cuts with uncut denominators; shape chi2 normalized by achieved efficiency.",
                             "uncertainty_scope": "16/50/84 percentiles across independent full method runs on fixed evaluation events; one saved ensemble score per RIDDLE/R-ANODE run; no within-ensemble fit bands",
-                            "score_inputs": "Saved predictions only; no checkpoint inference or modification of results",
+                            "score_inputs": ("Legacy RIDDLE checkpoints evaluated on reserved validation; accepted scores reconstructed when needed. No training or modification of results."
+                                if any(a.get("checkpoint_inference") for a in score_loader.fit_audit.values())
+                                else "Saved predictions only; no checkpoint inference or modification of results"),
+                            "safeguard_filtering": not args.no_safeguard_filtering,
                             "score_ensembles": list(score_loader.fit_audit.values()),
-                            "invalid_fit_policy": "Honor producer acceptance inventories across partitions. RIDDLE v3 retries/excludes numerical and reserved-validation failures before export. R-ANODE and independent LaCathode exclude numerical failures in helpers; legacy R-ANODE ensembles can be rebuilt for plotting. Integrity/alignment errors remain fatal. No test-truth/AUC/SIC selection.",
+                            "invalid_fit_policy": ("RIDDLE: numerical validity and reserved-validation improvement, including legacy checkpoint evaluation. R-ANODE: numerical validity and mass support. Rebuild one accepted-fit ensemble across all partitions; skip results with no accepted fits. Production exclusions retained; no plot-time training/retries; no test-truth/AUC/SIC selection."
+                                if not args.no_safeguard_filtering else "Plot-time RIDDLE/R-ANODE safeguards disabled: use exact saved ensembles, retaining production exclusions. Artifact integrity, event alignment and finite-score checks remain active."),
                             "lacathode_event_plots": "Dynamically detected saved fits; mean per-fit histograms with matching per-fit validation cuts; shapes normalize those mean counts; no cross-fit score averaging",
                             "lacathode_roc_sic": "Median rejection and SIC interpolated at 1000 common signal efficiencies, as upstream, after statistical-support cuts. Bands are parametric 16/84-percentile ribbons at fixed signal efficiency; background-efficiency display axes retained.",
                             "lacathode_fit_counts": [{"scenario": b["report"]["scenario"], "seed": b["report"]["seed"], "fits": b["classifier_fit_count"]} for b in bundles if "classifier_fit_count" in b],
