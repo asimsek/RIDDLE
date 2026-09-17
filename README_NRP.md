@@ -113,7 +113,7 @@ python run.py setup --methods ranode
 **Prepare LHCO data:**
 
 ```bash
-python run.py prepare --dataset lhco --catalog config/datasets.yaml --output data/lhco --io-workers 4 --verbose 1
+python run.py prepare --dataset lhco --catalog config/datasets.yaml --output data/lhco --io-workers 8 --verbose 1
 ```
 
 
@@ -130,7 +130,7 @@ Together they use two separate GPU allocations, not a two-GPU request. They may 
 kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --name riddle-seed42 --methods riddle --scenarios signal_injection \
-  --seeds 42 --config config/settings.yaml --workers 2 --io-workers 8 \
+  --seeds 42 --config config/settings.yaml --workers 4 --io-workers 16 \
   --runs 10 --fits 10 --epochs 100 | kubectl apply -n cua-asimsek -f -
 ```
 
@@ -138,7 +138,7 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
 kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --name riddle-bg-seed42 --methods riddle --scenarios background_only \
-  --seeds 42 --config config/settings.yaml --workers 2 --io-workers 8 \
+  --seeds 42 --config config/settings.yaml --workers 4 --io-workers 16 \
   --runs 10 --fits 10 --epochs 100 | kubectl apply -n cua-asimsek -f -
 ```
 
@@ -148,7 +148,7 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
 kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --name lacathode-seed42 --methods lacathode --scenarios signal_injection \
-  --seeds 42 --runs 10 --epochs 100 --workers 2 --io-workers 8 \
+  --seeds 42 --runs 10 --epochs 100 --workers 2 --io-workers 16 \
   --lacathode-background independent \
   | kubectl apply -n cua-asimsek -f -
 ```
@@ -157,7 +157,7 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
 kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --name lacathode-bg-seed42 --methods lacathode --scenarios background_only \
-  --seeds 42 --runs 10 --epochs 100 --workers 2 --io-workers 8 \
+  --seeds 42 --runs 10 --epochs 100 --workers 2 --io-workers 16 \
   --lacathode-background independent \
   | kubectl apply -n cua-asimsek -f -
 ```
@@ -170,7 +170,7 @@ Add `--lacathode-background fixed` to a LaCathode submission to share one backgr
 kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --name ranode-seed42 --methods ranode --scenarios signal_injection \
-  --runs 10 --fits 10 --epochs 100 --seeds 42 --workers 2 --io-workers 8 | \
+  --runs 10 --fits 10 --epochs 100 --seeds 42 --workers 4 --io-workers 16 | \
   kubectl apply -n cua-asimsek -f -
 ```
 
@@ -178,7 +178,7 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
 kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --name ranode-bg-seed42 --methods ranode --scenarios background_only \
-  --runs 10 --fits 10 --epochs 100 --seeds 42 --workers 2 --io-workers 8 | \
+  --runs 10 --fits 10 --epochs 100 --seeds 42 --workers 4 --io-workers 16 | \
   kubectl apply -n cua-asimsek -f -
 ```
 

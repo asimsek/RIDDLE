@@ -275,11 +275,19 @@ def discover(root, requested=None, *, scan=False):
     return groups
 
 
-def load_scores(root, report, name):
-    path = root / (name + "_scores.npz")
-    expected = report.get("artifacts_sha256", {}).get(path.name)
-    if not expected or file_digest(path) != expected:
-        raise ValueError("Score artifact is missing or changed")
+class InvalidFitScores(ValueError):
+    """Numerically unusable predictions, distinct from damaged/misaligned files."""
+
+
+class NoValidFits(ValueError):
+    """A result cannot be plotted, but other method/run results can continue."""
+
+
+def load_scores(root, report, name, *, attempt=None):
+    relative = Path(name + "_scores.npz")
+    if attempt is not None:
+        relative = Path(attempt) / relative
+    path = verify_plot_input(root, report, str(relative))
     with np.load(path, allow_pickle=False) as archive:
         fields = ("mass", "labels", "mask", "scores", "physical")
         if report["method"] in ("riddle", "lacathode") or "latent" in archive:
@@ -327,7 +335,10 @@ def load_scores(root, report, name):
         np.isfinite(data[k]).all() for k in ("mass", "physical", "latent") if k in data
     ):
         raise ValueError("Invalid event features or labels")
-    validate_score_record(data, method=report["method"], stage=f"{root}/{name}")
+    if (not data["mask"].any() or not np.isfinite(data["scores"][data["mask"]]).all()
+            or not np.isnan(data["scores"][~data["mask"]]).all()):
+        raise InvalidFitScores(f"{path}: empty/nonfinite accepted scores or invalid rejected-event scores")
+    validate_score_record(data, method=report["method"], stage=str(path))
     if report["method"] == "lacathode":
         settings = report.get("contract", {}).get("settings", {})
         independent = report.get("contract", {}).get("lacathode_run_layout") == "independent_background_classifier_v1"
@@ -355,20 +366,95 @@ def load_scores(root, report, name):
     return data
 
 
+def ranode_plot_ensemble(root, report):
+    """Recover a plotting ensemble from valid saved fits, without editing results.
+
+    One cohort is used for every partition. Exclusions depend only on numerical
+    validity; weak but valid fits stay. Missing/changed files and event alignment
+    errors still stop plotting rather than being mistaken for failed training.
+    """
+    from external.ranode_utils.ensemble import validate_mass_normalization
+
+    protocol = read_metadata(root, report, "protocol.json")
+    attempts = protocol.get("signal_attempts") or [protocol.get("signal_attempt")]
+    requested = protocol.get("requested_runs", 1)
+    if (not isinstance(attempts, list) or type(requested) is not int or requested < 1 or len(attempts) != requested
+            or any(not isinstance(a, str) or not a for a in attempts)
+            or len(set(attempts)) != requested):
+        raise ValueError(f"R-ANODE {root}: incomplete signal-fit normalization evidence")
+    indices = {m["attempt"]: m["fit_index"] for m in protocol.get("members", [])}
+    partitions = ("validation", "test", "signal_region")
+    fields = ("mass", "physical", "labels", "mask", "is_signal_region")
+    accepted, excluded, base, combined = [], [], {}, {}
+    for index, attempt in enumerate(attempts):
+        member = {"fit_index": indices.get(attempt, index), "attempt": attempt}
+        # Integrity errors are intentionally outside the numerical-failure catch.
+        verify_plot_input(root, report, str(Path(attempt) / "results/upstream/signal/fit/samples.npy"))
+        try:
+            validate_mass_normalization(root / attempt)
+        except ValueError as error:
+            excluded.append({**member, "reason": str(error), "check": "mass_normalization"})
+            continue
+        try:
+            records = {p: load_scores(root, report, p, attempt=attempt) for p in partitions}
+        except InvalidFitScores as error:
+            excluded.append({**member, "reason": str(error), "check": "score_validity"})
+            continue
+        for partition, record in records.items():
+            mask = record["mask"]
+            if partition not in base:
+                base[partition] = record
+                combined[partition] = record["scores"][mask].astype(np.float64)
+            else:
+                if any(not np.array_equal(base[partition][key], record[key]) for key in fields):
+                    raise ValueError(f"R-ANODE {root}: fit {member['fit_index']} has misaligned {partition} events")
+                combined[partition] = np.logaddexp(combined[partition], record["scores"][mask])
+        accepted.append(member)
+    audit = {
+        "method": "ranode", "source": str(root.resolve()), "scenario": report["scenario"], "seed": report["seed"],
+        "requested_fits": requested, "used_fits": len(accepted), "used_members": accepted, "excluded_members": excluded,
+        "status": "rebuilt_from_valid_fits" if excluded and accepted else "saved_ensemble" if accepted else "no_valid_fits",
+        "selection": "Numerical validity only; no selection on AUC, SIC or signal labels",
+        "ensemble": "log(mean(exp(per-fit log ratio))) with equal weights over used fits",
+        "partitions": list(partitions), "independent_runs": 1,
+        "source_artifacts_modified": False,
+    }
+    if excluded:
+        for partition, record in base.items():
+            if len(accepted) > 1:
+                record["scores"] = record["scores"].copy()
+                record["scores"][record["mask"]] = combined[partition] - np.log(len(accepted))
+            validate_score_record(record, method="ranode", stage=f"Rebuilt {root}/{partition}")
+    else:
+        # Preserve the exact saved predictions when every fit passes.
+        base = {p: load_scores(root, report, p) for p in partitions}
+    for record in base.values():
+        record["plot_ensemble"] = audit
+    return base, audit
+
+
 class ScoreLoader:
     """Load saved method predictions once; ensemble members are not repeat runs."""
 
     def __init__(self):
         self.cache = {}
         self.validated = set()
+        self.fit_audit = {}
 
     def __call__(self, root, report, partition):
         identity = str(root.resolve())
         if identity not in self.validated:
             if report["method"] == "ranode":
-                from external.ranode_utils.ensemble import validate_result_normalization
-
-                validate_result_normalization(root, report)
+                records, audit = ranode_plot_ensemble(root, report)
+                self.fit_audit[identity] = audit
+                if not records:
+                    raise NoValidFits(f"R-ANODE {root}: no numerically valid saved fits; skipping this result")
+                self.cache.update({(identity, p): record for p, record in records.items()})
+                if audit["excluded_members"]:
+                    indices = ", ".join(f"{m['fit_index']:03d}" for m in audit["excluded_members"])
+                    colored_status(f"R-ANODE {report['scenario']}/seed_{report['seed']:03d}: "
+                                   f"using {audit['used_fits']}/{audit['requested_fits']} saved fits; "
+                                   f"excluded invalid fits {indices}; ensemble rebuilt for plotting", kind="INFO", level=0)
             if "density/normalization_check.json" in report.get("artifacts_sha256", {}):
                 audit = read_metadata(root, report, "density/normalization_check.json")
                 if audit.get("status") != "passed":
@@ -382,17 +468,25 @@ class ScoreLoader:
 
 def preflight_scores(groups, loader, *, allow_smoke=False):
     """Finish scientific input checks before --overwrite removes any figures."""
-    seen = set()
+    seen, skipped = set(), set()
     for group in groups:
-        for root, report in group.values():
+        for method, (root, report) in list(group.items()):
             identity = str(root.resolve())
+            if identity in skipped:
+                del group[method]
+                continue
             if identity in seen:
                 continue
             seen.add(identity)
             if report.get("contract", {}).get("inputs", {}).get("synthetic_smoke_fixture") and not allow_smoke:
                 raise ValueError("Synthetic fixtures require --allow-smoke for QA")
-            for partition in ("validation", "test", "signal_region"):
-                loader(root, report, partition)
+            try:
+                for partition in ("validation", "test", "signal_region"):
+                    loader(root, report, partition)
+            except NoValidFits as error:
+                skipped.add(identity)
+                del group[method]
+                colored_status(str(error), kind="WARNING")
 
 
 def run_scores(record):
@@ -753,7 +847,7 @@ def csv_write(path, rows):
     atomic_write(path, writer)
 
 
-def settings_rows(group):
+def settings_rows(group, score_loader=None):
     rows = []
 
     def flatten(value, prefix=""):
@@ -776,6 +870,8 @@ def settings_rows(group):
             "protocol": protocol,
             "preparation": report["contract"].get("inputs", {}).get("preparation", {}),
         }
+        if score_loader is not None and str(root.resolve()) in score_loader.fit_audit:
+            payload["plot_ensemble"] = score_loader.fit_audit[str(root.resolve())]
         if method == "riddle":
             result = read_metadata(root, report, "density/ensemble_selection.json")
             payload["ensemble"] = {
@@ -803,10 +899,12 @@ def settings_rows(group):
     return rows
 
 
-def training_figures(group, output):
+def training_figures(group, output, score_loader=None):
     for method, (root, report) in group.items():
         if method == "ranode":
-            render_ranode_training((root, report), output)
+            audit = score_loader.fit_audit.get(str(root.resolve())) if score_loader is not None else None
+            attempts = [m["attempt"] for m in audit["used_members"]] if audit else None
+            render_ranode_training((root, report), output, signal_attempts=attempts)
             continue
         destination = output / STYLES[KEYS[method]][0] / "02_training"
         if method == "riddle":
@@ -1451,7 +1549,7 @@ def render_physical_features(records, selected, retention, budget, output, *, sc
         f.save(fig, output / "05_features" / f"{name}_{'density' if density else 'counts'}_background_{tag}")
 
 
-def render_ranode_training(source, output):
+def render_ranode_training(source, output, *, signal_attempts=None):
     root, report = source
     protocol = read_metadata(root, report, "protocol.json")
     for stage in ("background", "signal"):
@@ -1459,6 +1557,8 @@ def render_ranode_training(source, output):
             protocol["signal_attempts"] if stage == "signal" and "signal_attempts" in protocol
             else [protocol[stage + "_attempt"]]
         )
+        if stage == "signal" and signal_attempts is not None:
+            attempts = signal_attempts
         suffix = "_list" if stage == "background" else ""
         fig, ax, _ = f.canvas("Negative log likelihood", "Epoch")
         for kind, color, ls in (
@@ -1512,6 +1612,7 @@ def render_physical_comparison(group, output, args, load_scores, *, scope="signa
             "population": "Common physical events, independent acceptance and uncut denominators",
             "excluded_methods": excluded,
             "score_transforms": {m: METHOD_SPECS[m].score_transform for m in group},
+            "score_ensembles": {m: r["plot_ensemble"] for m, r in records.items() if "plot_ensemble" in r},
             "methods": render_physical_curves(records, output / "01_performance", scenario, args.min_background, scope=scope),
         }
     with ProgressStage("physical_scores", f"Plot {label.lower()} scores"):
@@ -1825,9 +1926,15 @@ def main(argv=None):
             if any(path.is_symlink() for path in args.output.rglob("*")):
                 raise ValueError("Cannot overwrite a plot directory containing symbolic links")
         score_loader = ScoreLoader()
+        # Retain requested scopes so obsolete figures for skipped results are
+        # removed too; do not leave an old invalid curve behind on --overwrite.
+        requested_groups = {key: dict(group) for key, group in groups.items()}
+        requested_scan_groups = {key: dict(group) for key, group in scan_groups.items()}
         colored_status("Validate saved score artifacts and method normalization before plotting", kind="INFO", level=1)
         with threadpool_limits(limits=args.io_workers):
             preflight_scores([*groups.values(), *scan_groups.values()], score_loader, allow_smoke=args.allow_smoke)
+        groups = {key: group for key, group in groups.items() if group}
+        scan_groups = {key: group for key, group in scan_groups.items() if group}
         args.output.mkdir(parents=True, exist_ok=args.overwrite)
         rows, settings, bundles = [], [], []
         comparisons = {}
@@ -1841,7 +1948,7 @@ def main(argv=None):
                 f.plt.style.context(f.STYLE), threadpool_limits(limits=args.io_workers), locked(args.output / ".plot.lock"), \
                 f.plot_resources(workers=args.plot_workers, cache_mb=args.plot_cache_mb) as exporter:
             if args.overwrite:
-                refresh_plot_scopes(args.output, groups, scan_groups)
+                refresh_plot_scopes(args.output, requested_groups, requested_scan_groups)
             scan_audit = None
             if scan_groups:
                 with progress.task("Injection scan | discrimination and significance"):
@@ -1875,7 +1982,7 @@ def main(argv=None):
                     comparison["full_region"] = render_physical_comparison(
                         group, target / "comparison" / "full_region", args, score_loader, scope="full_region")
                 comparisons[f"{scenario}/{seed}"] = comparison
-                settings.extend(settings_rows(group))
+                settings.extend(settings_rows(group, score_loader))
                 rows.extend(comparison_rows(comparison, scenario, seed))
                 rows.extend(comparison_rows(comparison["full_region"], scenario, seed, scope="full_region"))
                 for method, source in group.items():
@@ -1884,7 +1991,7 @@ def main(argv=None):
                         destination = target / METHOD_SPECS[method].label
                         render_physical_comparison(individual, destination, args, score_loader)
                         render_physical_comparison(individual, destination / "full_region", args, score_loader, scope="full_region")
-                        training_figures(individual, target)
+                        training_figures(individual, target, score_loader)
                         if method in ("lacathode", "riddle"):
                             bundle = make_bundle(individual, args.confidence, score_loader)
                             bundle["individual"] = method
@@ -1915,8 +2022,11 @@ def main(argv=None):
                                     individual, args.output, args, view=view)
             with progress.task("Export comparison tables, configuration and plot manifest"):
                 exporter.flush()
-                csv_write(args.output / "comparison.csv", rows)
-                csv_write(args.output / "configuration.csv", settings)
+                for filename, table in (("comparison.csv", rows), ("configuration.csv", settings)):
+                    if table:
+                        csv_write(args.output / filename, table)
+                    else:
+                        (args.output / filename).unlink(missing_ok=True)
                 write_json(args.output / "comparison.json", json_safe(comparisons))
                 write_json(
                     args.output / "plot_manifest.json",
@@ -1943,6 +2053,8 @@ def main(argv=None):
                             "mass_summary": "Common background in each plotted region: 300 equal-occupancy bins, test-derived cuts with uncut denominators; shape chi2 normalized by achieved efficiency.",
                             "uncertainty_scope": "16/50/84 percentiles across independent full method runs on fixed evaluation events; one saved ensemble score per RIDDLE/R-ANODE run; no within-ensemble fit bands",
                             "score_inputs": "Saved predictions only; no checkpoint inference or modification of results",
+                            "score_ensembles": list(score_loader.fit_audit.values()),
+                            "invalid_fit_policy": "R-ANODE: exclude numerically invalid saved fits consistently across all partitions; rebuild equal-weight density-ratio ensemble for plotting; skip results with no valid fits. Integrity/alignment errors remain fatal. No selection on discrimination performance.",
                             "lacathode_event_plots": "Dynamically detected saved fits; mean per-fit histograms with matching per-fit validation cuts; shapes normalize those mean counts; no cross-fit score averaging",
                             "lacathode_roc_sic": "Median rejection and SIC interpolated at 1000 common signal efficiencies, as upstream, after statistical-support cuts. Bands are parametric 16/84-percentile ribbons at fixed signal efficiency; background-efficiency display axes retained.",
                             "lacathode_fit_counts": [{"scenario": b["report"]["scenario"], "seed": b["report"]["seed"], "fits": b["classifier_fit_count"]} for b in bundles if "classifier_fit_count" in b],
