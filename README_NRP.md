@@ -148,8 +148,8 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
 kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --name lacathode-seed42 --methods lacathode --scenarios signal_injection \
-  --seeds 42 --runs 10 --epochs 100 --workers 1 --io-workers 8 \
-  --lacathode-background fixed \
+  --seeds 42 --runs 10 --epochs 100 --workers 2 --io-workers 8 \
+  --lacathode-background independent \
   | kubectl apply -n cua-asimsek -f -
 ```
 
@@ -157,8 +157,8 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
 kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --name lacathode-bg-seed42 --methods lacathode --scenarios background_only \
-  --seeds 42 --runs 10 --epochs 100 --workers 1 --io-workers 8 \
-  --lacathode-background fixed \
+  --seeds 42 --runs 10 --epochs 100 --workers 2 --io-workers 8 \
+  --lacathode-background independent \
   | kubectl apply -n cua-asimsek -f -
 ```
 
@@ -273,7 +273,7 @@ kubectl delete job ranode-bg-seed42 -n cua-asimsek --ignore-not-found --wait=tru
 ```bash
 cd /shared/work/RIDDLE
 python scripts/nrp_runtime.py
-python plot.py --results results --output plots --methods lacathode riddle ranode --verbose 1 --overwrite
+python plot.py --results results --output plots --methods lacathode riddle ranode --verbose 1 --io-workers 16 --overwrite
 ```
 
 Request either method alone with `--methods lacathode`, `--methods riddle`, or `--methods ranode`.<br>

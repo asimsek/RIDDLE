@@ -121,9 +121,9 @@ class ProgressStage:
 
 
 @contextmanager
-def local_progress(label):
+def local_progress(label, *, display=None):
     with ExitStack() as stack:
-        display = WorkerDisplays(stack, label, startup=False)
+        display = WorkerDisplays(stack, label, startup=False) if display is None else display
         guard, stop = (threading.RLock(), threading.Event())
 
         def publish(event):

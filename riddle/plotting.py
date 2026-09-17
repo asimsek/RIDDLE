@@ -1,8 +1,10 @@
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import csv
 import json
 from pathlib import Path
+import threading
+import time
 
 import numpy as np
 import yaml
@@ -11,7 +13,7 @@ from sklearn.metrics import average_precision_score, roc_auc_score, roc_curve
 
 from . import figures as f
 from .storage import atomic_write, file_digest, locked, write_json
-from .progress import set_verbosity, colored_status
+from .progress import set_verbosity, colored_status, verbosity, _duration
 from .worker_progress import ProgressStage, local_progress
 from .metrics import acceptance_report, efficiency_curve, oracle_metrics
 
@@ -29,6 +31,108 @@ PHYSICAL_STYLES = {
 
 class PopulationMismatch(ValueError):
     pass
+
+
+def plot_group_label(scenario, seed, group):
+    names = ", ".join(STYLES[KEYS[m]][0] for m in KEYS if m in group)
+    return f"{f.SCENARIO_LABELS[scenario]} | seed {seed} | {names}"
+
+
+def plot_task_count(groups, scan_groups):
+    return (1 + bool(scan_groups) + bool(groups)
+            + sum(("ranode" in group) + 2 * bool(set(group) - {"ranode"})
+                  for group in groups.values()))
+
+
+class PlotProgress:
+    """Count plotting task groups; keep nested inference quiet at verbosity 1."""
+
+    def __init__(self, total, *, heartbeat_seconds=30):
+        self.total, self.index = total, 0
+        self.heartbeat_seconds = heartbeat_seconds
+        self.lock = threading.RLock()
+        self.label = self.detail_label = self.phase = None
+        self.started = self.last_message = time.monotonic()
+
+    def status(self, message, *, kind="WORK", level=1):
+        colored_status(message, kind=kind, label=f"Plots {self.index}/{self.total}", level=level)
+        self.last_message = time.monotonic()
+
+    @contextmanager
+    def task(self, label):
+        with self.lock:
+            if self.label is not None or self.index >= self.total:
+                raise RuntimeError("Invalid plotting task plan")
+            self.index += 1
+            self.label, self.phase = label, None
+            self.started = time.monotonic()
+            self.status(label, kind="START")
+        try:
+            yield
+        except BaseException:
+            with self.lock:
+                self.status(f"{label} | failed; elapsed={_duration(time.monotonic() - self.started)}",
+                            kind="ERROR", level=0)
+            raise
+        else:
+            with self.lock:
+                self.status(f"{label} | done; elapsed={_duration(time.monotonic() - self.started)}",
+                            kind="PASS")
+        finally:
+            with self.lock:
+                self.label = self.detail_label = self.phase = None
+
+    @contextmanager
+    def detail(self, label):
+        started = time.monotonic()
+        with self.lock:
+            previous = self.detail_label
+            self.detail_label, self.phase = label, None
+        try:
+            yield
+        except BaseException:
+            with self.lock:
+                self.status(f"{self.label} | {label} | failed", kind="ERROR", level=0)
+            raise
+        else:
+            if verbosity() < 2:
+                with self.lock:
+                    self.status(f"{self.label} | {label} | done in {_duration(time.monotonic() - started)}",
+                                kind="PROGRESS")
+        finally:
+            with self.lock:
+                self.detail_label, self.phase = previous, None
+
+    def event(self, event):
+        with self.lock:
+            if "message" in event:
+                self.status(event["message"], kind=event.get("kind", "INFO"), level=event.get("level", 1))
+                return
+            phase = (event["phase"], event["label"])
+            if self.phase != phase:
+                self.phase = phase
+                self.phase_started = time.monotonic()
+                if self.label is not None and self.detail_label is None:
+                    self.status(f"{self.label} | {event['label']}")
+            self.completed = event.get("completed") or 0
+            self.phase_total = event.get("total", 1)
+            self.unit = event.get("unit", "step")
+
+    def tick(self):
+        with self.lock:
+            now = time.monotonic()
+            if self.label is None or now - self.last_message < self.heartbeat_seconds:
+                return
+            detail = self.detail_label or (self.phase[1] if self.phase else "Working")
+            counter = ""
+            if self.phase and self.completed < self.phase_total:
+                counter = f" | {self.completed}/{self.phase_total} {self.unit}"
+                if self.completed:
+                    eta = (now - self.phase_started) * (self.phase_total - self.completed) / self.completed
+                    counter += f"; stage ETA={_duration(eta)}"
+            elif self.phase and self.detail_label is None:
+                detail = "Finalizing task"
+            self.status(f"{self.label} | {detail}{counter}; elapsed={_duration(now - self.started)}")
 
 
 @contextmanager
@@ -155,8 +259,9 @@ def load_scores(root, report, name):
 class FitScoreLoader:
     """Read-only member evaluation for SIC/sculpting; never replace ensemble scores."""
 
-    def __init__(self, *, mode="members", device="cpu", io_workers=2):
+    def __init__(self, *, mode="members", device="cpu", io_workers=2, progress=None):
         self.mode, self.device, self.io_workers = mode, device, io_workers
+        self.progress = progress
         self.cache = {}
         self.runtime_ready = False
 
@@ -204,17 +309,22 @@ class FitScoreLoader:
             scores = []
             for i, member in enumerate(members):
                 directory = Path("density") / member["directory"]
-                try:
-                    verify_plot_input(root, report, str(directory / "residual_training_inputs.json"))
-                    for epoch in member["epochs"]:
-                        verify_plot_input(root, report, str(directory / f"residual_epoch_{epoch}.pt"))
-                except (ValueError, OSError) as error:
-                    raise ValueError(
-                        f"RIDDLE fit-band checkpoint inputs are missing or changed: {directory}. "
-                        "Restore the original saved files, or use --fit-bands seeds to plot saved ensemble scores."
-                    ) from error
-                colored_status(f"RIDDLE | {partition} | Evaluate saved fit {i + 1}/{len(members)} (inference only)", kind="WORK")
-                values = residual_scores(root / directory, member["epochs"], record["latent"], self.device)
+                label = (f"RIDDLE | {partition} | fit {i + 1}/{len(members)} "
+                         f"(inference only, {len(member['epochs'])} checkpoints)")
+                colored_status(f"{plot_group_label(report['scenario'], report['seed'], ['riddle'])} | "
+                               f"{partition} | Evaluate saved fit {i + 1}/{len(members)} (inference only)",
+                               kind="WORK", level=2 if self.progress else 1)
+                with self.progress.detail(label) if self.progress else nullcontext():
+                    try:
+                        verify_plot_input(root, report, str(directory / "residual_training_inputs.json"))
+                        for epoch in member["epochs"]:
+                            verify_plot_input(root, report, str(directory / f"residual_epoch_{epoch}.pt"))
+                    except (ValueError, OSError) as error:
+                        raise ValueError(
+                            f"RIDDLE fit-band checkpoint inputs are missing or changed: {directory}. "
+                            "Restore the original saved files, or use --fit-bands seeds to plot saved ensemble scores."
+                        ) from error
+                    values = residual_scores(root / directory, member["epochs"], record["latent"], self.device)
                 aligned = np.full(record["scores"].shape, np.nan, dtype=values.dtype)
                 aligned[record["mask"]] = values
                 scores.append(aligned)
@@ -388,8 +498,10 @@ def render_bundle(bundle, target, args):
     for key in keys:
         with methods([key]), ProgressStage("representation", "Plot input and latent distributions"):
             f.render_representation({**bundle, "latents": bundle["latents_by_method"][key]}, target)
-    training_figures(group, target)
-    render_full_pipeline(bundle, target, args)
+    with ProgressStage("training_plots", "Plot saved training histories"):
+        training_figures(group, target)
+    with ProgressStage("evaluation_plots", "Plot signal-region performance"):
+        render_full_pipeline(bundle, target, args)
     bundle["metrics"]["mapping_acceptance"] = bundle["acceptance"]
     write_json(target / "metrics.json", json_safe(bundle["metrics"]))
 
@@ -1357,12 +1469,14 @@ def render_physical_comparison(group, output, args, load_scores):
         for m, (root, report) in group.items()
     }
     scenario = next(iter(group.values()))[1]["scenario"]
-    audit = {
-        "scope": "strict signal region; independent preprocessing acceptance, common uncut event denominators",
-        "score": "LaCathode classifier score; sigmoid of RIDDLE/R-ANODE log ratios for display only",
-        "methods": render_physical_curves(records, output, scenario, args.min_background),
-    }
-    render_physical_scores(records, output, scenario)
+    with ProgressStage("physical_curves", "Plot signal-region ROC, SIC and rejection"):
+        audit = {
+            "scope": "strict signal region; independent preprocessing acceptance, common uncut event denominators",
+            "score": "LaCathode classifier score; sigmoid of RIDDLE/R-ANODE log ratios for display only",
+            "methods": render_physical_curves(records, output, scenario, args.min_background),
+        }
+    with ProgressStage("physical_scores", "Plot signal-region scores"):
+        render_physical_scores(records, output, scenario)
     validation = {
         m: load_scores(root, report, "validation")
         for m, (root, report) in group.items()
@@ -1373,8 +1487,10 @@ def render_physical_comparison(group, output, args, load_scores):
             [records["lacathode"], validation["lacathode"], test["lacathode"]]
         )
         audit["lacathode_histograms"] = "Mean per-fit counts; separate validation cut per fit; no score averaging"
-    audit["working_points"] = render_physical_working_points(validation, test, output, scenario=scenario)
-    render_ranode_training(group["ranode"], output)
+    with ProgressStage("physical_cuts", "Plot signal-region mass cuts and features"):
+        audit["working_points"] = render_physical_working_points(validation, test, output, scenario=scenario)
+    with ProgressStage("ranode_training_plots", "Plot R-ANODE saved training histories"):
+        render_ranode_training(group["ranode"], output)
     return audit
 
 
@@ -1549,7 +1665,8 @@ def main(argv=None):
     parser.add_argument("--min-background", type=int, default=10)
     parser.add_argument("--random-reference", choices=("bootstrap", "subset"), default="bootstrap")
     parser.add_argument("--allow-smoke", action="store_true", help="Permit synthetic QA fixtures")
-    parser.add_argument("--verbose", type=int, choices=(0, 1, 2), default=1)
+    parser.add_argument("--verbose", type=int, choices=(0, 1, 2), default=1,
+                        help="0: warnings and result; 1: compact task/fit progress; 2: detailed inference progress")
     args = parser.parse_args(argv)
     args.population_summary = True
     set_verbosity(args.verbose)
@@ -1577,9 +1694,18 @@ def main(argv=None):
         args.output.mkdir(parents=True, exist_ok=args.overwrite)
         rows, settings, bundles = [], [], []
         ranode_audit = {}
-        score_loader = FitScoreLoader(mode=args.fit_bands, device=args.device, io_workers=args.io_workers)
-        with local_progress("Plots"), f.plt.style.context(f.STYLE), locked(args.output / ".plot.lock"):
-            scan_audit = render_injection_scan(scan_groups, args.output / "injection_scan", args) if scan_groups else None
+        progress = PlotProgress(plot_task_count(groups, scan_groups))
+        score_loader = FitScoreLoader(mode=args.fit_bands, device=args.device,
+                                      io_workers=args.io_workers, progress=progress)
+        colored_status(f"Plot plan: {progress.total} task groups | {len(groups)} scenario/seed groups | "
+                       f"{len(scan_groups)} injection-scan points | saved results only, no training",
+                       kind="INFO", level=1)
+        with local_progress("Plots", display=progress if args.verbose < 2 else None), \
+                f.plt.style.context(f.STYLE), locked(args.output / ".plot.lock"):
+            scan_audit = None
+            if scan_groups:
+                with progress.task("Injection scan | discrimination and significance"):
+                    scan_audit = render_injection_scan(scan_groups, args.output / "injection_scan", args)
             for (scenario, seed), group in groups.items():
                 if (
                     any(
@@ -1591,10 +1717,14 @@ def main(argv=None):
                     raise ValueError("Synthetic fixtures require --allow-smoke for QA")
                 missing = set(args.methods) - set(group)
                 if missing:
-                    colored_status("Using available method; requested counterpart is absent", kind="INFO")
+                    names = ", ".join(STYLES[KEYS[m]][0] for m in KEYS if m in missing)
+                    colored_status(f"{plot_group_label(scenario, seed, group)} | "
+                                   f"no completed results for: {names}; plotting available methods",
+                                   kind="INFO", level=1)
                 target = args.output / scenario / f"seed_{seed:03d}"
                 if "ranode" in group:
-                    comparison = render_physical_comparison(group, target / "comparison_with_ranode", args, score_loader)
+                    with progress.task(f"{plot_group_label(scenario, seed, group)} | signal-region comparison"):
+                        comparison = render_physical_comparison(group, target / "comparison_with_ranode", args, score_loader)
                     ranode_audit[f"{scenario}/{seed}"] = comparison
                     settings.extend(settings_rows({"ranode": group["ranode"]}))
                     for method, metrics in comparison["methods"].items():
@@ -1603,53 +1733,64 @@ def main(argv=None):
                     group = {m: entry for m, entry in group.items() if m != "ranode"}
                     if not group:
                         continue
-                for individual, bundle in bundles_for_group(group, args.confidence, score_loader):
-                    rows.extend(comparison_rows(bundle, args))
-                    settings.extend(settings_rows(bundle["sources"]))
-                    render_bundle(bundle, target / individual if individual else target, args)
-                    bundles.append(bundle)
-            audit = summary_figures([b for b in bundles if not b.get("individual")], args.output, args)
-            if ranode_audit:
-                ranode_audit["summary"] = physical_comparison_summary(groups, args.output / "comparison_with_ranode", args, score_loader)
-                write_json(args.output / "ranode_comparison.json", json_safe(ranode_audit))
-            for method in KEYS:
-                individual = [b for b in bundles if b.get("individual") == method]
-                separate = summary_figures(individual, args.output / "individual" / method, args)
-                audit.update({f"individual/{method}/{k}": v for k, v in separate.items()})
-            csv_write(args.output / "comparison.csv", rows)
-            csv_write(args.output / "configuration.csv", settings)
-            write_json(
-                args.output / "plot_manifest.json",
-                json_safe(
-                    {
-                        "schema": 1,
-                        "ranode_comparison": "SR-only, unchanged upstream score; independent mapping masks and common uncut denominators" if ranode_audit else None,
-                        "uncertainty": audit,
-                        "cuts": "Truth-assisted MC benchmark: validation-SR background thresholds; frozen cuts evaluated on independent physical test rows",
-                        "injection_scan": scan_audit,
-                        "mass_cut_scan": {
-                            "thresholds": list(f.SCORE_CUTS),
-                            "comparison": "strict score > threshold",
-                            "score_coordinate": "LaCathode classifier score; sigmoid of RIDDLE log density ratio (not a signal probability)",
-                            "scope": "full physical test mass range",
-                            "retention_denominator": "all physical test events of the corresponding class, before cuts and mapping rejection",
-                            "panels_per_page": 6,
-                            "individual_directory": "04_mass_cuts/individual_cuts",
-                            "histograms": "unweighted counts per fit, averaged over LaCathode fits; identical bins, no smoothing or pooled events; B + S is the sum of background and signal counts",
-                        },
-                        "mass_summary": "BG-Only: test-SR quantiles, 300 equal-occupancy full-range bins, normalized-shape Poisson chi2",
-                        "uncertainty_scope": "SIC/mass bands: 16/50/84 percentiles of per-fit metric curves, not uncertainty in an averaged ensemble; fixed-background fits exclude background-training variation; independent LaCathode runs retain their scope",
-                        "fit_bands": args.fit_bands,
-                        "fit_inference": {"device": args.device, "training": False, "result_files_modified": False},
-                        "lacathode_event_plots": "Dynamically detected saved fits; mean per-fit histograms with matching per-fit validation cuts; shapes normalize those mean counts; no cross-fit score averaging",
-                        "lacathode_roc_sic": "Median rejection and SIC interpolated at 1000 common signal efficiencies, as upstream, after statistical-support cuts. Bands are parametric 16/84-percentile ribbons at fixed signal efficiency; background-efficiency display axes retained.",
-                        "lacathode_fit_counts": [{"scenario": b["report"]["scenario"], "seed": b["report"]["seed"], "fits": b["classifier_fit_count"]} for b in bundles if "classifier_fit_count" in b],
-                        "summary_axes": f.SUMMARY_AXES,
-                        "warnings": [w for b in bundles for w in b["warnings"]],
-                    }
-                ),
-            )
-        colored_status("Figures and CSV tables completed", kind="PASS")
+                label = plot_group_label(scenario, seed, group)
+                with progress.task(f"{label} | prepare scores, fit bands and metrics"):
+                    prepared = bundles_for_group(group, args.confidence, score_loader)
+                with progress.task(f"{label} | render performance, cuts, features and histories"):
+                    for individual, bundle in prepared:
+                        rows.extend(comparison_rows(bundle, args))
+                        settings.extend(settings_rows(bundle["sources"]))
+                        render_bundle(bundle, target / individual if individual else target, args)
+                        bundles.append(bundle)
+            audit = {}
+            if groups:
+                with progress.task("Summary plots | SIC and mass-flatness uncertainty bands"):
+                    with ProgressStage("summary", "Summarize LaCathode/RIDDLE results", enabled=bool(bundles)):
+                        audit = summary_figures([b for b in bundles if not b.get("individual")], args.output, args)
+                    if ranode_audit:
+                        with ProgressStage("physical_summary", "Summarize comparisons with R-ANODE"):
+                            ranode_audit["summary"] = physical_comparison_summary(groups, args.output / "comparison_with_ranode", args, score_loader)
+                            write_json(args.output / "ranode_comparison.json", json_safe(ranode_audit))
+                    for method in KEYS:
+                        individual = [b for b in bundles if b.get("individual") == method]
+                        with ProgressStage("individual_summary", f"Summarize separate {STYLES[KEYS[method]][0]} results", enabled=bool(individual)):
+                            separate = summary_figures(individual, args.output / "individual" / method, args)
+                        audit.update({f"individual/{method}/{k}": v for k, v in separate.items()})
+            with progress.task("Export comparison tables, configuration and plot manifest"):
+                csv_write(args.output / "comparison.csv", rows)
+                csv_write(args.output / "configuration.csv", settings)
+                write_json(
+                    args.output / "plot_manifest.json",
+                    json_safe(
+                        {
+                            "schema": 1,
+                            "ranode_comparison": "SR-only, unchanged upstream score; independent mapping masks and common uncut denominators" if ranode_audit else None,
+                            "uncertainty": audit,
+                            "cuts": "Truth-assisted MC benchmark: validation-SR background thresholds; frozen cuts evaluated on independent physical test rows",
+                            "injection_scan": scan_audit,
+                            "mass_cut_scan": {
+                                "thresholds": list(f.SCORE_CUTS),
+                                "comparison": "strict score > threshold",
+                                "score_coordinate": "LaCathode classifier score; sigmoid of RIDDLE log density ratio (not a signal probability)",
+                                "scope": "full physical test mass range",
+                                "retention_denominator": "all physical test events of the corresponding class, before cuts and mapping rejection",
+                                "panels_per_page": 6,
+                                "individual_directory": "04_mass_cuts/individual_cuts",
+                                "histograms": "unweighted counts per fit, averaged over LaCathode fits; identical bins, no smoothing or pooled events; B + S is the sum of background and signal counts",
+                            },
+                            "mass_summary": "BG-Only: test-SR quantiles, 300 equal-occupancy full-range bins, normalized-shape Poisson chi2",
+                            "uncertainty_scope": "SIC/mass bands: 16/50/84 percentiles of per-fit metric curves, not uncertainty in an averaged ensemble; fixed-background fits exclude background-training variation; independent LaCathode runs retain their scope",
+                            "fit_bands": args.fit_bands,
+                            "fit_inference": {"device": args.device, "training": False, "result_files_modified": False},
+                            "lacathode_event_plots": "Dynamically detected saved fits; mean per-fit histograms with matching per-fit validation cuts; shapes normalize those mean counts; no cross-fit score averaging",
+                            "lacathode_roc_sic": "Median rejection and SIC interpolated at 1000 common signal efficiencies, as upstream, after statistical-support cuts. Bands are parametric 16/84-percentile ribbons at fixed signal efficiency; background-efficiency display axes retained.",
+                            "lacathode_fit_counts": [{"scenario": b["report"]["scenario"], "seed": b["report"]["seed"], "fits": b["classifier_fit_count"]} for b in bundles if "classifier_fit_count" in b],
+                            "summary_axes": f.SUMMARY_AXES,
+                            "warnings": [w for b in bundles for w in b["warnings"]],
+                        }
+                    ),
+                )
+        colored_status(f"Completed {progress.index}/{progress.total} plotting task groups | {args.output}", kind="PASS")
         return 0
     except (ValueError, OSError, KeyError, RuntimeError) as error:
         parser.exit(1, f"[ERROR] {error}\n")
