@@ -5,9 +5,6 @@ metadata:
 spec:
   priorityClassName: owner-no-preempt
   restartPolicy: Never
-  nodeSelector:
-    kubernetes.io/arch: amd64
-    topology.kubernetes.io/region: us-west
   securityContext:
     fsGroup: 100
     fsGroupChangePolicy: OnRootMismatch
