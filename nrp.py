@@ -52,8 +52,8 @@ def job(args):
     default_image, default_secrets, default_region = setup_runtime()
     image = args.image or default_image
     region = getattr(args, "region", None) or default_region
-    if not region or not re.fullmatch(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?", region) or len(region) > 63:
-        raise ValueError("Set a valid storage region in config/nrp/jupyter.yaml or pass --region")
+    if region and (not re.fullmatch(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?", region) or len(region) > 63):
+        raise ValueError("Use a valid Kubernetes region label value for --region")
     if not re.fullmatch(r"[^\s@]+/[^\s@]+@sha256:[0-9a-f]{64}", image):
         raise ValueError("Provide an immutable registry/image@sha256:<64 hex digits> reference")
     if not re.fullmatch("[a-z0-9]([-a-z0-9]*[a-z0-9])?", args.name) or len(args.name) > 63:
@@ -131,7 +131,6 @@ def job(args):
                     "automountServiceAccountToken": False,
                     "nodeSelector": {
                         "kubernetes.io/arch": "amd64",
-                        "topology.kubernetes.io/region": region,
                     },
                     "securityContext": {
                         "runAsUser": 1000,
@@ -170,6 +169,8 @@ def job(args):
             },
         },
     }
+    if region:
+        result["spec"]["template"]["spec"]["nodeSelector"]["topology.kubernetes.io/region"] = region
     if gpu_product is not None:
         result["spec"]["template"]["spec"]["nodeSelector"]["nvidia.com/gpu.product"] = gpu_product
     secrets = [dict(item) for item in default_secrets]
@@ -246,7 +247,10 @@ def main(argv=None):
         help="Request one GPU of this type (case-insensitive; default: a100); namespace access is still required",
     )
     add_resume_options(p, always_resume=True)
-    p.add_argument("--region", help="Storage region; defaults to the Jupyter node selector")
+    p.add_argument(
+        "--region",
+        help="Optional Kubernetes region constraint; defaults to the Jupyter node selector when present",
+    )
     p.add_argument(
         "--image", help="Override the pinned runtime image from config/nrp/jupyter.yaml"
     )
