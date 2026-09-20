@@ -4,10 +4,12 @@ import numpy as np
 
 SR_BOUNDS = (3.3, 3.7)
 PRODUCTION_POLICY = {
-    "ensemble": "accepted_fits_after_bounded_retries_v1",
+    "ensemble": "numerically_valid_fits_after_bounded_retries_v2",
     "signal_region": "strict_prepared_input_membership",
     "signal_region_bounds": list(SR_BOUNDS),
 }
+EVIDENCE_GATED_POLICY = {**PRODUCTION_POLICY, "ensemble": "accepted_fits_after_bounded_retries_v1"}
+FIT_ACCEPTANCE_POLICY = "numerical_validity_with_diagnostic_evidence_v2"
 
 
 class IncompleteEnsembleError(RuntimeError):
@@ -21,8 +23,7 @@ class NumericalFitError(ValueError):
 def validation_improvement(log_mixture_ratios, *, sigma):
     """Paired validation gain against the fixed background, without truth labels.
 
-    This is an optimization/selection rule, not a calibrated discovery test.
-    The threshold and retry budget are part of the scientific run contract.
+    This is a diagnostic, not a fit-retry criterion or calibrated discovery test.
     """
     values = np.asarray(log_mixture_ratios, dtype=np.float64)
     if values.ndim != 1 or len(values) < 2:
@@ -37,11 +38,55 @@ def validation_improvement(log_mixture_ratios, *, sigma):
     if not np.isfinite([gain, error, margin]).all():
         raise NumericalFitError("Nonfinite validation improvement statistics")
     tolerance = 10 * np.finfo(np.float32).eps
+    evidence = ("improved" if margin > tolerance else
+                "deteriorated" if gain + sigma * error < -tolerance else "inconclusive")
     return dict(status="passed" if margin > tolerance else "insufficient_validation_improvement",
+                evidence_status=evidence, upper_margin=gain + sigma * error,
                 events=len(values), mean_log_likelihood_gain=gain,
                 standard_error=error, sigma=float(sigma), lower_margin=margin, numerical_tolerance=float(tolerance),
                 baseline="standard-normal background", truth_labels_used=False,
-                interpretation="validation selection only; not evidence of a physical signal")
+                interpretation="validation diagnostic only; not evidence of a physical signal")
+
+
+def fit_acceptance(health):
+    """Separate usable densities from evidence and deployment decisions.
+
+    Derive the current assessment from numerical/quality receipts, including old
+    receipts, without trusting their combined production_guard_would_accept flag.
+    Reading an old receipt does not restore previously discarded fits or change
+    any historical training selection. Calibration must be assessed separately.
+    """
+    normal = health.get("normalization_status", health.get("normalization", {}).get("status"))
+    quality = health.get("quality", {}) or {}
+    evidence = "unavailable"
+    try:
+        gain, error, sigma, tolerance = (float(quality[k]) for k in
+            ("mean_log_likelihood_gain", "standard_error", "sigma", "numerical_tolerance"))
+        if np.isfinite([gain, error, sigma, tolerance]).all() and min(error, sigma, tolerance) >= 0:
+            evidence = ("improved" if gain - sigma * error > tolerance else
+                        "deteriorated" if gain + sigma * error < -tolerance else "inconclusive")
+    except (KeyError, TypeError, ValueError):
+        pass
+    valid = (normal == "passed" and health.get("normalization", {}).get("status", "passed") == "passed"
+             and not health.get("failures") and evidence != "unavailable")
+    calibration = health.get("calibration_status", "unassessed")
+    deployment = ("blocked_numerical_or_incomplete" if not valid else
+                  "blocked_validation_deterioration" if evidence == "deteriorated" else
+                  "blocked_calibration" if calibration == "failed" else
+                  "requires_search_validation" if calibration == "passed" else
+                  "requires_calibration_and_search_validation")
+    return dict(acceptance_policy=FIT_ACCEPTANCE_POLICY, fit_valid=valid,
+                fit_status="valid_" + evidence if valid else "invalid_or_incomplete",
+                evidence_status=evidence, calibration_status=calibration,
+                deployment_status=deployment, production_ready=False,
+                # Compatibility alias: numerical acceptance, NOT production certification.
+                production_guard_would_accept=valid)
+
+
+def fit_status_label(health):
+    assessment = fit_acceptance(health)
+    return ("valid / " + assessment["evidence_status"] if assessment["fit_valid"]
+            else "invalid or incomplete")
 
 
 def score_diagnostics(scores, *, stage, probability=False, summarize=True):
@@ -74,16 +119,28 @@ def validate_score_record(record, *, method, stage):
             raise ValueError(f"{stage}: misaligned {key}")
     if not np.isin(record["labels"], [0, 1]).all():
         raise ValueError(f"{stage}: invalid labels")
-    for key in ("mass", "physical", "latent", "fit_latents"):
+    for key in ("mass", "physical", "latent", "fit_latents", "density_inputs", "background_log_density"):
         if key in record and not np.isfinite(record[key]).all():
             raise ValueError(f"{stage}: nonfinite {key}")
     if "physical" in record and (record["physical"].ndim != 2 or len(record["physical"]) != n):
         raise ValueError(f"{stage}: misaligned physical features")
     if "latent" in record and (record["latent"].ndim != 2 or len(record["latent"]) != mask.sum()):
         raise ValueError(f"{stage}: misaligned accepted latents")
+    if "density_inputs" in record and (record["density_inputs"].ndim != 2 or len(record["density_inputs"]) != mask.sum()):
+        raise ValueError(f"{stage}: misaligned accepted density inputs")
+    if "background_log_density" in record and record["background_log_density"].shape != (int(mask.sum()),):
+        raise ValueError(f"{stage}: misaligned accepted background density")
     if not np.isnan(scores[~mask]).all():
         raise ValueError(f"{stage}: rejected-event scores must be NaN")
     summary = score_diagnostics(scores[mask], stage=stage, probability=method == "lacathode")
+    if "score_kind" in record and str(np.asarray(record["score_kind"]).item()) not in (
+            "log_density_ratio", "background_percentile_logit"):
+        raise ValueError(f"{stage}: unrecognized RIDDLE score coordinate")
+    if "raw_scores" in record:
+        raw = np.asarray(record["raw_scores"])
+        if raw.shape != (n,) or not np.isnan(raw[~mask]).all():
+            raise ValueError(f"{stage}: invalid raw density-score alignment")
+        score_diagnostics(raw[mask], stage=stage+" raw density ratio")
     summary["rejected_events"] = int((~mask).sum())
     if "fit_scores" in record:
         fits = record["fit_scores"]
@@ -119,6 +176,8 @@ def validate_density_ratio(log_ratios, *, stage, tests=1):
     log_ratios = np.asarray(log_ratios)
     summary = score_diagnostics(log_ratios, stage=stage)
     thresholds = (100., 1000., 10000., 1000000.)
+    if type(tests) is not int or tests < 1:
+        raise ValueError("Normalization multiplicity must be a positive integer")
     cutoff = np.log(1e-12 / (len(thresholds) * tests))
     checks = []
     for threshold in thresholds:
@@ -127,7 +186,7 @@ def validate_density_ratio(log_ratios, *, stage, tests=1):
         checks.append(dict(ratio_threshold=threshold, exceedances=count,
                            log_p_upper_bound=log_p if np.isfinite(log_p) else None))
         if log_p < cutoff:
-            raise NumericalFitError(f"{stage}: density-ratio normalization failed on independent Gaussian reference "
+            raise NumericalFitError(f"{stage}: density-ratio normalization failed on independent denominator reference "
                              f"draws ({count}/{len(log_ratios)} ratios >= {threshold:g}). "
                              "Inspect the flow/checkpoint; this density cannot be used for scoring.")
     summary["normalization_checks"] = checks
@@ -196,9 +255,13 @@ def require_complete_members(members, requested, checkpoints, *, configuration, 
 
 
 def require_complete_ensemble(selection):
+    completion = selection.get('ensemble_completion', 'partial')
+    if completion not in ('strict', 'partial'):
+        raise IncompleteEnsembleError('Unrecognized ensemble completion policy')
     policy = selection.get("production_policy")
     legacy = policy == {**PRODUCTION_POLICY, "ensemble": "all_requested_runs"}
-    if selection.get("status") != "completed" or (not legacy and policy != PRODUCTION_POLICY):
+    evidence_gated = policy == EVIDENCE_GATED_POLICY
+    if selection.get("status") != "completed" or (not legacy and not evidence_gated and policy != PRODUCTION_POLICY):
         raise IncompleteEnsembleError("RIDDLE ensemble is not finalized under a recognized production policy")
     requested = selection.get("requested_runs")
     checkpoints = selection.get("checkpoints_per_run")
@@ -207,6 +270,8 @@ def require_complete_ensemble(selection):
         raise IncompleteEnsembleError("RIDDLE ensemble has failed or missing configurations")
     for config in configs:
         members = config.get("members", [])
+        if completion == 'strict' and len(members) != requested:
+            raise IncompleteEnsembleError('Strict ensemble has missing requested fits')
         if members or legacy:
             require_complete_members(members, requested, checkpoints,
                                      configuration=config.get("name"), allow_excluded=not legacy)
@@ -218,7 +283,8 @@ def require_complete_ensemble(selection):
             if (type(requested) is not int or any(type(i) is not int for i in indices)
                     or sorted(indices) != list(range(requested))
                     or any(m.get("status") != "excluded" for m in excluded)
-                    or any(m.get("quality", {}).get("status") != "passed" for m in members)
+                    or (evidence_gated and any(m.get("quality", {}).get("status") != "passed" for m in members))
+                    or (not evidence_gated and any(not fit_acceptance(m)["fit_valid"] for m in members))
                     or any(m.get("normalization", {}).get("status") != "passed" for m in members)):
                 raise IncompleteEnsembleError("RIDDLE fit acceptance/exclusion inventory is inconsistent")
     chosen = [c for c in configs if c.get("name") == selection.get("selected_configuration")]

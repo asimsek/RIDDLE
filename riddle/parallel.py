@@ -23,9 +23,11 @@ def _fit_worker(events, job, rows, validation, options):
     recovery.mkdir(parents=True, exist_ok=True)
     fit, started = job["fit"], time.monotonic()
     label = f"RIDDLE fit {fit}/{options['total']}"
-    already_finished = (directory / "fit.json").exists()
+    epoch_progress = {}
     with (recovery / "worker.log").open("a") as log, redirect_stdout(log), redirect_stderr(log):
         def publish(event):
+            if event.get("phase") == "residual_training" and event.get("completed") is not None:
+                epoch_progress[event["label"]] = max(0, event["completed"] - event.get("initial", 0))
             log.write(json.dumps(event) + "\n")
             log.flush()
             events.put((fit, "progress", event))
@@ -38,9 +40,11 @@ def _fit_worker(events, job, rows, validation, options):
                 relative=job["relative"], index=job["index"], fraction=job["fraction"],
                 epochs=options["epochs"], seed=options["seed"], device=options["device"],
                 initialization=options["initialization"], settings=options["settings"],
-                label=label, normalization_tests=options["normalization_tests"])
+                label=label, normalization_tests=options["normalization_tests"],
+                member_split_indices=job.get("member_split_indices"), source_ids=options.get("source_ids"))
             result = dict(status=saved["status"], initial_epoch=0,
-                          new_epochs=0 if already_finished else options["epochs"],
+                          new_epochs=sum(epoch_progress.values()),
+                          trained_epochs=saved.get("trained_epochs", options["epochs"]),
                           training_seconds=time.monotonic() - started, finalization_seconds=0,
                           worker_started=started, worker_finished=time.monotonic(), pid=os.getpid())
             write_json(recovery / "execution.json", result)
@@ -66,7 +70,7 @@ def fitting_eta(mean_fit, epochs, active, queued, workers):
 
 
 def run_fits(
-    rows, jobs, *, validation, epochs, seed, device, initialization, workers, io_workers, total, started=None, settings, normalization_tests
+    rows, jobs, *, validation, epochs, seed, device, initialization, workers, io_workers, total, started=None, settings, normalization_tests, source_ids=None
 ):
     if not jobs:
         return
@@ -86,6 +90,7 @@ def run_fits(
         total=total,
         settings=settings,
         normalization_tests=normalization_tests,
+        source_ids=source_ids,
     )
     previous_handler = signal.getsignal(signal.SIGTERM)
 
@@ -136,7 +141,7 @@ def run_fits(
                 completed += 1
                 if event["status"] == "completed" and state["printed_epoch"] < epochs:
                     emit_message(
-                        f"RIDDLE fit {fit}/{total}: {epochs}/{epochs} epoch; fit_elapsed={_duration(time.monotonic() - state['started'])}",
+                        f"RIDDLE fit {fit}/{total}: {event.get('trained_epochs', epochs)}/{epochs} epoch; fit_elapsed={_duration(time.monotonic() - state['started'])}",
                         kind="WORK",
                     )
                 emit_message(

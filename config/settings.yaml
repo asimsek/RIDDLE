@@ -6,9 +6,26 @@ inputs:
   label_column: label
 riddle:
   fits: 20
-  epochs: 300
+  epochs: 100
   fractions: [learned]
   initialization: background
+  enhancements:
+    rosenblatt: true
+    guided_fit: true
+    hard_bg: true
+    contrastive_fit: true
+    score_flow: true
+    coherent_mixture: true
+    guide_epochs: 20
+    guide_warmup_epochs: 10
+    hard_start_epoch: 5
+    hard_pool_fraction: 0.25
+    hard_sampling_fraction: 0.5
+    contrastive_strength: 1.0
+    score_flow_epochs: 60
+    rosenblatt_bins: 12
+    rosenblatt_hidden: 64
+    rosenblatt_bound: 8.0
   fit_recovery:
     max_retries: 2
     validation_sigma: 2.0
@@ -44,6 +61,7 @@ background:
     num_hidden: 128
     activation_function: relu
     pre_exp_tanh: false
+    affine_log_scale_bound: 2.0
     batch_norm: true
     batch_norm_momentum: 1
     optimizer:

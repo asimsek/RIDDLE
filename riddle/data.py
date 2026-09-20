@@ -23,6 +23,29 @@ DATA_FILES = tuple(f"{r}data_{p}.npy" for r in ("inner", "outer") for p in ("tra
 )
 
 
+def diagnostic_profile(manifest):
+    """Explicit real-data pilot subsets; never label these as synthetic fixtures."""
+    profile = manifest.get("diagnostic_subset")
+    if profile is None:
+        return None
+    if (manifest.get("schema") != 2 or manifest.get("synthetic_smoke_fixture")
+            or not isinstance(profile, dict) or profile.get("purpose") != "cpu_mass_dependence"
+            or profile.get("schema") != 1):
+        raise ValueError("Invalid diagnostic subset provenance")
+    checksum = profile.get("parent_inputs_sha256", "")
+    if (not isinstance(checksum, str) or len(checksum) != 64
+            or any(c not in "0123456789abcdef" for c in checksum)):
+        raise ValueError("Diagnostic subset requires its parent manifest checksum")
+    for key, minimum in (("background_epochs", 11), ("reference_samples", 512)):
+        if type(profile.get(key)) is not int or profile[key] < minimum:
+            raise ValueError(f"Invalid diagnostic {key}")
+    counts = profile.get("row_counts")
+    if (not isinstance(counts, dict) or set(counts) != set(DATA_FILES)
+            or any(type(n) is not int or n < 0 for n in counts.values())):
+        raise ValueError("Invalid diagnostic partition counts")
+    return profile
+
+
 def rows(arrays, variant="default"):
     if not np.all(arrays["event_weight"] == 1):
         raise ValueError("Only unweighted LHCO inputs are supported")
@@ -227,7 +250,10 @@ def validate(directory):
         stored = manifest.get("uncut_signal_region", {})
         if (stored.get("background"), stored.get("signal")) != tuple(sr_counts):
             raise ValueError("Uncut SR population counts changed")
-    if not manifest.get("synthetic_smoke_fixture"):
+    profile = diagnostic_profile(manifest)
+    if profile is not None and lengths != profile["row_counts"]:
+        raise ValueError("Diagnostic subset partition counts changed")
+    if not manifest.get("synthetic_smoke_fixture") and profile is None:
         spec = DatasetSpec()
         scan = manifest.get("injection_scan")
         if scan is not None:

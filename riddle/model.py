@@ -14,7 +14,7 @@ PROTOCOL = {
     "hidden_features": 64,
     "batch_size": 256,
     "validation_batch_size": 1280,
-    "default_epochs": 300,
+    "default_epochs": DEFAULTS["riddle"]["epochs"],
     "optimizer": "AdamW",
     "learning_rate": 0.0003,
     "weight_decay": 0.01,
@@ -32,6 +32,9 @@ PROTOCOL = {
 
 
 def build_signal_flow(device="cpu", *, features=4, settings=None):
+    mass_conditioning = bool((settings or {}).get("mass_conditioning", False))
+    physical_inputs = (settings or {}).get("input_space") == "physical"
+    features -= int(mass_conditioning) + int(physical_inputs)
     if features not in (4, 5):
         raise ValueError("Residual flow accepts four configured latents, or five for DeltaR")
     if version("nflows") != "0.14":
@@ -48,7 +51,7 @@ def build_signal_flow(device="cpu", *, features=4, settings=None):
         transforms.append(
             MaskedPiecewiseRationalQuadraticAutoregressiveTransform(
                 features=features,
-                context_features=None,
+                context_features=1 if mass_conditioning else None,
                 hidden_features=config["hidden_features"],
                 num_blocks=config["num_blocks"],
                 use_residual_blocks=config["use_residual_blocks"],
@@ -65,7 +68,10 @@ def build_signal_flow(device="cpu", *, features=4, settings=None):
             )
         )
         transforms.append(RandomPermutation(features))
-    return Flow(CompositeTransform(transforms), StandardNormal([features])).to(device)
+    model = Flow(CompositeTransform(transforms), StandardNormal([features])).to(device)
+    model.mass_conditioning = mass_conditioning
+    model.physical_inputs = physical_inputs
+    return model
 
 
 def match_background(model):
@@ -88,8 +94,30 @@ def initial_fraction_logit(seed, device="cpu"):
     )
 
 
-def background_log_prob(z):
+def background_log_prob(z, *, mass_conditioning=False, physical_inputs=False):
+    if physical_inputs:
+        # Cached frozen p_B in exactly the same preprocessed coordinates as p_S.
+        # This column is bookkeeping and is never passed to the signal network.
+        return z[..., -1]
+    if mass_conditioning:
+        z = z[..., :-1]
     return -0.5 * (z.square().sum(-1) + z.shape[-1] * math.log(2 * math.pi))
+
+
+def signal_log_prob(model, inputs):
+    if getattr(model, "physical_inputs", False):
+        inputs = inputs[:, :-1]
+    if getattr(model, "mass_conditioning", False):
+        return model.log_prob(inputs[:, :-1], context=inputs[:, -1:])
+    return model.log_prob(inputs)
+
+
+def with_mass_context(z, mass):
+    """Fixed SR coordinate; no fitted transform, truth labels, or test statistics."""
+    mass = np.asarray(mass)
+    if mass.shape != (len(z),) or not np.isfinite(mass).all():
+        raise ValueError("Invalid mass context")
+    return np.column_stack((z, (mass - 3.5) / .2)).astype(np.float32)
 
 
 def residual_loss(signal_log_prob, background_log_density, fraction_logit):
@@ -106,8 +134,9 @@ def residual_optimizer(model, logit, options):
     return torch.optim.AdamW(groups, lr=options["learning_rate"])
 
 
-def real_sr_latents(rows):
-    if rows.ndim != 2 or rows.shape[1] not in (7, 8) or rows.dtype != np.float32:
+def real_sr_latents(rows, *, mass_conditioning=False, physical_inputs=False):
+    widths = (8, 9) if physical_inputs else (7, 8)
+    if rows.ndim != 2 or rows.shape[1] not in widths or rows.dtype != np.float32:
         raise ValueError("Expected float32 latent rows with four or five features")
     if not np.all(np.isfinite(rows[:, :-1])) or not np.all(np.isin(rows[:, -2], (0, 1))):
         raise ValueError("Invalid data/reference rows")
@@ -115,7 +144,12 @@ def real_sr_latents(rows):
     real = rows[selected]
     if len(real) < 2 or np.any((real[:, 0] < 3.3) | (real[:, 0] > 3.7)):
         raise ValueError("Expected at least two real signal-region training rows")
-    return np.ascontiguousarray(real[:, 1:-2])
+    z = np.ascontiguousarray(real[:, 1:-2])
+    if physical_inputs:
+        if not mass_conditioning:
+            raise ValueError("Physical-input pilot requires mass conditioning")
+        return np.column_stack((with_mass_context(z[:, :-1], real[:, 0]), z[:, -1])).astype(np.float32)
+    return with_mass_context(z, real[:, 0]) if mass_conditioning else z
 
 
 def train_epoch(model, logit, loader, optimizer=None, progress=None, *, gradient_clip_norm=1):
@@ -127,7 +161,10 @@ def train_epoch(model, logit, loader, optimizer=None, progress=None, *, gradient
             z = z.to(logit.device)
             if optimizer is not None:
                 optimizer.zero_grad()
-            loss = residual_loss(model.log_prob(z), background_log_prob(z), logit)
+            loss = residual_loss(signal_log_prob(model, z),
+                                 background_log_prob(z, mass_conditioning=getattr(model, "mass_conditioning", False),
+                                                     physical_inputs=getattr(model, "physical_inputs", False)),
+                                 logit)
             total += loss.item() * len(z)
             events += len(z)
             if optimizer is not None:

@@ -80,10 +80,32 @@ def validate_result_normalization(root, report):
     return diagnostics
 
 
-def selected_epochs(attempt, epochs):
+def mass_normalization_check(attempt, *, safeguards=True):
+    """The explicit pilot control records failures without excluding the fit."""
+    try:
+        health = validate_mass_normalization(attempt)
+    except NumericalFitError as error:
+        if safeguards:
+            raise
+        return dict(status="disabled", would_reject=True, diagnostic=str(error))
+    return health if safeguards else dict(health, status="disabled", would_reject=False)
+
+
+def signal_fit_health(attempt, namespace, *, safeguards=True):
+    health = mass_normalization_check(attempt, safeguards=safeguards)
+    try:
+        validate_upstream_likelihood(namespace)
+    except NumericalFitError as error:
+        if safeguards:
+            raise
+        health["likelihood_diagnostic"] = str(error)
+    return health
+
+
+def selected_epochs(attempt, epochs, *, safeguards=True):
     root = Path(attempt) / "results/upstream/signal/fit"
     losses = np.load(root / "valloss.npy", allow_pickle=False)
-    if losses.shape != (epochs,) or not np.isfinite(losses).all() or epochs < 10:
+    if losses.shape != (epochs,) or (safeguards and not np.isfinite(losses).all()) or epochs < 10:
         raise ValueError("Incomplete R-ANODE validation losses")
     selected = np.argsort(losses).flatten()[:10].tolist()
     if any(not (root / f"model_S_{epoch}.pt").is_file() for epoch in selected):
@@ -91,12 +113,12 @@ def selected_epochs(attempt, epochs):
     return selected
 
 
-def combine_fits(attempts, output, *, requested_runs):
+def combine_fits(attempts, output, *, requested_runs, safeguards=True):
     if not attempts or len(attempts) != requested_runs or len(set(attempts)) != requested_runs:
         raise ValueError("All requested R-ANODE fits must complete before ensembling")
     # Validate every denominator before writing any ensemble partition.
     for attempt in attempts:
-        validate_mass_normalization(attempt)
+        mass_normalization_check(attempt, safeguards=safeguards)
     fields = ("mass", "physical", "labels", "scores", "mask", "is_signal_region")
     for name in ("validation", "test", "signal_region"):
         base, combined = None, None

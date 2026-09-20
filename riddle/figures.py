@@ -243,6 +243,11 @@ def plot_resources(*, workers=1, cache_mb=1024):
 
 
 def fit_scores(record):
+    if (record.get("plot_saved_ensemble", False) or
+            str(record.get("fit_score_kind", "")) == "member_ratio_mapped_by_frozen_ensemble_calibrator"):
+        # Component densities are not independent calibrated methods. Averaging
+        # their histograms/efficiencies does not evaluate the saved ensemble.
+        return record["scores"][None, :]
     return record.get("fit_scores", record["scores"][None, :])
 
 

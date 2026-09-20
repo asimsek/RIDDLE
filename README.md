@@ -114,14 +114,13 @@ Use the corresponding `shifted` locations for the shifted control.
 ## Plot
 
 ```bash
-python plot.py --results results --output plots --io-workers 8 --verbose 1 --overwrite
+python plot.py --results results --output plots --device auto --io-workers 8 --verbose 1 --overwrite
 ```
 
 All completed methods are discovered automatically.<br>
 Request either method alone with `--methods lacathode`, `--methods riddle`, or `--methods ranode`.<br>
 `--plot-workers` controls parallel PDF/PNG export; `--io-workers` controls numerical CPU threads.<br>
 Add `--overwrite` to regenerate matching plots and tables.
-
 
 ## Optional signal-strength scan
 

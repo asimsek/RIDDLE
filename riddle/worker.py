@@ -97,6 +97,23 @@ def main():
 
     torch.set_num_threads(args.io_workers)
     torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False
+    mapping_experiment = getattr(args, "mapping_experiment", None)
+    if mapping_experiment is not None:
+        from .mapping_experiment import validate_worker
+        validate_worker(args)
+        torch.set_num_interop_threads(1)
+        from .mapping_experiment import environment as experiment_environment, read as experiment_read
+        numerical = experiment_environment(args.output / '.resume/mapping_experiment_environment.json')
+        if numerical != experiment_read(mapping_experiment['manifest'])['numerical_environment']:
+            raise ValueError('Mapping experiment is not running in its pinned numerical environment')
+    audit_environment = os.environ.get("RIDDLE_PROTOCOL_EXECUTION_RECORD")
+    if audit_environment:
+        if (args.method != "riddle" or args.device != "cpu" or
+                args.settings["riddle"].get("data_policy") != "study_replay_v1"):
+            raise ValueError("Paired protocol environment recording is restricted to CPU study replay")
+        torch.set_num_interop_threads(1)
+        from scripts.riddle_protocol_environment import record
+        record(audit_environment)
     if args.device != "cpu" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but unavailable; refusing CPU fallback")
     inputs = validate(args.data)
@@ -105,6 +122,9 @@ def main():
 
         input_features(args.settings, inputs)
     code = runtime_code(args.method)
+    mass_pilot = args.method == "riddle" and args.settings["riddle"].get("mass_conditioning", False)
+    if mass_pilot:
+        code["scripts/cpu_mass_dependence.py"] = file_digest(Path(__file__).parents[1] / "scripts/cpu_mass_dependence.py")
     settings = {"seed": args.seed, "scenario": args.scenario, "device": args.device}
     if args.method == "riddle":
         settings.update(args.settings)
@@ -127,6 +147,8 @@ def main():
         from .production import PRODUCTION_POLICY
 
         contract["riddle_production_policy"] = PRODUCTION_POLICY
+        if mapping_experiment is not None:
+            contract["mapping_experiment"] = mapping_experiment
     if args.method == "lacathode":
         from external.lacathode_utils.source import verify, COMMIT
         from external.lacathode_utils.pipeline import RUN_LAYOUT, FIXED_RUN_LAYOUT
@@ -163,7 +185,7 @@ def main():
         return
     report = {
         "schema": 1,
-        "method": args.method,
+        "method": ("riddlev3" if args.settings["riddle"].get("input_space") == "physical" else "riddlev2") if mass_pilot else args.method,
         "seed": args.seed,
         "scenario": args.scenario,
         "variant": inputs.get("variant", "default"),

@@ -15,14 +15,50 @@ from pathlib import Path
 
 import yaml
 
-from .data import BACKGROUND_PROTOCOL, input_features, scientific_version, validate
-from .ensemble import combine_fits, selected_epochs, validate_mass_normalization, validate_result_normalization
+from .data import BACKGROUND_PROTOCOL, input_features, latent_inputs, scientific_version, validate
+from .ensemble import combine_fits, selected_epochs, mass_normalization_check, validate_result_normalization
 from .resume import check_contract, policy, transition_history
 from .source import COMMIT, REPOSITORY, digest, verify
 from riddle.worker_progress import EVENT_PREFIX, ProgressStage, emit_message, emit_progress
 from riddle.production import NumericalFitError
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def safeguards_active(args):
+    return not getattr(args, "pilot_no_safeguards", False)
+
+
+def paired_rng_contract(args, inputs, config, source, environment):
+    """Pair the diagnostic control with saved stage RNGs, without altering the source run."""
+    root = getattr(args, "pilot_rng_source", None)
+    if root is None:
+        return dict(paired=False, reason="No saved guarded R-ANODE run supplied; independent initialization")
+    root = Path(root).resolve()
+    report = json.loads((root / "result.json").read_text())
+    original = report["contract"]
+    expected = {**config, "seed": args.seed, "scenario": args.scenario,
+                "device": args.device, "io_workers": args.io_workers}
+    if (report.get("method") != "ranode" or original["inputs"] != inputs or original["source_sha256"] != source
+            or any(original["settings"].get(k) != v for k, v in expected.items())
+            or original["environment"] != environment):
+        raise ValueError("R-ANODE RNG pairing requires identical data, upstream sources, settings and runtime")
+    if report.get("completed"):
+        check_files(root, report["artifacts_sha256"])
+    names = ["upstream_runs/background/initial_rng.pt"] + [
+        f"fits/fit_{i:03d}/upstream_runs/signal/initial_rng.pt"
+        for i in range(config["fit_index"], config["fit_index"] + config["runs"])]
+    hashes = {}
+    for name in names:
+        path = root / name
+        if not path.exists():
+            raise ValueError(f"Missing paired RNG state: {path}; guarded job must finish its stages first")
+        checksum = digest(path)
+        if path.with_suffix(".sha256").read_text().strip() != checksum:
+            raise ValueError(f"Changed paired RNG state: {path}")
+        hashes[name] = checksum
+    return dict(paired=True, source=str(root), files=hashes,
+                note="Same initial stage RNGs; equality also requires deterministic upstream CPU operations")
 
 
 class StageReporter:
@@ -226,6 +262,9 @@ def stage_failure(options):
 
 
 def reject_signal_fit(args, index, error):
+    if not safeguards_active(args):
+        # The control must never quietly become a filtered ensemble.
+        raise error
     attempt = Path(error.attempt)
     relative = attempt.relative_to(args.output)
     receipt = dict(fit_index=index, status="excluded", check="numerical_validity",
@@ -277,7 +316,7 @@ def prepare_stage(args, stage, config, background=None):
         check_files(args.output, saved["files"])
         if stage == "signal":
             try:
-                validate_mass_normalization(args.output / saved["attempt"])
+                mass_normalization_check(args.output / saved["attempt"], safeguards=safeguards_active(args))
             except NumericalFitError as error:
                 error.attempt = str(args.output / saved["attempt"])
                 raise
@@ -300,6 +339,26 @@ def prepare_stage(args, stage, config, background=None):
         "epochs": config[stage + "_epochs"],
         "resample_training": config["split_mode"] == "resample_training",
     }
+    if not safeguards_active(args):
+        options["safeguards"] = False
+    if getattr(args, "pilot_latent_inputs", None) is not None:
+        options.update(latent_inputs=str(args.pilot_latent_inputs),
+                       latent_manifest_sha256=args.production_contract["settings"]["latent_manifest_sha256"])
+    if "rng_pairing" in args.production_contract["settings"]:
+        pairing = args.production_contract["settings"]["rng_pairing"]
+        if pairing["paired"]:
+            import shutil
+            destination = Path(options["rng"])
+            name = str(destination.relative_to(args.output))
+            source = Path(pairing["source"]) / name
+            checksum = pairing["files"][name]
+            if digest(source) != checksum:
+                raise ValueError("Paired RNG source changed during execution")
+            if destination.exists() and digest(destination) != checksum:
+                raise ValueError("Paired RNG destination changed during execution")
+            if not destination.exists():
+                shutil.copyfile(source, destination)
+                destination.with_suffix(".sha256").write_text(checksum + "\n")
     if background is not None:
         options["background"] = str(background / "results/upstream/background/fit")
     env = os.environ.copy()
@@ -323,7 +382,7 @@ def complete_stage(args, options):
     attempt = Path(options["attempt"])
     if options["stage"] == "signal":
         try:
-            validate_mass_normalization(attempt)
+            mass_normalization_check(attempt, safeguards=safeguards_active(args))
         except NumericalFitError as error:
             error.attempt = str(attempt)
             raise
@@ -366,6 +425,8 @@ def run_signal_fits(args, config, background):
     for index in indices:
         receipt = stage_root(args, "signal", {"fit_index": index}) / "fit_failure.json"
         if receipt.exists():
+            if not safeguards_active(args):
+                raise ValueError("Unguarded pilot cannot reuse a fit exclusion receipt")
             saved = json.loads(receipt.read_text())
             if saved.get("fit_index") != index or saved.get("status") != "excluded":
                 raise ValueError("Invalid R-ANODE fit exclusion receipt")
@@ -488,7 +549,19 @@ def run(args):
         args.config, runs=getattr(args, "fits", None), epochs=getattr(args, "epochs", None)
     )
     checks = ProgressStage("ranode_checks", "Verify inputs, upstream sources and runtime", 3)
-    inputs, _ = validate(args.data)
+    inputs, original_arrays = validate(args.data)
+    guarded = safeguards_active(args)
+    latent = getattr(args, "pilot_latent_inputs", None)
+    if latent is not None:
+        latent = args.pilot_latent_inputs = Path(latent).resolve()
+        if not guarded or args.device != "cpu" or not latent.is_relative_to(args.output):
+            raise ValueError("riddlev4 requires guarded CPU execution with latent inputs stored inside its output")
+        latent_meta, _, _ = latent_inputs(latent, inputs, original_arrays)
+    if not guarded or getattr(args, "pilot_rng_source", None) is not None:
+        from riddle.data import diagnostic_profile
+        if (guarded and latent is None) or args.device != "cpu" or diagnostic_profile(inputs) is None:
+            raise ValueError("R-ANODE controls/RNG pairing are restricted to the explicit CPU pilot")
+    method = "riddlev4" if latent is not None else ("ranode" if guarded else "ranodev2")
     checks.update(1, force=True)
     if inputs["scenario"] != args.scenario:
         raise ValueError("R-ANODE scenario disagrees with prepared inputs")
@@ -508,7 +581,7 @@ def run(args):
     )
     contract = {
         "schema": 1,
-        "method": "ranode",
+        "method": method,
         "scientific_version": scientific_version(inputs.get("variant", "default")),
         "source_commit": COMMIT,
         "source_sha256": source,
@@ -528,6 +601,14 @@ def run(args):
                  "framework/production.py": digest(ROOT / "riddle/production.py"),
                  "framework/resume.py": digest(ROOT / "riddle/resume.py")},
     }
+    if not guarded:
+        contract["settings"].update(fit_failure_policy="disabled_cpu_pilot_control",
+            rng_pairing=paired_rng_contract(args, inputs, config, source, environment))
+    if latent is not None:
+        contract["scientific_version"] += "_latent_inputs_v1"
+        contract["settings"].update(input_representation=latent_meta,
+            latent_manifest_sha256=digest(latent / "manifest.json"),
+            rng_pairing=paired_rng_contract(args, inputs, config, source, environment))
     args.output.mkdir(parents=True, exist_ok=True)
     with lock(args.output / ".ranode.lock"):
         manifest = args.output / "result.json"
@@ -554,7 +635,8 @@ def run(args):
                                      reuse_completed=saved.get("completed") is True, **resume_options)
             if saved["completed"]:
                 check_files(args.output, saved["artifacts_sha256"])
-                validate_result_normalization(args.output, saved)
+                if guarded:
+                    validate_result_normalization(args.output, saved)
                 from riddle.production import validate_result_scores
 
                 validate_result_scores(args.output, "ranode")
@@ -580,7 +662,7 @@ def run(args):
                 return
         report = {
             "schema": 1,
-            "method": "ranode",
+            "method": method,
             "seed": args.seed,
             "campaign_seed": getattr(args, "campaign_seed", None) if getattr(args, "campaign_seed", None) is not None else args.seed,
             "run_index": getattr(args, "run_index", 0),
@@ -605,7 +687,7 @@ def run(args):
                 receipt = stage_root(args, "signal", {"fit_index": index}) / "fit_failure.json"
                 excluded.append(json.loads(receipt.read_text()))
                 continue
-            epochs = selected_epochs(fit, config["signal_epochs"])
+            epochs = selected_epochs(fit, config["signal_epochs"], safeguards=guarded)
             members.append({
                 "fit_index": index,
                 "attempt": str(fit.relative_to(args.output)),
@@ -615,11 +697,12 @@ def run(args):
         write_json(args.output / "fit_selection.json", dict(
             status="completed" if members else "no_accepted_fits", requested_fits=config["runs"],
             accepted_fits=len(members), members=members, excluded_fits=excluded,
-            selection="numerical validity only; no AUC, SIC, truth or validation-performance selection"))
+            selection=("numerical validity only; no AUC, SIC, truth or validation-performance selection"
+                       if guarded else "all completed fits; helper safeguards disabled; no fit exclusions")))
         fits = [fit for fit in fits if fit is not None]
         if not fits:
             raise RuntimeError("R-ANODE: no numerically valid fits; no physics result was produced")
-        combine_fits(fits, args.output, requested_runs=len(fits))
+        combine_fits(fits, args.output, requested_runs=len(fits), safeguards=guarded)
         ensemble_progress.update(config["runs"] + 1, force=True)
         protocol = {
             "repository": REPOSITORY,
@@ -655,12 +738,31 @@ def run(args):
             },
             "configuration": config,
         }
+        if not guarded:
+            protocol.update(method="ranodev2", safeguards=False,
+                rng_pairing=contract["settings"]["rng_pairing"],
+                ensemble="Equal-weight upstream ratios from every requested fit; no helper fit filtering",
+                score="Original upstream likelihood including its density floors and nan_to_num; no helper repair",
+                integrity_checks="Event alignment, complete artifacts, hashes, and finite exported scores remain required")
+        if latent is not None:
+            protocol.update(method="riddlev4", safeguards=True, benchmark="Pinned R-ANODE applied to frozen RIDDLE latent features",
+                features=[f"z{i+1}" for i in range(len(input_features(inputs.get("variant", "default"))))],
+                latent_transformation=latent_meta, rng_pairing=contract["settings"]["rng_pairing"],
+                background_preprocessing="Original upstream preprocessing fitted on mapped sideband development rows",
+                signal_inputs="Latent features plus original mass as a joint density coordinate",
+                background_density="Original upstream learned conditional background on latent inputs, not an imposed Gaussian",
+                coordinate_ratio="Signal and background densities use the same latent coordinates; mapping Jacobians cancel",
+                export="All original physical event rows retained; both mapping and upstream-domain rejections recorded in mask",
+                riddle_residual_training=False)
         if inputs.get("variant") == "deltaR":
             protocol["dimensional_extension"] = {
                 "background_num_inputs": 5,
                 "background_num_cond_inputs": 1,
                 "signal_num_features": 6,
-                "changes": "Add physical deltaR; adjust input dimensions, sample reshapes and diagnostic feature loops only",
+                "changes": ("Map all five physical features, including deltaR, to five latent coordinates; "
+                            "adjust upstream input dimensions, sample reshapes and diagnostic feature loops only"
+                            if latent is not None else
+                            "Add physical deltaR; adjust input dimensions, sample reshapes and diagnostic feature loops only"),
                 "unchanged": "Upstream flow classes, preprocessing, likelihood, optimization, split rules, checkpoint selection and score definition",
             }
         write_json(args.output / "protocol.json", protocol)
@@ -668,7 +770,7 @@ def run(args):
 
         health = validate_result_scores(args.output, "ranode")
         health["mass_normalization"] = {
-            member["attempt"]: validate_mass_normalization(fit) for member, fit in zip(members, fits)
+            member["attempt"]: mass_normalization_check(fit, safeguards=guarded) for member, fit in zip(members, fits)
         }
         write_json(args.output / "score_health.json", health)
         final_progress = ProgressStage("ranode_final", "Verify inputs, sources and final result artifacts", 3)
@@ -684,6 +786,11 @@ def run(args):
             and p.name not in ("result.json", ".ranode.lock", "training.log")
         ]
         hashes = {p.name: digest(p) for p in artifacts}
+        if latent is not None:
+            # The result remains auditable after the source RIDDLE run is moved.
+            latent_inputs(latent, inputs, original_arrays,
+                          expected_digest=contract["settings"]["latent_manifest_sha256"])
+            hashes.update({str(p.relative_to(args.output)): digest(p) for p in latent.rglob("*") if p.is_file()})
         receipts = [args.output / "background_complete.json"] + [
             stage_root(args, "signal", {"fit_index": member["fit_index"]}) / "signal_complete.json"
             for member in members
@@ -742,6 +849,9 @@ def main(argv=None):
     parser.add_argument("--mps", choices=("auto", "on", "off"), default="auto")
     parser.add_argument("--io-workers", type=int, default=2)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--pilot-no-safeguards", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--pilot-rng-source", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--pilot-latent-inputs", type=Path, help=argparse.SUPPRESS)
     parser.add_argument(
         "--resume-across-code-change", action="store_true",
         help="With --resume, permit recorded helper-code changes; upstream sources stay pinned",

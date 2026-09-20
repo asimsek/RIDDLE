@@ -100,6 +100,7 @@ class DE_MAF(DensityEstimator):
                 params["num_cond_inputs"],
                 act=params["activation_function"],
                 pre_exp_tanh=params["pre_exp_tanh"],
+                affine_log_scale_bound=params.get("affine_log_scale_bound"),
             )
         ]
         if params["batch_norm"]:

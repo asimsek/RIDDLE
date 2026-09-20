@@ -95,6 +95,10 @@ def job(args):
         value = getattr(args, key, None)
         if value is not None:
             command.extend(["--" + key, str(value)])
+    from riddle.options import FEATURES
+    for name in FEATURES:
+        if getattr(args, name, None) is not None:
+            command.append("--" + ("" if getattr(args, name) else "no-") + name.replace("_", "-"))
     if "lacathode" in args.methods:
         command.extend(["--lacathode-background", getattr(args, "lacathode_background", "independent")])
     if "ranode" in args.methods:
@@ -230,6 +234,8 @@ def main(argv=None):
     p.add_argument("--results", help="Result directory; defaults to results or results/injection_scan for scans")
     p.add_argument("--runs", type=positive, help="Complete independent runs per seed (default: 1)")
     p.add_argument("--fits", type=positive, help="Signal ensemble fits per RIDDLE/R-ANODE run; does not change LaCathode")
+    from riddle.options import add_feature_arguments
+    add_feature_arguments(p)
     p.add_argument("--lacathode-background", choices=("independent", "fixed"), default="independent",
                    help="Retrain each LaCathode background flow (default), or share one flow across classifier fits")
     p.add_argument("--epochs", type=positive, help="Override RIDDLE/R-ANODE signal-fit and LaCathode classifier epochs; background stages are unchanged")

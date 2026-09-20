@@ -370,11 +370,15 @@ def run_single(args, contract):
     from .worker_progress import ProgressStage, emit_progress
     from .source import verify, COMMIT
     from .resume import resume_policy
+    from riddle.data import diagnostic_profile
 
     settings = run_settings(getattr(args, "runs", None), getattr(args, "epochs", None),
                             getattr(args, "lacathode_background", "independent"))
     if settings["pipeline_runs"] != 1:
         raise ValueError("A single LaCathode pipeline must contain exactly one background flow")
+    pilot = diagnostic_profile(contract["inputs"])
+    background_epochs = pilot["background_epochs"] if pilot else 100
+    reference_samples = pilot["reference_samples"] if pilot else 267000
     config_file = (
         "DE_MAF_model_deltaR.yml" if contract["inputs"].get("variant") == "deltaR" else "DE_MAF_model.yml"
     )
@@ -415,7 +419,7 @@ def run_single(args, contract):
         "--cf_separate_val_set",
         "--no_extra_signal",
         "--cf_n_samples",
-        "267000",
+        str(reference_samples),
         "--cf_realistic_conditional",
         "--cf_oversampling",
         "--cf_no_logit",
@@ -424,7 +428,7 @@ def run_single(args, contract):
         "--cf_n_runs",
         str(settings["classifier_runs"]),
         "--DE_epochs",
-        "100",
+        str(background_epochs),
         "--cf_epochs",
         str(settings["classifier_epochs"]),
         "--DE_file_name",
@@ -437,7 +441,7 @@ def run_single(args, contract):
     seed_start(args.seed)
 
     def flow():
-        emit_progress("flow", "Train background flow", total=100, unit="epoch", completed=0)
+        emit_progress("flow", "Train background flow", total=background_epochs, unit="epoch", completed=0)
         run_all.train_DE(de)
 
     recovery.stage("flow", flow)
@@ -496,12 +500,12 @@ def run_single(args, contract):
             "scientific_version": "pinned_upstream",
             "flow_checkpoint_prefix": FLOW_PREFIX,
             "commit": COMMIT,
-            "flow_epochs": 100,
+            "flow_epochs": background_epochs,
             "classifier_epochs": parsed.cf_epochs,
             "classifier_runs": parsed.cf_n_runs,
             "run_layout": contract["lacathode_run_layout"],
             "background_mode": getattr(args, "lacathode_background", "independent"),
-            "reference_samples": 267000,
+            "reference_samples": reference_samples,
             "selected_checkpoints": 10,
             "score": "Upstream ten-validation-checkpoint mean per classifier fit; no averaging across fits",
             "primary_classifier_fit": 0,

@@ -11,11 +11,12 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .data import BACKGROUND_PROTOCOL, MatchedPartitions, evaluation, export_scores, input_features, region, validate
+from .data import BACKGROUND_PROTOCOL, MatchedPartitions, evaluation, export_scores, input_features, latent_inputs, region, validate
 from .source import digest, verify
-from .ensemble import validate_mass_normalization, validate_upstream_likelihood
+from .ensemble import signal_fit_health
 from .variants import background_diagnostics, extend_delta_r, model_config
 from riddle.worker_progress import emit_progress as stage_progress
+from riddle.production import NumericalFitError
 
 
 @contextmanager
@@ -157,6 +158,18 @@ def main():
     stage_progress("inputs", "Verify upstream sources and load input arrays")
     verify(sources)
     inputs, arrays = validate(data)
+    originals, mapping_masks = None, None
+    if options.get("latent_inputs") is not None:
+        if options["device"] != "cpu" or not options.get("safeguards", True):
+            raise ValueError("riddlev4 requires the guarded CPU pilot path")
+        originals = arrays
+        _, arrays, mapping_masks = latent_inputs(options["latent_inputs"], inputs, originals,
+                                                expected_digest=options["latent_manifest_sha256"])
+    safeguards = options.get("safeguards", True)
+    if not safeguards:
+        from riddle.data import diagnostic_profile
+        if diagnostic_profile(inputs) is None or options["device"] != "cpu":
+            raise ValueError("Disabling R-ANODE safeguards is restricted to the CPU pilot")
     variant = inputs.get("variant", "default")
     sys.path.insert(0, str(sources))
     for name in ("src.nflow_utils", "src.utils", "wandb"):
@@ -242,6 +255,7 @@ def main():
         if stage == "background"
         else ("trainloss", "valloss")
     )
+    nonfinite_losses = []
     for name in loss_names:
         loss = np.load(output / (name + ".npy"), allow_pickle=False)
         if loss.shape != (options["epochs"],):
@@ -249,8 +263,9 @@ def main():
                 "Incomplete upstream R-ANODE losses; refusing this result"
             )
         if not np.isfinite(loss).all():
-            from riddle.production import NumericalFitError
-            raise NumericalFitError("Nonfinite upstream R-ANODE losses")
+            if safeguards:
+                raise NumericalFitError("Nonfinite upstream R-ANODE losses")
+            nonfinite_losses.append(name)
     if adapter.split_audit is None:
         raise ValueError("The pinned script did not use the matched partitions")
     (attempt / "partition_audit.json").write_text(
@@ -262,11 +277,12 @@ def main():
     )
     if stage == "signal":
         stage_progress("normalization", "Validate sampled signal-mass normalization")
-        health = validate_mass_normalization(attempt)
-        validate_upstream_likelihood(namespace)
+        health = signal_fit_health(attempt, namespace, safeguards=safeguards)
+        health["nonfinite_loss_arrays"] = nonfinite_losses
         (attempt / "mass_normalization.json").write_text(json.dumps(health, indent=2) + "\n")
         stage_progress("export", "Export validation, test and signal-region scores")
-        export_scores(namespace, arrays, attempt)
+        export_scores(namespace, arrays, attempt, **(
+            dict(original_arrays=originals, mapping_masks=mapping_masks) if originals is not None else {}))
         np.save(attempt / "upstream_likelihood.npy", namespace["likelihood"])
     stage_progress("sources", "Verify upstream sources are unchanged")
     verify(sources)

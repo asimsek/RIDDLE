@@ -33,8 +33,20 @@ class MaskedLinear(nn.Module):
 
 
 class MADE(nn.Module):
-    def __init__(self, num_inputs, num_hidden, num_cond_inputs=None, act="relu", pre_exp_tanh=False):
+    def __init__(self, num_inputs, num_hidden, num_cond_inputs=None, act="relu", pre_exp_tanh=False,
+                 affine_log_scale_bound=None):
         super(MADE, self).__init__()
+        if type(pre_exp_tanh) is not bool:
+            raise ValueError("pre_exp_tanh must be boolean")
+        # An explicit bound takes precedence; the legacy switch means tanh(a).
+        if affine_log_scale_bound is None and pre_exp_tanh:
+            affine_log_scale_bound = 1.
+        if affine_log_scale_bound is not None and (
+            type(affine_log_scale_bound) not in (int, float)
+            or not math.isfinite(affine_log_scale_bound) or affine_log_scale_bound <= 0
+        ):
+            raise ValueError("affine_log_scale_bound must be finite and positive")
+        self.affine_log_scale_bound = affine_log_scale_bound
         activations = {"relu": nn.ReLU, "sigmoid": nn.Sigmoid, "tanh": nn.Tanh}
         act_func = activations[act]
         input_mask = get_mask(num_inputs, num_hidden, num_inputs, mask_type="input")
@@ -48,10 +60,15 @@ class MADE(nn.Module):
             MaskedLinear(num_hidden, num_inputs * 2, output_mask),
         )
 
+    def bounded_log_scale(self, a):
+        bound = self.affine_log_scale_bound
+        return a if bound is None else bound * torch.tanh(a / bound)
+
     def forward(self, inputs, cond_inputs=None, mode="direct"):
         if mode == "direct":
             h = self.joiner(inputs, cond_inputs)
             m, a = self.trunk(h).chunk(2, 1)
+            a = self.bounded_log_scale(a)
             u = (inputs - m) * torch.exp(-a)
             return (u, -a.sum(-1, keepdim=True))
         else:
@@ -59,8 +76,9 @@ class MADE(nn.Module):
             for i_col in range(inputs.shape[1]):
                 h = self.joiner(x, cond_inputs)
                 m, a = self.trunk(h).chunk(2, 1)
+                a = self.bounded_log_scale(a)
                 x[:, i_col] = inputs[:, i_col] * torch.exp(a[:, i_col]) + m[:, i_col]
-            return (x, -a.sum(-1, keepdim=True))
+            return (x, a.sum(-1, keepdim=True))
 
 
 class BatchNormFlow(nn.Module):

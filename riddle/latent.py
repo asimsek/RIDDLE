@@ -160,6 +160,57 @@ class Mapper:
         self.model.load_state_dict(weights)
         self.model.to(device).eval().requires_grad_(False)
 
+    def physical(self, rows):
+        """Preprocessed physical features and frozen log p_B in that coordinate system."""
+        prepared = load_dataset(rows.astype("float32"), external_datadict=self.reference)
+        x, m = prepared["tensor2"], prepared["labels"]
+        densities = []
+        with torch.no_grad():
+            for offset in range(0, len(x), 8192):
+                densities.append(self.model.log_probs(x[offset:offset+8192].to(self.device),
+                    m[offset:offset+8192].to(self.device)).flatten().cpu().numpy())
+        if not densities:
+            raise ValueError("No physical events remain inside the background domain")
+        result = np.column_stack((x.cpu().numpy(), np.concatenate(densities))).astype(np.float32)
+        require_finite(result, "Physical background densities")
+        return result, prepared["mask"].cpu().numpy()
+
+    def physical_development(self, data, reference_samples):
+        """Reproduce development_rows membership/order, replacing z with x and log p_B."""
+        real = []
+        for suffix in ("train", "val"):
+            original = np.load(Path(data) / f"innerdata_{suffix}.npy").astype(np.float32)
+            features, mask = self.physical(original)
+            real.append(np.column_stack((original[mask, 0], features, np.ones(mask.sum()),
+                                         original[mask, -1])).astype(np.float32))
+        # Reference rows never train the residual model; preserve their positions
+        # in the common shuffle so v2/v3 reserve exactly the same real events.
+        placeholders = np.zeros((reference_samples, real[0].shape[1]), dtype=np.float32)
+        count = int(len(real[0]) / (len(real[0]) + len(real[1])) * reference_samples)
+        train = np.concatenate((placeholders[:count], real[0]))
+        validation = np.concatenate((placeholders[count:], real[1]))
+        rng = np.random.RandomState(42)
+        rng.shuffle(train)
+        rng.shuffle(validation)
+        return train, validation[:int(2.0 / 5 * len(validation))]
+
+    def physical_reference(self, validation, count=8192):
+        """Independent samples from frozen p_B(x|m), at reserved-validation masses."""
+        from .model import with_mass_context
+        masses = np.random.default_rng(3408).choice(validation[validation[:, -2] == 1, 0], count)
+        dimensions = validation.shape[1] - 4
+        noise = np.random.default_rng(3407).standard_normal((count, dimensions)).astype(np.float32)
+        outputs = []
+        with torch.no_grad():
+            for offset in range(0, count, 1024):
+                m = torch.from_numpy(masses[offset:offset+1024, None]).to(self.device)
+                x = self.model.sample(noise=torch.from_numpy(noise[offset:offset+1024]).to(self.device), cond_inputs=m)
+                log_b = self.model.log_probs(x, m).flatten().cpu().numpy()
+                outputs.append(np.column_stack((with_mass_context(x.cpu().numpy(), m.cpu().numpy().ravel()), log_b)))
+        result = np.concatenate(outputs).astype(np.float32)
+        require_finite(result, "Frozen physical background reference")
+        return result
+
     def map(self, rows):
         prepared = load_dataset(rows.astype("float32"), external_datadict=self.reference)
         x, m = prepared["tensor2"], prepared["labels"]

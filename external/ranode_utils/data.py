@@ -140,6 +140,43 @@ def evaluation(arrays):
     }
 
 
+def latent_inputs(root, inputs, originals, *, expected_digest=None):
+    """Read an explicitly identified pilot representation, never a fake physical dataset."""
+    from riddle.data import diagnostic_profile
+
+    root = Path(root).resolve()
+    path = root / "manifest.json"
+    if expected_digest is not None and digest(path) != expected_digest:
+        raise ValueError("Latent-input manifest changed")
+    meta = json.loads(path.read_text())
+    if (diagnostic_profile(inputs) is None or meta.get("schema") != 1
+            or meta.get("method") != "riddlev4" or meta.get("parent_inputs") != inputs
+            or meta.get("representation") != "frozen_riddle_latents"):
+        raise ValueError("Latent R-ANODE inputs require a matching verified CPU pilot")
+    files = meta.get("files", {})
+    if not set(FILES + ("mapping_masks.npz",)) <= set(files):
+        raise ValueError("Incomplete latent-input receipt")
+    for name, checksum in files.items():
+        item = (root / name).resolve()
+        if not item.is_relative_to(root) or (root / name).is_symlink() or digest(item) != checksum:
+            raise ValueError("Latent-input artifact changed: " + name)
+    arrays, masks = {}, {}
+    with np.load(root / "mapping_masks.npz", allow_pickle=False) as saved:
+        if set(saved.files) != set(FILES):
+            raise ValueError("Incomplete latent event mapping")
+        for name in FILES:
+            mask = saved[name]
+            rows = np.load(root / name, allow_pickle=False)
+            original = originals[name]
+            if (mask.dtype != bool or mask.shape != (len(original),)
+                    or rows.dtype != np.float64 or rows.shape != (int(mask.sum()), original.shape[1])
+                    or not len(rows) or not np.isfinite(rows).all()
+                    or not np.array_equal(rows[:, [0, -1]], original[mask][:, [0, -1]])):
+                raise ValueError("Latent inputs lost mass/label/event alignment: " + name)
+            arrays[name], masks[name] = rows, mask
+    return meta, arrays, masks
+
+
 class MatchedPartitions:
     """Replace only input selection and train/validation membership, not preprocessing."""
 
@@ -191,8 +228,12 @@ class MatchedPartitions:
         return np.flatnonzero(train), np.flatnonzero(~train)
 
 
-def export_scores(namespace, arrays, output):
+def export_scores(namespace, arrays, output, *, original_arrays=None, mapping_masks=None):
     records = evaluation(arrays)
+    if (original_arrays is None) != (mapping_masks is None):
+        raise ValueError("Original rows and mapping masks must be supplied together")
+    original_records = evaluation(original_arrays) if original_arrays is not None else None
+    original_masks = evaluation(mapping_masks) if mapping_masks is not None else None
     all_rows = np.concatenate([rows[region(rows[:, 0])] for rows in records.values()])
     from src.utils import logit_transform
 
@@ -213,6 +254,15 @@ def export_scores(namespace, arrays, output):
         mask[sr] = accepted[offset:stop]
         scores = np.full(len(rows), np.nan)
         scores[sr] = all_scores[offset:stop]
+        if original_records is not None:
+            mapped = original_masks[name]
+            original = original_records[name]
+            if (mapped.dtype != bool or mapped.shape != (len(original),) or int(mapped.sum()) != len(rows)
+                    or not np.array_equal(rows[:, [0, -1]], original[mapped][:, [0, -1]])):
+                raise ValueError("Latent score export lost original event alignment")
+            full_mask, full_scores = np.zeros(len(original), bool), np.full(len(original), np.nan)
+            full_mask[mapped], full_scores[mapped] = mask, scores
+            rows, mask, scores, sr = original, full_mask, full_scores, region(original[:, 0])
         np.savez_compressed(
             Path(output) / (name + "_scores.npz"),
             mass=rows[:, 0].astype("float32"),

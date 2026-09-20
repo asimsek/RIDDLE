@@ -293,6 +293,9 @@ def load_scores(root, report, name, *, attempt=None, for_rebuild=False):
         if report["method"] in ("riddle", "lacathode") or "latent" in archive:
             fields += ("latent",)
         data = {k: archive[k] for k in fields}
+        for key in ("raw_scores", "score_kind", "fit_score_kind"):
+            if key in archive:
+                data[key] = archive[key]
         if "fit_scores" in archive:
             data["fit_scores"] = archive["fit_scores"]
             if report.get("contract", {}).get("lacathode_run_layout") == "independent_background_classifier_v1":
@@ -349,6 +352,8 @@ def load_scores(root, report, name, *, attempt=None, for_rebuild=False):
             or not np.isnan(data["scores"][~data["mask"]]).all()):
         raise InvalidFitScores(f"{path}: empty/nonfinite accepted scores or invalid rejected-event scores")
     validate_score_record(data, method=report["method"], stage=str(path))
+    if report["method"] == "riddle" and "method_health.json" in report.get("artifacts_sha256", {}):
+        data["plot_saved_ensemble"] = True
     if report["method"] == "lacathode":
         settings = report.get("contract", {}).get("settings", {})
         independent = report.get("contract", {}).get("lacathode_run_layout") == "independent_background_classifier_v1"
@@ -459,7 +464,31 @@ def ranode_plot_ensemble(root, report):
     return base, audit
 
 
-def riddle_plot_predictions(root, report, member, groups):
+def plot_device_argument(value):
+    if value not in ("cpu", "auto") and not re.fullmatch(r"cuda:\d+", value):
+        raise argparse.ArgumentTypeError("--device must be cpu, auto, or cuda:<index>")
+    return value
+
+
+def resolve_plot_device(requested):
+    """Resolve only when checkpoint inference is needed; other plots need no CUDA."""
+    import torch
+
+    plot_device_argument(requested)
+    if requested == "auto":
+        requested = "cuda:0" if torch.cuda.is_available() else "cpu"
+    if requested.startswith("cuda:"):
+        if not torch.cuda.is_available():
+            raise RuntimeError(f"Plot safeguard inference requested {requested}, but CUDA is unavailable; "
+                               "use --device cpu or --device auto")
+        index = int(requested.split(":")[1])
+        if index >= torch.cuda.device_count():
+            raise ValueError(f"Plot device {requested} is outside the visible CUDA device set")
+        requested = f"cuda:{index}"
+    return requested
+
+
+def riddle_plot_predictions(root, report, member, groups, *, device="cpu"):
     """Read-only v2/v3 inference; production training/resume version rules stay strict."""
     import torch
     from .model import build_signal_flow, background_log_prob
@@ -474,7 +503,7 @@ def riddle_plot_predictions(root, report, member, groups):
     for z in groups.values():
         if z.ndim != 2 or z.shape[1] != inputs["features"] or not len(z) or not np.isfinite(z).all():
             raise ValueError("Invalid RIDDLE inference latents")
-    model = build_signal_flow("cpu", features=inputs["features"], settings=inputs["settings"]).eval()
+    model = build_signal_flow(device, features=inputs["features"], settings=inputs["settings"]).eval()
     backgrounds = {key: background_log_prob(torch.from_numpy(z)).numpy().astype(np.float64)
                    for key, z in groups.items()}
     sums, mixture = {}, None
@@ -482,6 +511,8 @@ def riddle_plot_predictions(root, report, member, groups):
     completed = 0
     with torch.no_grad(), ProgressStage("plot_riddle_inference", "Evaluate saved RIDDLE fit", total, "prediction") as progress:
         for path, epoch, weight in zip(paths, member["epochs"], member["signal_fractions"]):
+            # Stage checkpoint tensors on CPU, then copy into the model on the
+            # selected device. Keep only one inference batch in GPU memory.
             checkpoint = torch.load(path, map_location="cpu", weights_only=True)
             if checkpoint.get("scientific_version") != version or checkpoint.get("epoch") != epoch:
                 raise ValueError("RIDDLE checkpoint identity differs from saved selection")
@@ -490,7 +521,8 @@ def riddle_plot_predictions(root, report, member, groups):
                 chunks = []
                 for offset in range(0, len(z), 8192):
                     batch = z[offset:offset + 8192]
-                    chunks.append(model.log_prob(torch.from_numpy(batch)).numpy())
+                    x = torch.from_numpy(batch).to(device)
+                    chunks.append(model.log_prob(x).cpu().numpy())
                     completed += len(batch)
                     progress.update(completed)
                 ratio = np.concatenate(chunks).astype(np.float64) - backgrounds[key]
@@ -510,16 +542,34 @@ def riddle_plot_predictions(root, report, member, groups):
         None if mixture is None else mixture - np.log(count))
 
 
-def riddle_plot_ensemble(root, report, *, io_workers=2):
-    """Filter legacy fits using reserved validation, then rebuild all score partitions."""
+def riddle_plot_ensemble(root, report, *, io_workers=2, device="cpu"):
+    """Filter numerical failures only; record reserved-validation evidence separately."""
     import torch
     from .model import real_sr_latents
     from .production import (NumericalFitError, require_complete_ensemble,
-                             validate_density_ratio, validation_improvement)
+                             validate_density_ratio, validation_improvement, fit_acceptance)
     from .storage import digest
 
+    device = resolve_plot_device(device)
+    cuda_devices = [int(device.split(":")[1])] if device.startswith("cuda:") else []
+    colored_status(f"RIDDLE safeguard checkpoint inference | device={device}", kind="INFO", level=1)
     selection = read_metadata(root, report, "density/ensemble_selection.json")
     require_complete_ensemble(selection)
+    if "method_health.json" in report.get("artifacts_sha256", {}):
+        # A calibrated score is tied to its exact frozen ensemble. Removing fits
+        # after calibration would silently change the method and invalidate u.
+        health = read_metadata(root, report, "method_health.json")
+        if not fit_acceptance(health)["fit_valid"]:
+            raise NumericalFitError("Invalid saved RIDDLE ensemble; rerun training rather than recalibrating while plotting")
+        base = {p: load_scores(root, report, p) for p in ("validation", "test", "signal_region")}
+        audit = dict(method="riddle", source=str(root.resolve()), scenario=report["scenario"], seed=report["seed"],
+                     status="saved_ensemble", requested_fits=selection["requested_runs"], used_fits=len(selection["members"]),
+                     used_members=selection["members"], excluded_members=[], independent_runs=1,
+                     source_artifacts_modified=False, safeguard_filtering=True, checkpoint_inference=False,
+                     health=health, ensemble="immutable production ensemble with its saved score calibration")
+        for record in base.values():
+            record["plot_ensemble"] = audit
+        return base, audit
     inputs = read_metadata(root, report, "density/ensemble_inputs.json")
     path = verify_plot_input(root, report, "background/validation_latents.npy")
     validation = real_sr_latents(np.load(path, allow_pickle=False))
@@ -536,31 +586,34 @@ def riddle_plot_ensemble(root, report, *, io_workers=2):
     accepted, excluded, combined, base = [], [], {}, {}
     audit = dict(method="riddle", source=str(root.resolve()), scenario=report["scenario"], seed=report["seed"],
                  requested_fits=selection["requested_runs"], used_fits=0, used_members=[], excluded_members=excluded,
-                 status="no_valid_fits", selection="Numerical validity and reserved-validation mixture improvement; no truth/AUC/SIC selection",
+                 status="no_valid_fits", selection="Numerical validity only; reserved-validation evidence is diagnostic; historical production exclusions retained",
                  validation_sigma=sigma, reference_seed=3407, reference_samples=len(reference),
                  ensemble="log(mean(exp(per-fit log ratio))) with equal weights over used fits",
                  partitions=["validation", "test", "signal_region"], independent_runs=1,
-                 source_artifacts_modified=False, safeguard_filtering=True, checkpoint_inference=True)
+                 source_artifacts_modified=False, safeguard_filtering=True, checkpoint_inference=True,
+                 inference_device=device)
     previous_threads = torch.get_num_threads()
+    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
     try:
         torch.set_num_threads(io_workers)
-        with torch.random.fork_rng(devices=[]):
+        if cuda_devices:
+            # Keep full float32 model evaluation; likelihood aggregation and
+            # safeguard statistics remain float64 on CPU as before.
+            torch.backends.cuda.matmul.allow_tf32 = False
+        with torch.random.fork_rng(devices=cuda_devices):
             for member in members:
                 colored_status(f"RIDDLE fit {member['fit_index']:03d}: check saved checkpoints on reserved validation",
                                kind="WORK", level=1)
                 try:
                     scores, mixture = riddle_plot_predictions(root, report, member,
-                        {"reserved_validation": validation, "reference": reference})
+                        {"reserved_validation": validation, "reference": reference}, device=device)
                     validate_density_ratio(scores["reference"], stage=f"{member['directory']} ensemble", tests=tests)
                     quality = validation_improvement(mixture, sigma=sigma)
                 except (NumericalFitError, FloatingPointError) as error:
                     excluded.append(dict(member, check="numerical_validity", reason=str(error)))
                     continue
-                if quality["status"] != "passed":
-                    excluded.append(dict(member, check="validation_improvement", quality=quality,
-                                         reason="Insufficient reserved-validation improvement over background"))
-                    continue
-                accepted.append(dict(member, quality=quality))
+                accepted.append(dict(member, quality=quality, **fit_acceptance(
+                    dict(normalization_status="passed", quality=quality))))
             if accepted:
                 base = {p: load_scores(root, report, p, for_rebuild=True) for p in audit["partitions"]}
                 # Keep the saved prediction exactly when no fit was rejected and it is usable.
@@ -573,7 +626,7 @@ def riddle_plot_ensemble(root, report, *, io_workers=2):
                                        kind="WORK", level=1)
                         try:
                             predictions, _ = riddle_plot_predictions(root, report, member,
-                                {p: r["latent"] for p, r in base.items()})
+                                {p: r["latent"] for p, r in base.items()}, device=device)
                         except (NumericalFitError, FloatingPointError) as error:
                             excluded.append(dict(member, check="score_validity", reason=str(error)))
                             continue
@@ -589,6 +642,8 @@ def riddle_plot_ensemble(root, report, *, io_workers=2):
                     audit["status"] = "rebuilt_from_valid_fits" if excluded or not valid_saved_scores else "saved_ensemble"
     finally:
         torch.set_num_threads(previous_threads)
+        if cuda_devices:
+            torch.backends.cuda.matmul.allow_tf32 = previous_tf32
     audit.update(used_fits=len(accepted), used_members=accepted)
     if not accepted:
         return {}, audit
@@ -625,12 +680,13 @@ def unfiltered_plot_ensemble(root, report):
 class ScoreLoader:
     """Load saved method predictions once; ensemble members are not repeat runs."""
 
-    def __init__(self, *, safeguard_filtering=True, io_workers=2):
+    def __init__(self, *, safeguard_filtering=True, io_workers=2, device="cpu"):
         self.cache = {}
         self.validated = set()
         self.fit_audit = {}
         self.safeguard_filtering = safeguard_filtering
         self.io_workers = io_workers
+        self.device = plot_device_argument(device)
 
     def __call__(self, root, report, partition):
         identity = str(root.resolve())
@@ -641,7 +697,7 @@ class ScoreLoader:
                 if not self.safeguard_filtering:
                     records, audit = unfiltered_plot_ensemble(root, report)
                 elif legacy_riddle:
-                    records, audit = riddle_plot_ensemble(root, report, io_workers=self.io_workers)
+                    records, audit = riddle_plot_ensemble(root, report, io_workers=self.io_workers, device=self.device)
                 else:
                     records, audit = ranode_plot_ensemble(root, report)
                 self.fit_audit[identity] = audit
@@ -783,7 +839,7 @@ def make_bundle(group, confidence, score_loader=None):
         sample = {k: base[k] for k in ("mass", "labels", "mask")}
         sample["sr_masks"] = sr_masks
         sample.update({k + "_scores": r["scores"] for k, r in records.items()})
-        sample.update({k + "_fit_scores": r["fit_scores"] for k, r in records.items() if "fit_scores" in r})
+        sample.update({k + "_fit_scores": f.fit_scores(r) for k, r in records.items() if "fit_scores" in r})
         if partition == "signal_region":
             bundle["curves"]["signal_region"] = (
                 base["labels"][base["mask"]],
@@ -1563,7 +1619,7 @@ def physical_sr_record(record, sr=None):
     result = {k: record[k][sr] for k in ("mass", "labels", "physical", "scores", "mask")}
     if "fit_scores" in record:
         result["fit_scores"] = record["fit_scores"][:, sr]
-    for key in ("independent_runs", "run_seeds"):
+    for key in ("independent_runs", "run_seeds", "score_kind", "fit_score_kind", "plot_saved_ensemble"):
         if key in record:
             result[key] = record[key]
     return result
@@ -1588,16 +1644,12 @@ def background_cuts(record, budgets):
 
 
 def render_physical_working_points(validation, test, output, *, scenario=None, scope="signal_region"):
-    require_same_physical_population(validation)
     require_same_physical_population(test)
-    validation, test = (
-        {
-            m: physical_sr_record(r, scope_region(records, scope))
-            for m, r in records.items()
-        }
-        for records in (validation, test)
-    )
-    require_same_physical_population(validation)
+    # Calibration roles differ across methods; evaluation populations may not.
+    # Select each validation region independently, without aligning unrelated
+    # held-out rows or requiring them to match another method's training roles.
+    validation = {m: physical_sr_record(r, scope_region({m: r}, scope)) for m, r in validation.items()}
+    test = {m: physical_sr_record(r, scope_region(test, scope)) for m, r in test.items()}
     require_same_physical_population(test)
     base = next(iter(test.values()))
     edges = (np.linspace(3.3, 3.7, 21) if scope == "signal_region" else
@@ -1605,7 +1657,9 @@ def render_physical_working_points(validation, test, output, *, scenario=None, s
     inclusive = np.histogram(base["mass"][base["labels"] == 0], edges)[0]
     audit = []
     budgets = (0.10, 0.05, 0.01, 0.004)
-    cuts = {method: background_cuts(record, budgets) for method, record in validation.items()}
+    cuts = {method: ([np.array([np.log((1-b)/b)]) for b in budgets]
+                     if str(record.get("score_kind", "")) == "background_percentile_logit"
+                     else background_cuts(record, budgets)) for method, record in validation.items()}
     for index, budget in enumerate(budgets):
         selected, retention = {}, {}
         for method, val in validation.items():
@@ -1627,6 +1681,9 @@ def render_physical_working_points(validation, test, output, *, scenario=None, s
                     background_budget=budget,
                     cut=float(cut[0]) if len(cut) == 1 else cut.tolist(),
                     fit_count=len(cut),
+                    threshold_source=("analytic conditional-percentile threshold"
+                        if str(val.get("score_kind", "")) == "background_percentile_logit"
+                        else "MC validation-background quantile (diagnostic)"),
                     background_efficiency=retention[method][0],
                     signal_efficiency=retention[method][1],
                 )
@@ -2118,6 +2175,9 @@ def main(argv=None):
     parser.add_argument("--methods", nargs="+", default=None,
                         help="Optional method IDs to include; default: discover every completed method")
     parser.add_argument("--io-workers", type=int, default=2, help="CPU threads for numerical calculations and legacy RIDDLE checkpoint inference")
+    parser.add_argument("--device", type=plot_device_argument, default="cpu",
+                        help="RIDDLE safeguard/checkpoint inference device: cpu (default), cuda:<index>, "
+                             "or auto (CUDA when available, otherwise CPU); other plotting stays on CPU")
     parser.add_argument("--no-safeguard-filtering", action="store_true",
                         help="Disable plot-time RIDDLE/R-ANODE fit filtering and use saved ensemble scores; "
                              "does not undo production exclusions or disable artifact/finite-score validation")
@@ -2155,7 +2215,8 @@ def main(argv=None):
                 raise FileExistsError("Plot output exists; use --overwrite or choose a new output directory")
             if any(path.is_symlink() for path in args.output.rglob("*")):
                 raise ValueError("Cannot overwrite a plot directory containing symbolic links")
-        score_loader = ScoreLoader(safeguard_filtering=not args.no_safeguard_filtering, io_workers=args.io_workers)
+        score_loader = ScoreLoader(safeguard_filtering=not args.no_safeguard_filtering,
+                                   io_workers=args.io_workers, device=args.device)
         # Retain requested scopes so obsolete figures for skipped results are
         # removed too; do not leave an old invalid curve behind on --overwrite.
         requested_groups = {key: dict(group) for key, group in groups.items()}
@@ -2270,12 +2331,12 @@ def main(argv=None):
                             "comparison": "All available methods in their supported scope: signal region and full region; independent acceptance and uncut denominators",
                             "layout": "<scenario>/seed_<seed>/{comparison,<method label>}/; summaries in <scenario>/summary/{comparison,<method label>}/ only when combining multiple result directories; full-region panels in full_region/; injection_scan/{comparison,<method label>}/",
                             "uncertainty": audit,
-                            "cuts": "Truth-assisted MC benchmark: validation thresholds in the plotted region; frozen cuts evaluated on independent physical test rows",
+                            "cuts": "Calibrated RIDDLE: analytic percentile thresholds. Other scores: truth-assisted MC validation thresholds in the plotted region. Frozen cuts evaluated on independent physical test rows; each cut records its origin.",
                             "injection_scan": scan_audit,
                             "mass_cut_scan": {
                                 "thresholds": list(f.SCORE_CUTS),
                                 "comparison": "strict score > threshold",
-                                "score_coordinate": "LaCathode classifier score; sigmoid of RIDDLE log density ratio (not a signal probability)",
+                                "score_coordinate": "LaCathode classifier score; RIDDLE background percentile when score_kind=background_percentile_logit, otherwise sigmoid(log density ratio); neither density coordinate is a signal probability",
                                 "scope": "full physical test mass range",
                                 "retention_denominator": "all physical test events of the corresponding class, before cuts and mapping rejection",
                                 "panels_per_page": 6,
@@ -2288,6 +2349,9 @@ def main(argv=None):
                                 if any(a.get("checkpoint_inference") for a in score_loader.fit_audit.values())
                                 else "Saved predictions only; no checkpoint inference or modification of results"),
                             "safeguard_filtering": not args.no_safeguard_filtering,
+                            "requested_inference_device": args.device,
+                            "checkpoint_inference_devices": sorted({a["inference_device"] for a in
+                                score_loader.fit_audit.values() if a.get("checkpoint_inference")}),
                             "score_ensembles": list(score_loader.fit_audit.values()),
                             "invalid_fit_policy": ("RIDDLE: numerical validity and reserved-validation improvement, including legacy checkpoint evaluation. R-ANODE: numerical validity and mass support. Rebuild one accepted-fit ensemble across all partitions; skip results with no accepted fits. Production exclusions retained; no plot-time training/retries; no test-truth/AUC/SIC selection."
                                 if not args.no_safeguard_filtering else "Plot-time RIDDLE/R-ANODE safeguards disabled: use exact saved ensembles, retaining production exclusions. Artifact integrity, event alignment and finite-score checks remain active."),

@@ -89,6 +89,11 @@ def parser():
             "--epochs", type=positive, help="Override RIDDLE/R-ANODE signal-fit and LaCathode classifier epochs; background stages are unchanged"
         )
         run.add_argument("--fractions", nargs="+", help="Override YAML mixture-fraction configurations")
+        from .roles import POLICIES
+        run.add_argument("--data-policy", choices=tuple(POLICIES), help="Source-role policy; default production_v2 uses HC study mapping + production residual roles")
+        run.add_argument("--ensemble-completion", choices=("strict", "partial"), help="Require every requested fit, or explicitly retain a partial ensemble")
+        from .options import add_feature_arguments
+        add_feature_arguments(run)
         add_resume_options(run)
         run.add_argument("--verbose", type=int, choices=[0, 1, 2], default=1)
         if command == "run":

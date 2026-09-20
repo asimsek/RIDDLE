@@ -11,7 +11,9 @@ from riddle.storage import digest, file_digest
 from .model import PROTOCOL as SINGLE_PROTOCOL, background_log_prob, real_sr_latents
 from .training import train_residual, residual_scores
 from .integrity import SCIENTIFIC_VERSION
-from .production import PRODUCTION_POLICY, require_complete_members, require_complete_ensemble
+from .production import (PRODUCTION_POLICY, EVIDENCE_GATED_POLICY, fit_acceptance,
+                         require_complete_members, require_complete_ensemble)
+from .options import effective_features
 
 PROTOCOL = {
     **SINGLE_PROTOCOL,
@@ -19,7 +21,7 @@ PROTOCOL = {
     "campaign_version": SCIENTIFIC_VERSION,
     "ensemble": "equal-weight mean signal density over accepted fits and ten validation-selected epochs per fit",
     "splits": "80/20 resamples of development training rows; reserved validation reserved for configuration/cuts",
-    "failures": "bounded fresh retries for numerical or reserved-validation failures; exclude exhausted fits",
+    "failures": "bounded fresh retries for numerical failures only; retain inconclusive evidence without retries",
 }
 
 
@@ -78,11 +80,20 @@ def member_split(n, seed, index, *, batch_size=256):
     return (order[:count], order[count:], seeds[1])
 
 
-def assess_fit(directory, epochs, fractions, validation, device, *, sigma, normalization_tests):
+def assess_fit(directory, epochs, fractions, validation, device, *, sigma, normalization_tests,
+               mass_conditioning=False, background_reference=None, profile_validation=None,
+               fixed_coherent_fraction=None):
     """Validate selected checkpoints before any physical/test score is exported."""
     from .production import validate_density_ratio, validation_improvement
 
-    reference = np.random.default_rng(3407).standard_normal((8192, validation.shape[1])).astype(np.float32)
+    reference = (np.asarray(background_reference) if background_reference is not None else
+                 np.random.default_rng(3407).standard_normal((8192, validation.shape[1])).astype(np.float32))
+    if reference.shape != (8192, validation.shape[1]) or not np.isfinite(reference).all():
+        raise ValueError("Invalid background normalization reference")
+    if mass_conditioning and background_reference is None:
+        # Gaussian latents at reserved-data masses, independent of the latents.
+        # The conditional denominator has no Gaussian density factor for mass.
+        reference[:, -1] = np.random.default_rng(3408).choice(validation[:, -1], len(reference))
     rows = np.concatenate((validation, reference))
     mixture, reference_sum, checks = None, None, []
     with torch.random.fork_rng(devices=[] if str(device) == "cpu" else None):
@@ -96,34 +107,69 @@ def assess_fit(directory, epochs, fractions, validation, device, *, sigma, norma
                                     (np.log(weight) if weight > 0 else -np.inf) + valid)
             mixture = weighted if mixture is None else np.logaddexp(mixture, weighted)
     mixture -= np.log(len(epochs))
+    if profile_validation is not None:
+        from .enhancements import profile_fraction, mixture_gain
+        internal_ratio = residual_scores(directory, epochs, profile_validation, device)
+        coherent_fraction = (profile_fraction(internal_ratio) if fixed_coherent_fraction is None
+                             else fixed_coherent_fraction)
+        ratio = residual_scores(directory, epochs, validation, device)
+        mixture = mixture_gain(ratio, coherent_fraction)
+        write_json(directory / "coherent_mixture.json", dict(fraction=coherent_fraction,
+                   density="uniform mean of selected checkpoint densities", truth_labels_used=False,
+                   profiling_population="internal fit validation; not reserved evidence",
+                   validation_sha256=digest(profile_validation), fixed_fraction=fixed_coherent_fraction is not None))
     normalization = dict(status="passed", reference="independent standard normal",
                          reference_seed=3407, reference_samples=len(reference), checkpoints=checks,
                          ensemble=validate_density_ratio(reference_sum - np.log(len(epochs)),
                              stage=f"{directory} ensemble", tests=normalization_tests))
+    if mass_conditioning:
+        normalization.update(reference="independent standard-normal latents at reserved-validation masses",
+                             mass_context_seed=3408, conditional_density=True)
+    if background_reference is not None:
+        normalization.update(reference="frozen physical background flow sampled at reserved-validation masses",
+                             reference_sha256=digest(reference), conditional_density=True)
     quality = validation_improvement(mixture, sigma=sigma)
-    write_json(directory / "fit_health.json", dict(quality=quality, normalization=normalization))
+    if background_reference is not None:
+        quality["baseline"] = "frozen conditional background density in preprocessed physical coordinates"
+    health = dict(quality=quality, normalization=normalization)
+    health.update(fit_acceptance(health))
+    write_json(directory / "fit_health.json", health)
     return quality, normalization, mixture
 
 
 def train_member(rows, validation, output, *, relative, index, fraction, epochs, seed,
-                 device, initialization, settings, label, normalization_tests):
+                 device, initialization, settings, label, normalization_tests, background_reference=None, member_split_indices=None, source_ids=None):
     """One persisted attempt budget shared by sequential and spawned workers."""
     from .production import NumericalFitError
     from .storage import locked, save_npz
 
+    if (np.asarray(rows).ndim != 2 or np.asarray(validation).ndim != 2
+            or not np.isfinite(rows).all() or not np.isfinite(validation).all()):
+        raise ValueError("Invalid fit inputs; repair the input data before training, not through fit retries")
     root = Path(output) / relative
     root.mkdir(parents=True, exist_ok=True)
     policy = settings["fit_recovery"]
     a, b, first_seed = member_split(len(rows), seed, index,
                                    batch_size=settings["training"]["batch_size"])
+    if member_split_indices is not None:
+        from .roles import validate_member_split
+        a, b = validate_member_split(member_split_indices, len(rows))
+    if source_ids is not None:
+        if len(source_ids) != len(rows): raise ValueError("Member source identities are misaligned")
     seeds = [first_seed] + [int(np.random.SeedSequence([seed, index, 1380275289, i]).generate_state(1)[0])
                            for i in range(1, policy["max_retries"] + 1)]
     if len(set(seeds)) != len(seeds):
         raise ValueError("Fit retry seeds collided")
-    identity = dict(schema=1, scientific_version=SCIENTIFIC_VERSION, seed=seed, fit_index=index,
+    identity = dict(schema=2, scientific_version=SCIENTIFIC_VERSION, production_policy=PRODUCTION_POLICY,
+                    seed=seed, fit_index=index,
                     attempt_seeds=seeds, settings=settings, fraction=fraction,
                     training_sha256=digest(rows), validation_sha256=digest(validation),
                     normalization_tests=normalization_tests)
+    if background_reference is not None:
+        identity["background_reference_sha256"] = digest(background_reference)
+    if member_split_indices is not None:
+        identity["explicit_split"] = dict(train=digest(a), validation=digest(b))
+    if source_ids is not None: identity["source_ids_sha256"] = digest(source_ids)
     state_path = root / "attempts.json"
     with locked(root / ".resume/fit.lock"):
         if state_path.exists():
@@ -134,7 +180,7 @@ def train_member(rows, validation, output, *, relative, index, fraction, epochs,
             if (not isinstance(attempts, list) or len(attempts) > len(seeds)
                     or any(a.get("attempt") != i or a.get("seed") != seeds[i]
                            or a.get("directory") != str(Path(relative) / "attempts" / f"attempt_{i:03d}")
-                           or a.get("status") not in ("running", "completed", "numerical_failure", "validation_failure")
+                           or a.get("status") not in ("running", "completed", "numerical_failure")
                            or (i < len(attempts) - 1 and a.get("status") in ("running", "completed"))
                            for i, a in enumerate(attempts))):
                 raise ValueError("Invalid persisted fit attempt inventory")
@@ -150,11 +196,13 @@ def train_member(rows, validation, output, *, relative, index, fraction, epochs,
                     raise ValueError("Saved residual split changed")
         else:
             atomic_write(split_path, lambda p: save_npz(p, training=a, validation=b))
+        if source_ids is not None:
+            atomic_write(root / "event_roles.npz", lambda p: save_npz(p, train_ids=source_ids[a], validation_ids=source_ids[b], train_indices=a, validation_indices=b))
         terminal = root / "fit.json"
         if state.pop("invalidated_receipt", False):
             terminal.unlink(missing_ok=True)
             write_json(state_path, state)
-        # Verify every recorded attempt, including rejected evidence, on resume.
+        # Verify every recorded attempt, including numerical failures, on resume.
         for attempt in state["attempts"]:
             directory = Path(output) / attempt["directory"]
             if attempt.get("artifacts_sha256") is not None:
@@ -197,19 +245,30 @@ def train_member(rows, validation, output, *, relative, index, fraction, epochs,
                 weights = [history[e]["signal_fraction"] for e in order]
                 quality, normalization, mixture = assess_fit(
                     directory, order, weights, validation, device,
-                    sigma=policy["validation_sigma"], normalization_tests=normalization_tests)
+                    sigma=policy["validation_sigma"], normalization_tests=normalization_tests,
+                    mass_conditioning=settings.get("mass_conditioning", False),
+                    **({"profile_validation": real_sr_latents(rows[b]), "fixed_coherent_fraction": fraction}
+                       if effective_features(settings)["coherent_mixture"] else {}),
+                    **({"background_reference": background_reference} if background_reference is not None else {}))
                 # Kept alongside the selected density for configuration selection, never test labels.
                 from .storage import save_array
                 atomic_write(directory / "validation_log_mixture_ratio.npy", lambda p: save_array(p, mixture))
-                attempt.update(status="completed" if quality["status"] == "passed" else "validation_failure",
+                assessment = fit_acceptance(dict(quality=quality, normalization=normalization))
+                if not assessment["fit_valid"]:
+                    raise NumericalFitError("Incomplete or invalid fit health assessment")
+                attempt.update(status="completed", **assessment,
                                epochs=order, signal_fractions=weights, quality=quality,
                                normalization=normalization)
-                if attempt["status"] != "completed":
-                    attempt["error"] = "Insufficient reserved-validation improvement over background"
+                if "optimization" in settings:
+                    attempt["trained_epochs"] = len(history)
+                if assessment["evidence_status"] != "improved":
+                    emit_message(f"{label} | Numerically valid; evidence {assessment['evidence_status']}; "
+                                 "retained without retry", kind="INFO", level=0)
             except (FloatingPointError, NumericalFitError) as error:
                 attempt.update(status="numerical_failure", error=str(error), error_type=type(error).__name__)
             attempt["artifacts_sha256"] = {
-                p.name: file_digest(p) for p in directory.iterdir() if p.is_file()
+                str(p.relative_to(directory)): file_digest(p) for p in directory.rglob("*")
+                if p.is_file() and ".resume" not in p.relative_to(directory).parts
             }
             write_json(state_path, state)
             if attempt["status"] == "completed":
@@ -230,7 +289,8 @@ def train_member(rows, validation, output, *, relative, index, fraction, epochs,
 def train_campaign(
     train, validation, output, *, epochs=DEFAULTS["riddle"]["epochs"],
     runs=DEFAULTS["riddle"]["runs"], seed=0, device="cpu", fraction_values=(None,),
-    initialization="background", started=None, workers=1, io_workers=2, settings=None,
+    initialization="background", started=None, workers=1, io_workers=2, settings=None, background_reference=None,
+    selection_validation=None, member_splits=None, source_ids=None,
 ):
     settings = deepcopy(DEFAULTS["riddle"] if settings is None else settings)
     settings.update(epochs=epochs, runs=runs, initialization=initialization)
@@ -239,13 +299,36 @@ def train_campaign(
     output.mkdir(parents=True, exist_ok=True)
     if min(runs, workers, io_workers) < 1:
         raise ValueError("Require positive runs/workers/io_workers")
-    ztrain, zval = real_sr_latents(train), real_sr_latents(validation)
-    rows = np.column_stack((np.full(len(ztrain), 3.5), ztrain,
-                            np.ones(len(ztrain)), np.zeros(len(ztrain)))).astype(np.float32)
+    mass_conditioning = settings.get("mass_conditioning", False)
+    physical_inputs = settings.get("input_space") == "physical"
+    if physical_inputs and (background_reference is None or workers != 1):
+        raise ValueError("Physical pilot requires a frozen-background reference and one fit worker")
+    if background_reference is not None and not physical_inputs:
+        raise ValueError("Custom background reference is only supported by the physical pilot")
+    ztrain, zval = (real_sr_latents(rows, mass_conditioning=mass_conditioning,
+                                  physical_inputs=physical_inputs) for rows in (train, validation))
+    zselection = (None if selection_validation is None else real_sr_latents(selection_validation))
+    coherent = effective_features(settings)["coherent_mixture"]
+    if coherent and zselection is None:
+        raise ValueError("Coherent mixture requires separate internal selection and reserved evidence populations")
+    if mass_conditioning:
+        rows = train[train[:, -2] == 1].copy()
+        rows[:, -1] = 0  # Truth is never used by the density fit.
+    else:
+        rows = np.column_stack((np.full(len(ztrain), 3.5), ztrain,
+                                np.ones(len(ztrain)), np.zeros(len(ztrain)))).astype(np.float32)
     identity = dict(scientific_version=SCIENTIFIC_VERSION, production_policy=PRODUCTION_POLICY,
                     training_sha256=digest(ztrain), selection_sha256=digest(zval),
                     epochs=epochs, runs=runs, seed=seed, fractions=list(fraction_values),
                     initialization=initialization, settings=settings)
+    if background_reference is not None:
+        identity["background_reference_sha256"] = digest(background_reference)
+    if zselection is not None:
+        identity["internal_selection_sha256"] = digest(zselection)
+    if member_splits is not None:
+        if set(member_splits) != set(range(runs)): raise ValueError("Explicit splits required for every member")
+        identity["explicit_splits"] = {str(i): {k:digest(v) for k,v in split.items()} for i,split in member_splits.items()}
+    if source_ids is not None: identity["source_ids_sha256"] = digest(source_ids)
     identity_path = output / "ensemble_inputs.json"
     if identity_path.exists() and json.loads(identity_path.read_text()) != identity:
         raise ValueError("Residual ensemble inputs/settings changed; use a new output")
@@ -258,17 +341,21 @@ def train_campaign(
                  relative=str(Path(tag) / f"run_{i:03d}"),
                  directory=str(output / tag / f"run_{i:03d}"))
             for c, tag in enumerate(tags) for i in range(runs)]
+    for job in jobs:
+        job["member_split_indices"] = None if member_splits is None else member_splits[job["index"]]
     if workers > 1:
         from .parallel import run_fits
         run_fits(rows, jobs, validation=zval, epochs=epochs, seed=seed, device=device,
                  initialization=initialization, workers=workers, io_workers=io_workers,
-                 total=total, started=started, settings=settings, normalization_tests=tests)
+                 total=total, started=started, settings=settings, normalization_tests=tests, source_ids=source_ids)
     else:
         for job in jobs:
             train_member(rows, zval, output, relative=job["relative"], index=job["index"],
                          fraction=job["fraction"], epochs=epochs, seed=seed, device=device,
                          initialization=initialization, settings=settings,
-                         label=f"RIDDLE fit {job['fit']}/{total}", normalization_tests=tests)
+                         label=f"RIDDLE fit {job['fit']}/{total}", normalization_tests=tests,
+                         member_split_indices=job["member_split_indices"], source_ids=source_ids,
+                         **({"background_reference": background_reference} if background_reference is not None else {}))
     configs, failures = [], []
     for tag in tags:
         receipts = [json.loads((output / tag / f"run_{i:03d}" / "fit.json").read_text()) for i in range(runs)]
@@ -282,27 +369,67 @@ def train_campaign(
             require_complete_members(members, runs, checkpoints, configuration=tag, allow_excluded=True)
             mixtures = [np.load(output / m["directory"] / "validation_log_mixture_ratio.npy") for m in members]
             combined = np.logaddexp.reduce(mixtures, axis=0) - np.log(len(members))
+            selection_gain = None
+            if zselection is not None:
+                # A single ensemble density and coefficient, profiled on a common
+                # sample withheld from every member, never on evidence/test rows.
+                from .enhancements import profile_fraction, mixture_gain
+                ratios = [residual_scores(output / m["directory"], m["epochs"], zselection, device)
+                          for m in members]
+                internal = np.logaddexp.reduce(ratios, axis=0)-np.log(len(members))
+                if coherent:
+                    weight = profile_fraction(internal) if config["fraction"] is None else config["fraction"]
+                    config["coherent_mixture"] = dict(fraction=weight, density="uniform mean over fits and checkpoints",
+                        validation_sha256=digest(zselection), selection_events=len(zselection), truth_labels_used=False)
+                    evidence_ratio = np.logaddexp.reduce([
+                        residual_scores(output / m["directory"], m["epochs"], zval, device) for m in members], axis=0)-np.log(len(members))
+                    combined = mixture_gain(evidence_ratio, weight)
+                    selection_gain = mixture_gain(internal, weight)
+                else:
+                    # Preserve checkpoint-specific fractions when coherence is disabled.
+                    terms = [mixture_gain(residual_scores(output / m["directory"], [e], zselection, device), w)
+                             for m in members for e, w in zip(m["epochs"], m["signal_fractions"])]
+                    selection_gain = np.logaddexp.reduce(terms, axis=0)-np.log(len(terms))
+            from .production import validation_improvement
+            config["health"] = dict(normalization_status="passed",
+                quality=validation_improvement(combined, sigma=settings["fit_recovery"]["validation_sigma"]))
+            config["health"].update(fit_acceptance(config["health"]))
             config["selection_nll"] = -float(np.mean(
-                background_log_prob(torch.from_numpy(zval)).numpy().astype(np.float64) + combined))
+                background_log_prob(torch.from_numpy(zselection if zselection is not None else zval), mass_conditioning=mass_conditioning,
+                                    physical_inputs=physical_inputs).numpy().astype(np.float64)
+                + (selection_gain if selection_gain is not None else combined)))
             histories = [json.loads((output / m["directory"] / "residual_losses.json").read_text())["history"]
                          for m in members]
-            config["history"] = [dict(epoch=e, **{key: float(np.mean([h[e][key] for h in histories]))
-                for key in ("train_nll", "validation_nll", "signal_fraction")}) for e in range(epochs)]
+            config["history"] = [dict(epoch=e, **{key: float(np.mean([h[e][key] for h in histories if e < len(h)]))
+                for key in ("train_nll", "validation_nll", "signal_fraction")},
+                **(dict(contributing_fits=sum(e < len(h) for h in histories)) if "optimization" in settings else {}))
+                for e in range(max(map(len, histories)))]
         configs.append(config)
     usable = [c for c in configs if c["members"]]
     result = dict(status="completed" if usable else "no_accepted_fits", production_policy=PRODUCTION_POLICY,
                   requested_runs=runs, checkpoints_per_run=checkpoints, configurations=configs,
                   failures=failures, fit_recovery=settings["fit_recovery"],
-                  selection="reserved-validation mixture likelihood; no truth or test-score selection")
+                  selection=("internal selection likelihood; reserved evidence never selects configurations"
+                             if zselection is not None else "reserved-validation mixture likelihood; no truth or test-score selection"))
+    result['ensemble_completion'] = settings.get('ensemble_completion', 'partial')
     write_json(output / "numerical_failures.json", {"failures": failures})
     if not usable:
         write_json(output / "ensemble_selection.json", result)
         from .production import IncompleteEnsembleError
         raise IncompleteEnsembleError("RIDDLE: no fits passed after bounded retries; no physics result was produced. "
                                       "Inspect density/ensemble_selection.json and the fit attempt records.")
+    if settings.get("ensemble_completion", "partial") == "strict" and any(len(c["members"]) != runs for c in configs):
+        from .production import IncompleteEnsembleError
+        result["status"] = "incomplete_strict_ensemble"
+        write_json(output / "ensemble_selection.json", result)
+        raise IncompleteEnsembleError("Strict ensemble incomplete after bounded retries; artifacts preserved")
     chosen = min(usable, key=lambda c: c["selection_nll"])
     result.update(selected_configuration=chosen["name"], members=chosen["members"],
+                  health=chosen["health"], production_ready=False,
                   valid_runs=len(chosen["members"]), selected_checkpoints=len(chosen["members"]) * checkpoints)
+    if coherent:
+        result["coherent_mixture"] = chosen["coherent_mixture"]
+        write_json(output / "coherent_mixture.json", chosen["coherent_mixture"])
     require_complete_ensemble(result)
     write_json(output / "ensemble_selection.json", result)
     write_json(output / "residual_losses.json", dict(history=chosen["history"], aggregation="mean over accepted fits"))
@@ -318,13 +445,16 @@ def validate_normalization(output, features, device):
     root = Path(output)
     selection = json.loads((root / "ensemble_selection.json").read_text())
     require_complete_ensemble(selection)
-    if selection["production_policy"] == PRODUCTION_POLICY:
+    if selection["production_policy"] in (PRODUCTION_POLICY, EVIDENCE_GATED_POLICY):
         members = []
         for member in selection["members"]:
             directory = root / member["directory"]
             verify_artifacts(directory, member["artifacts_sha256"], "Verify accepted RIDDLE density")
             health = json.loads((directory / "fit_health.json").read_text())
-            if health != dict(quality=member["quality"], normalization=member["normalization"]):
+            expected = dict(quality=member["quality"], normalization=member["normalization"])
+            if selection["production_policy"] == PRODUCTION_POLICY:
+                expected.update(fit_acceptance(expected))
+            if health != expected:
                 raise ValueError("Selected RIDDLE fit health disagrees with its acceptance receipt")
             members.append(dict(directory=member["directory"], **health["normalization"]))
         audit = dict(schema=1, status="passed", features=features, members=members,

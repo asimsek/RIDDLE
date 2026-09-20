@@ -13,9 +13,71 @@ from .model import (
     real_sr_latents,
     train_epoch,
     background_log_prob,
+    signal_log_prob,
     residual_optimizer,
 )
 from .integrity import SCIENTIFIC_VERSION, ordered_epochs
+from .options import feature_options, effective_features
+
+ENHANCED_TRAINING_PROTOCOL = "study_parity_validation_rng_v2"
+
+
+def enhanced_epoch(model, logit, ztrain, optimizer, options, additions, *, epoch, seed, guide,
+                   fixed_fraction=False, progress=None):
+    """Guided EM or ordinary mixture fitting, with independent contrastive control."""
+    from .enhancements import chunks, contrastive_loss, clip_gradients, standard_normal_log_prob
+    from .integrity import mixture_log_density, require_finite
+    device = logit.device
+    z = torch.from_numpy(ztrain)
+    logb = standard_normal_log_prob(z)
+    model.eval()
+    guided = additions["guided_fit"]
+    warm = guided and epoch < additions["guide_warmup_epochs"]
+    if warm:
+        weights = guide
+    else:
+        logs = chunks(model.log_prob, z, device=device)
+        old_logit = logit.detach().cpu()
+        weights = (torch.nn.functional.logsigmoid(old_logit)+logs-mixture_log_density(logs, logb, old_logit)).exp().detach().float()
+        if guided and not fixed_fraction:
+            fraction = float(weights.double().mean().clamp(1e-8, 1-1e-8))
+            with torch.no_grad():
+                logit.fill_(np.log(fraction/(1-fraction)))
+    mean_weight = float(weights.double().mean())
+    if mean_weight <= 0 or not np.isfinite(mean_weight):
+        raise FloatingPointError("Invalid residual responsibilities")
+    loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(z, logb, weights),
+                                         batch_size=options["batch_size"], shuffle=True)
+    total = contrast = 0.
+    for step, (xb, lb, w) in enumerate(loader):
+        xb, lb, w = xb.to(device), lb.to(device), w.to(device)
+        model.train(); optimizer.zero_grad()
+        log_signal = model.log_prob(xb)
+        loss = (-(w*log_signal).mean()/mean_weight if guided else
+                -mixture_log_density(log_signal, lb, logit).mean())
+        nc = torch.zeros((), device=device)
+        if additions["contrastive_fit"]:
+            # Reference samples must not change BatchNorm running statistics.
+            model.eval()
+            gen = torch.Generator().manual_seed(int(seed)+600000+epoch*10000+step)
+            ref = torch.randn(xb.shape, generator=gen).to(device)
+            both = model.log_prob(torch.cat((xb, ref)))
+            nc = contrastive_loss(both[:len(xb)]-lb, both[len(xb):]-standard_normal_log_prob(ref), w, mean_weight)
+            loss = loss + additions["contrastive_strength"]*nc
+            model.train()
+        require_finite(loss, "Residual objective")
+        loss.backward()
+        if logit.requires_grad:
+            require_finite(logit.grad, "Mixture-fraction gradient")
+        clip_gradients(model.parameters(), options["gradient_clip_norm"])
+        optimizer.step(); total += float(loss.detach())*len(xb); contrast += float(nc.detach())*len(xb)
+        if progress:
+            progress(step+1, len(loader))
+    model.eval()
+    nll = -float(mixture_log_density(chunks(model.log_prob, z, device=device), logb, logit.detach().cpu()).double().mean())
+    return nll, dict(train_objective=total/len(z), contrastive_loss=contrast/len(z),
+                     phase="guided_initialization" if warm else "alternating_mixture" if guided else "mixture_likelihood",
+                     effective_residual_events=float(weights.sum().square()/weights.square().sum()))
 
 
 def validate_checkpoint(checkpoint, epochs):
@@ -66,6 +128,15 @@ def train_residual(
     settings.update(epochs=epochs, initialization=initialization)
     settings = validate_residual(settings)
     options = settings["training"]
+    additions = feature_options(settings)
+    active = effective_features(settings)
+    enhanced = active["guided_fit"] or active["contrastive_fit"]
+    if (checkpoint is not None and enhanced
+            and checkpoint.get("enhanced_training_protocol") != ENHANCED_TRAINING_PROTOCOL):
+        raise ValueError("Enhanced training protocol changed; keep the original runtime or start a new output")
+    control = settings.get("optimization", {})
+    warmup = (additions["guide_warmup_epochs"] if active["guided_fit"] else
+              control.get("fraction_warmup_epochs", 0) if fraction is None else 0)
     if checkpoint is not None:
         validate_checkpoint(checkpoint, epochs)
         if checkpoint.get("settings") != settings:
@@ -80,7 +151,10 @@ def train_residual(
     progress = ProgressStage(
         "residual_training", progress_label, epochs, "epoch", initial=start, report_every=1
     )
-    ztrain, zval = real_sr_latents(train), real_sr_latents(validation)
+    mass_conditioning = settings.get("mass_conditioning", False)
+    physical_inputs = settings.get("input_space") == "physical"
+    ztrain, zval = (real_sr_latents(rows, mass_conditioning=mass_conditioning,
+                                  physical_inputs=physical_inputs) for rows in (train, validation))
     if len(ztrain) % options["batch_size"] == 1 and settings["flow"]["use_batch_norm"]:
         raise ValueError("BatchNorm cannot train a singleton final batch; no rows were dropped")
     train_loader = torch.utils.data.DataLoader(
@@ -98,7 +172,7 @@ def train_residual(
         build_signal_flow(device, features=ztrain.shape[1], settings=settings),
         initial_fraction_logit(seed, device),
     )
-    if initialization == "background":
+    if initialization in ("background", "identity"):
         from .model import match_background
 
         match_background(model)
@@ -108,17 +182,41 @@ def train_residual(
         if not np.isfinite(fraction) or not 0 < fraction < 1:
             raise ValueError("Fixed signal fraction must lie in (0,1)")
         logit = torch.tensor(np.log(fraction / (1 - fraction)), dtype=torch.float64, device=device)
+    elif control.get("initial_fraction") is not None:
+        initial = control["initial_fraction"]
+        with torch.no_grad():
+            logit.fill_(np.log(initial / (1 - initial)))
+    initial_fraction = float(logit.sigmoid().detach())
+    if active["guided_fit"]:
+        logit.requires_grad_(False)
     optimizer = residual_optimizer(model, logit, options)
+    scheduler = None
+    if control.get("lr_factor", 1) < 1:
+        # Only the flow learning rate changes; fraction learning stays unchanged.
+        minimum = [control["min_lr"]] + [options["learning_rate"]] * (len(optimizer.param_groups) - 1)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=control["lr_factor"], patience=control["lr_patience"],
+            threshold=control["min_delta"], threshold_mode="abs", min_lr=minimum)
     history, files, start = [], {}, 0
     if checkpoint is not None:
         model.load_state_dict(checkpoint["model"])
         with torch.no_grad():
             logit.copy_(checkpoint["fraction_logit"].to(device))
         optimizer.load_state_dict(checkpoint["optimizer"])
+        if scheduler is not None:
+            scheduler.load_state_dict(checkpoint["scheduler"])
         history, files, start = checkpoint["history"], checkpoint["files"], checkpoint["epoch"] + 1
         restore_rng(checkpoint["rng"])
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
+    guide = None
+    if active["guided_fit"]:
+        from .enhancements import teacher_weights
+        before = rng_state()
+        guide = teacher_weights(output / "guide", ztrain, initial_fraction,
+                                seed=(int(seed)+2000) % 2**32, options={**additions, **active},
+                                batch_size=options["batch_size"], device=device)
+        restore_rng(before)
     write_json(
         output / "residual_training_inputs.json",
         {
@@ -129,22 +227,56 @@ def train_residual(
             "validation_latents_sha256": digest(zval),
             "data_reference_label": 1,
             "truth_labels_used": False,
-            "mass_input_used": False,
-            "initial_fraction": float(initial_fraction_logit(seed).sigmoid().detach())
-            if fraction is None
-            else fraction,
+            "mass_input_used": mass_conditioning,
+            "initial_fraction": initial_fraction,
             "fraction_mode": "learned" if fraction is None else "fixed",
             "initialization": initialization,
             "settings": settings,
+            "effective_features": active,
+            "fraction_estimator": "guided responsibilities" if active["guided_fit"] else "gradient likelihood",
+            "enhanced_training_protocol": ENHANCED_TRAINING_PROTOCOL if enhanced else None,
             "features": ztrain.shape[1],
         },
     )
     if on_training_start is not None:
         on_training_start()
+    best, stale = float("inf"), 0
+    for row in history[warmup:]:
+        if row["validation_nll"] < best - control.get("min_delta", 0):
+            best, stale = row["validation_nll"], 0
+        else:
+            stale += 1
+    stopped = bool(checkpoint and checkpoint.get("stopped_early", False))
+    if stopped:
+        start = epochs
     for epoch in range(start, epochs):
+        if fraction is None and not active["guided_fit"]:
+            # Optimizer retains the fraction parameter, but receives no gradient
+            # during warm-up. No optimizer state is created for it until release.
+            logit.requires_grad_(epoch >= warmup)
         losses = {}
+        flow_lr = optimizer.param_groups[0]["lr"]
+        diagnostics = {}
         for part, loader, opt in (("train", train_loader, optimizer), ("validation", val_loader, None)):
             progress.substep(part.title(), 0, len(loader))
+            if part == "train" and enhanced:
+                losses["train_nll"], diagnostics = enhanced_epoch(
+                    model, logit, ztrain, optimizer, options, additions, epoch=epoch, seed=seed, guide=guide,
+                    fixed_fraction=fraction is not None,
+                    progress=lambda done, total: progress.substep("Train", done, total))
+                continue
+            if part == "validation" and enhanced:
+                # DataLoader iteration draws a base seed even without shuffle.
+                # Validation must not perturb the next training permutation or
+                # dropout stream. Match the study's chunked, float64 reduction.
+                from .enhancements import chunks, standard_normal_log_prob
+                from .integrity import mixture_log_density
+                model.eval()
+                valid = torch.from_numpy(zval)
+                losses["validation_nll"] = -float(mixture_log_density(
+                    chunks(model.log_prob, valid, device=device), standard_normal_log_prob(valid),
+                    logit.detach().cpu()).double().mean())
+                continue
             losses[part + "_nll"] = train_epoch(
                 model,
                 logit,
@@ -153,11 +285,23 @@ def train_residual(
                 lambda done, total: progress.substep(part.title(), done, total),
                 gradient_clip_norm=options["gradient_clip_norm"],
             )
-        fraction = float(logit.sigmoid().detach())
-        if not np.isfinite([*losses.values(), fraction]).all():
+        fitted_fraction = float(logit.sigmoid().detach())
+        if not np.isfinite([*losses.values(), fitted_fraction]).all():
             raise FloatingPointError("Nonfinite residual training state")
-        row = {"epoch": epoch, **losses, "signal_fraction": fraction}
+        row = {"epoch": epoch, **losses, "signal_fraction": fitted_fraction, **diagnostics}
+        if control:
+            row.update(flow_learning_rate=flow_lr, fraction_warmup=epoch < warmup)
         history.append(row)
+        if epoch >= warmup:
+            if scheduler is not None:
+                scheduler.step(losses["validation_nll"])
+            if losses["validation_nll"] < best - control.get("min_delta", 0):
+                best, stale = losses["validation_nll"], 0
+            else:
+                stale += 1
+        stopped = bool(control.get("early_stopping_patience", 0)
+                       and epoch + 1 >= control["minimum_epochs"]
+                       and stale >= control["early_stopping_patience"])
         name = f"residual_epoch_{epoch}.pt"
         progress.update(force=True, operation="Save residual checkpoint", minibatch="-")
         atomic_write(
@@ -178,14 +322,21 @@ def train_residual(
             "history": history,
             "files": files,
             "settings": settings,
+            "enhanced_training_protocol": ENHANCED_TRAINING_PROTOCOL if enhanced else None,
         }
+        if control:
+            state.update(stopped_early=stopped, scheduler=scheduler.state_dict() if scheduler else None)
         atomic_write(output / ".resume/latest.pt", lambda p: torch.save(state, p))
         write_json(output / "residual_losses.json", {"history": history})
-        progress.update(epoch + 1, force=True, operation="Epoch complete", **losses, fraction=fraction)
+        progress.update(epoch + 1, force=True, operation="Early stop" if stopped else "Epoch complete",
+                        **losses, fraction=fitted_fraction)
         if after_epoch is not None:
             after_epoch(epoch)
+        if stopped:
+            break
     write_json(output / "residual_losses.json", {"history": history})
-    order = ordered_epochs([r["validation_nll"] for r in history], options["selected_checkpoints"])
+    order = [i + warmup for i in ordered_epochs(
+        [r["validation_nll"] for r in history[warmup:]], options["selected_checkpoints"])]
     write_json(
         output / "residual_selection.json",
         {
@@ -193,6 +344,8 @@ def train_residual(
             "criterion": f"{options['selected_checkpoints']} lowest validation mixture NLL epochs",
             "density_ensemble": "arithmetic mean",
             "signal_fractions": [history[i]["signal_fraction"] for i in order],
+            **(dict(trained_epochs=len(history), maximum_epochs=epochs, stopped_early=stopped,
+                    excluded_warmup_epochs=warmup) if control or enhanced else {}),
         },
     )
     return order, history
@@ -207,8 +360,22 @@ def residual_scores(output, order, z, device, *, normalization_checks=None, norm
     if inputs["features"] != z.shape[1]:
         raise ValueError("Scoring feature count differs from training")
     model = build_signal_flow(device, features=z.shape[1], settings=inputs["settings"]).eval()
-    log_background = background_log_prob(torch.from_numpy(z)).numpy()
+    from .roles import DEFAULT_POLICY, REPLAY_SCORING_POLICIES
+    policy = inputs['settings'].get('data_policy', DEFAULT_POLICY)
+    replay = policy in REPLAY_SCORING_POLICIES
+    if replay:
+        # Historical diagnostic replay uses the independent study arithmetic.
+        # Both production_v1 and the HC-derived production_v2 use the normal
+        # production scoring path so multi-fit production is not treated as a
+        # study-replay diagnostic.
+        from .enhancements import standard_normal_log_prob
+        log_background = standard_normal_log_prob(torch.from_numpy(z).double()).numpy()
+    else:
+        log_background = background_log_prob(torch.from_numpy(z), mass_conditioning=model.mass_conditioning,
+                                             physical_inputs=model.physical_inputs).numpy()
     log_sum = None
+    columns = []
+    batch = 4096 if replay else 8192
     with ProgressStage(
         "residual_scoring", "Score residual density ensemble", len(order) * len(z), "prediction"
     ) as progress:
@@ -223,10 +390,10 @@ def residual_scores(output, order, z, device, *, normalization_checks=None, norm
                     raise ValueError("Residual checkpoint epoch differs from requested selection")
                 model.load_state_dict(checkpoint["model"])
                 chunks = []
-                for offset in range(0, len(z), 8192):
-                    x = torch.as_tensor(z[offset : offset + 8192], device=device)
-                    chunks.append(model.log_prob(x).cpu().numpy())
-                    progress.update(i * len(z) + min(offset + 8192, len(z)))
+                for offset in range(0, len(z), batch):
+                    x = torch.as_tensor(z[offset : offset + batch], device=device)
+                    chunks.append(signal_log_prob(model, x).cpu().numpy())
+                    progress.update(i * len(z) + min(offset + batch, len(z)))
                 log_density = np.concatenate(chunks).astype(np.float64)
                 if not np.isfinite(log_density).all():
                     raise FloatingPointError("Nonfinite residual checkpoint density")
@@ -237,7 +404,11 @@ def residual_scores(output, order, z, device, *, normalization_checks=None, norm
                         log_density - log_background.astype(np.float64),
                         stage=f"RIDDLE {output}, checkpoint {epoch}", tests=normalization_tests)))
                 log_sum = log_density if log_sum is None else np.logaddexp(log_sum, log_density)
+                if replay: columns.append(log_density)
     log_signal = log_sum - np.log(len(order))
+    if replay:
+        from scipy.special import logsumexp
+        log_signal = logsumexp(np.column_stack(columns), axis=1)-np.log(len(order))
     scores = log_signal.astype(np.float64) - log_background.astype(np.float64)
     if not np.isfinite(scores).all():
         raise FloatingPointError("Nonfinite residual ensemble scores")

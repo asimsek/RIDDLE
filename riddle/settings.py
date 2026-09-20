@@ -29,21 +29,57 @@ def number(value, label, minimum=0, maximum=math.inf, *, strict=True):
 
 def validate_residual(value):
     value = deepcopy(value)
+    from .options import DEFAULT_ENHANCEMENTS, FEATURES, feature_options
+    supplied = value.get("enhancements", {})
+    if not isinstance(supplied, dict) or set(supplied) - DEFAULT_ENHANCEMENTS.keys():
+        raise ValueError("Invalid RIDDLE enhancement settings")
+    value["enhancements"] = e = feature_options(value)
+    for name in FEATURES:
+        if type(e[name]) is not bool:
+            raise ValueError(f"{name} must be boolean")
+    for name in ("guide_epochs", "score_flow_epochs", "rosenblatt_bins", "rosenblatt_hidden"):
+        integer(e[name], name, 2)
+    for name in ("guide_warmup_epochs", "hard_start_epoch"):
+        integer(e[name], name, 0)
+    for name in ("hard_pool_fraction", "hard_sampling_fraction"):
+        number(e[name], name, maximum=1)
+    for name in ("contrastive_strength", "rosenblatt_bound"):
+        number(e[name], name)
+    if e["guided_fit"] and e["hard_bg"] and e["hard_start_epoch"] >= e["guide_epochs"]:
+        raise ValueError("Hard-background mining must start before the last guide epoch")
     if isinstance(value, dict) and "fits" in value:
         if "runs" in value:
             raise ValueError("Use fits, or the legacy runs key, not both")
         value["runs"] = value.pop("fits")
     # Older configuration files acquire the current, recorded recovery policy.
     value.setdefault("fit_recovery", {"max_retries": 2, "validation_sigma": 2.0})
-    keys(value, "runs epochs fractions initialization flow training fit_recovery", "RIDDLE")
+    # production_v2 is the HC-derived production baseline: study mapping roles
+    # with the normal production residual/member policy.
+    from .roles import DEFAULT_POLICY
+    value.setdefault("data_policy", DEFAULT_POLICY)
+    # Optional pilot ablation; the resolved data policy is always explicit.
+    extra = "".join(" " + k for k in ("mass_conditioning", "input_space", "optimization", "data_policy", "ensemble_completion") if k in value)
+    keys(value, "runs epochs fractions initialization flow training fit_recovery enhancements" + extra, "RIDDLE")
+    if "data_policy" in value:
+        from .roles import policy_parts, DIAGNOSTIC_POLICIES
+        policy_parts(value["data_policy"])
+        if value["data_policy"] in DIAGNOSTIC_POLICIES and (value["runs"] != 1 or not all(e[k] for k in FEATURES)):
+            raise ValueError("Diagnostic role replay requires one fit and all six features")
+    if value.get("ensemble_completion", "partial") not in ("strict", "partial"):
+        raise ValueError("ensemble_completion must be strict or partial")
+    if "mass_conditioning" in value and type(value["mass_conditioning"]) is not bool:
+        raise ValueError("mass_conditioning must be boolean")
+    if "input_space" in value and (value["input_space"] != "physical" or not value.get("mass_conditioning")):
+        raise ValueError("input_space is only supported for the physical, mass-conditioned pilot")
     recovery = value["fit_recovery"]
     keys(recovery, "max_retries validation_sigma", "fit recovery")
     integer(recovery["max_retries"], "max_retries", 0)
     number(recovery["validation_sigma"], "validation_sigma", strict=False)
     integer(value["runs"], "fits")
     integer(value["epochs"], "epochs")
-    if value["initialization"] not in ("background", "random"):
-        raise ValueError("Initialization must be background or random")
+    allowed = ("identity", "random") if value.get("input_space") == "physical" else ("background", "random")
+    if value["initialization"] not in allowed:
+        raise ValueError("Initialization must be " + " or ".join(allowed))
     fractions = value["fractions"]
     if not isinstance(fractions, list) or not fractions:
         raise ValueError("Provide at least one mixture-fraction configuration")
@@ -61,6 +97,8 @@ def validate_residual(value):
         raise ValueError("Duplicate mixture fractions")
     value["fractions"] = normalized
     f, t = value["flow"], value["training"]
+    from .roles import validate_replay_batch
+    validate_replay_batch(value["data_policy"], t["batch_size"])
     keys(
         f,
         "layers hidden_features num_blocks use_residual_blocks use_batch_norm dropout_probability activation random_mask num_bins tails tail_bound min_bin_width min_bin_height min_derivative",
@@ -92,6 +130,38 @@ def validate_residual(value):
     number(t["weight_decay"], "weight_decay", strict=False)
     if value["epochs"] < t["selected_checkpoints"]:
         raise ValueError("Epochs must cover the number of selected checkpoints")
+    if e["guided_fit"] and e["guide_warmup_epochs"] + t["selected_checkpoints"] > value["epochs"]:
+        raise ValueError("Require enough post-guidance epochs for checkpoint selection")
+    if value.get("mass_conditioning") and any(e[k] for k in FEATURES):
+        raise ValueError("Legacy mass/physical pilots require all six RIDDLE enhancements disabled")
+    if "optimization" in value:
+        defaults = dict(initial_fraction=None, fraction_warmup_epochs=0,
+                        lr_factor=1.0, lr_patience=10, min_lr=1e-5,
+                        min_delta=1e-5, early_stopping_patience=0, minimum_epochs=40)
+        supplied = value["optimization"]
+        if not isinstance(supplied, dict) or set(supplied) - defaults.keys():
+            raise ValueError("Invalid residual optimization settings")
+        o = value["optimization"] = {**defaults, **supplied}
+        if o["initial_fraction"] is not None:
+            number(o["initial_fraction"], "initial_fraction", maximum=1)
+        for name in ("fraction_warmup_epochs", "early_stopping_patience"):
+            integer(o[name], name, 0)
+        for name in ("lr_patience", "minimum_epochs"):
+            integer(o[name], name)
+        number(o["lr_factor"], "lr_factor", maximum=1.00000001)
+        if o["lr_factor"] > 1:
+            raise ValueError("lr_factor must be at most 1")
+        number(o["min_lr"], "min_lr")
+        number(o["min_delta"], "min_delta", strict=False)
+        if o["lr_factor"] < 1 and o["min_lr"] > t["learning_rate"]:
+            raise ValueError("min_lr exceeds the starting learning rate")
+        if o["fraction_warmup_epochs"] + t["selected_checkpoints"] > value["epochs"]:
+            raise ValueError("Require enough post-warm-up epochs for checkpoint selection")
+        effective_warmup = e["guide_warmup_epochs"] if e["guided_fit"] else o["fraction_warmup_epochs"]
+        if o["early_stopping_patience"] and not (
+            effective_warmup + t["selected_checkpoints"] <= o["minimum_epochs"] <= value["epochs"]
+        ):
+            raise ValueError("Invalid minimum_epochs for early stopping")
     return value
 
 
@@ -121,9 +191,14 @@ def load_settings(path=DEFAULT_PATH):
         raise ValueError("Background configuration must be a nested YAML mapping")
     keys(
         b["configuration"],
-        "ModelType Transform num_inputs num_cond_inputs num_blocks num_hidden activation_function pre_exp_tanh batch_norm batch_norm_momentum optimizer",
+        "ModelType Transform num_inputs num_cond_inputs num_blocks num_hidden activation_function pre_exp_tanh batch_norm batch_norm_momentum optimizer"
+        + (" affine_log_scale_bound" if "affine_log_scale_bound" in b["configuration"] else ""),
         "background flow",
     )
+    if "affine_log_scale_bound" in b["configuration"]:
+        number(b["configuration"]["affine_log_scale_bound"], "affine_log_scale_bound")
+        if b["configuration"]["ModelType"] != "MAF" or b["configuration"]["Transform"] != "Affine":
+            raise ValueError("affine_log_scale_bound requires an affine MAF")
     if b["configuration"]["num_inputs"] != 4:
         raise ValueError("Keep num_inputs=4; the DeltaR control automatically selects five dimensions")
     scan = value["injection_scan"]
@@ -167,7 +242,12 @@ DEFAULTS = load_settings()
 def resolve(args):
     effective = load_settings(args.config)
     if "riddle" in args.methods:
-        for key in ("runs", "epochs", "fractions"):
+        from .options import FEATURES
+        for key in FEATURES:
+            override = getattr(args, key, None)
+            if override is not None:
+                effective["riddle"]["enhancements"][key] = override
+        for key in ("runs", "epochs", "fractions", "data_policy", "ensemble_completion"):
             override = getattr(args, "fits" if key == "runs" else key, None)
             if override is not None:
                 effective["riddle"][key] = override
