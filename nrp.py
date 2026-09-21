@@ -76,8 +76,10 @@ def job(args):
         str(args.workers),
         "--io-workers",
         str(args.io_workers),
+        "--torch-threads",
+        str(args.torch_threads),
         "--mps",
-        "auto",
+        args.mps,
         "--resume",
         "--verbose",
         "1",
@@ -99,6 +101,10 @@ def job(args):
     for name in FEATURES:
         if getattr(args, name, None) is not None:
             command.append("--" + ("" if getattr(args, name) else "no-") + name.replace("_", "-"))
+    if getattr(args, "mass_conditioning", None) is not None:
+        command.append("--" + ("" if args.mass_conditioning else "no-") + "mass-conditioning")
+    if getattr(args, "background_correction", None) is not None:
+        command.extend(["--background-correction", args.background_correction])
     if "lacathode" in args.methods:
         command.extend(["--lacathode-background", getattr(args, "lacathode_background", "independent")])
     if "ranode" in args.methods:
@@ -237,11 +243,20 @@ def main(argv=None):
     p.add_argument("--fits", type=positive, help="Signal ensemble fits per RIDDLE/R-ANODE run; does not change LaCathode")
     from riddle.options import add_feature_arguments
     add_feature_arguments(p)
+    p.add_argument("--mass-conditioning", action=argparse.BooleanOptionalAction, default=None,
+                   help="Condition the RIDDLE residual density on mjj inside the signal region")
+    p.add_argument("--background-correction", choices=("none", "bgcorr_40_reguide"), default=None,
+                   help="Use the shared 40-epoch corrected latent background denominator and corrected guide")
     p.add_argument("--lacathode-background", choices=("independent", "fixed"), default="independent",
                    help="Retrain each LaCathode background flow (default), or share one flow across classifier fits")
     p.add_argument("--epochs", type=positive, help="Override RIDDLE/R-ANODE signal-fit and LaCathode classifier epochs; background stages are unchanged")
     p.add_argument("--workers", type=positive, default=2)
-    p.add_argument("--io-workers", type=positive, default=4)
+    p.add_argument("--io-workers", type=positive, default=4,
+                   help="Filesystem/host I/O concurrency")
+    p.add_argument("--torch-threads", type=positive, default=2,
+                   help="Intra-op CPU threads per training process (default: 2)")
+    p.add_argument("--mps", choices=("auto", "on", "off"), default="auto",
+                   help="CUDA MPS policy forwarded to the training framework")
     p.add_argument(
         "--gpu", type=str.lower, choices=GPU_TYPES, default="a100",
         help="Request one GPU of this type (case-insensitive; default: a100); namespace access is still required",

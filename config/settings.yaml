@@ -5,6 +5,8 @@ inputs:
   mass_column: mjj
   label_column: label
 riddle:
+  mass_conditioning: true
+  background_correction: bgcorr_40_reguide
   fits: 10
   epochs: 100
   fractions: [learned]
@@ -14,7 +16,7 @@ riddle:
     guided_fit: true
     hard_bg: true
     contrastive_fit: true
-    score_flow: true
+    score_flow: false
     coherent_mixture: true
     guide_epochs: 20
     guide_warmup_epochs: 10

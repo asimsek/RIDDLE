@@ -58,7 +58,7 @@ def validate_residual(value):
     from .roles import DEFAULT_POLICY
     value.setdefault("data_policy", DEFAULT_POLICY)
     # Optional pilot ablation; the resolved data policy is always explicit.
-    extra = "".join(" " + k for k in ("mass_conditioning", "input_space", "optimization", "data_policy", "ensemble_completion") if k in value)
+    extra = "".join(" " + k for k in ("mass_conditioning", "input_space", "optimization", "data_policy", "ensemble_completion", "background_correction") if k in value)
     keys(value, "runs epochs fractions initialization flow training fit_recovery enhancements" + extra, "RIDDLE")
     if "data_policy" in value:
         from .roles import policy_parts, DIAGNOSTIC_POLICIES
@@ -69,6 +69,19 @@ def validate_residual(value):
         raise ValueError("ensemble_completion must be strict or partial")
     if "mass_conditioning" in value and type(value["mass_conditioning"]) is not bool:
         raise ValueError("mass_conditioning must be boolean")
+    correction = value.get("background_correction", "none")
+    if correction not in ("none", "bgcorr_40_reguide"):
+        raise ValueError("background_correction must be none or bgcorr_40_reguide")
+    value["background_correction"] = correction
+    if correction == "bgcorr_40_reguide":
+        if not value.get("mass_conditioning"):
+            raise ValueError("bgcorr_40_reguide requires mass_conditioning=true")
+        if not e["guided_fit"] or not e["contrastive_fit"]:
+            raise ValueError("bgcorr_40_reguide requires guided_fit and contrastive_fit")
+        if e["score_flow"]:
+            raise ValueError("bgcorr_40_reguide uses the q_phi density ratio directly; disable score_flow")
+        if value.get("input_space") == "physical":
+            raise ValueError("bgcorr_40_reguide is defined in mapped latent space, not physical-input mode")
     if "input_space" in value and (value["input_space"] != "physical" or not value.get("mass_conditioning")):
         raise ValueError("input_space is only supported for the physical, mass-conditioned pilot")
     recovery = value["fit_recovery"]
@@ -132,8 +145,13 @@ def validate_residual(value):
         raise ValueError("Epochs must cover the number of selected checkpoints")
     if e["guided_fit"] and e["guide_warmup_epochs"] + t["selected_checkpoints"] > value["epochs"]:
         raise ValueError("Require enough post-guidance epochs for checkpoint selection")
-    if value.get("mass_conditioning") and any(e[k] for k in FEATURES):
-        raise ValueError("Legacy mass/physical pilots require all six RIDDLE enhancements disabled")
+    if value.get("input_space") == "physical" and any(e[k] for k in FEATURES):
+        raise ValueError("Physical-input pilot requires all six RIDDLE enhancements disabled")
+    if value.get("mass_conditioning") and e["score_flow"]:
+        raise ValueError(
+            "Mass-conditioned residual scoring is currently signal-region scoped; disable score_flow "
+            "until a sideband-trained conditional-score calibration is defined"
+        )
     if "optimization" in value:
         defaults = dict(initial_fraction=None, fraction_warmup_epochs=0,
                         lr_factor=1.0, lr_patience=10, min_lr=1e-5,
@@ -247,7 +265,7 @@ def resolve(args):
             override = getattr(args, key, None)
             if override is not None:
                 effective["riddle"]["enhancements"][key] = override
-        for key in ("runs", "epochs", "fractions", "data_policy", "ensemble_completion"):
+        for key in ("runs", "epochs", "fractions", "data_policy", "ensemble_completion", "mass_conditioning", "background_correction"):
             override = getattr(args, "fits" if key == "runs" else key, None)
             if override is not None:
                 effective["riddle"][key] = override

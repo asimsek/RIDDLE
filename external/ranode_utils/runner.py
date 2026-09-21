@@ -38,7 +38,7 @@ def paired_rng_contract(args, inputs, config, source, environment):
     report = json.loads((root / "result.json").read_text())
     original = report["contract"]
     expected = {**config, "seed": args.seed, "scenario": args.scenario,
-                "device": args.device, "io_workers": args.io_workers}
+                "device": args.device, "io_workers": args.io_workers, "torch_threads": args.torch_threads}
     if (report.get("method") != "ranode" or original["inputs"] != inputs or original["source_sha256"] != source
             or any(original["settings"].get(k) != v for k, v in expected.items())
             or original["environment"] != environment):
@@ -334,6 +334,7 @@ def prepare_stage(args, stage, config, background=None):
         "rng": str(attempts / "initial_rng.pt"),
         "scenario": args.scenario,
         "device": args.device,
+        "torch_threads": args.torch_threads,
         "seed": args.seed,
         "fit_index": config["fit_index"],
         "epochs": config[stage + "_epochs"],
@@ -371,7 +372,7 @@ def prepare_stage(args, stage, config, background=None):
         PYTHONPATH=os.pathsep.join(filter(None, (str(ROOT), env.get("PYTHONPATH")))),
     )
     for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
-        env[key] = str(args.io_workers)
+        env[key] = str(args.torch_threads)
     write_json(attempt / "producer_contract.json", args.production_contract)
     return options, env
 
@@ -593,13 +594,15 @@ def run(args):
             "scenario": args.scenario,
             "device": args.device,
             "io_workers": args.io_workers,
+            "torch_threads": args.torch_threads,
             "ensemble": "mean_upstream_ratios_v1",
             "background_protocol": BACKGROUND_PROTOCOL,
             "fit_failure_policy": "exclude_numerically_invalid_fits_v1",
         },
         "code": {**{p.name: digest(p) for p in sorted(Path(__file__).parent.glob("*.py"))},
                  "framework/production.py": digest(ROOT / "riddle/production.py"),
-                 "framework/resume.py": digest(ROOT / "riddle/resume.py")},
+                 "framework/resume.py": digest(ROOT / "riddle/resume.py"),
+                 "framework/acceleration.py": digest(ROOT / "riddle/acceleration.py")},
     }
     if not guarded:
         contract["settings"].update(fit_failure_policy="disabled_cpu_pilot_control",
@@ -848,6 +851,7 @@ def main(argv=None):
     parser.add_argument("--workers", type=int, default=1, help="Concurrent signal fits after the shared background stage")
     parser.add_argument("--mps", choices=("auto", "on", "off"), default="auto")
     parser.add_argument("--io-workers", type=int, default=2)
+    parser.add_argument("--torch-threads", type=int, default=2)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--pilot-no-safeguards", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--pilot-rng-source", type=Path, help=argparse.SUPPRESS)
@@ -861,8 +865,8 @@ def main(argv=None):
         help="With --resume, permit recorded CUDA GPU changes; software and precision stay strict",
     )
     args = parser.parse_args(argv)
-    if args.workers < 1 or args.io_workers < 1 or not 0 <= args.seed < 2**32:
-        parser.error("Positive workers/CPU threads and a nonnegative 32-bit seed are required")
+    if args.workers < 1 or args.io_workers < 1 or args.torch_threads < 1 or not 0 <= args.seed < 2**32:
+        parser.error("Positive workers/I/O workers/PyTorch threads and a nonnegative 32-bit seed are required")
 
     def terminate(signum, frame):
         raise SystemExit(128 + signum)
@@ -871,7 +875,7 @@ def main(argv=None):
     if args.device == "cpu":
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
     for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
-        os.environ[key] = str(args.io_workers)
+        os.environ[key] = str(args.torch_threads)
     try:
         if os.environ.get("RIDDLE_WORKER_PROGRESS") == "1":
             run_repetitions(args)

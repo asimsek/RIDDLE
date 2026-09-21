@@ -408,7 +408,7 @@ def run_single(args, contract):
     classifier_training_utils.train_model = recovery.classifier_fits(
         install_epoch_recovery(classifier_training_utils, "train_model", "classifier", recovery)
     )
-    acceleration = install_tensor_batches()
+    acceleration = install_tensor_batches(args.device)
     arguments = [
         "--data_dir",
         str(args.data),

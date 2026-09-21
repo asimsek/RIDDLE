@@ -171,6 +171,100 @@ def teacher_weights(directory, z, fraction, *, seed, options, batch_size, device
     return weights
 
 
+def corrected_teacher_weights(directory, z, context, fraction, *, seed, options, batch_size,
+                              background_model, background_sha256, device="cpu"):
+    """Two-fold mass-blind guide using q_phi(z|m) samples at matched SR masses.
+
+    This is the production form of the validated bgcorr_40_reguide control.  The
+    classifier never receives mass; mass is used only to sample the denominator
+    at the same contexts as the data events.
+    """
+    from .background_correction import sample as sample_background
+    directory = Path(directory); directory.mkdir(parents=True, exist_ok=True)
+    z = torch.as_tensor(z, dtype=torch.float32).cpu()
+    context = torch.as_tensor(context, dtype=torch.float32).flatten().cpu()
+    require_finite(z, "Corrected-guide inputs"); require_finite(context, "Corrected-guide mass contexts")
+    if z.ndim != 2 or context.shape != (len(z),) or len(z) < 4 or not 0 < fraction < 1:
+        raise ValueError("Corrected guide requires aligned latent/context events and an interior fraction")
+    contract = dict(z=digest(z.numpy()), context=digest(context.numpy()), seed=seed, options=options,
+                    batch_size=batch_size, fraction=fraction, device=str(device),
+                    reference="q_phi(z|m)", background_sha256=background_sha256)
+    saved = directory / "weights.pt"
+    if saved.exists():
+        result = load_torch(saved)
+        if result["contract"] != contract:
+            raise ValueError("Corrected-guide inputs/settings changed")
+        require_finite(result["weights"], "Saved corrected-guide weights")
+        write_json(directory / "guidance.json", result["guidance"])
+        return result["weights"]
+    folds = np.array_split(np.random.default_rng(seed).permutation(len(z)), 2)
+    logits, reports = torch.zeros(len(z)), []
+    for f in range(2):
+        seed_start((seed + f) % 2**32)
+        model = nn.Sequential(nn.Linear(z.shape[1], 64), nn.LeakyReLU(), nn.Linear(64, 64),
+                              nn.LeakyReLU(), nn.Linear(64, 1)).to(device)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=.01)
+        train, hold = folds[1-f], folds[f]
+        ref = sample_background(background_model, context[train].to(device), z.shape[1],
+                                seed + 71000 + f, device).detach().cpu()
+        n = len(train); origin = torch.cat((torch.ones(n), torch.zeros(n)))
+        latest = directory / f"fold_{f}.pt"
+        start, history = 0, []
+        if latest.exists():
+            state = load_torch(latest, device)
+            if state["contract"] != contract:
+                raise ValueError("Corrected-guide recovery contract changed")
+            model.load_state_dict(state["model"]); optimizer.load_state_dict(state["optimizer"])
+            start, history = state["epoch"] + 1, state["history"]
+            restore_rng(state["rng"])
+        for epoch in range(start, options["guide_epochs"]):
+            model.eval()
+            if options["hard_bg"] and epoch >= options["hard_start_epoch"]:
+                pool = chunks(lambda x: model(x).flatten(), ref, device=device)
+                q, importance, hard = proposal(pool, options["hard_pool_fraction"], options["hard_sampling_fraction"])
+                draw = torch.Generator().manual_seed(seed + 72000 + 1000*f + epoch)
+                chosen = torch.multinomial(q, n, replacement=True, generator=draw)
+                iw = importance[chosen].float()
+                info = dict(phase="hard_background", hard_pool_events=int(hard.sum()),
+                            selected_hard_fraction=float(hard[chosen].double().mean()),
+                            importance_mean=float(iw.mean()), proposal_sha256=digest(q.numpy()))
+            else:
+                chosen, iw = torch.arange(n), torch.ones(n)
+                info = dict(phase="uniform_reference")
+            loader_gen = torch.Generator().manual_seed(seed + 73000 + 1000*f + epoch)
+            loader = DataLoader(TensorDataset(torch.cat((z[train], ref[chosen])), origin,
+                                             torch.cat((torch.ones(n), iw))),
+                                batch_size=batch_size, shuffle=True, generator=loader_gen)
+            model.train(); total = 0.
+            for x, y, w in loader:
+                x, y, w = x.to(device), y.to(device), w.to(device)
+                optimizer.zero_grad()
+                loss = (w*nn.functional.binary_cross_entropy_with_logits(model(x).flatten(), y,
+                                                                          reduction="none")).mean()
+                require_finite(loss, "Corrected-guide weighted BCE")
+                loss.backward(); clip_gradients(model.parameters(), 1.)
+                optimizer.step(); total += float(loss.detach())*len(x)
+            history.append(dict(epoch=epoch, loss=total/(2*n), **info))
+            save_torch(latest, dict(epoch=epoch, model=model.state_dict(), optimizer=optimizer.state_dict(),
+                                   history=history, rng=rng_state(), contract=contract))
+            emit_message(f"Corrected guide fold {f+1}/2 epoch {epoch+1}/{options['guide_epochs']}: {info['phase']}")
+        model.eval()
+        logits[hold] = chunks(lambda x: model(x).flatten(), z[hold], device=device)
+        reports.append(dict(fold=f, train_indices_sha256=digest(train), holdout_indices_sha256=digest(hold),
+                            training_events=len(train), holdout_events=len(hold), history=history))
+    weights = -torch.expm1(torch.minimum(torch.zeros_like(logits), math.log1p(-fraction)-logits))
+    fallback = float(weights.sum()) < 1e-8
+    if fallback:
+        weights.fill_(fraction)
+    report = dict(truth_labels_used=False, folds=2, hard_bg=options["hard_bg"], fold_reports=reports,
+                  initial_fraction=fraction, mean_weight=float(weights.mean()), uniform_fallback=fallback,
+                  reference="q_phi(z|m) samples at matched masses; classifier inputs are latent coordinates only",
+                  background_sha256=background_sha256)
+    save_torch(saved, dict(contract=contract, weights=weights, logits=logits, guidance=report))
+    write_json(directory / "guidance.json", report)
+    return weights
+
+
 def clip_gradients(parameters, limit):
     try:
         nn.utils.clip_grad_norm_(parameters, limit, error_if_nonfinite=True)

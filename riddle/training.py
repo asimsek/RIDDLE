@@ -23,20 +23,29 @@ ENHANCED_TRAINING_PROTOCOL = "study_parity_validation_rng_v2"
 
 
 def enhanced_epoch(model, logit, ztrain, optimizer, options, additions, *, epoch, seed, guide,
-                   fixed_fraction=False, progress=None):
-    """Guided EM or ordinary mixture fitting, with independent contrastive control."""
+                   fixed_fraction=False, progress=None, background_model=None):
+    """Guided EM/mixture fitting with an optional corrected q_phi(z|m) denominator."""
     from .enhancements import chunks, contrastive_loss, clip_gradients, standard_normal_log_prob
     from .integrity import mixture_log_density, require_finite
     device = logit.device
     z = torch.from_numpy(ztrain)
-    logb = standard_normal_log_prob(z)
+    conditional = bool(getattr(model, "mass_conditioning", False))
+    latent = z[:, :-1] if conditional else z
+    if background_model is not None:
+        if not conditional:
+            raise ValueError("Corrected latent background requires mass-conditioned residual inputs")
+        from .background_correction import log_prob as corrected_log_prob
+        logb = chunks(lambda x, c: corrected_log_prob(background_model, x, c),
+                      latent, z[:, -1], device=device)
+    else:
+        logb = standard_normal_log_prob(latent)
     model.eval()
     guided = additions["guided_fit"]
     warm = guided and epoch < additions["guide_warmup_epochs"]
     if warm:
         weights = guide
     else:
-        logs = chunks(model.log_prob, z, device=device)
+        logs = chunks(lambda x: signal_log_prob(model, x), z, device=device)
         old_logit = logit.detach().cpu()
         weights = (torch.nn.functional.logsigmoid(old_logit)+logs-mixture_log_density(logs, logb, old_logit)).exp().detach().float()
         if guided and not fixed_fraction:
@@ -46,23 +55,41 @@ def enhanced_epoch(model, logit, ztrain, optimizer, options, additions, *, epoch
     mean_weight = float(weights.double().mean())
     if mean_weight <= 0 or not np.isfinite(mean_weight):
         raise FloatingPointError("Invalid residual responsibilities")
+    loader_generator = (torch.Generator().manual_seed(int(seed)+22000+epoch)
+                        if background_model is not None else None)
     loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(z, logb, weights),
-                                         batch_size=options["batch_size"], shuffle=True)
+                                         batch_size=options["batch_size"], shuffle=True,
+                                         generator=loader_generator)
     total = contrast = 0.
     for step, (xb, lb, w) in enumerate(loader):
         xb, lb, w = xb.to(device), lb.to(device), w.to(device)
         model.train(); optimizer.zero_grad()
-        log_signal = model.log_prob(xb)
+        log_signal = signal_log_prob(model, xb)
         loss = (-(w*log_signal).mean()/mean_weight if guided else
                 -mixture_log_density(log_signal, lb, logit).mean())
         nc = torch.zeros((), device=device)
         if additions["contrastive_fit"]:
-            # Reference samples must not change BatchNorm running statistics.
+            # Reference samples must come from the same denominator that defines
+            # the density ratio.  Mass is context only and never a guide input.
             model.eval()
-            gen = torch.Generator().manual_seed(int(seed)+600000+epoch*10000+step)
-            ref = torch.randn(xb.shape, generator=gen).to(device)
-            both = model.log_prob(torch.cat((xb, ref)))
-            nc = contrastive_loss(both[:len(xb)]-lb, both[len(xb):]-standard_normal_log_prob(ref), w, mean_weight)
+            if background_model is not None:
+                from .background_correction import sample as sample_background, log_prob as corrected_log_prob
+                ref_latent = sample_background(background_model, xb[:, -1], xb.shape[1]-1,
+                                               int(seed)+600000+epoch*10000+step, device)
+                ref = torch.cat((ref_latent, xb[:, -1:]), dim=1)
+                with torch.no_grad():
+                    ref_logb = corrected_log_prob(background_model, ref_latent, xb[:, -1])
+            else:
+                gen = torch.Generator().manual_seed(int(seed)+600000+epoch*10000+step)
+                if conditional:
+                    ref_latent = torch.randn(xb[:, :-1].shape, generator=gen).to(device)
+                    ref = torch.cat((ref_latent, xb[:, -1:]), dim=1)
+                    ref_logb = standard_normal_log_prob(ref_latent)
+                else:
+                    ref = torch.randn(xb.shape, generator=gen).to(device)
+                    ref_logb = standard_normal_log_prob(ref)
+            both = signal_log_prob(model, torch.cat((xb, ref)))
+            nc = contrastive_loss(both[:len(xb)]-lb, both[len(xb):]-ref_logb, w, mean_weight)
             loss = loss + additions["contrastive_strength"]*nc
             model.train()
         require_finite(loss, "Residual objective")
@@ -74,7 +101,8 @@ def enhanced_epoch(model, logit, ztrain, optimizer, options, additions, *, epoch
         if progress:
             progress(step+1, len(loader))
     model.eval()
-    nll = -float(mixture_log_density(chunks(model.log_prob, z, device=device), logb, logit.detach().cpu()).double().mean())
+    nll = -float(mixture_log_density(chunks(lambda x: signal_log_prob(model, x), z, device=device), logb,
+                                     logit.detach().cpu()).double().mean())
     return nll, dict(train_objective=total/len(z), contrastive_loss=contrast/len(z),
                      phase="guided_initialization" if warm else "alternating_mixture" if guided else "mixture_likelihood",
                      effective_residual_events=float(weights.sum().square()/weights.square().sum()))
@@ -123,6 +151,7 @@ def train_residual(
     progress_label="Train residual mixture",
     on_training_start=None,
     settings=None,
+    background_correction=None,
 ):
     settings = deepcopy(DEFAULTS["riddle"] if settings is None else settings)
     settings.update(epochs=epochs, initialization=initialization)
@@ -141,6 +170,9 @@ def train_residual(
         validate_checkpoint(checkpoint, epochs)
         if checkpoint.get("settings") != settings:
             raise ValueError("Residual training settings changed; use a new output")
+        expected_background = None if background_correction is None else background_correction["model_sha256"]
+        if checkpoint.get("background_correction_sha256") != expected_background:
+            raise ValueError("Residual background correction changed; use a new output")
         inputs = Path(output) / "residual_training_inputs.json"
         if (
             inputs.is_file()
@@ -172,12 +204,22 @@ def train_residual(
         build_signal_flow(device, features=ztrain.shape[1], settings=settings),
         initial_fraction_logit(seed, device),
     )
-    if initialization in ("background", "identity"):
-        from .model import match_background
-
-        match_background(model)
-    elif initialization != "random":
-        raise ValueError("Unknown residual initialization")
+    corrected_background = None
+    corrected_background_digest = None
+    if background_correction is not None:
+        from .background_correction import load as load_background_correction
+        corrected_background = load_background_correction(
+            background_correction, settings, ztrain.shape[1]-1, device
+        )
+        model.load_state_dict(corrected_background.state_dict())
+    if corrected_background is None:
+        if initialization in ("background", "identity"):
+            from .model import match_background
+            match_background(model)
+        elif initialization != "random":
+            raise ValueError("Unknown residual initialization")
+    elif initialization not in ("background", "identity"):
+        raise ValueError("bgcorr_40_reguide fixes residual initialization to q_phi; use background initialization")
     if fraction is not None:
         if not np.isfinite(fraction) or not 0 < fraction < 1:
             raise ValueError("Fixed signal fraction must lie in (0,1)")
@@ -209,13 +251,25 @@ def train_residual(
         restore_rng(checkpoint["rng"])
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
+    if corrected_background is not None:
+        from .background_correction import save_local
+        corrected_background_digest = save_local(output, corrected_background, background_correction)
     guide = None
     if active["guided_fit"]:
-        from .enhancements import teacher_weights
         before = rng_state()
-        guide = teacher_weights(output / "guide", ztrain, initial_fraction,
-                                seed=(int(seed)+2000) % 2**32, options={**additions, **active},
-                                batch_size=options["batch_size"], device=device)
+        guide_inputs = ztrain[:, :-1] if mass_conditioning else ztrain
+        if corrected_background is not None:
+            from .enhancements import corrected_teacher_weights
+            guide = corrected_teacher_weights(
+                output / "guide", guide_inputs, ztrain[:, -1], initial_fraction,
+                seed=(int(seed)+93000) % 2**32, options={**additions, **active},
+                batch_size=options["batch_size"], background_model=corrected_background,
+                background_sha256=background_correction["model_sha256"], device=device)
+        else:
+            from .enhancements import teacher_weights
+            guide = teacher_weights(output / "guide", guide_inputs, initial_fraction,
+                                    seed=(int(seed)+2000) % 2**32, options={**additions, **active},
+                                    batch_size=options["batch_size"], device=device)
         restore_rng(before)
     write_json(
         output / "residual_training_inputs.json",
@@ -236,6 +290,14 @@ def train_residual(
             "fraction_estimator": "guided responsibilities" if active["guided_fit"] else "gradient likelihood",
             "enhanced_training_protocol": ENHANCED_TRAINING_PROTOCOL if enhanced else None,
             "features": ztrain.shape[1],
+            "background_correction": (None if corrected_background is None else {
+                "mode": background_correction["mode"],
+                "protocol": background_correction["protocol"],
+                "source_sha256": background_correction["model_sha256"],
+                "local_sha256": corrected_background_digest,
+                "selected_epoch": background_correction["selected_epoch"],
+                "epochs": background_correction["epochs"],
+            }),
         },
     )
     if on_training_start is not None:
@@ -262,7 +324,7 @@ def train_residual(
             if part == "train" and enhanced:
                 losses["train_nll"], diagnostics = enhanced_epoch(
                     model, logit, ztrain, optimizer, options, additions, epoch=epoch, seed=seed, guide=guide,
-                    fixed_fraction=fraction is not None,
+                    fixed_fraction=fraction is not None, background_model=corrected_background,
                     progress=lambda done, total: progress.substep("Train", done, total))
                 continue
             if part == "validation" and enhanced:
@@ -273,8 +335,16 @@ def train_residual(
                 from .integrity import mixture_log_density
                 model.eval()
                 valid = torch.from_numpy(zval)
+                valid_latent = valid[:, :-1] if mass_conditioning else valid
+                if corrected_background is not None:
+                    from .background_correction import log_prob as corrected_log_prob
+                    log_background = chunks(
+                        lambda x, c: corrected_log_prob(corrected_background, x, c),
+                        valid_latent, valid[:, -1], device=device)
+                else:
+                    log_background = standard_normal_log_prob(valid_latent)
                 losses["validation_nll"] = -float(mixture_log_density(
-                    chunks(model.log_prob, valid, device=device), standard_normal_log_prob(valid),
+                    chunks(lambda x: signal_log_prob(model, x), valid, device=device), log_background,
                     logit.detach().cpu()).double().mean())
                 continue
             losses[part + "_nll"] = train_epoch(
@@ -323,6 +393,7 @@ def train_residual(
             "files": files,
             "settings": settings,
             "enhanced_training_protocol": ENHANCED_TRAINING_PROTOCOL if enhanced else None,
+            "background_correction_sha256": (None if background_correction is None else background_correction["model_sha256"]),
         }
         if control:
             state.update(stopped_early=stopped, scheduler=scheduler.state_dict() if scheduler else None)
@@ -360,10 +431,31 @@ def residual_scores(output, order, z, device, *, normalization_checks=None, norm
     if inputs["features"] != z.shape[1]:
         raise ValueError("Scoring feature count differs from training")
     model = build_signal_flow(device, features=z.shape[1], settings=inputs["settings"]).eval()
+    corrected_background = None
+    correction_info = inputs.get("background_correction")
+    if correction_info is not None:
+        from .background_correction import load_local
+        loaded = load_local(output, inputs["settings"], z.shape[1]-1, device)
+        if loaded is None:
+            raise ValueError("Missing fit-local corrected background")
+        corrected_background, saved_correction = loaded
+        if file_digest(Path(output) / "background_correction.pt") != correction_info["local_sha256"]:
+            raise ValueError("Fit-local corrected background artifact changed")
+        if saved_correction.get("source_sha256") != correction_info["source_sha256"]:
+            raise ValueError("Fit-local corrected background source changed")
     from .roles import DEFAULT_POLICY, REPLAY_SCORING_POLICIES
     policy = inputs['settings'].get('data_policy', DEFAULT_POLICY)
     replay = policy in REPLAY_SCORING_POLICIES
-    if replay:
+    if corrected_background is not None:
+        if not model.mass_conditioning:
+            raise ValueError("Corrected-background scoring requires mass-conditioned inputs")
+        from .background_correction import log_prob as corrected_log_prob
+        from .enhancements import chunks as infer_chunks
+        values = torch.from_numpy(z)
+        log_background = infer_chunks(
+            lambda x, c: corrected_log_prob(corrected_background, x, c),
+            values[:, :-1], values[:, -1], device=device, size=8192).numpy()
+    elif replay:
         # Historical diagnostic replay uses the independent study arithmetic.
         # Both production_v1 and the HC-derived production_v2 use the normal
         # production scoring path so multi-fit production is not treated as a
@@ -413,3 +505,53 @@ def residual_scores(output, order, z, device, *, normalization_checks=None, norm
     if not np.isfinite(scores).all():
         raise FloatingPointError("Nonfinite residual ensemble scores")
     return scores
+
+
+
+def residual_background_log_prob(output, z, device):
+    """Return the exact denominator log density recorded for a residual fit."""
+    output = Path(output)
+    inputs = json.loads((output / "residual_training_inputs.json").read_text())
+    z = np.asarray(z, dtype=np.float32)
+    if inputs["features"] != z.shape[1]:
+        raise ValueError("Background scoring feature count differs from training")
+    info = inputs.get("background_correction")
+    if info is not None:
+        from .background_correction import load_local, log_prob as corrected_log_prob
+        from .enhancements import chunks
+        loaded = load_local(output, inputs["settings"], z.shape[1]-1, device)
+        if loaded is None:
+            raise ValueError("Missing fit-local corrected background")
+        q, saved = loaded
+        if saved.get("source_sha256") != info["source_sha256"]:
+            raise ValueError("Corrected-background source identity changed")
+        t = torch.from_numpy(z)
+        return chunks(lambda x, c: corrected_log_prob(q, x, c), t[:, :-1], t[:, -1],
+                      device=device, size=8192).numpy().astype(np.float64)
+    model = build_signal_flow(device, features=z.shape[1], settings=inputs["settings"])
+    return background_log_prob(torch.from_numpy(z), mass_conditioning=model.mass_conditioning,
+                               physical_inputs=model.physical_inputs).numpy().astype(np.float64)
+
+
+def residual_background_sample(output, contexts, count, seed, device):
+    """Draw full residual inputs from the recorded denominator at supplied contexts."""
+    output = Path(output)
+    inputs = json.loads((output / "residual_training_inputs.json").read_text())
+    info = inputs.get("background_correction")
+    contexts = np.asarray(contexts, dtype=np.float32)
+    if contexts.shape != (count,):
+        raise ValueError("Background sample contexts are misaligned")
+    features = inputs["features"]
+    if info is not None:
+        from .background_correction import load_local, sample as sample_background
+        loaded = load_local(output, inputs["settings"], features-1, device)
+        if loaded is None:
+            raise ValueError("Missing fit-local corrected background")
+        q, saved = loaded
+        if saved.get("source_sha256") != info["source_sha256"]:
+            raise ValueError("Corrected-background source identity changed")
+        latent = sample_background(q, torch.from_numpy(contexts), features-1, seed, device).detach().cpu().numpy()
+        return np.column_stack((latent, contexts)).astype(np.float32)
+    rng = np.random.default_rng(seed)
+    latent = rng.standard_normal((count, features-1)).astype(np.float32)
+    return np.column_stack((latent, contexts)).astype(np.float32)

@@ -73,7 +73,7 @@ def check_contract(previous, current, *, allow_code_change=False, allow_device_c
     )
     thread_fields = {("environment", "threads"), ("environment", "torch_threads")}
     if current.get("method") == "ranode":
-        thread_fields.add(("settings", "io_workers"))
+        thread_fields.add(("settings", "torch_threads"))
     changes, protected, required = [], [], set()
     for path, values in _differences(previous, current):
         field = ".".join(path)
@@ -103,7 +103,7 @@ def check_contract(previous, current, *, allow_code_change=False, allow_device_c
             "Resume contract has protected changes: " + ", ".join(protected)
             + ". Data, scientific settings, pinned sources, software, architecture and precision "
             "must match. Continuing unfinished training also requires the original CPU thread "
-            "count (--io-workers); device migration is CUDA-to-CUDA only. Restore the saved "
+            "count (--torch-threads); device migration is CUDA-to-CUDA only. Restore the saved "
             "settings or use a new output."
         )
     if required:

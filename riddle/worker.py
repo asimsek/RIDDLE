@@ -95,13 +95,13 @@ def main():
             emit_message("MPS unavailable; ordinary concurrent fits remain enabled", kind="WARNING")
     import torch
 
-    torch.set_num_threads(args.io_workers)
+    torch.set_num_threads(args.torch_threads)
+    torch.set_num_interop_threads(1)
     torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False
     mapping_experiment = getattr(args, "mapping_experiment", None)
     if mapping_experiment is not None:
         from .mapping_experiment import validate_worker
         validate_worker(args)
-        torch.set_num_interop_threads(1)
         from .mapping_experiment import environment as experiment_environment, read as experiment_read
         numerical = experiment_environment(args.output / '.resume/mapping_experiment_environment.json')
         if numerical != experiment_read(mapping_experiment['manifest'])['numerical_environment']:
@@ -111,7 +111,6 @@ def main():
         if (args.method != "riddle" or args.device != "cpu" or
                 args.settings["riddle"].get("data_policy") != "study_replay_v1"):
             raise ValueError("Paired protocol environment recording is restricted to CPU study replay")
-        torch.set_num_interop_threads(1)
         from scripts.riddle_protocol_environment import record
         record(audit_environment)
     if args.device != "cpu" and not torch.cuda.is_available():
@@ -124,7 +123,9 @@ def main():
     code = runtime_code(args.method)
     mass_pilot = args.method == "riddle" and args.settings["riddle"].get("mass_conditioning", False)
     if mass_pilot:
-        code["scripts/cpu_mass_dependence.py"] = file_digest(Path(__file__).parents[1] / "scripts/cpu_mass_dependence.py")
+        pilot_script = Path(__file__).parents[1] / "scripts/cpu_mass_dependence.py"
+        if pilot_script.is_file():
+            code["scripts/cpu_mass_dependence.py"] = file_digest(pilot_script)
     settings = {"seed": args.seed, "scenario": args.scenario, "device": args.device}
     if args.method == "riddle":
         settings.update(args.settings)

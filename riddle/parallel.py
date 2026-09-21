@@ -33,15 +33,17 @@ def _fit_worker(events, job, rows, validation, options):
             events.put((fit, "progress", event))
         token = _LOCAL_SINK.set(publish)
         try:
-            torch.set_num_threads(options["io_workers"])
-            install_tensor_batches()
+            torch.set_num_threads(options["torch_threads"])
+            torch.set_num_interop_threads(1)
+            install_tensor_batches(options["device"])
             torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False
             saved = train_member(rows, validation, directory.parents[1],
                 relative=job["relative"], index=job["index"], fraction=job["fraction"],
                 epochs=options["epochs"], seed=options["seed"], device=options["device"],
                 initialization=options["initialization"], settings=options["settings"],
                 label=label, normalization_tests=options["normalization_tests"],
-                member_split_indices=job.get("member_split_indices"), source_ids=options.get("source_ids"))
+                member_split_indices=job.get("member_split_indices"), source_ids=options.get("source_ids"),
+                background_correction=options.get("background_correction"))
             result = dict(status=saved["status"], initial_epoch=0,
                           new_epochs=sum(epoch_progress.values()),
                           trained_epochs=saved.get("trained_epochs", options["epochs"]),
@@ -70,7 +72,8 @@ def fitting_eta(mean_fit, epochs, active, queued, workers):
 
 
 def run_fits(
-    rows, jobs, *, validation, epochs, seed, device, initialization, workers, io_workers, total, started=None, settings, normalization_tests, source_ids=None
+    rows, jobs, *, validation, epochs, seed, device, initialization, workers, io_workers, total, started=None,
+    settings, normalization_tests, source_ids=None, background_correction=None, torch_threads=2
 ):
     if not jobs:
         return
@@ -87,10 +90,12 @@ def run_fits(
         device=str(device),
         initialization=initialization,
         io_workers=io_workers,
+        torch_threads=torch_threads,
         total=total,
         settings=settings,
         normalization_tests=normalization_tests,
         source_ids=source_ids,
+        background_correction=background_correction,
     )
     previous_handler = signal.getsignal(signal.SIGTERM)
 

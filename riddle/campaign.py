@@ -9,7 +9,7 @@ from riddle.worker_progress import emit_message
 from riddle.storage import atomic_write, write_json
 from riddle.storage import digest, file_digest
 from .model import PROTOCOL as SINGLE_PROTOCOL, background_log_prob, real_sr_latents
-from .training import train_residual, residual_scores
+from .training import train_residual, residual_scores, residual_background_log_prob, residual_background_sample
 from .integrity import SCIENTIFIC_VERSION
 from .production import (PRODUCTION_POLICY, EVIDENCE_GATED_POLICY, fit_acceptance,
                          require_complete_members, require_complete_ensemble)
@@ -86,14 +86,23 @@ def assess_fit(directory, epochs, fractions, validation, device, *, sigma, norma
     """Validate selected checkpoints before any physical/test score is exported."""
     from .production import validate_density_ratio, validation_improvement
 
-    reference = (np.asarray(background_reference) if background_reference is not None else
-                 np.random.default_rng(3407).standard_normal((8192, validation.shape[1])).astype(np.float32))
+    correction_inputs = json.loads((Path(directory) / "residual_training_inputs.json").read_text())
+    correction = correction_inputs.get("background_correction")
+    if background_reference is not None:
+        reference = np.asarray(background_reference)
+    elif correction is not None:
+        # Match the validated bgcorr study: sample the actual q_phi denominator
+        # across the full SR context range, not a Gaussian proxy.
+        contexts = np.random.default_rng(3407).uniform(-1.0, 1.0, 8192).astype(np.float32)
+        reference = residual_background_sample(directory, contexts, len(contexts), 3408, device)
+    else:
+        reference = np.random.default_rng(3407).standard_normal((8192, validation.shape[1])).astype(np.float32)
+        if mass_conditioning:
+            # Gaussian latents at reserved-data masses, independent of the latents.
+            # The conditional denominator has no Gaussian density factor for mass.
+            reference[:, -1] = np.random.default_rng(3408).choice(validation[:, -1], len(reference))
     if reference.shape != (8192, validation.shape[1]) or not np.isfinite(reference).all():
         raise ValueError("Invalid background normalization reference")
-    if mass_conditioning and background_reference is None:
-        # Gaussian latents at reserved-data masses, independent of the latents.
-        # The conditional denominator has no Gaussian density factor for mass.
-        reference[:, -1] = np.random.default_rng(3408).choice(validation[:, -1], len(reference))
     rows = np.concatenate((validation, reference))
     mixture, reference_sum, checks = None, None, []
     with torch.random.fork_rng(devices=[] if str(device) == "cpu" else None):
@@ -122,7 +131,12 @@ def assess_fit(directory, epochs, fractions, validation, device, *, sigma, norma
                          reference_seed=3407, reference_samples=len(reference), checkpoints=checks,
                          ensemble=validate_density_ratio(reference_sum - np.log(len(epochs)),
                              stage=f"{directory} ensemble", tests=normalization_tests))
-    if mass_conditioning:
+    if correction is not None:
+        normalization.update(reference="q_phi(z|m) samples across the signal-region mass context",
+                             reference_seed=3408, mass_context_seed=3407, conditional_density=True,
+                             background_correction=correction["mode"],
+                             background_sha256=correction["source_sha256"])
+    elif mass_conditioning:
         normalization.update(reference="independent standard-normal latents at reserved-validation masses",
                              mass_context_seed=3408, conditional_density=True)
     if background_reference is not None:
@@ -138,7 +152,8 @@ def assess_fit(directory, epochs, fractions, validation, device, *, sigma, norma
 
 
 def train_member(rows, validation, output, *, relative, index, fraction, epochs, seed,
-                 device, initialization, settings, label, normalization_tests, background_reference=None, member_split_indices=None, source_ids=None):
+                 device, initialization, settings, label, normalization_tests, background_reference=None,
+                 background_correction=None, member_split_indices=None, source_ids=None):
     """One persisted attempt budget shared by sequential and spawned workers."""
     from .production import NumericalFitError
     from .storage import locked, save_npz
@@ -167,6 +182,14 @@ def train_member(rows, validation, output, *, relative, index, fraction, epochs,
                     normalization_tests=normalization_tests)
     if background_reference is not None:
         identity["background_reference_sha256"] = digest(background_reference)
+    if background_correction is not None:
+        identity["background_correction"] = {
+            "mode": background_correction["mode"],
+            "protocol": background_correction["protocol"],
+            "epochs": background_correction["epochs"],
+            "selected_epoch": background_correction["selected_epoch"],
+            "model_sha256": background_correction["model_sha256"],
+        }
     if member_split_indices is not None:
         identity["explicit_split"] = dict(train=digest(a), validation=digest(b))
     if source_ids is not None: identity["source_ids_sha256"] = digest(source_ids)
@@ -241,13 +264,17 @@ def train_member(rows, validation, output, *, relative, index, fraction, epochs,
                 order, history = train_residual(
                     rows[a], rows[b], directory, epochs=epochs, seed=training_seed, device=device,
                     checkpoint=checkpoint, fraction=fraction, initialization=initialization,
-                    progress_label=f"{label} | Attempt {number + 1}/{len(seeds)}", settings=settings)
+                    progress_label=f"{label} | Attempt {number + 1}/{len(seeds)}", settings=settings,
+                    background_correction=background_correction)
                 weights = [history[e]["signal_fraction"] for e in order]
                 quality, normalization, mixture = assess_fit(
                     directory, order, weights, validation, device,
                     sigma=policy["validation_sigma"], normalization_tests=normalization_tests,
                     mass_conditioning=settings.get("mass_conditioning", False),
-                    **({"profile_validation": real_sr_latents(rows[b]), "fixed_coherent_fraction": fraction}
+                    **({"profile_validation": real_sr_latents(
+                            rows[b], mass_conditioning=settings.get("mass_conditioning", False),
+                            physical_inputs=settings.get("input_space") == "physical"),
+                        "fixed_coherent_fraction": fraction}
                        if effective_features(settings)["coherent_mixture"] else {}),
                     **({"background_reference": background_reference} if background_reference is not None else {}))
                 # Kept alongside the selected density for configuration selection, never test labels.
@@ -289,25 +316,31 @@ def train_member(rows, validation, output, *, relative, index, fraction, epochs,
 def train_campaign(
     train, validation, output, *, epochs=DEFAULTS["riddle"]["epochs"],
     runs=DEFAULTS["riddle"]["runs"], seed=0, device="cpu", fraction_values=(None,),
-    initialization="background", started=None, workers=1, io_workers=2, settings=None, background_reference=None,
-    selection_validation=None, member_splits=None, source_ids=None,
+    initialization="background", started=None, workers=1, io_workers=2, torch_threads=2, settings=None, background_reference=None,
+    background_correction=None, selection_validation=None, member_splits=None, source_ids=None,
 ):
     settings = deepcopy(DEFAULTS["riddle"] if settings is None else settings)
     settings.update(epochs=epochs, runs=runs, initialization=initialization)
     settings = validate_residual(settings)
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
-    if min(runs, workers, io_workers) < 1:
-        raise ValueError("Require positive runs/workers/io_workers")
+    if min(runs, workers, io_workers, torch_threads) < 1:
+        raise ValueError("Require positive runs/workers/io_workers/torch_threads")
     mass_conditioning = settings.get("mass_conditioning", False)
     physical_inputs = settings.get("input_space") == "physical"
     if physical_inputs and (background_reference is None or workers != 1):
         raise ValueError("Physical pilot requires a frozen-background reference and one fit worker")
     if background_reference is not None and not physical_inputs:
         raise ValueError("Custom background reference is only supported by the physical pilot")
+    if background_correction is not None:
+        if settings.get("background_correction") != "bgcorr_40_reguide":
+            raise ValueError("Background-correction descriptor supplied for a disabled profile")
+        if not mass_conditioning or physical_inputs:
+            raise ValueError("bgcorr_40_reguide requires mapped latent inputs with mass conditioning")
     ztrain, zval = (real_sr_latents(rows, mass_conditioning=mass_conditioning,
                                   physical_inputs=physical_inputs) for rows in (train, validation))
-    zselection = (None if selection_validation is None else real_sr_latents(selection_validation))
+    zselection = (None if selection_validation is None else real_sr_latents(
+        selection_validation, mass_conditioning=mass_conditioning, physical_inputs=physical_inputs))
     coherent = effective_features(settings)["coherent_mixture"]
     if coherent and zselection is None:
         raise ValueError("Coherent mixture requires separate internal selection and reserved evidence populations")
@@ -323,6 +356,12 @@ def train_campaign(
                     initialization=initialization, settings=settings)
     if background_reference is not None:
         identity["background_reference_sha256"] = digest(background_reference)
+    if background_correction is not None:
+        identity["background_correction"] = {
+            "mode": background_correction["mode"], "protocol": background_correction["protocol"],
+            "epochs": background_correction["epochs"], "selected_epoch": background_correction["selected_epoch"],
+            "model_sha256": background_correction["model_sha256"],
+        }
     if zselection is not None:
         identity["internal_selection_sha256"] = digest(zselection)
     if member_splits is not None:
@@ -346,8 +385,9 @@ def train_campaign(
     if workers > 1:
         from .parallel import run_fits
         run_fits(rows, jobs, validation=zval, epochs=epochs, seed=seed, device=device,
-                 initialization=initialization, workers=workers, io_workers=io_workers,
-                 total=total, started=started, settings=settings, normalization_tests=tests, source_ids=source_ids)
+                 initialization=initialization, workers=workers, io_workers=io_workers, torch_threads=torch_threads,
+                 total=total, started=started, settings=settings, normalization_tests=tests, source_ids=source_ids,
+                 background_correction=background_correction)
     else:
         for job in jobs:
             train_member(rows, zval, output, relative=job["relative"], index=job["index"],
@@ -355,7 +395,8 @@ def train_campaign(
                          initialization=initialization, settings=settings,
                          label=f"RIDDLE fit {job['fit']}/{total}", normalization_tests=tests,
                          member_split_indices=job["member_split_indices"], source_ids=source_ids,
-                         **({"background_reference": background_reference} if background_reference is not None else {}))
+                         **({"background_reference": background_reference} if background_reference is not None else {}),
+                         **({"background_correction": background_correction} if background_correction is not None else {}))
     configs, failures = [], []
     for tag in tags:
         receipts = [json.loads((output / tag / f"run_{i:03d}" / "fit.json").read_text()) for i in range(runs)]
@@ -367,6 +408,16 @@ def train_campaign(
                       excluded_fits=excluded, valid_runs=len(members))
         if members:
             require_complete_members(members, runs, checkpoints, configuration=tag, allow_excluded=True)
+            if background_correction is not None:
+                recorded = []
+                for member in members:
+                    inputs = json.loads((output / member["directory"] / "residual_training_inputs.json").read_text())
+                    info = inputs.get("background_correction")
+                    if info is None:
+                        raise ValueError("Accepted corrected-background member is missing its denominator identity")
+                    recorded.append(info["source_sha256"])
+                if set(recorded) != {background_correction["model_sha256"]}:
+                    raise ValueError("Accepted RIDDLE members do not share one coherent q_phi denominator")
             mixtures = [np.load(output / m["directory"] / "validation_log_mixture_ratio.npy") for m in members]
             combined = np.logaddexp.reduce(mixtures, axis=0) - np.log(len(members))
             selection_gain = None
@@ -394,10 +445,11 @@ def train_campaign(
             config["health"] = dict(normalization_status="passed",
                 quality=validation_improvement(combined, sigma=settings["fit_recovery"]["validation_sigma"]))
             config["health"].update(fit_acceptance(config["health"]))
+            selection_rows = zselection if zselection is not None else zval
+            selected_background = residual_background_log_prob(
+                output / members[0]["directory"], selection_rows, device)
             config["selection_nll"] = -float(np.mean(
-                background_log_prob(torch.from_numpy(zselection if zselection is not None else zval), mass_conditioning=mass_conditioning,
-                                    physical_inputs=physical_inputs).numpy().astype(np.float64)
-                + (selection_gain if selection_gain is not None else combined)))
+                selected_background + (selection_gain if selection_gain is not None else combined)))
             histories = [json.loads((output / m["directory"] / "residual_losses.json").read_text())["history"]
                          for m in members]
             config["history"] = [dict(epoch=e, **{key: float(np.mean([h[e][key] for h in histories if e < len(h)]))
@@ -408,6 +460,10 @@ def train_campaign(
     usable = [c for c in configs if c["members"]]
     result = dict(status="completed" if usable else "no_accepted_fits", production_policy=PRODUCTION_POLICY,
                   requested_runs=runs, checkpoints_per_run=checkpoints, configurations=configs,
+                  background_correction=(None if background_correction is None else {
+                      "mode": background_correction["mode"], "protocol": background_correction["protocol"],
+                      "epochs": background_correction["epochs"], "selected_epoch": background_correction["selected_epoch"],
+                      "model_sha256": background_correction["model_sha256"]}),
                   failures=failures, fit_recovery=settings["fit_recovery"],
                   selection=("internal selection likelihood; reserved evidence never selects configurations"
                              if zselection is not None else "reserved-validation mixture likelihood; no truth or test-score selection"))

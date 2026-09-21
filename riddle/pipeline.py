@@ -17,7 +17,7 @@ from .options import effective_features, feature_options
 
 def run(args, contract):
     fraction_values = fractions(args.fractions)
-    acceleration = install_tensor_batches()
+    acceleration = install_tensor_batches(args.device)
     output = args.output
     latent_root = output / "background"
     recovery = EpochRecovery(latent_root, contract, args.resume, **resume_policy(args))
@@ -27,10 +27,6 @@ def run(args, contract):
     development = None
     mass_conditioning = settings["riddle"].get("mass_conditioning", False)
     physical_inputs = settings["riddle"].get("input_space") == "physical"
-    if mass_conditioning:
-        from .data import diagnostic_profile
-        if diagnostic_profile(contract["inputs"]) is None:
-            raise ValueError("Mass-conditioned RIDDLE is currently restricted to the CPU pilot")
     if enhanced:
         from .mapping import prepare as prepare_mapping
         if getattr(args, "mapping_experiment", None) is not None:
@@ -54,6 +50,19 @@ def run(args, contract):
         training, validation = mapper.physical_development(args.data, settings["background"]["reference_samples"])
         background_reference = mapper.physical_reference(validation)
     dimensions = training.shape[1] - 3 - int(physical_inputs)
+    background_correction = None
+    if settings["riddle"].get("background_correction", "none") == "bgcorr_40_reguide":
+        if development is None:
+            raise ValueError("bgcorr_40_reguide requires the enhanced mapping pipeline and reserved correction roles")
+        for role in ("correction_train", "correction_val"):
+            if role not in development:
+                raise ValueError(f"Missing reserved {role} role required by bgcorr_40_reguide")
+        from .background_correction import train as train_background_correction
+        background_correction = train_background_correction(
+            output / "density" / "background_correction",
+            development["correction_train"]["z"], development["correction_train"]["mass"],
+            development["correction_val"]["z"], development["correction_val"]["mass"],
+            settings=settings["riddle"], seed=(int(args.seed)+91000) % 2**32, device=args.device)
     acceptance, mapped = {}, {}
     evaluation_ids = {}
     ids_path = args.data / "event_ids.npz"
@@ -100,9 +109,11 @@ def run(args, contract):
             initialization=settings["riddle"]["initialization"],
             workers=args.workers,
             io_workers=args.io_workers,
+            torch_threads=args.torch_threads,
             settings=settings["riddle"],
             **({"selection_validation": np.load(latent_root / "mixture_validation_latents.npy")} if enhanced else {}),
             **({"background_reference": background_reference} if physical_inputs else {}),
+            **({"background_correction": background_correction} if background_correction is not None else {}),
             **({"member_splits": development.get("member_splits"),
                 "source_ids": development["residual_train"].get("ids")} if enhanced else {}),
         )
@@ -197,7 +208,8 @@ def run(args, contract):
             "gradient_clip": f"flow parameters only; norm {settings['riddle']['training']['gradient_clip_norm']}",
             "ensemble": f"equal-weight mean signal density over accepted fits and {settings['riddle']['training']['selected_checkpoints']} validation-selected epochs per fit",
             "settings": settings,
-            "implementation": "riddle_default_six_features_v2_hc_baseline",
+            "implementation": ("riddle_bgcorr_40_reguide_v1" if background_correction is not None
+                               else "riddle_default_six_features_v2_hc_baseline"),
             "data_policy": ("mapping_component_diagnostic_v1" if getattr(args,"mapping_experiment",None)
                             else settings["riddle"].get("data_policy", DEFAULT_POLICY)),
             "requested_features": {k: feature_options(settings["riddle"])[k] for k in active},
@@ -206,8 +218,20 @@ def run(args, contract):
                 if settings['riddle'].get('data_policy') == 'study_replay_v1' else
                 "Disjoint mapping, residual development, common mixture-selection, reserved evidence, calibration training/validation, and sideband closure roles; final test untouched")} if enhanced else {}),
             "feature_dependencies": {"hard_bg": "inactive when guided_fit is disabled"},
-            "score": "logit conditional background percentile" if active["score_flow"] else "log mean residual/background density ratio",
-            "raw_score": "log mean residual/background density ratio",
+            "score": ("log p_signal(z|mjj) ensemble - log q_phi(z|mjj)" if background_correction is not None else
+                      "logit conditional background percentile" if active["score_flow"] else "log mean residual/background density ratio"),
+            "raw_score": ("log p_signal(z|mjj) ensemble - log q_phi(z|mjj)" if background_correction is not None else
+                          "log mean residual/background density ratio"),
+            "background_correction": (None if background_correction is None else {
+                "mode": background_correction["mode"], "protocol": background_correction["protocol"],
+                "epochs": background_correction["epochs"], "selected_epoch": background_correction["selected_epoch"],
+                "model_sha256": background_correction["model_sha256"],
+                "training_roles": ["correction_train", "correction_val"],
+                "shared_across_residual_fits": True,
+                "guide": "retrained against q_phi(z|m) samples at matched masses",
+                "residual_initialization": "q_phi",
+                "denominator": "q_phi(z|m)",
+            }),
             "fit_score_note": "Individual density scores through the frozen ensemble calibrator; not independently calibrated member models" if active["score_flow"] else "individual density ratios",
             "coherent_mixture": result.get("coherent_mixture"),
             "calibration_status": calibration_status,
@@ -227,10 +251,13 @@ def run(args, contract):
             "fractions": args.fractions,
             "selected_checkpoints": result["selected_checkpoints"],
             "acceleration": execution_report(acceleration),
-            **({"name": "RIDDLE + mass (CPU pilot)", "mass_conditioning": True,
+            **({"name": ("RIDDLE bgcorr_40_reguide" if background_correction is not None else "RIDDLE + mass-conditioned residual"),
+                "mass_conditioning": True,
                 "inputs": "SR latents plus mass context (mjj - 3.5 TeV) / 0.2 TeV; no truth labels",
-                "score": "log(mean signal density p(z|mjj)) - log standard-normal latent density",
-                "background": "standard-normal latent density conditional on mass; no mass PDF factor",
+                "score": ("log(mean signal density p(z|mjj)) - log q_phi(z|mjj)" if background_correction is not None else
+                          "log(mean signal density p(z|mjj)) - log standard-normal latent density"),
+                "background": ("shared sideband-trained q_phi(z|mjj); no mass PDF factor" if background_correction is not None else
+                               "standard-normal latent density conditional on mass; no mass PDF factor"),
                 "context_features": ["mjj"], "scope": "signal_region"} if mass_conditioning else {}),
             **({"name": "RIDDLE physical + mass (CPU pilot)", "input_space": "physical",
                 "inputs": "Logit-standardized physical features plus mass context; no learned latent transform in signal inputs",

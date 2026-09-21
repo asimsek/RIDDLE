@@ -177,6 +177,10 @@ def main():
 
     if options["device"] != "cpu" and not torch.cuda.is_available():
         raise RuntimeError("R-ANODE requested CUDA, but it is unavailable")
+    torch.set_num_threads(int(options.get("torch_threads", 2)))
+    torch.set_num_interop_threads(1)
+    from riddle.acceleration import install_tensor_batches, execution_report
+    tensor_acceleration = install_tensor_batches(options["device"])
     stage_progress("prepare", "Prepare physical features and restore stage RNG")
     initial_rng(options["rng"])
     records = evaluation(arrays)
@@ -286,6 +290,8 @@ def main():
         np.save(attempt / "upstream_likelihood.npy", namespace["likelihood"])
     stage_progress("sources", "Verify upstream sources are unchanged")
     verify(sources)
+    from riddle.storage import write_json
+    write_json(attempt / "tensor_batch_acceleration.json", execution_report(tensor_acceleration))
     stage_progress("sources", "Verify upstream sources are unchanged", completed=1)
 
 

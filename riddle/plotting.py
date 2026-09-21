@@ -491,7 +491,7 @@ def resolve_plot_device(requested):
 def riddle_plot_predictions(root, report, member, groups, *, device="cpu"):
     """Read-only v2/v3 inference; production training/resume version rules stay strict."""
     import torch
-    from .model import build_signal_flow, background_log_prob
+    from .model import build_signal_flow, background_log_prob, signal_log_prob
 
     relative = Path("density") / member["directory"]
     inputs = read_metadata(root, report, str(relative / "residual_training_inputs.json"))
@@ -504,8 +504,25 @@ def riddle_plot_predictions(root, report, member, groups, *, device="cpu"):
         if z.ndim != 2 or z.shape[1] != inputs["features"] or not len(z) or not np.isfinite(z).all():
             raise ValueError("Invalid RIDDLE inference latents")
     model = build_signal_flow(device, features=inputs["features"], settings=inputs["settings"]).eval()
-    backgrounds = {key: background_log_prob(torch.from_numpy(z)).numpy().astype(np.float64)
-                   for key, z in groups.items()}
+    correction = inputs.get("background_correction")
+    corrected_background = None
+    if correction is not None:
+        from .background_correction import load_local, log_prob as corrected_log_prob
+        corrected_background, saved_correction = load_local(root / relative, inputs["settings"], inputs["features"]-1, device)
+        if saved_correction.get("source_sha256") != correction["source_sha256"]:
+            raise ValueError("RIDDLE plot denominator identity changed")
+        from .enhancements import chunks as inference_chunks
+        backgrounds = {}
+        for key, z in groups.items():
+            t = torch.from_numpy(z)
+            backgrounds[key] = inference_chunks(
+                lambda x, c: corrected_log_prob(corrected_background, x, c),
+                t[:, :-1], t[:, -1], device=device, size=8192).numpy().astype(np.float64)
+    else:
+        backgrounds = {key: background_log_prob(
+            torch.from_numpy(z), mass_conditioning=model.mass_conditioning,
+            physical_inputs=model.physical_inputs).numpy().astype(np.float64)
+            for key, z in groups.items()}
     sums, mixture = {}, None
     total = len(paths) * sum(len(z) for z in groups.values())
     completed = 0
@@ -522,7 +539,7 @@ def riddle_plot_predictions(root, report, member, groups, *, device="cpu"):
                 for offset in range(0, len(z), 8192):
                     batch = z[offset:offset + 8192]
                     x = torch.from_numpy(batch).to(device)
-                    chunks.append(model.log_prob(x).cpu().numpy())
+                    chunks.append(signal_log_prob(model, x).cpu().numpy())
                     completed += len(batch)
                     progress.update(completed)
                 ratio = np.concatenate(chunks).astype(np.float64) - backgrounds[key]

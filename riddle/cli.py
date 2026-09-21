@@ -77,7 +77,10 @@ def parser():
             default=1,
             help="Concurrent RIDDLE/R-ANODE fits or independent LaCathode runs; fixed-background LaCathode and method/seed jobs stay sequential",
         )
-        run.add_argument("--io-workers", type=positive, default=2)
+        run.add_argument("--io-workers", type=positive, default=2,
+                         help="Filesystem/host I/O concurrency; independent of PyTorch compute threads")
+        run.add_argument("--torch-threads", type=positive, default=2,
+                         help="Intra-op CPU threads per training process (default: 2)")
         run.add_argument("--mps", choices=["auto", "on", "off"], default="auto")
         run.add_argument("--runs", type=positive,
                          help="Complete independent runs per seed (default: 1); retrain background and signal models")
@@ -92,6 +95,10 @@ def parser():
         from .roles import POLICIES
         run.add_argument("--data-policy", choices=tuple(POLICIES), help="Source-role policy; default production_v2 uses HC study mapping + production residual roles")
         run.add_argument("--ensemble-completion", choices=("strict", "partial"), help="Require every requested fit, or explicitly retain a partial ensemble")
+        run.add_argument("--mass-conditioning", action=argparse.BooleanOptionalAction, default=None,
+                         help="Condition the RIDDLE residual density on mjj inside the signal region")
+        run.add_argument("--background-correction", choices=("none", "bgcorr_40_reguide"), default=None,
+                         help="Optional latent denominator correction; bgcorr_40_reguide trains one shared 40-epoch q_phi(z|m) and retrains each guide against it")
         from .options import add_feature_arguments
         add_feature_arguments(run)
         add_resume_options(run)
@@ -232,14 +239,14 @@ def run_campaign(args):
                 PYTHONPATH=os.pathsep.join(filter(None, (str(ROOT), env.get("PYTHONPATH")))),
             )
             for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
-                env[key] = str(args.io_workers)
+                env[key] = str(args.torch_threads)
             if method == "ranode":
                 command = [sys.executable, "-m", "external.ranode_utils.runner",
                            "--sources", str(args.ranode_sources), "--data", options["data"],
                            "--output", str(output), "--config", str(args.ranode_config),
                            "--scenario", scenario, "--seed", str(seed), "--device", options["device"],
-                           "--io-workers", str(args.io_workers), "--workers", str(args.workers),
-                           "--mps", args.mps]
+                           "--io-workers", str(args.io_workers), "--torch-threads", str(args.torch_threads),
+                           "--workers", str(args.workers), "--mps", args.mps]
                 for key, value in fit_overrides.items():
                     if value is not None:
                         command.extend(["--fits" if key == "runs" else "--" + key, str(value)])
