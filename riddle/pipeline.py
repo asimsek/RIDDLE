@@ -51,6 +51,7 @@ def run(args, contract):
         background_reference = mapper.physical_reference(validation)
     dimensions = training.shape[1] - 3 - int(physical_inputs)
     background_correction = None
+    background_correction_decision = None
     if settings["riddle"].get("background_correction", "none") == "bgcorr_40_reguide":
         if development is None:
             raise ValueError("bgcorr_40_reguide requires the enhanced mapping pipeline and reserved correction roles")
@@ -58,11 +59,12 @@ def run(args, contract):
             if role not in development:
                 raise ValueError(f"Missing reserved {role} role required by bgcorr_40_reguide")
         from .background_correction import train as train_background_correction
-        background_correction = train_background_correction(
+        background_correction_decision = train_background_correction(
             output / "density" / "background_correction",
             development["correction_train"]["z"], development["correction_train"]["mass"],
             development["correction_val"]["z"], development["correction_val"]["mass"],
             settings=settings["riddle"], seed=(int(args.seed)+91000) % 2**32, device=args.device)
+        background_correction = background_correction_decision["descriptor"]
     acceptance, mapped = {}, {}
     evaluation_ids = {}
     ids_path = args.data / "event_ids.npz"
@@ -208,7 +210,8 @@ def run(args, contract):
             "gradient_clip": f"flow parameters only; norm {settings['riddle']['training']['gradient_clip_norm']}",
             "ensemble": f"equal-weight mean signal density over accepted fits and {settings['riddle']['training']['selected_checkpoints']} validation-selected epochs per fit",
             "settings": settings,
-            "implementation": ("riddle_bgcorr_40_reguide_v1" if background_correction is not None
+            "implementation": ("riddle_bgcorr_40_reguide_v3_multiwindow_closure" if background_correction is not None
+                               else "riddle_bgcorr_gaussian_fallback_v3_multiwindow_closure" if background_correction_decision is not None
                                else "riddle_default_six_features_v2_hc_baseline"),
             "data_policy": ("mapping_component_diagnostic_v1" if getattr(args,"mapping_experiment",None)
                             else settings["riddle"].get("data_policy", DEFAULT_POLICY)),
@@ -226,12 +229,16 @@ def run(args, contract):
                 "mode": background_correction["mode"], "protocol": background_correction["protocol"],
                 "epochs": background_correction["epochs"], "selected_epoch": background_correction["selected_epoch"],
                 "model_sha256": background_correction["model_sha256"],
+                "validation_gate": background_correction["validation_gate"],
+                "pseudo_sr_closure": background_correction["pseudo_sr_closure"],
                 "training_roles": ["correction_train", "correction_val"],
                 "shared_across_residual_fits": True,
                 "guide": "retrained against q_phi(z|m) samples at matched masses",
                 "residual_initialization": "q_phi",
                 "denominator": "q_phi(z|m)",
             }),
+            "background_correction_decision": (None if background_correction_decision is None else
+                                                background_correction_decision["selection"]),
             "fit_score_note": "Individual density scores through the frozen ensemble calibrator; not independently calibrated member models" if active["score_flow"] else "individual density ratios",
             "coherent_mixture": result.get("coherent_mixture"),
             "calibration_status": calibration_status,
@@ -251,7 +258,9 @@ def run(args, contract):
             "fractions": args.fractions,
             "selected_checkpoints": result["selected_checkpoints"],
             "acceleration": execution_report(acceleration),
-            **({"name": ("RIDDLE bgcorr_40_reguide" if background_correction is not None else "RIDDLE + mass-conditioned residual"),
+            **({"name": ("RIDDLE bgcorr_40_reguide" if background_correction is not None else
+                         "RIDDLE bgcorr Gaussian fallback" if background_correction_decision is not None else
+                         "RIDDLE + mass-conditioned residual"),
                 "mass_conditioning": True,
                 "inputs": "SR latents plus mass context (mjj - 3.5 TeV) / 0.2 TeV; no truth labels",
                 "score": ("log(mean signal density p(z|mjj)) - log q_phi(z|mjj)" if background_correction is not None else

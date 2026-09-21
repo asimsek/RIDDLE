@@ -10,6 +10,7 @@ from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from pathlib import Path
 from .progress import colored_status, training_progress, verbosity, _duration, _short_value
+from riddle.worker_progress import BufferedLog, durable_progress_line
 
 EVENT_PREFIX = "[RIDDLE_WORKER_PROGRESS] "
 _LOCAL_SINK = ContextVar("riddle_progress_sink", default=None)
@@ -297,7 +298,7 @@ class WorkerDisplay:
 def monitor_worker(command, env, log, label, *, resume=False):
     messages = queue.Queue()
     with (
-        log.open("a" if resume else "w") as stream,
+        log.open("a" if resume else "w") as raw_stream,
         subprocess.Popen(
             command,
             env=env,
@@ -308,6 +309,7 @@ def monitor_worker(command, env, log, label, *, resume=False):
             errors="replace",
         ) as process,
     ):
+        stream = BufferedLog(raw_stream)
 
         def read_output():
             try:
@@ -327,6 +329,7 @@ def monitor_worker(command, env, log, label, *, resume=False):
                     try:
                         line = messages.get(timeout=1)
                     except queue.Empty:
+                        stream.flush_due()
                         display.tick()
                         continue
                     if line is None:
@@ -334,12 +337,15 @@ def monitor_worker(command, env, log, label, *, resume=False):
                     if isinstance(line, Exception):
                         raise line
                     stream.write(line)
-                    stream.flush()
+                    if durable_progress_line(line):
+                        stream.force_flush()
                     display.line(line)
                     display.tick()
+                stream.force_flush()
                 if process.wait():
                     raise RuntimeError(f"Worker failed (exit {process.returncode}); inspect {log}")
         except BaseException:
+            stream.force_flush()
             if process.poll() is None:
                 process.terminate()
                 try:
@@ -349,4 +355,5 @@ def monitor_worker(command, env, log, label, *, resume=False):
                     process.wait()
             raise
         finally:
+            stream.force_flush()
             reader.join(timeout=2)

@@ -17,12 +17,12 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from .integrity import require_finite
-from .storage import atomic_write, digest, write_json, rng_state, restore_rng, seed_start
+from .storage import atomic_torch_save, digest, write_json, rng_state, restore_rng, seed_start, persist_boundary
 from .worker_progress import emit_message
 
 
 def save_torch(path, value):
-    atomic_write(Path(path), lambda p: torch.save(value, p))
+    return atomic_torch_save(Path(path), value)
 
 
 def load_torch(path, device="cpu"):
@@ -152,8 +152,9 @@ def teacher_weights(directory, z, fraction, *, seed, options, batch_size, device
                 loss.backward(); clip_gradients(model.parameters(), 1.)
                 optimizer.step(); total += float(loss.detach())*len(x)
             history.append(dict(epoch=epoch, loss=total/(2*n), **info))
-            save_torch(latest, dict(epoch=epoch, model=model.state_dict(), optimizer=optimizer.state_dict(),
-                                   history=history, rng=rng_state(), contract=contract))
+            if persist_boundary(epoch, options["guide_epochs"]):
+                save_torch(latest, dict(epoch=epoch, model=model.state_dict(), optimizer=optimizer.state_dict(),
+                                       history=history, rng=rng_state(), contract=contract))
             emit_message(f"Guide fold {f+1}/2 epoch {epoch+1}/{options['guide_epochs']}: {info['phase']}")
         model.eval()
         logits[hold] = chunks(lambda x: model(x).flatten(), z[hold], device=device)
@@ -245,8 +246,9 @@ def corrected_teacher_weights(directory, z, context, fraction, *, seed, options,
                 loss.backward(); clip_gradients(model.parameters(), 1.)
                 optimizer.step(); total += float(loss.detach())*len(x)
             history.append(dict(epoch=epoch, loss=total/(2*n), **info))
-            save_torch(latest, dict(epoch=epoch, model=model.state_dict(), optimizer=optimizer.state_dict(),
-                                   history=history, rng=rng_state(), contract=contract))
+            if persist_boundary(epoch, options["guide_epochs"]):
+                save_torch(latest, dict(epoch=epoch, model=model.state_dict(), optimizer=optimizer.state_dict(),
+                                       history=history, rng=rng_state(), contract=contract))
             emit_message(f"Corrected guide fold {f+1}/2 epoch {epoch+1}/{options['guide_epochs']}: {info['phase']}")
         model.eval()
         logits[hold] = chunks(lambda x: model(x).flatten(), z[hold], device=device)
@@ -364,9 +366,10 @@ def train_score_flow(directory, train_score, train_mass, val_score, val_mass, *,
         history.append(dict(epoch=epoch, validation_nll=value))
         if value < best:
             best, best_model = value, deepcopy(model.state_dict())
-        save_torch(latest, dict(epoch=epoch, model=model.state_dict(), optimizer=optimizer.state_dict(),
-                               contract=contract, rng=rng_state(), history=history, best=best, best_model=best_model))
-        write_json(directory / "history.json", history)
+        if persist_boundary(epoch, epochs):
+            save_torch(latest, dict(epoch=epoch, model=model.state_dict(), optimizer=optimizer.state_dict(),
+                                   contract=contract, rng=rng_state(), history=history, best=best, best_model=best_model))
+            write_json(directory / "history.json", history)
         emit_message(f"Score flow {epoch+1}/{epochs}: sideband validation NLL={value:.6g}")
     model.load_state_dict(best_model); model.eval().requires_grad_(False)
     save_torch(directory / "model.pt", dict(model=best_model, contract=contract))

@@ -30,8 +30,6 @@ def train_ANODE(
     train_losses = np.full(epochs + 1, 1e20, dtype=np.float32)
     val_losses = np.full(epochs + 1, 1e20, dtype=np.float32)
     train_losses[0], val_losses[0] = train_loss_return[0], val_loss_return[0]
-    np.save(os.path.join(savedir, model_file_name + "_train_losses.npy"), train_losses)
-    np.save(os.path.join(savedir, model_file_name + "_val_losses.npy"), val_losses)
     for epoch in range(epochs):
         train_loss_return = train_epoch(
             model,
@@ -46,9 +44,6 @@ def train_ANODE(
         )
         train_losses[epoch + 1], val_losses[epoch + 1] = train_loss_return[0], val_loss_return[0]
         print(f"Epoch {epoch + 1}: train_loss={train_loss_return[0]}; val_loss={val_loss_return[0]}")
-        np.save(os.path.join(savedir, model_file_name + "_train_losses.npy"), train_losses)
-        np.save(os.path.join(savedir, model_file_name + "_val_losses.npy"), val_losses)
-        torch.save(model.state_dict(), os.path.join(savedir, model_file_name + f"_epoch_{epoch}.par"))
 
 
 def train_epoch(model, optimizer, data_loader, device, verbose=True, data_std=None):

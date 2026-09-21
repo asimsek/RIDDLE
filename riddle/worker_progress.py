@@ -11,10 +11,52 @@ from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from pathlib import Path
 from .progress import colored_status, training_progress, verbosity, _duration, _short_value
+from .storage import IO_PERSIST_EVERY, WORKER_LOG_FLUSH_SECONDS
 
 EVENT_PREFIX = "[RIDDLE_WORKER_PROGRESS] "
 _LOCAL_SINK = ContextVar("riddle_progress_sink", default=None)
 _NO_DIGEST = object()
+
+
+class BufferedLog:
+    """Keep small progress writes in userspace; persist periodically or at durable boundaries."""
+    def __init__(self, stream, interval=WORKER_LOG_FLUSH_SECONDS):
+        self.stream = stream
+        self.interval = float(interval)
+        self.last_flush = time.monotonic()
+
+    def write(self, value):
+        result = self.stream.write(value)
+        self.flush_due()
+        return result
+
+    def flush(self):
+        self.flush_due()
+
+    def flush_due(self):
+        now = time.monotonic()
+        if now - self.last_flush >= self.interval:
+            self.force_flush(now)
+
+    def force_flush(self, now=None):
+        self.stream.flush()
+        self.last_flush = time.monotonic() if now is None else now
+
+
+def durable_progress_event(event):
+    if event.get("unit") != "epoch" or event.get("completed") is None:
+        return False
+    completed = int(event["completed"]); total = int(event.get("total", 0) or 0)
+    return completed > 0 and (completed % IO_PERSIST_EVERY == 0 or completed == total)
+
+
+def durable_progress_line(line):
+    if not line.startswith(EVENT_PREFIX):
+        return False
+    try:
+        return durable_progress_event(json.loads(line[len(EVENT_PREFIX):]))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
 
 
 def emit_progress(
@@ -356,7 +398,7 @@ def monitor_worker(command, env, log, label, *, resume=False):
     messages = queue.Queue()
     recent_output = deque(maxlen=30)
     with (
-        log.open("a" if resume else "w") as stream,
+        log.open("a" if resume else "w") as raw_stream,
         subprocess.Popen(
             command,
             env=env,
@@ -367,6 +409,7 @@ def monitor_worker(command, env, log, label, *, resume=False):
             errors="replace",
         ) as process,
     ):
+        stream = BufferedLog(raw_stream)
 
         def read_output():
             try:
@@ -386,6 +429,7 @@ def monitor_worker(command, env, log, label, *, resume=False):
                     try:
                         line = messages.get(timeout=1)
                     except queue.Empty:
+                        stream.flush_due()
                         display.tick()
                         continue
                     if line is None:
@@ -393,11 +437,13 @@ def monitor_worker(command, env, log, label, *, resume=False):
                     if isinstance(line, Exception):
                         raise line
                     stream.write(line)
-                    stream.flush()
+                    if durable_progress_line(line):
+                        stream.force_flush()
                     if line.strip() and not line.startswith(EVENT_PREFIX):
                         recent_output.append(line.rstrip())
                     display.line(line)
                     display.tick()
+                stream.force_flush()
                 if process.wait():
                     details = "\n".join(recent_output)[-8000:]
                     raise RuntimeError(
@@ -405,6 +451,7 @@ def monitor_worker(command, env, log, label, *, resume=False):
                         + (f"\nRecent worker output:\n{details}" if details else "")
                     )
         except BaseException:
+            stream.force_flush()
             if process.poll() is None:
                 process.terminate()
                 try:
@@ -414,4 +461,5 @@ def monitor_worker(command, env, log, label, *, resume=False):
                     process.wait()
             raise
         finally:
+            stream.force_flush()
             reader.join(timeout=2)

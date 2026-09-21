@@ -19,7 +19,7 @@ from .data import BACKGROUND_PROTOCOL, input_features, latent_inputs, scientific
 from .ensemble import combine_fits, selected_epochs, mass_normalization_check, validate_result_normalization
 from .resume import check_contract, policy, transition_history
 from .source import COMMIT, REPOSITORY, digest, verify
-from riddle.worker_progress import EVENT_PREFIX, ProgressStage, emit_message, emit_progress
+from riddle.worker_progress import EVENT_PREFIX, ProgressStage, emit_message, emit_progress, BufferedLog
 from riddle.production import NumericalFitError
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -277,7 +277,8 @@ def reject_signal_fit(args, index, error):
 def execute(options, env):
     reporter = StageReporter(options)
     log_path = Path(options["attempt"]) / "stage.log"
-    with log_path.open("w") as stream:
+    with log_path.open("w") as raw_stream:
+        stream = BufferedLog(raw_stream)
         process = subprocess.Popen(
             stage_command(options), env=env, start_new_session=True,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
@@ -286,7 +287,6 @@ def execute(options, env):
         try:
             for line in process.stdout:
                 stream.write(line)
-                stream.flush()
                 reporter.line(line)
             if process.wait() != 0:
                 failure = stage_failure(options)
@@ -296,6 +296,7 @@ def execute(options, env):
                     f"Upstream R-ANODE {options['stage']} stage failed; artifacts retained in {options['attempt']}; see {log_path}"
                 )
         finally:
+            stream.force_flush()
             stop_processes([process])
             process.stdout.close()
 

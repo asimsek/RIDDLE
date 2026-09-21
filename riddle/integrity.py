@@ -5,7 +5,7 @@ import json
 import numpy as np
 import torch
 
-SCIENTIFIC_VERSION = 3
+SCIENTIFIC_VERSION = 4
 
 
 def require_finite(value, stage):

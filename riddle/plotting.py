@@ -59,7 +59,73 @@ BUILTINS = {
     "riddle": PlotMethod("RIDDLE", "#D55E00", "--", "#009E73", "sigmoid"),
     "ranode": PlotMethod("R-ANODE", "#8B1A1A", "-.", "#56B4E9", "sigmoid", "signal_region"),
 }
+# Mass-conditioned RIDDLE is serialized as riddlev2 (latent input) or riddlev3
+# (physical input).  They are scientific RIDDLE protocols, not independent
+# plotting methods.  Canonicalize them so comparisons, safeguards, labels and
+# training diagnostics all use the RIDDLE code path.
+RIDDLE_METHOD_IDS = frozenset(("riddle", "riddlev2", "riddlev3"))
 METHOD_SPECS = dict(BUILTINS)
+
+
+def method_family(method):
+    return "riddle" if method in RIDDLE_METHOD_IDS else method
+
+
+def result_variant(report):
+    return report.get("variant", report.get("contract", {}).get("inputs", {}).get("variant", "default"))
+
+
+def scientific_protocol(report):
+    value = report.get("contract", {}).get("scientific_version", 1)
+    return f"v{value}" if isinstance(value, (int, float)) and not isinstance(value, bool) else str(value)
+
+
+def protocol_rank(report):
+    value = report.get("contract", {}).get("scientific_version", 1)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return (1, float(value))
+    return (0, str(value))
+
+
+def identity_parts(identity):
+    if len(identity) == 2:
+        return identity[0], identity[1], "default"
+    if len(identity) >= 3:
+        return identity[0], identity[1], identity[2]
+    raise ValueError("Invalid plotting identity")
+
+
+def variant_component(variant):
+    if variant == "default":
+        return None
+    if not isinstance(variant, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", variant):
+        raise ValueError(f"Unsafe dataset variant {variant!r}")
+    return "variant_" + variant
+
+
+def scope_root(output, scope):
+    return output / ("SR-Only" if scope == "signal_region" else "Full-Range")
+
+
+def scoped_target(output, scope, scenario, seed=None, variant="default"):
+    target = scope_root(output, scope) / scenario
+    component = variant_component(variant)
+    if component:
+        target /= component
+    return target if seed is None else target / f"seed_{seed:03d}"
+
+
+def is_riddle_report(report):
+    return method_family(report.get("method")) == "riddle"
+
+
+def riddle_plot_spec(report):
+    # A mass-conditioned signal density is trained only in the SR, so it must
+    # never appear in full-mass comparison panels.
+    mass_conditioning = bool(report.get("contract", {}).get("settings", {}).get("riddle", {}).get("mass_conditioning", False))
+    base = BUILTINS["riddle"]
+    return PlotMethod(base.label, base.color, base.linestyle, base.signal_color,
+                      base.score_transform, "signal_region" if mass_conditioning else base.score_scope)
 
 
 def register_method(report):
@@ -67,8 +133,11 @@ def register_method(report):
     method = report.get("method")
     if not isinstance(method, str) or not re.fullmatch(r"[a-z][a-z0-9_-]*", method):
         raise ValueError("Result method must be a safe lowercase identifier")
-    if method in BUILTINS:
-        return BUILTINS[method]
+    family = method_family(method)
+    if family == "riddle":
+        return riddle_plot_spec(report)
+    if family in BUILTINS:
+        return BUILTINS[family]
     meta = report.get("plotting", {})
     if not isinstance(meta, dict):
         raise ValueError(f"Plotting metadata for {method} must be an object")
@@ -100,6 +169,15 @@ def register_method(report):
 KEYS = {"lacathode": "raw", "riddle": "residual", "ranode": "ranode"}
 STYLES = dict(f.METHODS)
 STYLES["ranode"] = ("R-ANODE", "#8B1A1A", "-.")
+# Figure-level population styles are separate from method line styles.  Keep
+# them synchronized for every plotting key so individual representation plots
+# (input/latent background-vs-signal densities, pairs and correlations) work
+# for R-ANODE and for dynamically registered future methods as well.
+POPULATION_STYLES = dict(f.POPULATIONS)
+POPULATION_STYLES["ranode"] = {
+    0: (BUILTINS["ranode"].color, "-"),
+    1: (BUILTINS["ranode"].signal_color, "--"),
+}
 
 
 PHYSICAL_STYLES = {method: spec.style for method, spec in METHOD_SPECS.items()}
@@ -109,9 +187,10 @@ class PopulationMismatch(ValueError):
     pass
 
 
-def plot_group_label(scenario, seed, group):
+def plot_group_label(scenario, seed, group, variant="default"):
     names = ", ".join(STYLES[KEYS[m]][0] for m in KEYS if m in group)
-    return f"{f.SCENARIO_LABELS[scenario]} | seed {seed} | {names}"
+    control = "" if variant == "default" else f" | {variant}"
+    return f"{f.SCENARIO_LABELS[scenario]}{control} | seed {seed} | {names}"
 
 
 def plot_task_count(groups, scan_groups):
@@ -120,18 +199,48 @@ def plot_task_count(groups, scan_groups):
 
 
 def summary_groups(groups, *, method=None, scope="signal_region"):
-    """Only combine scenarios with multiple result directories in this view."""
+    """Combine only statistically repeatable runs from one scientific protocol per method.
+
+    Per-seed comparisons may legitimately contain newer and older RIDDLE protocols in
+    the same results tree.  Uncertainty bands must never treat those protocols as
+    exchangeable repetitions, so each method is restricted to its highest numeric
+    protocol (or most common named protocol) before summary aggregation.
+    """
     eligible = {}
-    counts = {}
     for identity, group in groups.items():
         cohort = scope_group(group, scope)
         if method is not None:
             cohort = {method: cohort[method]} if method in cohort else {}
         if cohort:
             eligible[identity] = cohort
-            scenario = identity[0]
-            counts[scenario] = counts.get(scenario, 0) + 1
-    return {identity: group for identity, group in eligible.items() if counts[identity[0]] > 1}
+    if not eligible:
+        return {}
+    chosen = {}
+    for name in set().union(*(set(g) for g in eligible.values())):
+        reports = [report for group in eligible.values() if name in group for _, report in [group[name]]]
+        numeric = [r for r in reports if isinstance(r.get("contract", {}).get("scientific_version"), (int, float))
+                   and not isinstance(r.get("contract", {}).get("scientific_version"), bool)]
+        if numeric:
+            chosen[name] = scientific_protocol(max(numeric, key=protocol_rank))
+        else:
+            counts = {}
+            for report in reports:
+                tag = scientific_protocol(report)
+                counts[tag] = counts.get(tag, 0) + 1
+            chosen[name] = max(counts, key=lambda tag: (counts[tag], tag))
+    filtered = {}
+    counts = {}
+    for identity, group in eligible.items():
+        cohort = {name: source for name, source in group.items()
+                  if scientific_protocol(source[1]) == chosen[name]}
+        if not cohort:
+            continue
+        filtered[identity] = cohort
+        scenario, _, variant = identity_parts(identity)
+        key = (scenario, variant)
+        counts[key] = counts.get(key, 0) + 1
+    return {identity: group for identity, group in filtered.items()
+            if counts[(identity_parts(identity)[0], identity_parts(identity)[2])] > 1}
 
 
 class PlotProgress:
@@ -227,23 +336,34 @@ class PlotProgress:
 
 @contextmanager
 def methods(keys, *, view=None):
-    previous = f.METHODS, f.VIEWS
+    previous = f.METHODS, f.VIEWS, f.POPULATIONS
     f.METHODS = {k: STYLES[k] for k in keys}
+    # Every active figure key must have population styling.  Built-ins are
+    # pre-populated; dynamically registered methods are added lazily below.
+    missing = [k for k in keys if k not in POPULATION_STYLES]
+    if missing:
+        reverse_keys = {plot_key: method for method, plot_key in KEYS.items()}
+        for key in missing:
+            method = reverse_keys.get(key)
+            spec = METHOD_SPECS.get(method) if method is not None else None
+            if spec is None:
+                raise KeyError(f"Missing population style for plotting key {key!r}")
+            POPULATION_STYLES[key] = {0: (spec.color, "-"), 1: (spec.signal_color, "--")}
+    f.POPULATIONS = {k: POPULATION_STYLES[k] for k in keys}
     f.VIEWS = {view or ("comparison" if len(keys) > 1 else STYLES[keys[0]][0]): tuple(keys)}
     try:
         yield
     finally:
-        f.METHODS, f.VIEWS = previous
+        f.METHODS, f.VIEWS, f.POPULATIONS = previous
 
 
 def discover(root, requested=None, *, scan=False):
     paths = [root / "result.json"] if (root / "result.json").is_file() else sorted(root.rglob("result.json"))
     groups = {}
-    variants = set()
-    versions = {}
     for path in paths:
         report = json.loads(path.read_text())
-        method = report.get("method")
+        stored_method = report.get("method")
+        method = method_family(stored_method)
         if (requested is not None and method not in requested) or not report.get("completed"):
             continue
         if method == "lacathode" and "run_index" in report and path.parent != root:
@@ -252,25 +372,32 @@ def discover(root, requested=None, *, scan=False):
         if bool(point) != scan:
             continue
         spec = register_method(report)
+        METHOD_SPECS[method] = spec
         KEYS.setdefault(method, "method_" + method)
         STYLES[KEYS[method]] = spec.style[:3]
         PHYSICAL_STYLES[method] = spec.style
-        method_versions = versions.setdefault(method, set())
-        method_versions.add(report.get("contract", {}).get("scientific_version", 1))
-        if len(method_versions) > 1:
-            raise ValueError(f"Do not combine different scientific protocols for {method}")
-        variants.add(
-            report.get("variant", report.get("contract", {}).get("inputs", {}).get("variant", "default"))
-        )
-        if len(variants) > 1:
-            raise ValueError("Plot each dataset variant separately; do not mix controls in one comparison")
+        variant = result_variant(report)
         scenario, seed = report["scenario"], report["seed"]
         if scenario not in f.SCENARIOS or type(seed) is not int:
             raise ValueError("Invalid result identity")
-        identity = (point["signal_events"], point["replica"], report.get("run_index", 0)) if scan else (scenario, seed)
+        identity = ((point["signal_events"], point["replica"], report.get("run_index", 0), variant)
+                    if scan else (scenario, seed, variant))
         group = groups.setdefault(identity, {})
         if method in group:
-            raise ValueError("Duplicate method/scenario/seed results; choose a narrower input directory")
+            old_root, old_report = group[method]
+            if method == "riddle" and scientific_protocol(old_report) != scientific_protocol(report):
+                preferred = (path.parent, report) if protocol_rank(report) > protocol_rank(old_report) else (old_root, old_report)
+                discarded = old_report if preferred[1] is report else report
+                group[method] = preferred
+                colored_status(
+                    f"Multiple RIDDLE protocols for {scenario}/seed_{seed:03d}/{variant}; "
+                    f"using {scientific_protocol(preferred[1])} and ignoring {scientific_protocol(discarded)} for this plot cohort",
+                    kind="WARNING", level=0,
+                )
+                continue
+            raise ValueError(
+                f"Duplicate {METHOD_SPECS[method].label}/scenario/seed/variant results; choose a narrower input directory"
+            )
         group[method] = (path.parent, report)
     return groups
 
@@ -284,15 +411,23 @@ class NoValidFits(ValueError):
 
 
 def load_scores(root, report, name, *, attempt=None, for_rebuild=False):
+    method = method_family(report.get("method"))
     relative = Path(name + "_scores.npz")
     if attempt is not None:
         relative = Path(attempt) / relative
     path = verify_plot_input(root, report, str(relative))
     with np.load(path, allow_pickle=False) as archive:
         fields = ("mass", "labels", "mask", "scores", "physical")
-        if report["method"] in ("riddle", "lacathode") or "latent" in archive:
+        if method == "lacathode" or "latent" in archive:
             fields += ("latent",)
         data = {k: archive[k] for k in fields}
+        # Physical-input RIDDLE stores the density coordinates explicitly rather
+        # than calling them latents.  Keep them available for validation without
+        # relabelling them as z in representation plots.
+        if method == "riddle" and "density_inputs" in archive:
+            data["density_inputs"] = archive["density_inputs"]
+            if "background_log_density" in archive:
+                data["background_log_density"] = archive["background_log_density"]
         for key in ("raw_scores", "score_kind", "fit_score_kind"):
             if key in archive:
                 data[key] = archive[key]
@@ -308,14 +443,14 @@ def load_scores(root, report, name, *, attempt=None, for_rebuild=False):
                 raise ValueError("Invalid saved signal-region membership")
             if name == "signal_region" and not region.all():
                 raise ValueError("Signal-region evaluation contains non-SR events")
-        if report["method"] == "ranode":
+        if method == "ranode":
             data["is_signal_region"] = archive["is_signal_region"]
             region = data["is_signal_region"]
             if region.shape != data["mass"].shape or region.dtype != bool or (data["mask"] & ~region).any():
                 raise ValueError("Invalid R-ANODE signal-region membership")
             if name == "signal_region" and not region.all():
                 raise ValueError("R-ANODE evaluation contains non-SR events")
-        if report["method"] == "riddle":
+        if method == "riddle":
             from .production import validate_region
 
             if "is_signal_region" not in archive:
@@ -324,22 +459,34 @@ def load_scores(root, report, name, *, attempt=None, for_rebuild=False):
             if name == "signal_region" and not data["is_signal_region"].all():
                 raise ValueError("RIDDLE signal-region evaluation contains non-SR events")
     n = len(data["mass"])
-    variant = report.get("variant", report.get("contract", {}).get("inputs", {}).get("variant", "default"))
-    dimensions = 5 if variant == "deltaR" else 4
+    contract = report.get("contract", {})
+    inputs = contract.get("inputs", {})
+    columns = inputs.get("columns")
+    variant = report.get("variant", inputs.get("variant", "default"))
+    physical_dimensions = (len(columns) - 2 if isinstance(columns, list) and len(columns) >= 3
+                           else 5 if variant == "deltaR" else 4)
+    riddle_settings = contract.get("settings", {}).get("riddle", {}) if method == "riddle" else {}
+    mass_context = int(bool(riddle_settings.get("mass_conditioning", False)))
+    latent_dimensions = physical_dimensions + mass_context if method == "riddle" else physical_dimensions
     if any(data[k].shape != (n,) for k in ("mass", "labels", "scores", "mask")):
         raise ValueError("Misaligned score arrays")
-    if (
-        data["mask"].dtype != bool
-        or data["physical"].shape != (n, dimensions)
-        or ("latent" in data and data["latent"].shape != (data["mask"].sum(), dimensions))
-    ):
-        raise ValueError("Invalid feature/mapping shapes")
+    mapped_rows = int(data["mask"].sum())
+    invalid_mapping_shape = (
+        ("latent" in data and data["latent"].shape != (mapped_rows, latent_dimensions))
+        or ("density_inputs" in data and data["density_inputs"].shape != (mapped_rows, latent_dimensions))
+        or ("background_log_density" in data and data["background_log_density"].shape != (mapped_rows,))
+    )
+    if data["mask"].dtype != bool or data["physical"].shape != (n, physical_dimensions) or invalid_mapping_shape:
+        details = (f"physical={data['physical'].shape}, expected={(n, physical_dimensions)}; "
+                   f"mask accepted={mapped_rows}; latent={data.get('latent', np.empty((0,))).shape if 'latent' in data else 'absent'}, "
+                   f"expected latent width={latent_dimensions}")
+        raise ValueError(f"Invalid feature/mapping shapes ({details})")
     if not np.isin(data["labels"], [0, 1]).all() or not all(
-        np.isfinite(data[k]).all() for k in ("mass", "physical", "latent") if k in data
+        np.isfinite(data[k]).all() for k in ("mass", "physical", "latent", "density_inputs", "background_log_density") if k in data
     ):
         raise ValueError("Invalid event features or labels")
     if for_rebuild:
-        if report["method"] != "riddle":
+        if method != "riddle":
             raise ValueError("Only RIDDLE checkpoint reconstruction may defer score validation")
         # Validate all event identities/features, even when an old ensemble's
         # predictions are unusable. Actual rebuilt predictions are checked below.
@@ -351,10 +498,10 @@ def load_scores(root, report, name, *, attempt=None, for_rebuild=False):
     if (not data["mask"].any() or not np.isfinite(data["scores"][data["mask"]]).all()
             or not np.isnan(data["scores"][~data["mask"]]).all()):
         raise InvalidFitScores(f"{path}: empty/nonfinite accepted scores or invalid rejected-event scores")
-    validate_score_record(data, method=report["method"], stage=str(path))
-    if report["method"] == "riddle" and "method_health.json" in report.get("artifacts_sha256", {}):
+    validate_score_record(data, method=method, stage=str(path))
+    if method == "riddle" and "method_health.json" in report.get("artifacts_sha256", {}):
         data["plot_saved_ensemble"] = True
-    if report["method"] == "lacathode":
+    if method == "lacathode":
         settings = report.get("contract", {}).get("settings", {})
         independent = report.get("contract", {}).get("lacathode_run_layout") == "independent_background_classifier_v1"
         runs = settings.get("pipeline_runs") if independent else settings.get("classifier_runs")
@@ -383,7 +530,7 @@ def load_scores(root, report, name, *, attempt=None, for_rebuild=False):
                     or not np.array_equal(data["run_seeds"], [m["seed"] for m in members])
                     or len(set(data["run_seeds"].tolist())) != len(fits)):
                 raise ValueError("Invalid independent LaCathode run identities or latents")
-    if report["method"] in ("riddle", "ranode"):
+    if method in ("riddle", "ranode"):
         data.pop("fit_scores", None)
     return data
 
@@ -496,7 +643,7 @@ def riddle_plot_predictions(root, report, member, groups, *, device="cpu"):
     relative = Path("density") / member["directory"]
     inputs = read_metadata(root, report, str(relative / "residual_training_inputs.json"))
     version = report["contract"]["scientific_version"]
-    if version not in (2, 3) or inputs.get("scientific_version") != version:
+    if version not in (2, 3, 4) or inputs.get("scientific_version") != version:
         raise ValueError("Unsupported or inconsistent RIDDLE checkpoint protocol")
     paths = [verify_plot_input(root, report, str(relative / f"residual_epoch_{e}.pt"))
              for e in member["epochs"]]
@@ -672,7 +819,7 @@ def riddle_plot_ensemble(root, report, *, io_workers=2, device="cpu"):
 
 def unfiltered_plot_ensemble(root, report):
     """Opt out of plot-time selection, without undoing production exclusions."""
-    if report["method"] == "riddle":
+    if is_riddle_report(report):
         selection = read_metadata(root, report, "density/ensemble_selection.json")
         members = [dict(m, fit_index=m.get("fit_index", i)) for i, m in enumerate(selection["members"])]
         config = next(c for c in selection["configurations"] if c["name"] == selection["selected_configuration"])
@@ -684,7 +831,7 @@ def unfiltered_plot_ensemble(root, report):
         members = selection.get("members", [dict(fit_index=i, attempt=a) for i, a in enumerate(attempts)])
         excluded, requested = selection.get("excluded_fits", []), selection.get("requested_runs", 1)
     records = {p: load_scores(root, report, p) for p in ("validation", "test", "signal_region")}
-    audit = dict(method=report["method"], source=str(root.resolve()), scenario=report["scenario"], seed=report["seed"],
+    audit = dict(method=method_family(report["method"]), source=str(root.resolve()), scenario=report["scenario"], seed=report["seed"],
                  status="filtering_disabled", safeguard_filtering=False, checkpoint_inference=False,
                  requested_fits=requested, used_fits=len(members), used_members=members, excluded_members=excluded,
                  selection="Exact saved ensemble; plot-time filtering disabled; production exclusions retained",
@@ -708,7 +855,7 @@ class ScoreLoader:
     def __call__(self, root, report, partition):
         identity = str(root.resolve())
         if identity not in self.validated:
-            method = report["method"]
+            method = method_family(report["method"])
             legacy_riddle = method == "riddle" and report.get("contract", {}).get("scientific_version", 1) < 3
             if method in ("riddle", "ranode") and (not self.safeguard_filtering or legacy_riddle or method == "ranode"):
                 if not self.safeguard_filtering:
@@ -728,7 +875,8 @@ class ScoreLoader:
                                    f"excluded fits {indices}; accepted ensemble verified", kind="INFO", level=0)
             if self.safeguard_filtering and method == "riddle" and not legacy_riddle:
                 from .production import require_complete_ensemble
-                selection = read_metadata(root, report, "density/ensemble_selection.json")
+                selection = (read_metadata(root, report, "density/ensemble_selection.json")
+                             if "density/ensemble_selection.json" in report.get("artifacts_sha256", {}) else {})
                 require_complete_ensemble(selection)
                 chosen = next(c for c in selection["configurations"] if c["name"] == selection["selected_configuration"])
                 self.fit_audit[identity] = dict(method="riddle", source=identity, status="producer_selection",
@@ -737,7 +885,7 @@ class ScoreLoader:
                     used_members=selection["members"], excluded_members=chosen["excluded_fits"],
                     fit_recovery=selection["fit_recovery"], selection=selection["selection"], independent_runs=1,
                     safeguard_filtering=True, checkpoint_inference=False)
-            if report["method"] == "lacathode" and "run_selection.json" in report.get("artifacts_sha256", {}):
+            if method == "lacathode" and "run_selection.json" in report.get("artifacts_sha256", {}):
                 selection = read_metadata(root, report, "run_selection.json")
                 self.fit_audit[identity] = dict(method="lacathode", source=identity, status="producer_selection",
                     requested_fits=selection["requested_runs"], used_fits=selection["accepted_runs"],
@@ -847,7 +995,7 @@ def make_bundle(group, confidence, score_loader=None):
                 raise PopulationMismatch(
                     "Methods have different evaluation populations or mapping masks; plot them separately"
                 )
-        sr_masks = {k: r["is_signal_region"] for k, r in records.items() if k == "residual"}
+        sr_masks = {k: r["is_signal_region"] for k, r in records.items() if "is_signal_region" in r}
         if partition != "signal_region" and "residual" in sr_masks and "raw" in records:
             if not np.array_equal(sr_masks["residual"], f.sr(records["raw"]["mass"])):
                 raise PopulationMismatch(
@@ -866,7 +1014,23 @@ def make_bundle(group, confidence, score_loader=None):
             bundle["samples"][partition] = sample
         if partition == "test":
             bundle["feature_values"] = np.column_stack((base["mass"], base["physical"]))
-            bundle["latents_by_method"] = {k: r.get("fit_latents", r["latent"]) for k, r in records.items()}
+            latents = {}
+            for method, (_, method_report) in group.items():
+                key, record = KEYS[method], records[KEYS[method]]
+                if "fit_latents" in record:
+                    values = record["fit_latents"]
+                elif "latent" in record:
+                    values = record["latent"]
+                else:
+                    continue
+                # The extra coordinate in mass-conditioned RIDDLE is a context
+                # variable, not a learned latent feature.  Do not publish it as
+                # a fictitious z_5 in representation figures.
+                if (method == "riddle" and
+                        method_report.get("contract", {}).get("settings", {}).get("riddle", {}).get("mass_conditioning", False)):
+                    values = values[..., :-1]
+                latents[key] = values
+            bundle["latents_by_method"] = latents
     report = next(iter(group.values()))[1]
     if "lacathode" in group:
         bundle["classifier_fit_count"] = f.validate_fit_counts(
@@ -906,7 +1070,10 @@ def render_bundle(bundle, target, args):
                 ) else renderer(bundle, target)
     for key in keys:
         with methods([key], view="."), ProgressStage("representation", "Plot input and latent distributions"):
-            f.render_representation({**bundle, "latents": bundle["latents_by_method"][key]}, target)
+            representation = dict(bundle)
+            if key in bundle["latents_by_method"]:
+                representation["latents"] = bundle["latents_by_method"][key]
+            f.render_representation(representation, target)
     with ProgressStage("evaluation_plots", "Plot signal-region performance"):
         render_full_pipeline(bundle, target, args)
     bundle["metrics"]["mapping_acceptance"] = bundle["acceptance"]
@@ -959,8 +1126,18 @@ def render_full_pipeline(bundle, output, args):
 
 
 def render_injection_scan(groups, output, args, score_loader=None):
+    """Render injection scans versus both S/B and injected signal-event count.
+
+    Every figure is saved independently.  The upper x axis shows the realized
+    uncut nominal ``S/sqrt(B)`` when all scan points share one SR background
+    population, matching the convention used in the reference studies.
+    """
     score_loader = load_scores if score_loader is None else score_loader
     rows, cohorts, classifier_fits = [], {}, []
+    variants = {identity[3] if len(identity) > 3 else "default" for identity in groups}
+    if len(variants) > 1:
+        raise ValueError("Render each injection-scan dataset variant separately")
+    variant = next(iter(variants), "default")
     for identity, group in sorted(groups.items()):
         count, replica = identity[:2]
         reference = None
@@ -971,14 +1148,12 @@ def render_injection_scan(groups, output, args, score_loader=None):
             expected_protocol = "pinned_upstream"
             if method == "ranode":
                 from external.ranode_utils.data import scientific_version
-
                 expected_protocol = scientific_version(inputs.get("variant", "default"))
-            allowed_protocols = (2, 3) if method == "riddle" else (expected_protocol,)
+            allowed_protocols = (2, 3, 4) if method == "riddle" else (expected_protocol,)
             if method in BUILTINS and report["contract"].get("scientific_version") not in allowed_protocols:
                 raise ValueError(f"Injection scans require protocol in {allowed_protocols!r} for {method}")
             point = inputs["injection_scan"]
             from .cli import independent_run_seeds
-
             run_index = report.get("run_index", 0)
             expected_seed = independent_run_seeds(point["training_seed"], run_index + 1)[-1]
             if report["seed"] != expected_seed:
@@ -990,10 +1165,9 @@ def render_injection_scan(groups, output, args, score_loader=None):
             values = oracle_metrics(data["labels"], data["scores"], data["mask"],
                                     min_background=args.min_background)
             if "fit_scores" in data:
-                fit_values = [
-                    oracle_metrics(data["labels"], score, data["mask"], min_background=args.min_background)
-                    for score in fit_scores(data)
-                ]
+                fit_values = [oracle_metrics(data["labels"], score, data["mask"],
+                                             min_background=args.min_background)
+                              for score in fit_scores(data)]
                 classifier_fits.append(dict(method=method, signal_events=count, replica=replica,
                                             training_seed=report["seed"], fits=fit_values))
                 for field in ("conditional_auc", "conditional_max_sic", "full_pipeline_max_sic"):
@@ -1006,7 +1180,7 @@ def render_injection_scan(groups, output, args, score_loader=None):
             maximum = values["full_pipeline_max_sic"]
             fixed = [sic_at_background(data, score, 1e-3, args.min_background) for score in fit_scores(data)]
             fixed_sic = float(np.median(fixed)) if all(v is not None for v in fixed) else None
-            row = dict(method=method, signal_events=count, replica=replica, run_index=run_index,
+            row = dict(method=method, variant=variant, signal_events=count, replica=replica, run_index=run_index,
                        training_seed=report["seed"], preparation_seed=point["preparation_seed"],
                        sr_background=b0, sr_signal=s0, signal_to_background_percent=100*s0/b0,
                        uncut_nominal_significance=s0/np.sqrt(b0),
@@ -1022,66 +1196,84 @@ def render_injection_scan(groups, output, args, score_loader=None):
             cohorts.setdefault((method, count), []).append(row)
     csv_write(output / "injection_scan.csv", rows)
     audit = dict(
+        variant=variant,
         metric="Oracle maximum on truth-labelled SR test sample; mapping failures never pass",
-        nominal_significance="Per replica: maximum SIC times realized uncut SR S/sqrt(B), then aggregate",
+        nominal_significance="Per replica: SIC times realized uncut SR S/sqrt(B), then aggregate",
         uncertainty="16/50/84 percentiles across independently seeded partitions and training; finite source pool is reused, not independent collision datasets",
         minimum_background_count=args.min_background, minimum_background_efficiency=1e-4,
         fixed_efficiency="SIC at physical background efficiency 0.001; linear ROC interpolation within supported points only",
         significance_caveat="Nominal S/sqrt(B); no systematics, background fit, Poisson calibration or trials correction",
         points=[], plotted_metrics={},
     )
-    for field, title, filename in (
-        ("oracle_full_pipeline_max_sic", "Maximum significance improvement", "maximum_sic_vs_injection"),
-        ("oracle_max_nominal_significance", "Maximum nominal significance", "maximum_nominal_significance_vs_injection"),
-        ("sic_at_background_1e3", r"SIC at $\epsilon_B=10^{-3}$", "sic_at_fixed_background_vs_injection"),
-        ("nominal_significance_at_background_1e3", r"Nominal significance at $\epsilon_B=10^{-3}$", "significance_at_fixed_background_vs_injection"),
-    ):
-        fig, ax, _ = f.canvas(title, "Injected SR S/B [%]")
-        any_drawn = False
-        plotted = {}
-        for method in KEYS:
-            values = []
-            for (name, count), cohort in cohorts.items():
-                if name != method:
+
+    metric_specs = (
+        ("oracle_full_pipeline_max_sic", "Maximum significance improvement", "maximum_significance_improvement"),
+        ("oracle_max_nominal_significance", "Maximum achieved nominal significance", "maximum_achieved_significance"),
+        ("sic_at_background_1e3", r"SIC at $\epsilon_B=10^{-3}$", "sic_at_background_1e3"),
+        ("nominal_significance_at_background_1e3", r"Significance at $\epsilon_B=10^{-3}$", "significance_at_background_1e3"),
+    )
+    x_specs = (
+        ("signal_to_background_percent", "Injected SR S/B [%]", "s_over_b", True),
+        ("signal_events", "Injected signal events", "signal_events", False),
+    )
+    backgrounds = np.asarray([r["sr_background"] for r in rows], dtype=float)
+    common_background = len(backgrounds) and np.all(backgrounds == backgrounds[0])
+    for field, title, stem in metric_specs:
+        for x_field, xlabel, x_stem, invert in x_specs:
+            fig, ax, _ = f.canvas(title, xlabel)
+            any_drawn, plotted = False, {}
+            for method in KEYS:
+                values = []
+                for (name, count), cohort in cohorts.items():
+                    if name != method:
+                        continue
+                    finite = [r for r in cohort if r[field] is not None and np.isfinite(r[field])]
+                    if not finite:
+                        continue
+                    x = float(np.median([r[x_field] for r in finite]))
+                    low, median, high = np.quantile([r[field] for r in finite], [.16, .5, .84])
+                    values.append((x, low, median, high, len(finite), count))
+                if not values:
                     continue
-                finite = [r for r in cohort if r[field] is not None and np.isfinite(r[field])]
-                if not finite:
-                    continue
-                x = float(np.median([r["signal_to_background_percent"] for r in finite]))
-                low, median, high = np.quantile([r[field] for r in finite], [.16, .5, .84])
-                values.append((x, low, median, high, len(finite), count))
-            if not values:
+                values.sort()
+                matrix = np.asarray(values, dtype=float)
+                x, low, median, high = matrix[:, :4].T
+                name, color, ls = STYLES[KEYS[method]]
+                ax.plot(x, median, marker="x", ms=6, mew=1.2, color=color, ls=ls, label=name)
+                supported = matrix[:, 4] >= 2
+                if supported.any():
+                    ax.fill_between(x, low, high, where=supported, color=color, alpha=.18, linewidth=0)
+                if not supported.all():
+                    colored_status(f"{name}: scan band unavailable at single-replica points", kind="WARNING")
+                plotted[method] = [dict(x=float(a), low=float(l), median=float(m), high=float(h),
+                                       replicas=int(n), signal_events=int(c))
+                                   for a, l, m, h, n, c in values]
+                any_drawn = True
+            if not any_drawn:
+                f.plt.close(fig)
+                audit["plotted_metrics"][field + "/" + x_field] = plotted
                 continue
-            values.sort()
-            matrix = np.asarray(values)
-            x, low, median, high = matrix[:, :4].T
-            name, color, ls = STYLES[KEYS[method]]
-            ax.plot(x, median, marker="x", color=color, ls=ls, label=name)
-            # A single replica has no uncertainty band, even beside multi-replica points.
-            supported = matrix[:, 4] >= 2
-            if supported.any():
-                ax.fill_between(x, low, high, where=supported, color=color, alpha=.22)
-            if not supported.all():
-                colored_status(f"{name}: scan band unavailable at single-replica points", kind="WARNING")
-            plotted[method] = [dict(x=float(a), low=float(l), median=float(m), high=float(h),
-                                   replicas=int(n), signal_events=int(c)) for a,l,m,h,n,c in values]
-            any_drawn = True
-        if any_drawn:
-            if field == "oracle_max_nominal_significance":
+            if field in ("oracle_max_nominal_significance", "nominal_significance_at_background_1e3"):
                 for level in (3, 5):
                     ax.axhline(level, ls=":", color=".5", lw=1)
             ax.set_ylim(bottom=0)
-            ax.invert_xaxis()
-            backgrounds = np.asarray([r["sr_background"] for r in rows])
-            if len(backgrounds) and np.all(backgrounds == backgrounds[0]):
-                factor = np.sqrt(backgrounds[0])/100
-                top = ax.secondary_xaxis("top", functions=(lambda x: x*factor, lambda x: x/factor))
+            if invert:
+                ax.invert_xaxis()
+            if common_background:
+                background = float(backgrounds[0])
+                if x_field == "signal_to_background_percent":
+                    factor = np.sqrt(background) / 100.0
+                    top = ax.secondary_xaxis("top", functions=(lambda x, a=factor: x*a,
+                                                                lambda x, a=factor: x/a))
+                else:
+                    factor = np.sqrt(background)
+                    top = ax.secondary_xaxis("top", functions=(lambda x, a=factor: x/a,
+                                                                lambda x, a=factor: x*a))
                 top.set_xlabel(r"Uncut $S/\sqrt{B}$")
-            f.legend(fig, title="Signal-Injected")
-            f.save(fig, output / filename)
-        else:
-            f.plt.close(fig)
-        audit["plotted_metrics"][field] = plotted
+            title_text = "Signal-Injected" if variant == "default" else f"Signal-Injected | {variant}"
+            f.legend(fig, title=title_text)
+            f.save(fig, output / f"{stem}_vs_{x_stem}")
+            audit["plotted_metrics"][field + "/" + x_field] = plotted
     audit["points"] = rows
     if classifier_fits:
         audit["lacathode_classifier_fits"] = classifier_fits
@@ -1103,12 +1295,12 @@ def sic_at_background(record, scores, efficiency, minimum):
     return float(np.interp(efficiency, unique, maxima) / np.sqrt(efficiency))
 
 
-def comparison_rows(audit, scenario, seed, *, scope="signal_region"):
+def comparison_rows(audit, scenario, seed, *, scope="signal_region", variant="default"):
     """Long-form tables have no fixed method columns or privileged pair."""
     rows = []
     def add(method, metric, value, selection="all"):
         if value is None or isinstance(value, (int, float, np.number)):
-            rows.append(dict(scenario=scenario, seed=seed, scope="common_physical_" + scope,
+            rows.append(dict(scenario=scenario, variant=variant, seed=seed, scope="common_physical_" + scope,
                              method=method, selection=selection, metric=metric, value=f.scalar(value)))
     for method, metrics in audit.get("methods", {}).items():
         for metric, value in metrics.items():
@@ -1138,6 +1330,315 @@ def csv_write(path, rows):
 
     atomic_write(path, writer)
 
+
+
+def _sic_signal_curve(record, minimum_background):
+    """SIC parameterized by signal efficiency on supported physical SR points."""
+    if len(np.unique(record["labels"][record["mask"]])) != 2:
+        return None
+    b, sig, _ = efficiency_curve(record["labels"], record["scores"], record["mask"], full_pipeline=True)
+    support = (b >= 1e-4) & (np.rint(b * (record["labels"] == 0).sum()) >= minimum_background) & (sig > 0)
+    if support.sum() < 2:
+        return None
+    x, y = sig[support], sig[support] / np.sqrt(b[support])
+    order = np.argsort(x)
+    x, y = x[order], y[order]
+    unique, inverse = np.unique(x, return_inverse=True)
+    maxima = np.full(len(unique), -np.inf)
+    np.maximum.at(maxima, inverse, y)
+    return unique, maxima
+
+
+def render_variant_sic_ratio(groups, output, args, score_loader):
+    """Compare non-default dataset/control variants with default at fixed signal efficiency.
+
+    This figure is emitted only when a method has matching seed and scientific
+    protocol in both the default and alternate dataset.  It therefore cannot
+    accidentally compare a code/protocol change with a dataset shift.
+    """
+    indexed = {}
+    for identity, group in groups.items():
+        scenario, seed, variant = identity_parts(identity)
+        if scenario != "signal_injection":
+            continue
+        for method, source in group.items():
+            indexed[(method, seed, variant)] = source
+    variants = sorted({key[2] for key in indexed if key[2] != "default"})
+    audit = {}
+    for variant in variants:
+        per_method = {}
+        for method in sorted({key[0] for key in indexed}):
+            ratios = []
+            members = []
+            seeds = sorted({key[1] for key in indexed if key[0] == method and key[2] == variant})
+            for seed in seeds:
+                default = indexed.get((method, seed, "default"))
+                alternate = indexed.get((method, seed, variant))
+                if default is None or alternate is None:
+                    continue
+                if scientific_protocol(default[1]) != scientific_protocol(alternate[1]):
+                    colored_status(
+                        f"{METHOD_SPECS[method].label} seed {seed}: skip {variant}/default ratio across different scientific protocols",
+                        kind="WARNING", level=1,
+                    )
+                    continue
+                base = score_loader(*default, "signal_region")
+                shifted = score_loader(*alternate, "signal_region")
+                # Same truth-labelled evaluation population size is required;
+                # features may intentionally differ for the alternate dataset.
+                if not np.array_equal(base["labels"], shifted["labels"]):
+                    colored_status(
+                        f"{METHOD_SPECS[method].label} seed {seed}: skip {variant}/default ratio with different SR labels",
+                        kind="WARNING", level=1,
+                    )
+                    continue
+                base_curve = _sic_signal_curve(base, args.min_background)
+                alt_curve = _sic_signal_curve(shifted, args.min_background)
+                if base_curve is None or alt_curve is None:
+                    continue
+                lo = max(base_curve[0].min(), alt_curve[0].min())
+                hi = min(base_curve[0].max(), alt_curve[0].max())
+                if not hi > lo:
+                    continue
+                grid = np.linspace(lo, hi, 350)
+                denominator = np.interp(grid, base_curve[0], base_curve[1])
+                numerator = np.interp(grid, alt_curve[0], alt_curve[1])
+                valid = np.isfinite(numerator) & np.isfinite(denominator) & (denominator > 0)
+                if valid.sum() < 2:
+                    continue
+                ratios.append((grid[valid], numerator[valid] / denominator[valid]))
+                members.append(dict(seed=seed, protocol=scientific_protocol(default[1])))
+            if ratios:
+                per_method[method] = (ratios, members)
+        if not per_method:
+            continue
+        fig, ax, _ = f.canvas("Ratio of significance improvements", "Signal efficiency")
+        variant_audit = {}
+        for method, (curves, members) in per_method.items():
+            lower = max(curve[0].min() for curve in curves)
+            upper = min(curve[0].max() for curve in curves)
+            if upper <= lower:
+                continue
+            grid = np.linspace(lower, upper, 350)
+            matrix = np.asarray([np.interp(grid, x, y) for x, y in curves])
+            low, median, high = np.quantile(matrix, [.16, .5, .84], axis=0)
+            label, color, ls, _ = PHYSICAL_STYLES[method]
+            ax.plot(grid, median, color=color, ls=ls, label=label)
+            if len(matrix) > 1:
+                ax.fill_between(grid, low, high, color=color, alpha=.18, linewidth=0)
+            variant_audit[method] = dict(seeds=members, signal_efficiency=[float(grid[0]), float(grid[-1])],
+                                         median_ratio=[float(v) for v in median])
+        if not variant_audit:
+            f.plt.close(fig)
+            continue
+        ax.axhline(1.0, color=".25", ls=":", lw=1.2)
+        ax.set(xlim=(0, 1))
+        f.legend(fig, title=f"Signal region | {variant} / default")
+        target = scope_root(output, "signal_region") / "signal_injection" / "dataset_controls" / variant
+        f.save(fig, target / "significance_improvement_ratio_vs_signal_efficiency")
+        write_json(target / "significance_improvement_ratio.json", json_safe(variant_audit))
+        audit[variant] = variant_audit
+    return audit
+
+
+def _prepared_data_directory(data_root, report):
+    """Locate the immutable prepared directory by its manifest hashes only."""
+    if data_root is None:
+        return None
+    data_root = Path(data_root)
+    if not data_root.exists():
+        return None
+    inputs = report.get("contract", {}).get("inputs", {})
+    expected = inputs.get("files")
+    scenario = report.get("scenario")
+    variant = result_variant(report)
+    candidates = [data_root / scenario, data_root / variant / scenario, data_root]
+    seen = set()
+    for candidate in candidates:
+        manifest = candidate / "inputs.json"
+        if manifest.is_file():
+            seen.add(manifest.resolve())
+            try:
+                payload = json.loads(manifest.read_text())
+            except (OSError, ValueError):
+                continue
+            if payload.get("files") == expected:
+                return candidate
+    for manifest in data_root.rglob("inputs.json"):
+        if manifest.resolve() in seen:
+            continue
+        try:
+            payload = json.loads(manifest.read_text())
+        except (OSError, ValueError):
+            continue
+        if payload.get("scenario") == scenario and payload.get("files") == expected:
+            return manifest.parent
+    return None
+
+
+def _array_rows(directory, name):
+    path = None if directory is None else Path(directory) / name
+    if path is None or not path.is_file():
+        return None
+    try:
+        return int(np.load(path, mmap_mode="r", allow_pickle=False).shape[0])
+    except (OSError, ValueError):
+        return None
+
+
+def _event_eval_counts(root, report, score_loader):
+    record = score_loader(root, report, "signal_region")
+    return int((record["labels"] == 0).sum()), int((record["labels"] == 1).sum())
+
+
+def _first_numeric(mapping, key):
+    if isinstance(mapping, dict):
+        if key in mapping and isinstance(mapping[key], (int, float)) and not isinstance(mapping[key], bool):
+            return int(mapping[key])
+        for value in mapping.values():
+            found = _first_numeric(value, key)
+            if found is not None:
+                return found
+    elif isinstance(mapping, list):
+        values = [_first_numeric(value, key) for value in mapping]
+        values = [value for value in values if value is not None]
+        if values:
+            return int(round(float(np.median(values))))
+    return None
+
+
+def event_size_rows(groups, score_loader, *, data_root=None):
+    """Build a paper-friendly event accounting table from saved provenance.
+
+    Counts come only from checksum-protected result metadata, score populations,
+    or the exact prepared-data manifest used by that result.  Missing counts are
+    left blank rather than inferred from a paper or hard-coded benchmark.
+    """
+    rows = []
+    for identity, group in sorted(groups.items()):
+        scenario, seed, variant = identity_parts(identity)
+        for method, (root, report) in sorted(group.items()):
+            protocol = scientific_protocol(report)
+            evaluation_background, evaluation_signal = _event_eval_counts(root, report, score_loader)
+            base = dict(
+                method=METHOD_SPECS[method].label,
+                scenario=scenario,
+                variant=variant,
+                scientific_protocol=protocol,
+                seed=seed,
+                evaluation_background=evaluation_background,
+                evaluation_signal=evaluation_signal,
+                evaluation_total=evaluation_background + evaluation_signal,
+                evaluation_sample="independent signal-region evaluation",
+            )
+            data_dir = _prepared_data_directory(data_root, report)
+            if method == "riddle":
+                roles = (read_metadata(root, report, "background/data_roles.json")
+                         if "background/data_roles.json" in report.get("artifacts_sha256", {}) else {})
+                rows.append({**base, "component": "Background map", "model_type": "conditional density estimator",
+                             "train_events": roles.get("map_train", {}).get("events"),
+                             "train_sample": "sideband data (" + roles.get("map_train", {}).get("source", "prepared") + ")",
+                             "validation_events": roles.get("map_val", {}).get("events"),
+                             "validation_sample": "sideband data (" + roles.get("map_val", {}).get("source", "prepared") + ")",
+                             "generated_reference_samples": "", "notes": "Background transformation/map"})
+                if "correction_train" in roles:
+                    rows.append({**base, "component": "Background correction", "model_type": "conditional density estimator",
+                                 "train_events": roles["correction_train"].get("events"),
+                                 "train_sample": "sideband data (" + roles["correction_train"].get("source", "prepared") + ")",
+                                 "validation_events": roles.get("correction_val", {}).get("events"),
+                                 "validation_sample": "sideband data (" + roles.get("correction_val", {}).get("source", "prepared") + ")",
+                                 "generated_reference_samples": "",
+                                 "notes": f"pseudo-SR closure events={roles.get('closure', {}).get('events', '')}"})
+                selection = (read_metadata(root, report, "density/ensemble_selection.json")
+                             if "density/ensemble_selection.json" in report.get("artifacts_sha256", {}) else {})
+                members = selection.get("members", [])
+                train_events = roles.get("residual_train", {}).get("events")
+                validation_events = None
+                if members:
+                    name = "density/" + members[0]["directory"] + "/residual_training_inputs.json"
+                    try:
+                        inputs = read_metadata(root, report, name)
+                        train_events = inputs.get("train_events", train_events)
+                        validation_events = inputs.get("validation_events")
+                    except (OSError, ValueError, KeyError):
+                        pass
+                validation_parts = []
+                if validation_events is not None:
+                    validation_parts.append("internal residual validation")
+                for role, label in (("mixture_validation", "mixture selection"), ("evidence", "reserved evidence")):
+                    count = roles.get(role, {}).get("events")
+                    if count is not None:
+                        validation_parts.append(f"{int(count):,} {label}")
+                rows.append({**base, "component": "Residual signal density", "model_type": "residual density estimator",
+                             "train_events": train_events, "train_sample": "signal-region data (unlabelled)",
+                             "validation_events": validation_events,
+                             "validation_sample": "; ".join(validation_parts) or "signal-region validation",
+                             "generated_reference_samples": "",
+                             "notes": f"{selection.get('valid_runs', '')}/{selection.get('requested_runs', '')} accepted fits; "
+                                      f"{selection.get('selected_checkpoints', '')} selected checkpoints"})
+            elif method == "lacathode":
+                metadata = read_metadata(root, report, "protocol.json")
+                rows.append({**base, "component": "Background flow", "model_type": "density estimator",
+                             "train_events": _array_rows(data_dir, "outerdata_train.npy"),
+                             "train_sample": "sideband data (outerdata_train)",
+                             "validation_events": _array_rows(data_dir, "outerdata_val.npy"),
+                             "validation_sample": "sideband data (outerdata_val)",
+                             "generated_reference_samples": "", "notes": "Pinned upstream LaCATHODE flow"})
+                rows.append({**base, "component": "Classifier", "model_type": "classifier",
+                             "train_events": _array_rows(data_dir, "innerdata_train.npy"),
+                             "train_sample": "signal-region data + generated background reference",
+                             "validation_events": _array_rows(data_dir, "innerdata_val.npy"),
+                             "validation_sample": "signal-region validation + generated background reference",
+                             "generated_reference_samples": metadata.get("reference_samples", ""),
+                             "notes": f"{metadata.get('classifier_runs', '')} classifier fits; generated reference count is configured pool size"})
+            elif method == "ranode":
+                metadata = read_metadata(root, report, "protocol.json")
+                partitions = metadata.get("partitions", {})
+                background = partitions.get("background", {})
+                signal = partitions.get("signal", [])
+                rows.append({**base, "component": "Background density", "model_type": "density estimator",
+                             "train_events": _first_numeric(background, "training_rows"),
+                             "train_sample": "sideband development data",
+                             "validation_events": _first_numeric(background, "validation_rows"),
+                             "validation_sample": "sideband validation",
+                             "generated_reference_samples": "", "notes": metadata.get("background_split", "")})
+                rows.append({**base, "component": "Signal-mixture density", "model_type": "density estimator",
+                             "train_events": _first_numeric(signal, "training_rows"),
+                             "train_sample": "signal-region training data",
+                             "validation_events": _first_numeric(signal, "validation_rows"),
+                             "validation_sample": "signal-region validation",
+                             "generated_reference_samples": "",
+                             "notes": f"{metadata.get('valid_runs', '')}/{metadata.get('requested_runs', '')} accepted fits"})
+            else:
+                rows.append({**base, "component": "Method", "model_type": "model",
+                             "train_events": "", "train_sample": "",
+                             "validation_events": "", "validation_sample": "",
+                             "generated_reference_samples": "", "notes": "No method-specific event ledger available"})
+    # Collapse identical event accounting across repeated seeds while preserving
+    # which seeds contributed to the paper table.
+    collapsed = {}
+    for row in rows:
+        key = tuple((k, str(v)) for k, v in row.items() if k != "seed")
+        collapsed.setdefault(key, {**row, "seeds": []})["seeds"].append(row["seed"])
+    result = []
+    for item in collapsed.values():
+        seeds = sorted(set(item.pop("seeds")))
+        item["seeds"] = ";".join(map(str, seeds))
+        item["seed_count"] = len(seeds)
+        item.pop("seed", None)
+        def describe(count, sample):
+            return (f"{int(count):,} {sample}" if isinstance(count, (int, np.integer))
+                    else (str(sample) if sample else ""))
+        item["paper_train"] = describe(item.get("train_events"), item.get("train_sample"))
+        item["paper_validation"] = describe(item.get("validation_events"), item.get("validation_sample"))
+        item["paper_evaluation"] = (
+            f"{int(item['evaluation_background']):,} SR background + {int(item['evaluation_signal']):,} SR signal"
+            if isinstance(item.get("evaluation_background"), (int, np.integer))
+            and isinstance(item.get("evaluation_signal"), (int, np.integer)) else ""
+        )
+        result.append(item)
+    result.sort(key=lambda row: (row["scenario"], row["variant"], row["method"], row["component"]))
+    return result
 
 def settings_rows(group, score_loader=None):
     rows = []
@@ -1182,7 +1683,7 @@ def settings_rows(group, score_loader=None):
                 {
                     "method": STYLES[KEYS[method]][0],
                     "scenario": report["scenario"],
-                    "variant": report.get("variant", "default"),
+                    "variant": result_variant(report),
                     "seed": report["seed"],
                     "setting": key,
                     "value": value,
@@ -1190,6 +1691,18 @@ def settings_rows(group, score_loader=None):
             )
     return rows
 
+
+
+def plot_history_series(ax, x, values, label, *, window=5):
+    """Plot unsmoothed history plus a trailing running mean without hiding data."""
+    x = np.asarray(x)
+    values = np.asarray(values, dtype=float)
+    line, = ax.plot(x, values, ls=":", lw=1.25, alpha=.80, label=f"{label} | per epoch")
+    if len(values) >= window:
+        smooth = np.convolve(values, np.ones(window) / window, mode="valid")
+        ax.plot(x[window - 1:], smooth, color=line.get_color(), lw=2.0, ls="-",
+                label=f"{label} | {window}-epoch average")
+    return line
 
 def training_figures(group, output, score_loader=None):
     for method, (root, report) in group.items():
@@ -1224,7 +1737,7 @@ def training_figures(group, output, score_loader=None):
                     else (("signal_fraction", "RIDDLE"),)
                 )
                 for field, label in fields:
-                    ax.plot(x, [r[field] for r in history], label=label)
+                    plot_history_series(ax, x, [r[field] for r in history], label)
                 f.legend(fig)
                 f.save(fig, destination / kind)
             if members:
@@ -1281,11 +1794,12 @@ def training_figures(group, output, score_loader=None):
                 values = np.load(directory / name)
                 histories = np.atleast_2d(values)
                 epochs = np.arange(histories.shape[1])
-                line, = ax.plot(epochs, histories.mean(axis=0), label=label)
+                mean_history = histories.mean(axis=0)
+                line = plot_history_series(ax, epochs + 1, mean_history, label)
                 if (len(histories) > 1 and method == "lacathode"
                         and report.get("contract", {}).get("lacathode_run_layout") == "independent_background_classifier_v1"):
                     low, high = np.quantile(histories, [.16, .84], axis=0)
-                    ax.fill_between(epochs, low, high, color=line.get_color(), alpha=.18)
+                    ax.fill_between(epochs + 1, low, high, color=line.get_color(), alpha=.14, linewidth=0)
             f.legend(fig)
             f.save(fig, destination / stage)
 
@@ -1874,13 +2388,14 @@ def render_ranode_training(source, output, *, signal_attempts=None):
                 ))
             values = np.asarray(values)
             epochs = np.arange(1, values.shape[1] + 1)
-            ax.plot(
-                epochs,
-                values.mean(axis=0),
-                color=color,
-                ls=ls,
-                label="Train" if kind == "trainloss" else "Validation",
-            )
+            mean_history = values.mean(axis=0)
+            label = "Train" if kind == "trainloss" else "Validation"
+            line, = ax.plot(epochs, mean_history, color=color, ls=":", lw=1.25, alpha=.80,
+                            label=f"{label} | per epoch")
+            if len(mean_history) >= 5:
+                smooth = np.convolve(mean_history, np.ones(5) / 5, mode="valid")
+                ax.plot(epochs[4:], smooth, color=color, ls="-", lw=2.0,
+                        label=f"{label} | 5-epoch average")
         f.legend(
             fig,
             title="R-ANODE | "
@@ -1934,24 +2449,28 @@ def render_physical_comparison(group, output, args, load_scores, *, scope="signa
         audit["working_points"] = render_physical_working_points(validation, test, output, scenario=scenario, scope=scope)
     with ProgressStage("mass_flatness", f"Plot {label.lower()} background chi-squared"):
         seed = next(iter(group.values()))[1]["seed"]
+        variant = result_variant(next(iter(group.values()))[1])
         audit["mass_flatness"] = physical_mass_summary(
-            {(scenario, seed): group}, output / "03_mass_sculpting", args, load_scores, scenario=scenario, scope=scope)
+            {(scenario, seed, variant): group}, output / "03_mass_sculpting", args, load_scores, scenario=scenario, scope=scope)
     write_json(output / "metrics.json", json_safe(audit))
     return audit
 
 
 def physical_comparison_summary(groups, output, args, load_scores, *, scope="signal_region", view="comparison"):
+    """Aggregate independent runs without crossing scenario, variant or protocol boundaries."""
     groups = {identity: scope_group(group, scope) for identity, group in groups.items() if scope_group(group, scope)}
     partition = "signal_region" if scope == "signal_region" else "test"
     audits = {}
-    for scenario in f.SCENARIOS:
-        destination = output / scenario / "summary" / view
-        if scope == "full_region":
-            destination /= "full_region"
+    cohorts = sorted({(identity_parts(identity)[0], identity_parts(identity)[2]) for identity in groups})
+    for scenario, variant in cohorts:
+        destination = scoped_target(output, scope, scenario, variant=variant) / "summary" / view
+        cohort_groups = {
+            identity: group for identity, group in groups.items()
+            if identity_parts(identity)[0] == scenario and identity_parts(identity)[2] == variant
+        }
         partitions = {
             json.dumps(report["contract"]["inputs"].get("files"), sort_keys=True)
-            for (name, _), group in groups.items()
-            if name == scenario
+            for group in cohort_groups.values()
             for _, report in group.values()
         }
         if len(partitions) > 1:
@@ -1965,13 +2484,9 @@ def physical_comparison_summary(groups, output, args, load_scores, *, scope="sig
         curve_groups = {metric: {m: [] for m in PHYSICAL_STYLES} for metric in curves}
         reference_records = None
         grid = np.geomspace(1e-4, 1, 300)
-        for (name, seed), group in groups.items():
-            if name != scenario:
-                continue
-            records = {
-                m: load_scores(root, report, partition)
-                for m, (root, report) in group.items()
-            }
+        for identity, group in cohort_groups.items():
+            _, seed, _ = identity_parts(identity)
+            records = {m: load_scores(root, report, partition) for m, (root, report) in group.items()}
             require_same_physical_population(records)
             if reference_records is not None:
                 require_same_physical_population({"reference": reference_records, **records})
@@ -1983,22 +2498,21 @@ def physical_comparison_summary(groups, output, args, load_scores, *, scope="sig
                     for run, score_group in enumerate(run_score_groups(method, record)):
                         fixed_background_curves = []
                         for score in score_group:
-                            b, s, _ = efficiency_curve(record["labels"], score, record["mask"], full_pipeline=True)
+                            b, sig, _ = efficiency_curve(record["labels"], score, record["mask"], full_pipeline=True)
                             use = b > 0 if metric == "roc" else (b >= 1e-4) & (
                                 np.rint(b * (record["labels"] == 0).sum()) >= args.min_background)
-                            native_curves[metric][method].append((b[use], s[use]))
+                            native_curves[metric][method].append((b[use], sig[use]))
                             curve_groups[metric][method].append(len(identities[metric][method]))
                             unique, inverse = np.unique(b, return_inverse=True)
                             maxima = np.zeros(len(unique))
-                            np.maximum.at(maxima, inverse, s)
+                            np.maximum.at(maxima, inverse, sig)
                             values = np.interp(grid, unique, maxima, left=np.nan, right=np.nan)
                             supported = grid >= (0 if metric == "roc" else args.min_background / (record["labels"] == 0).sum())
                             values[~supported] = np.nan
                             fixed_background_curves.append(values)
                         curves[metric][method].append(np.median(fixed_background_curves, axis=0))
                         identities[metric][method].append(dict(
-                            seed=seed, fit=run, source=score_variation_source(method, record),
-                            member_id=run,
+                            seed=seed, fit=run, source=score_variation_source(method, record), member_id=run,
                             run_seed=int(record["run_seeds"][run]) if "run_seeds" in record else seed,
                         ))
         for metric in curves:
@@ -2008,46 +2522,40 @@ def physical_comparison_summary(groups, output, args, load_scores, *, scope="sig
                 "Signal efficiency" if metric in ("sic_signal", "background_rejection") else "Background efficiency",
             )
             audit = {}
-            for method, cohort in curves[metric].items():
-                if not cohort:
+            for method, metric_cohort in curves[metric].items():
+                if not metric_cohort:
                     continue
                 require_independent_run_ids(identities[metric][method])
                 label, color, ls, _ = PHYSICAL_STYLES[method]
-                values = np.asarray(cohort) / (1 if metric == "roc" else np.sqrt(grid))
+                values = np.asarray(metric_cohort) / (1 if metric == "roc" else np.sqrt(grid))
                 audit[method] = (
                     f.draw_fit_curves(ax, native_curves[metric][method], metric, label, color, ls,
                                       run_groups=curve_groups[metric][method])
-                    if (method == "lacathode" and len(native_curves[metric][method]) > 1) or metric in ("sic_signal", "background_rejection")
+                    if (method == "lacathode" and len(native_curves[metric][method]) > 1)
+                    or metric in ("sic_signal", "background_rejection")
                     else f.draw_band(ax, grid, values, label, color, ls)
                 )
                 audit[method].update(uncertainty_source=fit_uncertainty(identities[metric][method]),
-                                     percentiles=[16, 50, 84], fit_count=len(cohort), run_count=len(cohort),
+                                     percentiles=[16, 50, 84], fit_count=len(metric_cohort), run_count=len(metric_cohort),
                                      members=identities[metric][method])
                 audit[method].pop("independent_runs", None)
             if not audit:
                 f.plt.close(fig)
                 continue
-            ax.plot(
-                grid,
-                grid if metric == "roc" else 1 / grid if metric == "background_rejection" else np.sqrt(grid),
-                color=".5",
-                ls=":",
-                label="Random",
-            )
-            ax.set(
-                xscale="linear" if metric in ("sic_signal", "background_rejection") else "log",
-                xlim=(0 if metric in ("sic_signal", "background_rejection") else 1e-4, 1),
-                yscale="log" if metric == "background_rejection" else "linear",
-                ylim=(1 if metric == "background_rejection" else 0, 1.02 if metric == "roc" else None),
-            )
-            f.legend(
-                fig, title=f.SCENARIO_LABELS[scenario] + " | " + scope_label(scope), ncols=1
-            )
+            ax.plot(grid, grid if metric == "roc" else 1 / grid if metric == "background_rejection" else np.sqrt(grid),
+                    color=".5", ls=":", label="Random")
+            ax.set(xscale="linear" if metric in ("sic_signal", "background_rejection") else "log",
+                   xlim=(0 if metric in ("sic_signal", "background_rejection") else 1e-4, 1),
+                   yscale="log" if metric == "background_rejection" else "linear",
+                   ylim=(1 if metric == "background_rejection" else 0, 1.02 if metric == "roc" else None))
+            title = f.SCENARIO_LABELS[scenario] + " | " + scope_label(scope)
+            if variant != "default":
+                title += " | " + variant
+            f.legend(fig, title=title, ncols=1)
             f.save(fig, destination / "01_performance" / (scope + "_" + metric))
-            audits[scenario + "/" + metric] = audit
-        if any(name == scenario for name, _ in groups):
-            audits[scenario + "/mass_flatness"] = physical_mass_summary(
-                groups, destination / "03_mass_sculpting", args, load_scores, scenario=scenario, scope=scope)
+            audits[f"{scenario}/{variant}/{metric}"] = audit
+        audits[f"{scenario}/{variant}/mass_flatness"] = physical_mass_summary(
+            cohort_groups, destination / "03_mass_sculpting", args, load_scores, scenario=scenario, scope=scope)
     return audits
 
 
@@ -2070,7 +2578,8 @@ def physical_mass_summary(groups, output, args, score_loader, *, scenario="backg
     identities = {m: [] for m in PHYSICAL_STYLES}
     efficiencies = {m: [] for m in PHYSICAL_STYLES}
     reference_mass = None
-    for (name, seed), group in groups.items():
+    for identity, group in groups.items():
+        name, seed, _ = identity_parts(identity)
         if name != scenario:
             continue
         records = {m: score_loader(root, report, "test") for m, (root, report) in group.items()}
@@ -2128,86 +2637,85 @@ def physical_mass_summary(groups, output, args, score_loader, *, scenario="backg
     return audit
 
 
+
+def render_method_scope_assets(individual, destination, args, score_loader, *, scope):
+    """Render scope-specific representation diagnostics and full-range mass scan."""
+    method = next(iter(individual))
+    key = KEYS[method]
+    bundle = make_bundle(individual, args.confidence, score_loader)
+    bundle["individual"] = method
+    with methods([key], view="."), ProgressStage("representation", f"Plot {scope_label(scope).lower()} inputs and latents"):
+        representation = dict(bundle)
+        if key in bundle["latents_by_method"]:
+            representation["latents"] = bundle["latents_by_method"][key]
+        f.render_representation(representation, destination, regions=(("sr",) if scope == "signal_region" else ("full",)))
+    if scope == "full_region":
+        with methods([key], view="."):
+            f.render_mass_scan(bundle, destination)
+    return bundle
+
 def refresh_plot_scopes(output, groups, scan_groups):
-    """Replace generated figures in requested scopes, preserving notes and other runs."""
-    manifest = output / "plot_manifest.json"
-    if not manifest.is_file() or json.loads(manifest.read_text()).get("schema") not in (1, 2, 3):
-        return
-    scopes = set()
-    for (scenario, seed), group in groups.items():
-        target = output / scenario / f"seed_{seed:03d}"
-        scopes.update((target / "comparison", target / "comparison_with_ranode",
-                       output / scenario / "summary" / "comparison",
-                       output / "comparison" / scenario, output / "comparison_with_ranode" / scenario))
-        for method in group:
-            label = METHOD_SPECS[method].label
-            scopes.update((target / label, output / scenario / "summary" / label,
-                           output / label / scenario, output / label / "full_mass" / scenario))
-        for filename in ("signal_region_sic", "mass_flatness_vs_selection"):
-            for suffix in (".pdf", ".png"):
-                (output / scenario / (filename + suffix)).unlink(missing_ok=True)
-    if scan_groups:
-        scopes.add(output / "comparison" / "injection_scan")
-        scopes.add(output / "injection_scan" / "comparison")
-        # Older scan files lived directly here; do not recurse into other methods.
-        for path in (output / "injection_scan").glob("*"):
-            if path.is_file() and (path.suffix in (".pdf", ".png") or path.name in (
-                    "injection_scan.json", "injection_scan.csv")):
-                path.unlink()
-        for group in scan_groups.values():
-            scopes.update(output / METHOD_SPECS[m].label / "injection_scan" for m in group)
-            scopes.update(output / "injection_scan" / METHOD_SPECS[m].label for m in group)
-    for scope in sorted(scopes):
+    """Remove only generated plot artifacts from requested old/new layout scopes."""
+    generated_names = {"metrics.json", "injection_scan.json", "injection_scan.csv",
+                       "significance_improvement_ratio.json"}
+
+    def clean(scope):
         if not scope.is_dir():
-            continue
+            return
         for path in scope.rglob("*"):
-            if path.is_file() and (path.suffix in (".pdf", ".png") or path.name in (
-                    "metrics.json", "injection_scan.json", "injection_scan.csv")):
-                path.unlink()
+            if path.is_file() and (path.suffix.lower() in (".pdf", ".png") or path.name in generated_names):
+                path.unlink(missing_ok=True)
         for path in sorted((p for p in scope.rglob("*") if p.is_dir()), reverse=True):
             if not any(path.iterdir()):
                 path.rmdir()
-        if not any(scope.iterdir()):
+        if scope.is_dir() and not any(scope.iterdir()):
             scope.rmdir()
-        # Remove empty containers from the obsolete method-first layout as well.
-        for parent in scope.parents:
-            if parent == output or not parent.is_relative_to(output):
-                break
-            if parent.is_dir() and not any(parent.iterdir()):
-                parent.rmdir()
-    legacy = output / "comparison_with_ranode"
-    if legacy.is_dir() and not any(legacy.iterdir()):
-        legacy.rmdir()
+
+    scopes = set()
+    for identity, group in groups.items():
+        scenario, seed, variant = identity_parts(identity)
+        for scope in ("signal_region", "full_region"):
+            scopes.add(scoped_target(output, scope, scenario, seed, variant))
+            scopes.add(scoped_target(output, scope, scenario, variant=variant) / "summary")
+        # Obsolete pre-v4.5 publication layout.
+        scopes.add(output / scenario / f"seed_{seed:03d}")
+        scopes.add(output / scenario / "summary")
+    for identity in scan_groups:
+        variant = identity[3] if len(identity) > 3 else "default"
+        scopes.add(scoped_target(output, "signal_region", "signal_injection", variant=variant) / "injection_scan")
+    if groups:
+        scopes.add(scope_root(output, "signal_region") / "signal_injection" / "dataset_controls")
+    scopes.update((output / "injection_scan", output / "comparison", output / "comparison_with_ranode"))
+    for scope in sorted(scopes, key=lambda p: len(p.parts), reverse=True):
+        clean(scope)
     (output / "ranode_comparison.json").unlink(missing_ok=True)
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Comparison and individual figures from all completed methods; no fitting")
+    parser = argparse.ArgumentParser(description="Publication figures from completed RIDDLE/LaCATHODE/R-ANODE results; no fitting")
     parser.add_argument("--results", type=Path, default=Path("results"))
     parser.add_argument("--output", type=Path, default=Path("plots"))
-    parser.add_argument(
-        "--overwrite", action="store_true",
-        help="Replace generated figures in requested scopes, including obsolete layouts; preserve notes and other runs",
-    )
+    parser.add_argument("--data", type=Path, default=Path("data/lhco"),
+                        help="Prepared LHCO root used only for exact event-count accounting in event_sizes.csv")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="Replace generated figures in requested scopes, preserving unrelated non-plot files")
     parser.add_argument("--methods", nargs="+", default=None,
                         help="Optional method IDs to include; default: discover every completed method")
     parser.add_argument("--io-workers", type=int, default=2, help="CPU threads for numerical calculations and legacy RIDDLE checkpoint inference")
     parser.add_argument("--device", type=plot_device_argument, default="cpu",
-                        help="RIDDLE safeguard/checkpoint inference device: cpu (default), cuda:<index>, "
-                             "or auto (CUDA when available, otherwise CPU); other plotting stays on CPU")
+                        help="RIDDLE safeguard/checkpoint inference device: cpu (default), cuda:<index>, or auto")
     parser.add_argument("--no-safeguard-filtering", action="store_true",
-                        help="Disable plot-time RIDDLE/R-ANODE fit filtering and use saved ensemble scores; "
-                             "does not undo production exclusions or disable artifact/finite-score validation")
+                        help="Disable plot-time RIDDLE/R-ANODE fit filtering and use saved ensemble scores")
     parser.add_argument("--plot-workers", type=int, default=min(8, max(1, (os.cpu_count() or 1) // 2)),
-                        help="Parallel PDF/PNG export processes (default: half the CPUs, capped at 8); use 1 for serial export")
+                        help="Parallel PDF/PNG export processes (default: half the CPUs, capped at 8)")
     parser.add_argument("--plot-cache-mb", type=int, default=1024,
-                        help="Memory limit in MiB for repeated numerical calculations (default: 1024); 0 disables caching")
+                        help="Memory limit in MiB for repeated numerical calculations; 0 disables caching")
     parser.add_argument("--confidence", type=float, default=0.95)
     parser.add_argument("--min-background", type=int, default=10)
     parser.add_argument("--random-reference", choices=("bootstrap", "subset"), default="bootstrap")
     parser.add_argument("--allow-smoke", action="store_true", help="Permit synthetic QA fixtures")
     parser.add_argument("--verbose", type=int, choices=(0, 1, 2), default=1,
-                        help="0: warnings and result; 1: compact task progress; 2: detailed plotting progress")
+                        help="0: warnings/result; 1: compact progress; 2: detailed progress")
     args = parser.parse_args(argv)
     from threadpoolctl import threadpool_limits
     args.population_summary = True
@@ -2217,12 +2725,15 @@ def main(argv=None):
             raise ValueError("Invalid confidence level or background support")
         if args.plot_workers < 1 or args.plot_cache_mb < 0:
             raise ValueError("Plot workers must be positive and plot cache size nonnegative")
+        if args.methods is not None:
+            args.methods = list(dict.fromkeys(method_family(method) for method in args.methods))
         groups = discover(args.results, args.methods)
         scan_groups = discover(args.results, args.methods, scan=True)
         if not groups and not scan_groups:
             colored_status("No completed results for the requested methods", kind="WARNING")
             return 0
         args.results, args.output = args.results.resolve(), args.output.resolve()
+        args.data = args.data.resolve()
         if args.output.is_relative_to(args.results) or args.results.is_relative_to(args.output):
             raise ValueError("Keep plots outside the result input tree")
         if args.output.exists():
@@ -2234,8 +2745,6 @@ def main(argv=None):
                 raise ValueError("Cannot overwrite a plot directory containing symbolic links")
         score_loader = ScoreLoader(safeguard_filtering=not args.no_safeguard_filtering,
                                    io_workers=args.io_workers, device=args.device)
-        # Retain requested scopes so obsolete figures for skipped results are
-        # removed too; do not leave an old invalid curve behind on --overwrite.
         requested_groups = {key: dict(group) for key, group in groups.items()}
         requested_scan_groups = {key: dict(group) for key, group in scan_groups.items()}
         colored_status("Validate plot inputs | RIDDLE/R-ANODE safeguard filtering "
@@ -2245,12 +2754,14 @@ def main(argv=None):
             preflight_scores([*groups.values(), *scan_groups.values()], score_loader, allow_smoke=args.allow_smoke)
         groups = {key: group for key, group in groups.items() if group}
         scan_groups = {key: group for key, group in scan_groups.items() if group}
-        args.output.mkdir(parents=True, exist_ok=args.overwrite)
-        rows, settings, bundles = [], [], []
+        args.output.mkdir(parents=True, exist_ok=True)
+        scope_root(args.output, "signal_region").mkdir(parents=True, exist_ok=True)
+        scope_root(args.output, "full_region").mkdir(parents=True, exist_ok=True)
+        rows, settings = [], []
         comparisons = {}
         available = set().union(*(set(g) for g in [*groups.values(), *scan_groups.values()]))
         progress = PlotProgress(plot_task_count(groups, scan_groups))
-        colored_status(f"Plot plan: {progress.total} task groups | {len(groups)} scenario/seed groups | "
+        colored_status(f"Plot plan: {progress.total} task groups | {len(groups)} scenario/seed/variant groups | "
                        f"{len(scan_groups)} injection-scan points | {args.plot_workers} export workers | "
                        f"{args.plot_cache_mb} MiB calculation cache | saved results only, no training",
                        kind="INFO", level=1)
@@ -2259,128 +2770,107 @@ def main(argv=None):
                 f.plot_resources(workers=args.plot_workers, cache_mb=args.plot_cache_mb) as exporter:
             if args.overwrite:
                 refresh_plot_scopes(args.output, requested_groups, requested_scan_groups)
-            scan_audit = None
+            scan_audit = {}
             if scan_groups:
                 with progress.task("Injection scan | discrimination and significance"):
-                    # Scans use saved ensemble scores, not member re-inference.
-                    scan_loader = score_loader
-                    scan_audit = render_injection_scan(scan_groups, args.output / "injection_scan" / "comparison", args, scan_loader)
-                    for method in sorted(available):
-                        cohort = {identity: {method: group[method]} for identity, group in scan_groups.items() if method in group}
-                        if cohort:
-                            render_injection_scan(cohort, args.output / "injection_scan" / METHOD_SPECS[method].label, args, scan_loader)
-                    del scan_loader
-            for (scenario, seed), group in groups.items():
-                if (
-                    any(
-                        r["contract"].get("inputs", {}).get("synthetic_smoke_fixture")
-                        for _, r in group.values()
-                    )
-                    and not args.allow_smoke
-                ):
+                    variants = sorted({identity[3] if len(identity) > 3 else "default" for identity in scan_groups})
+                    for variant in variants:
+                        variant_groups = {identity: group for identity, group in scan_groups.items()
+                                          if (identity[3] if len(identity) > 3 else "default") == variant}
+                        scan_target = scoped_target(args.output, "signal_region", "signal_injection", variant=variant) / "injection_scan"
+                        scan_audit[variant] = render_injection_scan(variant_groups, scan_target / "comparison", args, score_loader)
+                        for method in sorted(available):
+                            cohort = {identity: {method: group[method]} for identity, group in variant_groups.items() if method in group}
+                            if cohort:
+                                render_injection_scan(cohort, scan_target / METHOD_SPECS[method].label, args, score_loader)
+            for identity, group in groups.items():
+                scenario, seed, variant = identity_parts(identity)
+                if any(r["contract"].get("inputs", {}).get("synthetic_smoke_fixture") for _, r in group.values()) and not args.allow_smoke:
                     raise ValueError("Synthetic fixtures require --allow-smoke for QA")
                 missing = set(args.methods or available) - set(group)
+                label = plot_group_label(scenario, seed, group, variant)
                 if missing:
                     names = ", ".join(METHOD_SPECS[m].label if m in METHOD_SPECS else m for m in sorted(missing))
-                    colored_status(f"{plot_group_label(scenario, seed, group)} | "
-                                   f"no completed results for: {names}; plotting available methods",
+                    colored_status(f"{label} | no completed results for: {names}; plotting available methods",
                                    kind="INFO", level=1)
-                target = args.output / scenario / f"seed_{seed:03d}"
-                label = plot_group_label(scenario, seed, group)
+                sr_target = scoped_target(args.output, "signal_region", scenario, seed, variant)
+                full_target = scoped_target(args.output, "full_region", scenario, seed, variant)
                 with progress.task(f"{label} | shared comparison plots"):
-                    comparison = render_physical_comparison(group, target / "comparison", args, score_loader)
-                    comparison["full_region"] = render_physical_comparison(
-                        group, target / "comparison" / "full_region", args, score_loader, scope="full_region")
-                comparisons[f"{scenario}/{seed}"] = comparison
+                    comparison = render_physical_comparison(group, sr_target / "comparison", args, score_loader, scope="signal_region")
+                    full_comparison = render_physical_comparison(group, full_target / "comparison", args, score_loader, scope="full_region")
+                    comparison["full_region"] = full_comparison
+                comparisons[f"{scenario}/{variant}/{seed}"] = comparison
                 settings.extend(settings_rows(group, score_loader))
-                rows.extend(comparison_rows(comparison, scenario, seed))
-                rows.extend(comparison_rows(comparison["full_region"], scenario, seed, scope="full_region"))
+                rows.extend(comparison_rows(comparison, scenario, seed, variant=variant))
+                rows.extend(comparison_rows(full_comparison, scenario, seed, scope="full_region", variant=variant))
                 for method, source in group.items():
                     with progress.task(f"{label} | {METHOD_SPECS[method].label} individual plots"):
                         individual = {method: source}
-                        destination = target / METHOD_SPECS[method].label
-                        render_physical_comparison(individual, destination, args, score_loader)
-                        render_physical_comparison(individual, destination / "full_region", args, score_loader, scope="full_region")
-                        training_figures(individual, target, score_loader)
-                        if method in ("lacathode", "riddle"):
-                            bundle = make_bundle(individual, args.confidence, score_loader)
-                            bundle["individual"] = method
-                            render_bundle(bundle, destination / "full_mass", args)
-                            bundles.append(bundle)
-            audit = {}
-            if summary_groups(groups):
+                        sr_destination = sr_target / METHOD_SPECS[method].label
+                        render_physical_comparison(individual, sr_destination, args, score_loader, scope="signal_region")
+                        render_method_scope_assets(individual, sr_destination, args, score_loader, scope="signal_region")
+                        training_figures(individual, sr_target, score_loader)
+                        if METHOD_SPECS[method].score_scope == "full_region":
+                            full_destination = full_target / METHOD_SPECS[method].label
+                            render_physical_comparison(individual, full_destination, args, score_loader, scope="full_region")
+                            render_method_scope_assets(individual, full_destination, args, score_loader, scope="full_region")
+            variant_audit = render_variant_sic_ratio(groups, args.output, args, score_loader)
+            audit = {"dataset_variant_ratio": variant_audit}
+            cohorts = summary_groups(groups)
+            if cohorts:
                 with progress.task("Summary plots | SIC and mass-flatness uncertainty bands"):
-                    audit["comparison"] = physical_comparison_summary(
-                        summary_groups(groups), args.output, args, score_loader)
-                    audit["comparison"]["full_region"] = physical_comparison_summary(
-                        summary_groups(groups, scope="full_region"), args.output, args, score_loader, scope="full_region")
+                    audit["comparison"] = physical_comparison_summary(cohorts, args.output, args, score_loader)
+                    full_cohorts = summary_groups(groups, scope="full_region")
+                    if full_cohorts:
+                        audit["comparison"]["full_region"] = physical_comparison_summary(
+                            full_cohorts, args.output, args, score_loader, scope="full_region")
                     for method in sorted(available):
                         cohort = summary_groups(groups, method=method)
                         if not cohort:
                             continue
-                        with ProgressStage("individual_summary", f"Summarize {METHOD_SPECS[method].label}"):
-                            view = METHOD_SPECS[method].label
-                            audit[method] = physical_comparison_summary(
-                                cohort, args.output, args, score_loader, view=view)
+                        view = METHOD_SPECS[method].label
+                        audit[method] = physical_comparison_summary(cohort, args.output, args, score_loader, view=view)
+                        full_individual = summary_groups(groups, method=method, scope="full_region")
+                        if full_individual:
                             audit[method]["full_region"] = physical_comparison_summary(
-                                summary_groups(cohort, scope="full_region"), args.output, args, score_loader,
-                                scope="full_region", view=view)
-                            individual = [b for b in bundles if b.get("individual") == method
-                                          and (b["report"]["scenario"], b["report"]["seed"]) in cohort]
-                            if individual:
-                                audit[method]["full_mass"] = summary_figures(
-                                    individual, args.output, args, view=view)
-            with progress.task("Export comparison tables, configuration and plot manifest"):
+                                full_individual, args.output, args, score_loader, scope="full_region", view=view)
+            with progress.task("Export comparison tables, event accounting and plot manifest"):
                 exporter.flush()
-                for filename, table in (("comparison.csv", rows), ("configuration.csv", settings)):
+                event_rows = event_size_rows(groups, score_loader, data_root=args.data)
+                for filename, table in (("comparison.csv", rows), ("configuration.csv", settings),
+                                        ("event_sizes.csv", event_rows)):
                     if table:
                         csv_write(args.output / filename, table)
                     else:
                         (args.output / filename).unlink(missing_ok=True)
                 write_json(args.output / "comparison.json", json_safe(comparisons))
-                write_json(
-                    args.output / "plot_manifest.json",
-                    json_safe(
-                        {
-                            "schema": 3,
-                            "methods": {m: dict(label=METHOD_SPECS[m].label, score_transform=METHOD_SPECS[m].score_transform, score_scope=METHOD_SPECS[m].score_scope)
-                                        for m in sorted(available)},
-                            "comparison": "All available methods in their supported scope: signal region and full region; independent acceptance and uncut denominators",
-                            "layout": "<scenario>/seed_<seed>/{comparison,<method label>}/; summaries in <scenario>/summary/{comparison,<method label>}/ only when combining multiple result directories; full-region panels in full_region/; injection_scan/{comparison,<method label>}/",
-                            "uncertainty": audit,
-                            "cuts": "Calibrated RIDDLE: analytic percentile thresholds. Other scores: truth-assisted MC validation thresholds in the plotted region. Frozen cuts evaluated on independent physical test rows; each cut records its origin.",
-                            "injection_scan": scan_audit,
-                            "mass_cut_scan": {
-                                "thresholds": list(f.SCORE_CUTS),
-                                "comparison": "strict score > threshold",
-                                "score_coordinate": "LaCathode classifier score; RIDDLE background percentile when score_kind=background_percentile_logit, otherwise sigmoid(log density ratio); neither density coordinate is a signal probability",
-                                "scope": "full physical test mass range",
-                                "retention_denominator": "all physical test events of the corresponding class, before cuts and mapping rejection",
-                                "panels_per_page": 6,
-                                "individual_directory": "04_mass_cuts/individual_cuts",
-                                "histograms": "unweighted counts per fit, averaged over LaCathode fits; identical bins, no smoothing or pooled events; B + S is the sum of background and signal counts",
-                            },
-                            "mass_summary": "Common background in each plotted region: 300 equal-occupancy bins, test-derived cuts with uncut denominators; shape chi2 normalized by achieved efficiency.",
-                            "uncertainty_scope": "16/50/84 percentiles across independent full method runs on fixed evaluation events; one saved ensemble score per RIDDLE/R-ANODE run; no within-ensemble fit bands",
-                            "score_inputs": ("Legacy RIDDLE checkpoints evaluated on reserved validation; accepted scores reconstructed when needed. No training or modification of results."
-                                if any(a.get("checkpoint_inference") for a in score_loader.fit_audit.values())
-                                else "Saved predictions only; no checkpoint inference or modification of results"),
-                            "safeguard_filtering": not args.no_safeguard_filtering,
-                            "requested_inference_device": args.device,
-                            "checkpoint_inference_devices": sorted({a["inference_device"] for a in
-                                score_loader.fit_audit.values() if a.get("checkpoint_inference")}),
-                            "score_ensembles": list(score_loader.fit_audit.values()),
-                            "invalid_fit_policy": ("RIDDLE: numerical validity and reserved-validation improvement, including legacy checkpoint evaluation. R-ANODE: numerical validity and mass support. Rebuild one accepted-fit ensemble across all partitions; skip results with no accepted fits. Production exclusions retained; no plot-time training/retries; no test-truth/AUC/SIC selection."
-                                if not args.no_safeguard_filtering else "Plot-time RIDDLE/R-ANODE safeguards disabled: use exact saved ensembles, retaining production exclusions. Artifact integrity, event alignment and finite-score checks remain active."),
-                            "lacathode_event_plots": "Dynamically detected saved fits; mean per-fit histograms with matching per-fit validation cuts; shapes normalize those mean counts; no cross-fit score averaging",
-                            "lacathode_roc_sic": "Median rejection and SIC interpolated at 1000 common signal efficiencies, as upstream, after statistical-support cuts. Bands are parametric 16/84-percentile ribbons at fixed signal efficiency; background-efficiency display axes retained.",
-                            "lacathode_fit_counts": [{"scenario": b["report"]["scenario"], "seed": b["report"]["seed"], "fits": b["classifier_fit_count"]} for b in bundles if "classifier_fit_count" in b],
-                            "summary_axes": f.SUMMARY_AXES,
-                            "publication_y_ranges": f.PUBLICATION_Y_RANGES,
-                            "warnings": [w for b in bundles for w in b["warnings"]],
-                        }
-                    ),
-                )
+                write_json(args.output / "plot_manifest.json", json_safe({
+                    "schema": 4,
+                    "methods": {m: dict(label=METHOD_SPECS[m].label, score_transform=METHOD_SPECS[m].score_transform,
+                                        score_scope=METHOD_SPECS[m].score_scope) for m in sorted(available)},
+                    "layout": "SR-Only/<scenario>[/variant_<name>]/{seed_<seed>,summary}/... and Full-Range/<scenario>[/variant_<name>]/{seed_<seed>,summary}/...; injection scans live below SR-Only/signal_injection/injection_scan; root CSV/JSON files are publication metadata, not plots.",
+                    "publication": "Physical Review D-oriented vector PDF plus 600-dpi PNG; one plot per figure file except the multipage mass_cut_scan.pdf companion, which also retains every cut as an individual figure.",
+                    "comparison": "All available methods in their supported scope; independent acceptance and uncut denominators. Mass-conditioned RIDDLE and R-ANODE remain SR-only.",
+                    "uncertainty": audit,
+                    "cuts": "Calibrated RIDDLE: analytic percentile thresholds when available. Other scores: validation-background diagnostic thresholds in the plotted region; frozen cuts evaluated on independent physical test rows.",
+                    "injection_scan": scan_audit,
+                    "event_sizes": "event_sizes.csv uses checksum-protected result ledgers and exact prepared-array row counts when the matching --data manifest is available; unavailable counts are blank rather than inferred.",
+                    "mass_cut_scan": {
+                        "thresholds": list(f.SCORE_CUTS), "comparison": "strict score > threshold",
+                        "scope": "full physical test mass range", "panels_per_page": 6,
+                        "individual_directory": "04_mass_cuts/individual_cuts",
+                        "histograms": "unweighted counts per fit, averaged over LaCathode fits; identical bins, no smoothing or pooled events"},
+                    "mass_summary": "Common background in each plotted region: 300 equal-occupancy bins, test-derived cuts with uncut denominators; shape chi2 normalized by achieved efficiency.",
+                    "uncertainty_scope": "16/50/84 percentiles across independent full method runs on fixed evaluation events; protocols and dataset variants are never combined into one band.",
+                    "score_inputs": ("Legacy RIDDLE checkpoints evaluated on reserved validation; accepted scores reconstructed when needed. No training or modification of results."
+                        if any(a.get("checkpoint_inference") for a in score_loader.fit_audit.values())
+                        else "Saved predictions only; no checkpoint inference or modification of results"),
+                    "safeguard_filtering": not args.no_safeguard_filtering,
+                    "requested_inference_device": args.device,
+                    "checkpoint_inference_devices": sorted({a["inference_device"] for a in score_loader.fit_audit.values() if a.get("checkpoint_inference")}),
+                    "score_ensembles": list(score_loader.fit_audit.values()),
+                    "summary_axes": f.SUMMARY_AXES, "publication_y_ranges": f.PUBLICATION_Y_RANGES,
+                }))
         colored_status(f"Completed {progress.index}/{progress.total} plotting task groups | {args.output}", kind="PASS")
         return 0
     except (ValueError, OSError, KeyError, RuntimeError) as error:

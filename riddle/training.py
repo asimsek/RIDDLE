@@ -6,7 +6,7 @@ import torch
 from copy import deepcopy
 from .settings import DEFAULTS, validate_residual
 from riddle.worker_progress import ProgressStage
-from riddle.storage import atomic_write, write_json, digest, file_digest, rng_state, restore_rng
+from riddle.storage import atomic_torch_save, write_json, digest, file_digest, rng_state, restore_rng, persist_boundary
 from .model import (
     build_signal_flow,
     initial_fraction_logit,
@@ -108,7 +108,53 @@ def enhanced_epoch(model, logit, ztrain, optimizer, options, additions, *, epoch
                      effective_residual_events=float(weights.sum().square()/weights.square().sum()))
 
 
-def validate_checkpoint(checkpoint, epochs):
+def _cpu_residual_payload(model, logit, epoch):
+    return {
+        "model": {
+            key: value.detach().cpu().clone() if isinstance(value, torch.Tensor) else value
+            for key, value in model.state_dict().items()
+        },
+        "fraction_logit": logit.detach().cpu().clone(),
+        "epoch": int(epoch),
+        "scientific_version": SCIENTIFIC_VERSION,
+    }
+
+
+def _offer_candidate(candidates, count, epoch, validation_nll, model, logit):
+    key = (float(validation_nll), int(epoch))
+    if len(candidates) >= count:
+        worst = max((c["validation_nll"], c["epoch"]) for c in candidates)
+        if key >= worst:
+            return
+    candidates.append({
+        "epoch": int(epoch),
+        "validation_nll": float(validation_nll),
+        "filename": f"residual_epoch_{epoch}.pt",
+        "sha256": None,
+        "payload": _cpu_residual_payload(model, logit, epoch),
+    })
+    candidates.sort(key=lambda c: (c["validation_nll"], c["epoch"]))
+    if len(candidates) > count:
+        candidates.pop()
+
+
+def _persist_candidates(output, candidates):
+    for candidate in candidates:
+        if candidate.get("sha256") is None:
+            candidate["sha256"] = atomic_torch_save(
+                Path(output) / candidate["filename"], candidate.pop("payload")
+            )
+    return {candidate["filename"]: candidate["sha256"] for candidate in candidates}
+
+
+def _candidate_metadata(candidates):
+    return [
+        {k: candidate[k] for k in ("epoch", "validation_nll", "filename", "sha256")}
+        for candidate in candidates
+    ]
+
+
+def validate_checkpoint(checkpoint, epochs, warmup):
     if checkpoint.get("scientific_version") != SCIENTIFIC_VERSION:
         raise ValueError("Residual checkpoint uses a legacy scientific protocol; retrain in a new output")
     epoch, history = checkpoint.get("epoch"), checkpoint.get("history")
@@ -119,9 +165,6 @@ def validate_checkpoint(checkpoint, epochs):
         or len(history) != epoch + 1
     ):
         raise ValueError("Invalid residual recovery checkpoint epoch/history")
-    expected = {f"residual_epoch_{i}.pt" for i in range(epoch + 1)}
-    if not isinstance(checkpoint.get("files"), dict) or set(checkpoint["files"]) != expected:
-        raise ValueError("Incomplete residual recovery checkpoint file inventory")
     for i, row in enumerate(history):
         try:
             valid = (
@@ -134,6 +177,34 @@ def validate_checkpoint(checkpoint, epochs):
             valid = False
         if not valid:
             raise ValueError("Invalid residual recovery checkpoint loss history")
+    if checkpoint.get("selection_warmup") != warmup:
+        raise ValueError("Residual checkpoint selection warm-up changed")
+    candidates = checkpoint.get("candidates")
+    files = checkpoint.get("files")
+    if not isinstance(candidates, list) or not isinstance(files, dict):
+        raise ValueError("Residual recovery lacks validation-selected candidate inventory")
+    count = checkpoint.get("settings", {}).get("training", {}).get("selected_checkpoints")
+    if type(count) is not int or count < 1:
+        raise ValueError("Residual recovery has invalid checkpoint-selection count")
+    expected_epochs = [
+        i + warmup for i in sorted(
+            range(max(0, len(history) - warmup)),
+            key=lambda i: (history[i + warmup]["validation_nll"], i),
+        )[:count]
+    ]
+    if [c.get("epoch") for c in candidates] != expected_epochs:
+        raise ValueError("Residual recovery Top-N candidates do not match saved validation history")
+    expected_files = {}
+    for candidate in candidates:
+        e = candidate.get("epoch")
+        name = candidate.get("filename")
+        sha = candidate.get("sha256")
+        if (name != f"residual_epoch_{e}.pt" or candidate.get("validation_nll") != history[e]["validation_nll"]
+                or not isinstance(sha, str) or len(sha) != 64):
+            raise ValueError("Invalid residual recovery candidate metadata")
+        expected_files[name] = sha
+    if files != expected_files:
+        raise ValueError("Residual recovery candidate file inventory is inconsistent")
 
 
 def train_residual(
@@ -167,7 +238,7 @@ def train_residual(
     warmup = (additions["guide_warmup_epochs"] if active["guided_fit"] else
               control.get("fraction_warmup_epochs", 0) if fraction is None else 0)
     if checkpoint is not None:
-        validate_checkpoint(checkpoint, epochs)
+        validate_checkpoint(checkpoint, epochs, warmup)
         if checkpoint.get("settings") != settings:
             raise ValueError("Residual training settings changed; use a new output")
         expected_background = None if background_correction is None else background_correction["model_sha256"]
@@ -239,7 +310,7 @@ def train_residual(
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode="min", factor=control["lr_factor"], patience=control["lr_patience"],
             threshold=control["min_delta"], threshold_mode="abs", min_lr=minimum)
-    history, files, start = [], {}, 0
+    history, files, candidates, start = [], {}, [], 0
     if checkpoint is not None:
         model.load_state_dict(checkpoint["model"])
         with torch.no_grad():
@@ -248,6 +319,7 @@ def train_residual(
         if scheduler is not None:
             scheduler.load_state_dict(checkpoint["scheduler"])
         history, files, start = checkpoint["history"], checkpoint["files"], checkpoint["epoch"] + 1
+        candidates = [dict(candidate) for candidate in checkpoint["candidates"]]
         restore_rng(checkpoint["rng"])
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
@@ -309,105 +381,117 @@ def train_residual(
         else:
             stale += 1
     stopped = bool(checkpoint and checkpoint.get("stopped_early", False))
+    durable_history = list(history)
     if stopped:
         start = epochs
-    for epoch in range(start, epochs):
-        if fraction is None and not active["guided_fit"]:
-            # Optimizer retains the fraction parameter, but receives no gradient
-            # during warm-up. No optimizer state is created for it until release.
-            logit.requires_grad_(epoch >= warmup)
-        losses = {}
-        flow_lr = optimizer.param_groups[0]["lr"]
-        diagnostics = {}
-        for part, loader, opt in (("train", train_loader, optimizer), ("validation", val_loader, None)):
-            progress.substep(part.title(), 0, len(loader))
-            if part == "train" and enhanced:
-                losses["train_nll"], diagnostics = enhanced_epoch(
-                    model, logit, ztrain, optimizer, options, additions, epoch=epoch, seed=seed, guide=guide,
-                    fixed_fraction=fraction is not None, background_model=corrected_background,
-                    progress=lambda done, total: progress.substep("Train", done, total))
-                continue
-            if part == "validation" and enhanced:
-                # DataLoader iteration draws a base seed even without shuffle.
-                # Validation must not perturb the next training permutation or
-                # dropout stream. Match the study's chunked, float64 reduction.
-                from .enhancements import chunks, standard_normal_log_prob
-                from .integrity import mixture_log_density
-                model.eval()
-                valid = torch.from_numpy(zval)
-                valid_latent = valid[:, :-1] if mass_conditioning else valid
-                if corrected_background is not None:
-                    from .background_correction import log_prob as corrected_log_prob
-                    log_background = chunks(
-                        lambda x, c: corrected_log_prob(corrected_background, x, c),
-                        valid_latent, valid[:, -1], device=device)
+    try:
+        for epoch in range(start, epochs):
+            if fraction is None and not active["guided_fit"]:
+                # Optimizer retains the fraction parameter, but receives no gradient
+                # during warm-up. No optimizer state is created for it until release.
+                logit.requires_grad_(epoch >= warmup)
+            losses = {}
+            flow_lr = optimizer.param_groups[0]["lr"]
+            diagnostics = {}
+            for part, loader, opt in (("train", train_loader, optimizer), ("validation", val_loader, None)):
+                progress.substep(part.title(), 0, len(loader))
+                if part == "train" and enhanced:
+                    losses["train_nll"], diagnostics = enhanced_epoch(
+                        model, logit, ztrain, optimizer, options, additions, epoch=epoch, seed=seed, guide=guide,
+                        fixed_fraction=fraction is not None, background_model=corrected_background,
+                        progress=lambda done, total: progress.substep("Train", done, total))
+                    continue
+                if part == "validation" and enhanced:
+                    # DataLoader iteration draws a base seed even without shuffle.
+                    # Validation must not perturb the next training permutation or
+                    # dropout stream. Match the study's chunked, float64 reduction.
+                    from .enhancements import chunks, standard_normal_log_prob
+                    from .integrity import mixture_log_density
+                    model.eval()
+                    valid = torch.from_numpy(zval)
+                    valid_latent = valid[:, :-1] if mass_conditioning else valid
+                    if corrected_background is not None:
+                        from .background_correction import log_prob as corrected_log_prob
+                        log_background = chunks(
+                            lambda x, c: corrected_log_prob(corrected_background, x, c),
+                            valid_latent, valid[:, -1], device=device)
+                    else:
+                        log_background = standard_normal_log_prob(valid_latent)
+                    losses["validation_nll"] = -float(mixture_log_density(
+                        chunks(lambda x: signal_log_prob(model, x), valid, device=device), log_background,
+                        logit.detach().cpu()).double().mean())
+                    continue
+                losses[part + "_nll"] = train_epoch(
+                    model,
+                    logit,
+                    loader,
+                    opt,
+                    lambda done, total: progress.substep(part.title(), done, total),
+                    gradient_clip_norm=options["gradient_clip_norm"],
+                )
+            fitted_fraction = float(logit.sigmoid().detach())
+            if not np.isfinite([*losses.values(), fitted_fraction]).all():
+                raise FloatingPointError("Nonfinite residual training state")
+            row = {"epoch": epoch, **losses, "signal_fraction": fitted_fraction, **diagnostics}
+            if control:
+                row.update(flow_learning_rate=flow_lr, fraction_warmup=epoch < warmup)
+            history.append(row)
+            if epoch >= warmup:
+                if scheduler is not None:
+                    scheduler.step(losses["validation_nll"])
+                if losses["validation_nll"] < best - control.get("min_delta", 0):
+                    best, stale = losses["validation_nll"], 0
                 else:
-                    log_background = standard_normal_log_prob(valid_latent)
-                losses["validation_nll"] = -float(mixture_log_density(
-                    chunks(lambda x: signal_log_prob(model, x), valid, device=device), log_background,
-                    logit.detach().cpu()).double().mean())
-                continue
-            losses[part + "_nll"] = train_epoch(
-                model,
-                logit,
-                loader,
-                opt,
-                lambda done, total: progress.substep(part.title(), done, total),
-                gradient_clip_norm=options["gradient_clip_norm"],
-            )
-        fitted_fraction = float(logit.sigmoid().detach())
-        if not np.isfinite([*losses.values(), fitted_fraction]).all():
-            raise FloatingPointError("Nonfinite residual training state")
-        row = {"epoch": epoch, **losses, "signal_fraction": fitted_fraction, **diagnostics}
-        if control:
-            row.update(flow_learning_rate=flow_lr, fraction_warmup=epoch < warmup)
-        history.append(row)
-        if epoch >= warmup:
-            if scheduler is not None:
-                scheduler.step(losses["validation_nll"])
-            if losses["validation_nll"] < best - control.get("min_delta", 0):
-                best, stale = losses["validation_nll"], 0
-            else:
-                stale += 1
-        stopped = bool(control.get("early_stopping_patience", 0)
-                       and epoch + 1 >= control["minimum_epochs"]
-                       and stale >= control["early_stopping_patience"])
-        name = f"residual_epoch_{epoch}.pt"
-        progress.update(force=True, operation="Save residual checkpoint", minibatch="-")
-        atomic_write(
-            output / name,
-            lambda p: torch.save(
-                {"model": model.state_dict(), "fraction_logit": logit.detach(), "epoch": epoch,
-                 "scientific_version": SCIENTIFIC_VERSION}, p
-            ),
-        )
-        files[name] = file_digest(output / name)
-        state = {
-            "scientific_version": SCIENTIFIC_VERSION,
-            "epoch": epoch,
-            "model": model.state_dict(),
-            "fraction_logit": logit.detach(),
-            "optimizer": optimizer.state_dict(),
-            "rng": rng_state(),
-            "history": history,
-            "files": files,
-            "settings": settings,
-            "enhanced_training_protocol": ENHANCED_TRAINING_PROTOCOL if enhanced else None,
-            "background_correction_sha256": (None if background_correction is None else background_correction["model_sha256"]),
-        }
-        if control:
-            state.update(stopped_early=stopped, scheduler=scheduler.state_dict() if scheduler else None)
-        atomic_write(output / ".resume/latest.pt", lambda p: torch.save(state, p))
-        write_json(output / "residual_losses.json", {"history": history})
-        progress.update(epoch + 1, force=True, operation="Early stop" if stopped else "Epoch complete",
-                        **losses, fraction=fitted_fraction)
-        if after_epoch is not None:
-            after_epoch(epoch)
-        if stopped:
-            break
+                    stale += 1
+            stopped = bool(control.get("early_stopping_patience", 0)
+                           and epoch + 1 >= control["minimum_epochs"]
+                           and stale >= control["early_stopping_patience"])
+            if epoch >= warmup:
+                _offer_candidate(
+                    candidates, options["selected_checkpoints"], epoch, losses["validation_nll"], model, logit
+                )
+            durable = persist_boundary(epoch, epochs) or stopped
+            if durable:
+                progress.update(force=True, operation="Persist 10-epoch recovery boundary", minibatch="-")
+                files = _persist_candidates(output, candidates)
+                state = {
+                    "scientific_version": SCIENTIFIC_VERSION,
+                    "epoch": epoch,
+                    "model": model.state_dict(),
+                    "fraction_logit": logit.detach(),
+                    "optimizer": optimizer.state_dict(),
+                    "rng": rng_state(),
+                    "history": history,
+                    "files": files,
+                    "candidates": _candidate_metadata(candidates),
+                    "selection_warmup": warmup,
+                    "settings": settings,
+                    "enhanced_training_protocol": ENHANCED_TRAINING_PROTOCOL if enhanced else None,
+                    "background_correction_sha256": (None if background_correction is None else background_correction["model_sha256"]),
+                }
+                if control:
+                    state.update(stopped_early=stopped, scheduler=scheduler.state_dict() if scheduler else None)
+                atomic_torch_save(output / ".resume/latest.pt", state)
+                write_json(output / "residual_losses.json", {"history": history})
+                durable_history = list(history)
+            progress.update(epoch + 1, force=True, operation="Early stop" if stopped else "Epoch complete",
+                            **losses, fraction=fitted_fraction)
+            if after_epoch is not None:
+                after_epoch(epoch)
+            if stopped:
+                break
+    except BaseException:
+        # A controlled shutdown never publishes history newer than the last
+        # durable resume point. At most nine epochs are intentionally replayed.
+        write_json(output / "residual_losses.json", {"history": durable_history})
+        raise
     write_json(output / "residual_losses.json", {"history": history})
     order = [i + warmup for i in ordered_epochs(
         [r["validation_nll"] for r in history[warmup:]], options["selected_checkpoints"])]
+    if [candidate["epoch"] for candidate in candidates] != order:
+        raise ValueError("Buffered residual Top-N checkpoint inventory disagrees with final selection")
+    if set(files) != {f"residual_epoch_{epoch}.pt" for epoch in order}:
+        raise ValueError("Final residual checkpoint files disagree with validation selection")
     write_json(
         output / "residual_selection.json",
         {

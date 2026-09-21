@@ -57,6 +57,9 @@ def validate_residual(value):
     # with the normal production residual/member policy.
     from .roles import DEFAULT_POLICY
     value.setdefault("data_policy", DEFAULT_POLICY)
+    # Production must never silently finalize fewer residual members than were
+    # requested.  Diagnostics can still opt into ``partial`` explicitly.
+    value.setdefault("ensemble_completion", "strict")
     # Optional pilot ablation; the resolved data policy is always explicit.
     extra = "".join(" " + k for k in ("mass_conditioning", "input_space", "optimization", "data_policy", "ensemble_completion", "background_correction") if k in value)
     keys(value, "runs epochs fractions initialization flow training fit_recovery enhancements" + extra, "RIDDLE")
@@ -65,7 +68,7 @@ def validate_residual(value):
         policy_parts(value["data_policy"])
         if value["data_policy"] in DIAGNOSTIC_POLICIES and (value["runs"] != 1 or not all(e[k] for k in FEATURES)):
             raise ValueError("Diagnostic role replay requires one fit and all six features")
-    if value.get("ensemble_completion", "partial") not in ("strict", "partial"):
+    if value["ensemble_completion"] not in ("strict", "partial"):
         raise ValueError("ensemble_completion must be strict or partial")
     if "mass_conditioning" in value and type(value["mass_conditioning"]) is not bool:
         raise ValueError("mass_conditioning must be boolean")

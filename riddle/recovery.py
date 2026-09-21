@@ -4,9 +4,28 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .storage import atomic_write, write_json, rng_state, restore_rng, file_digest, verify_artifacts
+from .storage import (
+    atomic_torch_save,
+    write_json,
+    rng_state,
+    restore_rng,
+    file_digest,
+    verify_artifacts,
+    persist_boundary,
+    save_array,
+)
 from .worker_progress import emit_progress
 from .resume import check_contract, record_transition
+
+
+FLOW_CANDIDATES = 10
+
+
+def _cpu_state_dict(model):
+    return {
+        key: value.detach().cpu().clone() if isinstance(value, torch.Tensor) else value
+        for key, value in model.state_dict().items()
+    }
 
 
 class EpochRecovery:
@@ -20,6 +39,7 @@ class EpochRecovery:
         self.save_torch = torch.save
         self.done, self.files, self.next_epochs = [], {}, {}
         self.state = None
+        self.flow_candidates = []
         if self.manifest.exists():
             if not resume:
                 raise FileExistsError("Work already started; use --resume")
@@ -53,7 +73,8 @@ class EpochRecovery:
             "rng": rng_state(),
             **extra,
         }
-        atomic_write(self.path, lambda p: self.save_torch(state, p))
+        atomic_torch_save(self.path, state)
+        self.state = state
 
     def stage(self, phase, function):
         if phase in self.done:
@@ -69,10 +90,8 @@ class EpochRecovery:
         self.files = {
             p.name: file_digest(p)
             for p in sorted(self.root.iterdir())
-            if p.is_file()
-            and p.suffix in (".npy", ".par", ".p")
-            or p.is_file()
-            and p.name.startswith("model_run")
+            if (p.is_file() and p.suffix in (".npy", ".par", ".p"))
+            or (p.is_file() and p.name.startswith("model_run"))
         }
         self.save(phase, "complete")
 
@@ -84,6 +103,35 @@ class EpochRecovery:
             else ("train_dataloader", "val_dataloader")
         )
         return [values[name] for name in names]
+
+    def _offer_flow_candidate(self, epoch, validation_loss, model, model_file_name):
+        key = (float(validation_loss), int(epoch))
+        if len(self.flow_candidates) >= FLOW_CANDIDATES:
+            worst = max((c["validation_loss"], c["epoch"]) for c in self.flow_candidates)
+            if key >= worst:
+                return
+        self.flow_candidates.append({
+            "epoch": int(epoch),
+            "validation_loss": float(validation_loss),
+            "filename": f"{model_file_name}_epoch_{epoch}.par",
+            "sha256": None,
+            "state": _cpu_state_dict(model),
+        })
+        self.flow_candidates.sort(key=lambda c: (c["validation_loss"], c["epoch"]))
+        if len(self.flow_candidates) > FLOW_CANDIDATES:
+            self.flow_candidates.pop()
+
+    def _persist_flow_candidates(self):
+        for candidate in self.flow_candidates:
+            if candidate.get("sha256") is None:
+                candidate["sha256"] = atomic_torch_save(
+                    self.root / candidate["filename"], candidate.pop("state")
+                )
+        self.files = {c["filename"]: c["sha256"] for c in self.flow_candidates}
+        return [
+            {k: c[k] for k in ("epoch", "validation_loss", "filename", "sha256")}
+            for c in self.flow_candidates
+        ]
 
     def save_epoch(self, phase, epoch, values):
         model, optimizer = values["model"], values["optimizer"]
@@ -106,21 +154,33 @@ class EpochRecovery:
             }
             for name, module in model.named_modules()
         }
-        checkpoint = (
-            f"{values['model_file_name']}_epoch_{epoch}.par"
-            if phase == "flow" else f"model_run0_ep{epoch}"
-        )
-        self.files[checkpoint] = file_digest(self.root / checkpoint)
-        self.save(
-            phase,
-            "epoch",
-            next_epoch=epoch + 1,
-            model=model.state_dict(),
-            optimizer=optimizer.state_dict(),
-            attributes=attributes,
-            losses=losses,
-            loaders=loaders,
-        )
+
+        if phase == "flow":
+            validation_loss = float(losses[1][epoch + 1])
+            self._offer_flow_candidate(epoch, validation_loss, model, values["model_file_name"])
+
+        durable = persist_boundary(epoch, values["epochs"])
+        if durable:
+            candidates = None
+            if phase == "flow":
+                candidates = self._persist_flow_candidates()
+                save_array(self.root / f"{values['model_file_name']}_train_losses.npy", losses[0])
+                save_array(self.root / f"{values['model_file_name']}_val_losses.npy", losses[1])
+            else:
+                checkpoint = f"model_run0_ep{epoch}"
+                self.files[checkpoint] = file_digest(self.root / checkpoint)
+            self.save(
+                phase,
+                "epoch",
+                next_epoch=epoch + 1,
+                model=model.state_dict(),
+                optimizer=optimizer.state_dict(),
+                attributes=attributes,
+                losses=losses,
+                loaders=loaders,
+                **({"candidates": candidates} if candidates is not None else {}),
+            )
+
         emit_progress(
             phase,
             "Train background flow" if phase == "flow" else "Train classifier",
@@ -147,6 +207,11 @@ class EpochRecovery:
             loader._runtime_gather_verified = saved["verified"]
             if saved["generator"] is not None:
                 loader.generator.set_state(saved["generator"])
+        if phase == "flow":
+            candidates = state.get("candidates")
+            if not isinstance(candidates, list):
+                raise ValueError("Flow recovery lacks validation-selected candidate inventory")
+            self.flow_candidates = [dict(candidate) for candidate in candidates]
         restore_rng(state["rng"])
         self.next_epochs[phase] = state["next_epoch"]
         emit_progress(

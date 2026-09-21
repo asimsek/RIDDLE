@@ -79,13 +79,24 @@ STYLE = {
     "font.family": "sans-serif",
     "font.sans-serif": ["DejaVu Sans"],
     "font.size": 11,
+    "figure.dpi": 120,
     "axes.labelsize": 13,
     "axes.titlesize": 11,
+    "axes.labelpad": 6,
+    "axes.titlepad": 7,
+    "axes.axisbelow": True,
+    "axes.linewidth": 1.15,
     "legend.fontsize": 10,
+    "legend.handlelength": 2.0,
     "xtick.labelsize": 10,
     "ytick.labelsize": 10,
-    "axes.linewidth": 1.1,
-    "lines.linewidth": 1.5,
+    "xtick.major.width": 1.0,
+    "ytick.major.width": 1.0,
+    "xtick.minor.width": 0.8,
+    "ytick.minor.width": 0.8,
+    "lines.linewidth": 1.8,
+    "lines.solid_capstyle": "round",
+    "lines.dash_capstyle": "round",
     "xtick.direction": "in",
     "ytick.direction": "in",
     "xtick.top": True,
@@ -98,7 +109,9 @@ STYLE = {
     "ytick.minor.size": 2.5,
     "pdf.fonttype": 42,
     "ps.fonttype": 42,
-    "savefig.dpi": 300,
+    "savefig.dpi": 600,
+    "savefig.facecolor": "white",
+    "savefig.edgecolor": "white",
 }
 
 
@@ -368,12 +381,11 @@ def sr(mass):
 
 
 def sample_sr(sample, key):
-    if key == "residual":
+    if key in sample.get("sr_masks", {}):
         from .production import validate_region
-
-        if key not in sample.get("sr_masks", {}):
-            raise ValueError("RIDDLE SR membership is missing; regenerate its score artifacts")
         return validate_region(sample["sr_masks"][key], len(sample["mass"]))
+    if key == "residual":
+        raise ValueError("RIDDLE SR membership is missing; regenerate its score artifacts")
     return sr(sample["mass"])
 
 
@@ -707,7 +719,7 @@ def place_axis_legend(fig, ax, spec):
             item = ax.legend(
                 spec["handles"], spec["labels"], loc="lower left", ncol=spec["ncols"],
                 title=spec["title"], fontsize=fontsize, title_fontsize=9.5 * fontsize / base_size,
-                frameon=True, facecolor=ax.get_facecolor(), edgecolor="none", framealpha=1,
+                frameon=False, facecolor=ax.get_facecolor(), edgecolor="none", framealpha=0,
                 handlelength=1.7, handletextpad=0.5, columnspacing=0.9,
                 labelspacing=0.35, borderpad=0.25, borderaxespad=0,
             )
@@ -739,8 +751,20 @@ def place_axis_legend(fig, ax, spec):
         transform = ax.yaxis.get_transform()
         low, high = transform.transform(ax.get_ylim())
         ax.set_ylim(*transform.inverted().transform([low, high + 0.3 * (high - low)]))
+    # A crowded panel should never make the plotting campaign fail.  If an
+    # overlap-free internal position does not exist, use a compact external
+    # legend; bbox_inches="tight" keeps it in both vector and raster exports.
     ax.set_ylim(original_ylim)
-    raise ValueError(f"Cannot fit an internal legend in the {ax.get_ylabel()!r} panel without covering data")
+    item = ax.legend(
+        spec["handles"], spec["labels"], loc="upper left", bbox_to_anchor=(1.02, 1.0),
+        ncol=spec["ncols"], title=spec["title"], fontsize=minimum,
+        title_fontsize=9.5 * minimum / base_size, frameon=False,
+        handlelength=1.8, handletextpad=0.5, columnspacing=0.9, labelspacing=0.35,
+        borderaxespad=0,
+    )
+    for text in item.get_texts():
+        if text.get_text() in spec["headers"]:
+            text.set_weight("bold")
 
 
 def publication_ylim(ax, kind):
@@ -794,8 +818,11 @@ def _save_figure(fig, path):
         if kind is not None:
             publication_ylim(ax, kind)
     place_legend(fig)
-    fig.savefig(path.with_suffix(".pdf"), bbox_inches="tight", pad_inches=0.06)
-    fig.savefig(path.with_suffix(".png"), bbox_inches="tight", pad_inches=0.06)
+    metadata = {"Creator": "RIDDLE publication plotting framework"}
+    fig.savefig(path.with_suffix(".pdf"), bbox_inches="tight", pad_inches=0.06,
+                facecolor="white", metadata=metadata)
+    fig.savefig(path.with_suffix(".png"), bbox_inches="tight", pad_inches=0.06,
+                facecolor="white", dpi=600)
 
 
 def save(fig, path):
@@ -1491,11 +1518,22 @@ def feature_density(values, edges):
     )
 
 
-def render_representation(bundle, output):
+def render_representation(bundle, output, *, regions=None):
+    """Render event-level input/latent diagnostics as one figure per quantity.
+
+    ``regions`` can restrict rendering to ``("sr",)`` or ``("full",)``.  When
+    exactly one region is requested the region name is omitted from the path;
+    the caller is expected to have already placed the figure below the
+    top-level ``SR-Only`` or ``Full-Range`` directory.  This keeps publication
+    outputs flat enough to browse while preserving the legacy two-region mode.
+    """
     sample = bundle["samples"].get("test")
     if sample is None:
         bundle["warnings"].append("Input/latent plots unavailable without event-level features")
         return
+    requested = tuple(regions or ("sr", "full"))
+    if not requested or any(region not in ("sr", "full") for region in requested):
+        raise ValueError("Representation regions must be 'sr' and/or 'full'")
     spaces = {}
     if "feature_values" in bundle:
         labels = (r"$m_{J1}$ [TeV]", r"$\Delta m_J$ [TeV]", r"$\tau_{21,J1}$", r"$\tau_{21,J2}$")
@@ -1523,7 +1561,10 @@ def render_representation(bundle, output):
         "regions": {},
     }
     region_mask = sample_sr(sample, next(iter(METHODS)))[sample["mask"]]
-    for region, mask in (("sr", region_mask), ("full", np.ones(len(m), bool))):
+    region_masks = {"sr": region_mask, "full": np.ones(len(m), bool)}
+    single_region = len(requested) == 1
+    for region in requested:
+        mask = region_masks[region]
         groups = {label: mask & (y == truth) for label, truth in (("background", 0), ("signal", 1))}
         record = {"events": {name: int(v.sum()) for name, v in groups.items()}, "spaces": {}}
         bundle["representation"]["regions"][region] = record
@@ -1560,7 +1601,10 @@ def render_representation(bundle, output):
                 }
                 top = max(0.4 if space == "latent" else 0, *[max(v) for v in densities.values()]) * 1.25
                 for view in VIEWS:
-                    target = output / view / "06_input_latent" / region / space
+                    target = output / view / "06_input_latent"
+                    if not single_region:
+                        target /= region
+                    target /= space
                     fig, ax, _ = canvas("Probability density", labels[i])
                     key = VIEWS[view][0]
                     for truth, group in ((0, "background"), (1, "signal")):
@@ -1584,63 +1628,43 @@ def render_representation(bundle, output):
                         )
                 maximum = max([1e-6, *[h.max() for h in histograms.values()]])
                 for view in VIEWS:
+                    base = output / view / "06_input_latent"
+                    if not single_region:
+                        base /= region
+                    base /= space
                     for group, hist in histograms.items():
                         fig, ax, _ = canvas(labels[j], labels[i])
                         mesh = ax.pcolormesh(
-                            edges[i],
-                            edges[j],
-                            np.ma.masked_less_equal(hist.T, 0),
+                            edges[i], edges[j], np.ma.masked_less_equal(hist.T, 0),
                             norm=LogNorm(vmin=maximum * 1e-4, vmax=maximum),
-                            cmap="viridis",
-                            rasterized=True,
+                            cmap="viridis", rasterized=True,
                         )
                         fig.colorbar(mesh, ax=ax, label="Probability density", pad=0.025)
-                        ax.set(
-                            title=group.title(),
-                            xlim=(edges[i][0], edges[i][-1]),
-                            ylim=(edges[j][0], edges[j][-1]),
-                        )
-                        save(
-                            fig,
-                            output
-                            / view
-                            / "06_input_latent"
-                            / region
-                            / space
-                            / "pairs"
-                            / f"{group}_{names[i]}_{names[j]}",
-                        )
+                        ax.set(title=group.title(), xlim=(edges[i][0], edges[i][-1]), ylim=(edges[j][0], edges[j][-1]))
+                        save(fig, base / "pairs" / f"{group}_{names[i]}_{names[j]}")
             for group, pop in groups.items():
                 if pop.sum() < 3 or any(np.any(np.std(v[pop], axis=0) == 0) for v in cohort):
                     continue
                 matrix = np.mean([np.corrcoef(v[pop], rowvar=False) for v in cohort], axis=0)
                 for view in VIEWS:
+                    base = output / view / "06_input_latent"
+                    if not single_region:
+                        base /= region
+                    base /= space
                     fig, ax, _ = canvas("", "")
                     art = ax.imshow(matrix, vmin=-1, vmax=1, cmap="RdBu_r")
-                    ax.set(
-                        xticks=range(dimensions),
-                        yticks=range(dimensions),
-                        xticklabels=labels,
-                        yticklabels=labels,
-                        title=group.title(),
-                    )
+                    ax.set(xticks=range(dimensions), yticks=range(dimensions),
+                           xticklabels=labels, yticklabels=labels, title=group.title())
                     ax.tick_params(axis="x", labelsize=9, rotation=20)
                     ax.tick_params(axis="y", labelsize=9)
                     ax.minorticks_off()
                     for (a, b), value in np.ndenumerate(matrix):
-                        ax.text(
-                            b,
-                            a,
-                            f"{value:.2f}",
-                            ha="center",
-                            va="center",
-                            color="white" if abs(value) > 0.65 else "black",
-                        )
+                        ax.text(b, a, f"{value:.2f}", ha="center", va="center",
+                                color="white" if abs(value) > 0.65 else "black")
                     fig.colorbar(art, ax=ax, label="Pearson correlation", pad=0.025)
-                    save(fig, output / view / "06_input_latent" / region / space / f"correlation_{group}")
+                    save(fig, base / f"correlation_{group}")
             if bundle.get("verbose"):
                 print(f"[WORK] Input/latent distributions: {region}, {space}", flush=True)
-
 
 def equal_occupancy(mass, bins=300):
     mass = np.asarray(mass)

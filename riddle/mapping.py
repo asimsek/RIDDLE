@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from .enhancements import Rosenblatt, chunks, save_torch, load_torch, clip_gradients
 from .integrity import require_finite, train_flow_epoch
 from .preprocessing import load_dataset
-from .storage import digest, write_json, save_array, seed_start, rng_state, restore_rng, atomic_write, save_npz
+from .storage import digest, write_json, save_array, seed_start, rng_state, restore_rng, atomic_write, save_npz, persist_boundary
 from .worker_progress import emit_message
 
 PREPROCESS_KEYS = ("min", "max", "mean2", "std2", "std2_logit_fix")
@@ -103,7 +103,8 @@ def prepare(data, output, seed, device, *, background, options, data_policy=None
         mass_parameters = experiment["mass_parameters"]
     if mass_parameters[1] <= 0:
         raise ValueError("Mapping requires a nonzero sideband mass span")
-    contract = dict(schema=1, implementation="production_conditional_mapping_v1", configuration=config,
+    contract = dict(schema=1, implementation="production_conditional_mapping_v2_tail_safe_preprocessing",
+                    preprocessing="nonrejecting_minmax_logit_clip_eps_1e-6_v1", configuration=config,
                     options=options, background=background, seed=seed, features=features, device=str(device),
                     hashes={k: digest(a[:, :-1]) for k, a in clean.items()}, mass_parameters=mass_parameters)
     if data_policy != "production_v1":
@@ -165,16 +166,18 @@ def prepare(data, output, seed, device, *, background, options, data_policy=None
         if experiment is not None:
             from .mapping_experiment import observe_epoch
             observe_epoch(experiment, output, model, epoch, clean, sources, fit, mass_parameters, device, loss)
-        save_torch(latest, dict(contract=contract, next_epoch=epoch+1, model=model.state_dict(),
-                   optimizer=optimizer.state_dict(), rng=rng_state(), history=history,
-                   best=best, best_model=best_model, best_epoch=best_epoch))
-        write_json(output / "history.json", history)
+        if persist_boundary(epoch, background["epochs"]):
+            save_torch(latest, dict(contract=contract, next_epoch=epoch+1, model=model.state_dict(),
+                       optimizer=optimizer.state_dict(), rng=rng_state(), history=history,
+                       best=best, best_model=best_model, best_epoch=best_epoch))
+            write_json(output / "history.json", history)
         emit_message(f"Background map {epoch+1}/{background['epochs']}: validation NLL={loss:.6g}")
     save_torch(output / "model.pt", best_model)
     save_torch(output / "preprocessing.pt", {k: fit[k].cpu() for k in PREPROCESS_KEYS})
     selection = dict(training_mapping_epoch=best_epoch, inference_mapping_epoch=best_epoch,
                      trained_epochs=background["epochs"], criterion="lowest independent map-validation NLL",
-                     implementation="production_conditional_mapping_v1",
+                     implementation="production_conditional_mapping_v2_tail_safe_preprocessing",
+                     preprocessing="nonrejecting_minmax_logit_clip_eps_1e-6_v1",
                      architecture="Rosenblatt" if options["rosenblatt"] else "MAF",
                      affine_log_scale_bound=None if options["rosenblatt"] else config.get("affine_log_scale_bound"),
                      truth_labels_used=False)

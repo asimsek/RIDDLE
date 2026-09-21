@@ -131,7 +131,8 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --name riddle-seed42 --methods riddle --scenarios signal_injection \
   --seeds 42 --config config/settings.yaml --workers 5 --io-workers 2 --torch-threads 2 --mps on \
-  --runs 10 --fits 10 --epochs 100 | kubectl apply -n cua-asimsek -f -
+  --runs 10 --fits 10 --epochs 100 --data data/lhco --results results \
+  | kubectl apply -n cua-asimsek -f -
 ```
 
 ```bash
@@ -139,7 +140,8 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --name riddle-bg-seed42 --methods riddle --scenarios background_only \
   --seeds 42 --config config/settings.yaml --workers 5 --io-workers 2 --torch-threads 2 --mps on \
-  --runs 10 --fits 10 --epochs 100 | kubectl apply -n cua-asimsek -f -
+  --runs 10 --fits 10 --epochs 100 --data data/lhco --results results \
+  | kubectl apply -n cua-asimsek -f -
 ```
 
 **LaCathode:**
@@ -149,7 +151,7 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --name lacathode-seed42 --methods lacathode --scenarios signal_injection \
   --seeds 42 --runs 10 --epochs 100 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
-  --lacathode-background independent \
+  --lacathode-background independent --data data/lhco --results results \
   | kubectl apply -n cua-asimsek -f -
 ```
 
@@ -158,7 +160,7 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --name lacathode-bg-seed42 --methods lacathode --scenarios background_only \
   --seeds 42 --runs 10 --epochs 100 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
-  --lacathode-background independent \
+  --lacathode-background independent --data data/lhco --results results \
   | kubectl apply -n cua-asimsek -f -
 ```
 
@@ -171,6 +173,7 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --name ranode-seed42 --methods ranode --scenarios signal_injection \
   --runs 10 --fits 10 --epochs 100 --seeds 42 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
+  --data data/lhco --results results \
   | kubectl apply -n cua-asimsek -f -
 ```
 
@@ -179,6 +182,7 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --name ranode-bg-seed42 --methods ranode --scenarios background_only \
   --runs 10 --fits 10 --epochs 100 --seeds 42 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
+  --data data/lhco --results results \
   | kubectl apply -n cua-asimsek -f -
 ```
 
@@ -267,6 +271,14 @@ kubectl logs -n cua-asimsek -f job/ranode-bg-seed42 -c campaign
 ```bash
 kubectl delete job ranode-seed42 -n cua-asimsek --ignore-not-found --wait=true
 kubectl delete job ranode-bg-seed42 -n cua-asimsek --ignore-not-found --wait=true
+```
+
+## Monitor GPU usage of a batch job:
+
+```bash
+kubectl exec -n cua-asimsek \
+  $(kubectl get pod -n cua-asimsek -l job-name=riddle-seed42 -o jsonpath='{.items[0].metadata.name}') \
+  -c campaign -- nvidia-smi
 ```
 
 

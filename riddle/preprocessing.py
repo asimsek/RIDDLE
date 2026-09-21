@@ -3,6 +3,14 @@ import torch
 from .integrity import require_finite
 
 
+# Keep every finite event when applying a preprocessing transform learned on a
+# separate reference sample.  Values outside the fitted min/max range are
+# saturated only for the numerically singular logit step instead of being
+# deleted.  This is especially important for anomaly searches, where tail
+# events can be the signal-like population of interest.
+LOGIT_EPS = 1.0e-6
+
+
 class LHCORD_data_handler:
     def __init__(
         self,
@@ -148,15 +156,28 @@ def load_files(file_path):
     return loaded_file
 
 
-def logit_transform(data, datamax, datamin, domain_cut=False, fiducial_cut=False):
+def _clip_unit_interval(data, eps=LOGIT_EPS):
+    return torch.clamp(data, min=float(eps), max=1.0-float(eps))
+
+
+def logit_transform(data, datamax, datamin, domain_cut=False, fiducial_cut=False, tail_safe=False):
     data2 = (data - datamin) / (datamax - datamin)
     if fiducial_cut:
         mask = torch.prod((data2 > 0.05) & (data2 < 0.95), 1).type(torch.bool)
-    elif domain_cut:
+        data3 = data2[mask]
+    elif domain_cut and not tail_safe:
+        # Preserve the historical reference-fit behavior.  The result-affecting
+        # problem was applying these fitted limits as an acceptance cut to
+        # independent validation/SR/test events.
         mask = torch.prod((data2 > 0) & (data2 < 1), 1).type(torch.bool)
+        data3 = data2[mask]
     else:
-        mask = torch.ones(data2.shape[0], dtype=torch.bool)
-    data3 = data2[mask]
+        # Once preprocessing is frozen on a separate reference sample,
+        # production RIDDLE uses a non-rejecting tail-safe transform: all finite
+        # rows survive and only the unit-interval coordinate is saturated before
+        # the logit.  This avoids preferentially dropping anomalous tail events.
+        mask = torch.ones(data2.shape[0], dtype=torch.bool, device=data2.device)
+        data3 = _clip_unit_interval(data2)
     data4 = torch.log(data3 / (1 - data3))
     require_finite(data4, "Logit-transformed mapped features")
     return (data4, mask)
@@ -224,11 +245,16 @@ def load_dataset(
             tensor2 = datadict["tensor"][mask]
         else:
             tensor2 = (datadict["tensor"] - datadict["min"]) / (datadict["max"] - datadict["min"])
-            mask = ((tensor2 > 0.0) & (tensor2 < 1.0)).all(axis=1)
-            tensor2 = tensor2[mask]
+            if external_datadict is None:
+                mask = ((tensor2 > 0.0) & (tensor2 < 1.0)).all(axis=1)
+                tensor2 = tensor2[mask]
+            else:
+                mask = torch.ones(tensor2.shape[0], dtype=torch.bool, device=tensor2.device)
+                tensor2 = _clip_unit_interval(tensor2)
     else:
         tensor2, mask = logit_transform(
-            datadict["tensor"], datadict["max"], datadict["min"], domain_cut=True, fiducial_cut=fiducial_cut
+            datadict["tensor"], datadict["max"], datadict["min"], domain_cut=True,
+            fiducial_cut=fiducial_cut, tail_safe=external_datadict is not None
         )
     if external_datadict is not None:
         datadict["mean2"] = external_datadict["mean2"].clone()

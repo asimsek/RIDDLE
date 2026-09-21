@@ -15,13 +15,20 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from .integrity import SCIENTIFIC_VERSION, require_finite
 from .model import build_signal_flow, match_background
-from .storage import (atomic_write, digest, file_digest, rng_state, restore_rng,
-                      write_json)
+from .storage import (atomic_torch_save, digest, file_digest, rng_state, restore_rng,
+                      write_json, persist_boundary)
 from .worker_progress import emit_message
 
 MODE = "bgcorr_40_reguide"
 EPOCHS = 40
-PROTOCOL = "shared_sideband_qphi_reguide_v1"
+PROTOCOL = "shared_sideband_qphi_reguide_v3_multiwindow_closure"
+MIN_VALIDATION_IMPROVEMENT = 0.0
+# Three localized interpolation probes per sideband.  Quantile windows are
+# deliberately separated and leave training support on both sides of every gap.
+PSEUDO_WINDOW_QUANTILES = ((0.15, 0.30), (0.425, 0.575), (0.70, 0.85))
+MIN_PSEUDO_WINDOW_EVENTS = 30
+MIN_POSITIVE_WINDOWS_PER_SIDE = 2
+PSEUDO_COMPATIBILITY_SIGMA = 1.96
 
 
 def enabled(settings):
@@ -62,13 +69,229 @@ def sample(model, context, dimensions, seed, device):
     return values
 
 
+def _gaussian_log_prob(latent):
+    return -.5 * (latent.square() + math.log(2 * math.pi)).sum(-1)
+
+
+def _validation_metrics(model, latent, mass, device):
+    """Compare q_phi with the Gaussian latent denominator on independent rows."""
+    z = torch.as_tensor(latent, dtype=torch.float32, device=device)
+    m = torch.as_tensor(((np.asarray(mass, dtype=np.float32) - 3.5) / 0.2),
+                        dtype=torch.float32, device=device)
+    with torch.no_grad():
+        qlog = log_prob(model, z, m).double()
+        glog = _gaussian_log_prob(z).double()
+    gain = (qlog - glog).cpu().numpy()
+    require_finite(gain, "Background-correction validation gain")
+    return dict(
+        events=int(len(gain)),
+        qphi_nll=-float(qlog.mean().cpu()),
+        gaussian_nll=-float(glog.mean().cpu()),
+        improvement=float(gain.mean()),
+        improvement_standard_error=(float(gain.std(ddof=1) / math.sqrt(len(gain)))
+                                    if len(gain) > 1 else None),
+    )
+
+
+def _fit_probe(train_z, train_mass, val_z, val_mass, *, settings, seed, device):
+    """Deterministic auxiliary fit used only for masked-mass interpolation closure."""
+    torch.manual_seed(int(seed)); np.random.seed(int(seed) % 2**32)
+    model = _model(settings, train_z.shape[1], device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=settings["training"]["learning_rate"],
+                                  weight_decay=1e-4)
+    dataset = TensorDataset(torch.from_numpy(np.ascontiguousarray(train_z, dtype=np.float32)),
+                            torch.from_numpy(((np.asarray(train_mass, dtype=np.float32)-3.5)/0.2).astype(np.float32)))
+    zv = torch.as_tensor(val_z, dtype=torch.float32, device=device)
+    mv = torch.as_tensor(((np.asarray(val_mass, dtype=np.float32)-3.5)/0.2), dtype=torch.float32, device=device)
+    best, best_epoch, best_model = float("inf"), None, None
+    for epoch in range(EPOCHS):
+        generator = torch.Generator().manual_seed(int(seed) + 21000 + epoch)
+        loader = DataLoader(dataset, batch_size=512, shuffle=True, generator=generator)
+        model.train()
+        for z, m in loader:
+            z, m = z.to(device), m.to(device)
+            optimizer.zero_grad()
+            loss = -log_prob(model, z, m).mean()
+            require_finite(loss, "Pseudo-SR background-correction loss")
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
+            optimizer.step()
+        model.eval()
+        with torch.no_grad():
+            validation_nll = -float(log_prob(model, zv, mv).double().mean().cpu())
+        if (validation_nll, epoch) < (best, best_epoch if best_epoch is not None else math.inf):
+            best, best_epoch, best_model = validation_nll, epoch, deepcopy(model.state_dict())
+    if best_model is None:
+        raise FloatingPointError("Pseudo-SR closure produced no valid checkpoint")
+    model.load_state_dict(best_model)
+    return model.eval().requires_grad_(False), int(best_epoch), float(best)
+
+
+def _pseudo_sr_closure(train_z, train_mass, val_z, val_mass, *, settings, seed, device):
+    """Test q_phi interpolation in three artificial gaps on each side of the SR.
+
+    Each probe masks one localized mass window from both correction-training and
+    checkpoint-selection rows, fits a fresh auxiliary q_phi, and evaluates only
+    the held-out validation rows in that window.  The six windows are defined by
+    mass quantiles and use no truth labels.
+
+    A sideband passes when all three windows are evaluable, at least two have a
+    positive Gaussian-relative NLL gain, their event-weighted mean gain is
+    positive, and no individual window is significantly worse than Gaussian at
+    the configured compatibility threshold.  Both sidebands must pass.
+    """
+    all_mass = np.concatenate((train_mass, val_mass)).astype(np.float64, copy=False)
+    reports = []
+    sides = (
+        ("lower", all_mass < 3.3, lambda x: x < 3.3),
+        ("upper", all_mass > 3.7, lambda x: x > 3.7),
+    )
+    position_names = {
+        "lower": ("outer", "middle", "inner"),
+        "upper": ("inner", "middle", "outer"),
+    }
+    windows_per_side = len(PSEUDO_WINDOW_QUANTILES)
+
+    for side_index, (side_name, combined_side, side_selector) in enumerate(sides):
+        values = all_mass[combined_side]
+        minimum_side_events = 4 * MIN_PSEUDO_WINDOW_EVENTS
+        if len(values) < minimum_side_events:
+            for window_index, quantiles in enumerate(PSEUDO_WINDOW_QUANTILES):
+                reports.append(dict(
+                    side=side_name, window=window_index + 1,
+                    position=position_names[side_name][window_index],
+                    quantiles=list(quantiles), status="insufficient_events",
+                    events=int(len(values)),
+                ))
+            continue
+
+        train_side = side_selector(train_mass)
+        val_side = side_selector(val_mass)
+        for window_index, quantiles in enumerate(PSEUDO_WINDOW_QUANTILES):
+            low, high = (float(x) for x in np.quantile(values, quantiles))
+            train_gap = train_side & (train_mass >= low) & (train_mass <= high)
+            val_gap = val_side & (val_mass >= low) & (val_mass <= high)
+            train_keep = ~train_gap
+            val_keep = ~val_gap
+            same_side_left = int(np.sum(train_side & (train_mass < low)))
+            same_side_right = int(np.sum(train_side & (train_mass > high)))
+            counts = dict(
+                train_gap=int(train_gap.sum()), validation_gap=int(val_gap.sum()),
+                train_outside=int(train_keep.sum()), validation_outside=int(val_keep.sum()),
+                same_side_left=same_side_left, same_side_right=same_side_right,
+            )
+            base = dict(
+                side=side_name, window=window_index + 1,
+                position=position_names[side_name][window_index],
+                quantiles=list(quantiles), bounds=[low, high],
+            )
+            if (counts["validation_gap"] < MIN_PSEUDO_WINDOW_EVENTS
+                    or counts["train_outside"] < MIN_PSEUDO_WINDOW_EVENTS
+                    or counts["validation_outside"] < MIN_PSEUDO_WINDOW_EVENTS
+                    or same_side_left < MIN_PSEUDO_WINDOW_EVENTS
+                    or same_side_right < MIN_PSEUDO_WINDOW_EVENTS):
+                reports.append(dict(**base, status="insufficient_events", **counts))
+                continue
+
+            probe_index = side_index * windows_per_side + window_index
+            probe, selected_epoch, selection_nll = _fit_probe(
+                train_z[train_keep], train_mass[train_keep],
+                val_z[val_keep], val_mass[val_keep],
+                settings=settings, seed=(int(seed) + 3000 + probe_index) % 2**32,
+                device=device,
+            )
+            metrics = _validation_metrics(probe, val_z[val_gap], val_mass[val_gap], device)
+            improvement = metrics["improvement"]
+            standard_error = metrics["improvement_standard_error"]
+            positive = improvement > MIN_VALIDATION_IMPROVEMENT
+            if positive:
+                compatible = True
+            elif standard_error is None or not np.isfinite(standard_error) or standard_error <= 0:
+                compatible = False
+            else:
+                compatible = (improvement + PSEUDO_COMPATIBILITY_SIGMA * standard_error
+                              >= MIN_VALIDATION_IMPROVEMENT)
+            status = "passed" if positive else ("compatible" if compatible else "failed")
+            reports.append(dict(
+                **base, status=status, positive=bool(positive),
+                gaussian_compatible=bool(compatible), selected_epoch=selected_epoch,
+                selection_nll=selection_nll, **counts, **metrics,
+            ))
+            emit_message(
+                f"Background pseudo-SR closure {side_name} {base['position']} "
+                f"[{window_index+1}/{windows_per_side}]: improvement={improvement:.6g} "
+                f"({status})"
+            )
+
+    side_reports = []
+    for side_name, _, _ in sides:
+        windows = [r for r in reports if r["side"] == side_name]
+        evaluable = [r for r in windows if r.get("status") != "insufficient_events"]
+        positive_count = sum(bool(r.get("positive", False)) for r in evaluable)
+        incompatible_count = sum(not bool(r.get("gaussian_compatible", False)) for r in evaluable)
+        if evaluable:
+            weights = np.asarray([r["events"] for r in evaluable], dtype=np.float64)
+            gains = np.asarray([r["improvement"] for r in evaluable], dtype=np.float64)
+            weighted_improvement = float(np.average(gains, weights=weights))
+        else:
+            weighted_improvement = None
+        side_passed = (
+            len(evaluable) == windows_per_side
+            and positive_count >= MIN_POSITIVE_WINDOWS_PER_SIDE
+            and incompatible_count == 0
+            and weighted_improvement is not None
+            and weighted_improvement > MIN_VALIDATION_IMPROVEMENT
+        )
+        side_reports.append(dict(
+            side=side_name, status="passed" if side_passed else "failed",
+            windows_evaluable=len(evaluable), windows_total=windows_per_side,
+            positive_windows=positive_count,
+            minimum_positive_windows=MIN_POSITIVE_WINDOWS_PER_SIDE,
+            significantly_worse_windows=incompatible_count,
+            event_weighted_improvement=weighted_improvement,
+        ))
+        emit_message(
+            f"Background pseudo-SR closure {side_name} summary: "
+            f"positive={positive_count}/{windows_per_side}, "
+            f"significantly_worse={incompatible_count}, "
+            f"weighted_improvement={weighted_improvement if weighted_improvement is not None else 'n/a'} "
+            f"({'passed' if side_passed else 'failed'})"
+        )
+
+    passed = len(side_reports) == 2 and all(r["status"] == "passed" for r in side_reports)
+    return dict(
+        status="passed" if passed else "failed",
+        protocol="masked_sideband_multiwindow_interpolation_v2",
+        truth_labels_used=False,
+        gap_quantiles=[list(x) for x in PSEUDO_WINDOW_QUANTILES],
+        windows_per_side=windows_per_side,
+        minimum_gap_events=MIN_PSEUDO_WINDOW_EVENTS,
+        minimum_positive_windows_per_side=MIN_POSITIVE_WINDOWS_PER_SIDE,
+        compatibility_sigma=PSEUDO_COMPATIBILITY_SIGMA,
+        criterion=(
+            "both sidebands must pass; per side all three windows must be evaluable, "
+            "at least two must improve on Gaussian, the event-weighted mean improvement "
+            "must be positive, and no window may be significantly worse than Gaussian"
+        ),
+        sides=side_reports,
+        windows=reports,
+    )
+
+
 def _contract(settings, train_z, train_mass, val_z, val_mass, seed, device):
     return dict(
-        schema=1,
+        schema=3,
         scientific_version=SCIENTIFIC_VERSION,
         protocol=PROTOCOL,
         mode=MODE,
         epochs=EPOCHS,
+        activation_gate=dict(
+            min_validation_improvement=MIN_VALIDATION_IMPROVEMENT,
+            pseudo_window_quantiles=[list(x) for x in PSEUDO_WINDOW_QUANTILES],
+            minimum_pseudo_window_events=MIN_PSEUDO_WINDOW_EVENTS,
+            minimum_positive_windows_per_side=MIN_POSITIVE_WINDOWS_PER_SIDE,
+            compatibility_sigma=PSEUDO_COMPATIBILITY_SIGMA,
+        ),
         seed=int(seed),
         device=str(device),
         flow=settings["flow"],
@@ -81,7 +304,7 @@ def _contract(settings, train_z, train_mass, val_z, val_mass, seed, device):
 
 
 def train(directory, train_z, train_mass, val_z, val_mass, *, settings, seed, device):
-    """Fit the one shared q_phi(z|m) using exactly 40 reserved-sideband epochs."""
+    """Fit q_phi and activate it only after independent validation and gap closure."""
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     train_z = np.ascontiguousarray(train_z, dtype=np.float32)
@@ -136,27 +359,55 @@ def train(directory, train_z, train_mass, val_z, val_mass, *, settings, seed, de
         model.eval()
         with torch.no_grad():
             validation_nll = -float(log_prob(model, zv, mv).double().mean().cpu())
-            gaussian_nll = -float((-.5 * (zv.square() + math.log(2 * math.pi)).sum(-1)).double().mean().cpu())
+            gaussian_nll = -float(_gaussian_log_prob(zv).double().mean().cpu())
         row = dict(epoch=epoch, train_nll=total / len(train_z), validation_nll=validation_nll,
                    gaussian_validation_nll=gaussian_nll, improvement=gaussian_nll-validation_nll)
         history.append(row)
         if (validation_nll, epoch) < (best, best_epoch if best_epoch is not None else math.inf):
             best, best_epoch, best_model = validation_nll, epoch, deepcopy(model.state_dict())
-        state = dict(contract=contract, epoch=epoch, model=model.state_dict(), optimizer=optimizer.state_dict(),
-                     history=history, best=best, best_epoch=best_epoch, best_model=best_model, rng=rng_state())
-        latest.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write(latest, lambda p, value=state: torch.save(value, p))
-        write_json(directory / "history.json", history)
+        if persist_boundary(epoch, EPOCHS):
+            state = dict(contract=contract, epoch=epoch, model=model.state_dict(), optimizer=optimizer.state_dict(),
+                         history=history, best=best, best_epoch=best_epoch, best_model=best_model, rng=rng_state())
+            latest.parent.mkdir(parents=True, exist_ok=True)
+            atomic_torch_save(latest, state)
+            write_json(directory / "history.json", history)
         emit_message(f"Background correction {epoch+1}/{EPOCHS}: validation NLL={validation_nll:.6g}")
 
     if best_model is None:
         raise FloatingPointError("Background correction produced no valid checkpoint")
     selected = {"model": best_model, "selected_epoch": best_epoch, "contract": contract}
-    atomic_write(directory / "model.pt", lambda p: torch.save(selected, p))
-    write_json(directory / "selection.json", dict(mode=MODE, selected_epoch=best_epoch, epochs=EPOCHS,
-               criterion="lowest reserved correction-validation NLL", truth_labels_used=False,
-               training_region="reserved sidebands", denominator="q_phi(z|m)"))
-    return descriptor(directory)
+    atomic_torch_save(directory / "model.pt", selected)
+    model.load_state_dict(best_model); model.eval().requires_grad_(False)
+    validation = _validation_metrics(model, val_z, val_mass, device)
+    validation_passed = validation["improvement"] > MIN_VALIDATION_IMPROVEMENT
+    if validation_passed:
+        closure = _pseudo_sr_closure(train_z, train_mass, val_z, val_mass,
+                                     settings=settings, seed=(int(seed)+40000) % 2**32, device=device)
+    else:
+        closure = dict(status="not_run", reason="reserved validation did not beat Gaussian",
+                       truth_labels_used=False, protocol="masked_sideband_multiwindow_interpolation_v2")
+    active = validation_passed and closure.get("status") == "passed"
+    reasons = []
+    if not validation_passed:
+        reasons.append("q_phi did not improve reserved validation NLL over Gaussian")
+    if validation_passed and closure.get("status") != "passed":
+        reasons.append("q_phi failed masked-sideband pseudo-SR interpolation closure")
+    decision = dict(
+        mode=MODE, protocol=PROTOCOL, selected_epoch=int(best_epoch), epochs=EPOCHS,
+        status="activated" if active else "gaussian_fallback", active=bool(active),
+        criterion="lowest reserved correction-validation NLL, then positive Gaussian-relative validation gain and multi-window pseudo-SR closure",
+        validation_gate={**validation, "minimum_improvement": MIN_VALIDATION_IMPROVEMENT,
+                         "status": "passed" if validation_passed else "failed"},
+        pseudo_sr_closure=closure,
+        truth_labels_used=False, training_region="reserved sidebands",
+        denominator="q_phi(z|m)" if active else "standard_normal(z)",
+        fallback_reason="; ".join(reasons) if reasons else None,
+    )
+    write_json(directory / "selection.json", decision)
+    emit_message("Background correction activated" if active else
+                 "Background correction failed safety gates; using Gaussian denominator", level=0)
+    return dict(requested_mode=MODE, active=bool(active), descriptor=descriptor(directory) if active else None,
+                selection=decision)
 
 
 def descriptor(directory):
@@ -165,9 +416,13 @@ def descriptor(directory):
     contract = state["contract"]
     if contract.get("mode") != MODE or contract.get("epochs") != EPOCHS:
         raise ValueError("Invalid bgcorr_40_reguide model")
+    selection = json.loads((directory / "selection.json").read_text())
+    if selection.get("status") != "activated" or not selection.get("active"):
+        raise ValueError("Inactive background correction cannot be used as the RIDDLE denominator")
     return dict(mode=MODE, protocol=PROTOCOL, epochs=EPOCHS,
                 selected_epoch=int(state["selected_epoch"]), model_path=str((directory / "model.pt").resolve()),
-                model_sha256=file_digest(directory / "model.pt"), contract=contract)
+                model_sha256=file_digest(directory / "model.pt"), contract=contract,
+                validation_gate=selection["validation_gate"], pseudo_sr_closure=selection["pseudo_sr_closure"])
 
 
 def load(description, settings, features, device):
@@ -198,7 +453,7 @@ def save_local(directory, model, description):
         if saved.get("mode") != MODE or saved.get("source_sha256") != description["model_sha256"] or saved.get("contract") != description["contract"]:
             raise ValueError("Persisted fit background correction changed")
     else:
-        atomic_write(path, lambda p: torch.save(payload, p))
+        atomic_torch_save(path, payload)
     return file_digest(path)
 
 

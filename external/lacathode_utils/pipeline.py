@@ -76,16 +76,17 @@ def numerical_run_failure(options):
 
 def launch_run(options, index, count):
     from .worker_progress import EVENT_PREFIX
+    from riddle.worker_progress import BufferedLog, durable_progress_event
 
     output = Path(options["output"])
     command, env = run_command(options)
-    with (output / "training.log").open("a" if options["resume"] else "w") as log:
+    with (output / "training.log").open("a" if options["resume"] else "w") as raw_log:
+        log = BufferedLog(raw_log)
         with subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                               text=True, bufsize=1, errors="replace") as process:
             try:
                 for line in process.stdout:
                     log.write(line)
-                    log.flush()
                     if line.startswith(EVENT_PREFIX):
                         event = json.loads(line[len(EVENT_PREFIX):])
                         if "phase" in event:
@@ -93,11 +94,15 @@ def launch_run(options, index, count):
                             event["label"] = f"Run {index + 1}/{count} | " + event["label"]
                         elif "message" in event:
                             event["message"] = f"Run {index + 1}/{count} | " + event["message"]
+                        if durable_progress_event(event):
+                            log.force_flush()
                         line = EVENT_PREFIX + json.dumps(event) + "\n"
                     print(line, end="", flush=True)
+                log.force_flush()
                 if process.wait() and not numerical_run_failure(options):
                     raise RuntimeError(f"LaCathode run {index} failed; inspect {output / 'training.log'}")
             except BaseException:
+                log.force_flush()
                 if process.poll() is None:
                     process.terminate()
                     try:

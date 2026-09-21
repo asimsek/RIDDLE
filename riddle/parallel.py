@@ -8,7 +8,7 @@ import signal
 import time
 import traceback
 from riddle.progress import _duration, _short_value
-from riddle.worker_progress import _LOCAL_SINK, emit_message
+from riddle.worker_progress import _LOCAL_SINK, emit_message, BufferedLog, durable_progress_event
 
 
 def _fit_worker(events, job, rows, validation, options):
@@ -24,38 +24,50 @@ def _fit_worker(events, job, rows, validation, options):
     fit, started = job["fit"], time.monotonic()
     label = f"RIDDLE fit {fit}/{options['total']}"
     epoch_progress = {}
-    with (recovery / "worker.log").open("a") as log, redirect_stdout(log), redirect_stderr(log):
-        def publish(event):
-            if event.get("phase") == "residual_training" and event.get("completed") is not None:
-                epoch_progress[event["label"]] = max(0, event["completed"] - event.get("initial", 0))
-            log.write(json.dumps(event) + "\n")
-            log.flush()
-            events.put((fit, "progress", event))
-        token = _LOCAL_SINK.set(publish)
-        try:
-            torch.set_num_threads(options["torch_threads"])
-            torch.set_num_interop_threads(1)
-            install_tensor_batches(options["device"])
-            torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False
-            saved = train_member(rows, validation, directory.parents[1],
-                relative=job["relative"], index=job["index"], fraction=job["fraction"],
-                epochs=options["epochs"], seed=options["seed"], device=options["device"],
-                initialization=options["initialization"], settings=options["settings"],
-                label=label, normalization_tests=options["normalization_tests"],
-                member_split_indices=job.get("member_split_indices"), source_ids=options.get("source_ids"),
-                background_correction=options.get("background_correction"))
-            result = dict(status=saved["status"], initial_epoch=0,
-                          new_epochs=sum(epoch_progress.values()),
-                          trained_epochs=saved.get("trained_epochs", options["epochs"]),
-                          training_seconds=time.monotonic() - started, finalization_seconds=0,
-                          worker_started=started, worker_finished=time.monotonic(), pid=os.getpid())
-            write_json(recovery / "execution.json", result)
-            events.put((fit, "result", result))
-        except BaseException as error:
-            traceback.print_exc()
-            events.put((fit, "error", f"{type(error).__name__}: {error}"))
-        finally:
-            _LOCAL_SINK.reset(token)
+    previous_handler = signal.getsignal(signal.SIGTERM)
+
+    def terminate(signum, frame):
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, terminate)
+    with (recovery / "worker.log").open("a") as raw_log:
+        log = BufferedLog(raw_log)
+        with redirect_stdout(log), redirect_stderr(log):
+            def publish(event):
+                if event.get("phase") == "residual_training" and event.get("completed") is not None:
+                    epoch_progress[event["label"]] = max(0, event["completed"] - event.get("initial", 0))
+                log.write(json.dumps(event) + "\n")
+                if durable_progress_event(event):
+                    log.force_flush()
+                events.put((fit, "progress", event))
+            token = _LOCAL_SINK.set(publish)
+            try:
+                torch.set_num_threads(options["torch_threads"])
+                torch.set_num_interop_threads(1)
+                install_tensor_batches(options["device"])
+                torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False
+                saved = train_member(rows, validation, directory.parents[1],
+                    relative=job["relative"], index=job["index"], fraction=job["fraction"],
+                    epochs=options["epochs"], seed=options["seed"], device=options["device"],
+                    initialization=options["initialization"], settings=options["settings"],
+                    label=label, normalization_tests=options["normalization_tests"],
+                    member_split_indices=job.get("member_split_indices"), source_ids=options.get("source_ids"),
+                    background_correction=options.get("background_correction"))
+                result = dict(status=saved["status"], initial_epoch=0,
+                              new_epochs=sum(epoch_progress.values()),
+                              trained_epochs=saved.get("trained_epochs", options["epochs"]),
+                              training_seconds=time.monotonic() - started, finalization_seconds=0,
+                              worker_started=started, worker_finished=time.monotonic(), pid=os.getpid())
+                write_json(recovery / "execution.json", result)
+                events.put((fit, "result", result))
+            except BaseException as error:
+                traceback.print_exc()
+                log.force_flush()
+                events.put((fit, "error", f"{type(error).__name__}: {error}"))
+            finally:
+                log.force_flush()
+                _LOCAL_SINK.reset(token)
+                signal.signal(signal.SIGTERM, previous_handler)
 
 
 def fitting_eta(mean_fit, epochs, active, queued, workers):
