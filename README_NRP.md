@@ -113,7 +113,7 @@ python run.py setup --methods ranode
 **Prepare LHCO data:**
 
 ```bash
-python run.py prepare --dataset lhco --catalog config/datasets.yaml --output data/lhco --io-workers 8 --verbose 1
+python run.py prepare --dataset lhco --catalog config/datasets.yaml --output data/lhco --io-workers 16 --verbose 1
 ```
 
 
@@ -131,7 +131,7 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --name riddle-seed42 --methods riddle --scenarios signal_injection \
   --seeds 42 --config config/settings.yaml --workers 5 --io-workers 2 --torch-threads 2 --mps on \
-  --runs 10 --fits 20 --epochs 100 --data data/lhco --results results \
+  --runs 10 --fits 10 --epochs 100 --data data/lhco --results results \
   | kubectl apply -n cua-asimsek -f -
 ```
 
@@ -140,7 +140,7 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --name riddle-bg-seed42 --methods riddle --scenarios background_only \
   --seeds 42 --config config/settings.yaml --workers 5 --io-workers 2 --torch-threads 2 --mps on \
-  --runs 10 --fits 20 --epochs 100 --data data/lhco --results results \
+  --runs 10 --fits 10 --epochs 100 --data data/lhco --results results \
   | kubectl apply -n cua-asimsek -f -
 ```
 
@@ -309,35 +309,41 @@ After preparation is complete, submit the jobs below from your local terminal.
 **RIDDLE:**
 
 ```bash
-kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
-  python /shared/work/RIDDLE/nrp.py \
-  --workflow scan --name riddle-injection-scan --methods riddle \
-  --config config/settings.yaml --data data/injection_scan --results results_injection_scan \
-  --runs 10 --fits 20 --epochs 100 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
-  | kubectl apply -n cua-asimsek -f -
+for r in {0..9}; do
+  kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
+    python /shared/work/RIDDLE/nrp.py \
+    --workflow scan --name "riddle-injection-scan-r${r}" --methods riddle --replicas "$r" \
+    --config config/settings.yaml --data data/injection_scan --results results_injection_scan \
+    --runs 1 --fits 10 --epochs 100 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
+    | kubectl apply -n cua-asimsek -f -
+done
 ```
 
 **LaCathode:**
 
 ```bash
-kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
-  python /shared/work/RIDDLE/nrp.py \
-  --workflow scan --name lacathode-injection-scan --methods lacathode \
-  --config config/settings.yaml --data data/injection_scan --results results_injection_scan \
-  --runs 10 --epochs 100 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
-  --lacathode-background independent \
-  | kubectl apply -n cua-asimsek -f -
+for r in {0..9}; do
+  kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
+    python /shared/work/RIDDLE/nrp.py \
+    --workflow scan --name "lacathode-injection-scan-r${r}" --methods lacathode --replicas "$r" \
+    --config config/settings.yaml --data data/injection_scan --results results_injection_scan \
+    --runs 1 --epochs 100 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
+    --lacathode-background independent \
+    | kubectl apply -n cua-asimsek -f -
+done
 ```
 
 **R-ANODE:**
 
 ```bash
-kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
-  python /shared/work/RIDDLE/nrp.py \
-  --workflow scan --name ranode-injection-scan --methods ranode \
-  --data data/injection_scan --results results_injection_scan \
-  --runs 10 --fits 20 --epochs 300 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
-  | kubectl apply -n cua-asimsek -f -
+for r in {0..9}; do
+  kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
+    python /shared/work/RIDDLE/nrp.py \
+    --workflow scan --name "ranode-injection-scan-r${r}" --methods ranode --replicas "$r" \
+    --data data/injection_scan --results results_injection_scan \
+    --runs 1 --fits 20 --epochs 300 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
+    | kubectl apply -n cua-asimsek -f -
+done
 ```
 
 In Jupyter, plot completed scan results:
