@@ -131,7 +131,7 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --name riddle-seed42 --methods riddle --scenarios signal_injection \
   --seeds 42 --config config/settings.yaml --workers 5 --io-workers 2 --torch-threads 2 --mps on \
-  --runs 10 --fits 10 --epochs 100 --data data/lhco --results results \
+  --runs 10 --fits 20 --epochs 100 --data data/lhco --results results \
   | kubectl apply -n cua-asimsek -f -
 ```
 
@@ -140,7 +140,7 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --name riddle-bg-seed42 --methods riddle --scenarios background_only \
   --seeds 42 --config config/settings.yaml --workers 5 --io-workers 2 --torch-threads 2 --mps on \
-  --runs 10 --fits 10 --epochs 100 --data data/lhco --results results \
+  --runs 10 --fits 20 --epochs 100 --data data/lhco --results results \
   | kubectl apply -n cua-asimsek -f -
 ```
 
@@ -172,7 +172,7 @@ Add `--lacathode-background fixed` to a LaCathode submission to share one backgr
 kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --name ranode-seed42 --methods ranode --scenarios signal_injection \
-  --runs 10 --fits 10 --epochs 100 --seeds 42 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
+  --runs 10 --fits 20 --epochs 300 --seeds 42 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
   --data data/lhco --results results \
   | kubectl apply -n cua-asimsek -f -
 ```
@@ -181,7 +181,7 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
 kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --name ranode-bg-seed42 --methods ranode --scenarios background_only \
-  --runs 10 --fits 10 --epochs 100 --seeds 42 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
+  --runs 10 --fits 20 --epochs 300 --seeds 42 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
   --data data/lhco --results results \
   | kubectl apply -n cua-asimsek -f -
 ```
@@ -313,7 +313,7 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --workflow scan --name riddle-injection-scan --methods riddle \
   --config config/settings.yaml --data data/injection_scan --results results_injection_scan \
-  --runs 10 --fits 10 --epochs 100 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
+  --runs 10 --fits 20 --epochs 100 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
   | kubectl apply -n cua-asimsek -f -
 ```
 
@@ -336,7 +336,7 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --workflow scan --name ranode-injection-scan --methods ranode \
   --data data/injection_scan --results results_injection_scan \
-  --runs 10 --fits 10 --epochs 100 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
+  --runs 10 --fits 20 --epochs 300 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
   | kubectl apply -n cua-asimsek -f -
 ```
 

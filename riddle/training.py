@@ -1,4 +1,5 @@
 import json
+import math
 from pathlib import Path
 import random
 import numpy as np
@@ -25,7 +26,8 @@ ENHANCED_TRAINING_PROTOCOL = "study_parity_validation_rng_v2"
 def enhanced_epoch(model, logit, ztrain, optimizer, options, additions, *, epoch, seed, guide,
                    fixed_fraction=False, progress=None, background_model=None):
     """Guided EM/mixture fitting with an optional corrected q_phi(z|m) denominator."""
-    from .enhancements import chunks, contrastive_loss, clip_gradients, standard_normal_log_prob
+    from .enhancements import (chunks, contrastive_loss, clip_gradients, standard_normal_log_prob,
+                               sharpen_responsibilities, tail_ranking_loss)
     from .integrity import mixture_log_density, require_finite
     device = logit.device
     z = torch.from_numpy(ztrain)
@@ -52,6 +54,8 @@ def enhanced_epoch(model, logit, ztrain, optimizer, options, additions, *, epoch
             fraction = float(weights.double().mean().clamp(1e-8, 1-1e-8))
             with torch.no_grad():
                 logit.fill_(np.log(fraction/(1-fraction)))
+    if (not warm) and float(additions.get("responsibility_temperature", 1.0)) < 1.0:
+        weights = sharpen_responsibilities(weights, float(additions["responsibility_temperature"]))
     mean_weight = float(weights.double().mean())
     if mean_weight <= 0 or not np.isfinite(mean_weight):
         raise FloatingPointError("Invalid residual responsibilities")
@@ -60,7 +64,7 @@ def enhanced_epoch(model, logit, ztrain, optimizer, options, additions, *, epoch
     loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(z, logb, weights),
                                          batch_size=options["batch_size"], shuffle=True,
                                          generator=loader_generator)
-    total = contrast = 0.
+    total = contrast = tail_total = 0.
     for step, (xb, lb, w) in enumerate(loader):
         xb, lb, w = xb.to(device), lb.to(device), w.to(device)
         model.train(); optimizer.zero_grad()
@@ -92,18 +96,67 @@ def enhanced_epoch(model, logit, ztrain, optimizer, options, additions, *, epoch
             nc = contrastive_loss(both[:len(xb)]-lb, both[len(xb):]-ref_logb, w, mean_weight)
             loss = loss + additions["contrastive_strength"]*nc
             model.train()
+        tail = torch.zeros((), device=device)
+        if additions.get("tail_rank", False) and not warm:
+            multiplier = int(additions.get("tail_candidate_multiplier", 4))
+            candidate_count = max(len(xb), multiplier * len(xb))
+            if conditional:
+                candidate_context = xb[:, -1].repeat_interleave(multiplier)[:candidate_count]
+                if len(candidate_context) < candidate_count:
+                    candidate_context = candidate_context.repeat(
+                        int(np.ceil(candidate_count / max(1, len(candidate_context))))
+                    )[:candidate_count]
+            else:
+                candidate_context = None
+            model.eval()
+            if background_model is not None:
+                from .background_correction import sample as sample_background, log_prob as corrected_log_prob
+                candidate_latent = sample_background(
+                    background_model, candidate_context, xb.shape[1]-1,
+                    int(seed)+700000+epoch*10000+step, device
+                )
+                candidate = torch.cat((candidate_latent, candidate_context[:, None]), dim=1)
+                with torch.no_grad():
+                    candidate_logb = corrected_log_prob(background_model, candidate_latent, candidate_context)
+                    candidate_ratio = signal_log_prob(model, candidate) - candidate_logb
+            else:
+                gen = torch.Generator().manual_seed(int(seed)+700000+epoch*10000+step)
+                if conditional:
+                    candidate_latent = torch.randn((candidate_count, xb.shape[1]-1), generator=gen).to(device)
+                    candidate = torch.cat((candidate_latent, candidate_context[:, None]), dim=1)
+                    candidate_logb = standard_normal_log_prob(candidate_latent)
+                else:
+                    candidate = torch.randn((candidate_count, xb.shape[1]), generator=gen).to(device)
+                    candidate_logb = standard_normal_log_prob(candidate)
+                with torch.no_grad():
+                    candidate_ratio = signal_log_prob(model, candidate) - candidate_logb
+            hard_count = max(1, int(math.ceil(candidate_count * float(additions.get("tail_hard_fraction", .10)))))
+            hard_indices = torch.argsort(candidate_ratio, descending=True, stable=True)[:hard_count]
+            hard_candidate = candidate[hard_indices]
+            hard_logb = candidate_logb[hard_indices]
+            model.train()
+            hard_ratio = signal_log_prob(model, hard_candidate) - hard_logb
+            positive_ratio = log_signal - lb
+            tail = tail_ranking_loss(
+                positive_ratio, hard_ratio, w, mean_weight,
+                margin=float(additions.get("tail_margin", 0.0)),
+                temperature=float(additions.get("tail_temperature", 1.0)),
+            )
+            loss = loss + float(additions.get("tail_strength", .20)) * tail
         require_finite(loss, "Residual objective")
         loss.backward()
         if logit.requires_grad:
             require_finite(logit.grad, "Mixture-fraction gradient")
         clip_gradients(model.parameters(), options["gradient_clip_norm"])
-        optimizer.step(); total += float(loss.detach())*len(xb); contrast += float(nc.detach())*len(xb)
+        optimizer.step(); total += float(loss.detach())*len(xb); contrast += float(nc.detach())*len(xb); tail_total += float(tail.detach())*len(xb)
         if progress:
             progress(step+1, len(loader))
     model.eval()
     nll = -float(mixture_log_density(chunks(lambda x: signal_log_prob(model, x), z, device=device), logb,
                                      logit.detach().cpu()).double().mean())
     return nll, dict(train_objective=total/len(z), contrastive_loss=contrast/len(z),
+                     tail_rank_loss=tail_total/len(z),
+                     responsibility_temperature=float(additions.get("responsibility_temperature", 1.0)),
                      phase="guided_initialization" if warm else "alternating_mixture" if guided else "mixture_likelihood",
                      effective_residual_events=float(weights.sum().square()/weights.square().sum()))
 
@@ -341,7 +394,8 @@ def train_residual(
             from .enhancements import teacher_weights
             guide = teacher_weights(output / "guide", guide_inputs, initial_fraction,
                                     seed=(int(seed)+2000) % 2**32, options={**additions, **active},
-                                    batch_size=options["batch_size"], device=device)
+                                    batch_size=options["batch_size"],
+                                    context=(ztrain[:, -1] if mass_conditioning else None), device=device)
         restore_rng(before)
     write_json(
         output / "residual_training_inputs.json",
@@ -492,12 +546,23 @@ def train_residual(
         raise ValueError("Buffered residual Top-N checkpoint inventory disagrees with final selection")
     if set(files) != {f"residual_epoch_{epoch}.pt" for epoch in order}:
         raise ValueError("Final residual checkpoint files disagree with validation selection")
+    weighting = additions.get("checkpoint_weighting", "uniform")
+    selected_nll = np.asarray([history[i]["validation_nll"] for i in order], dtype=np.float64)
+    if weighting == "validation_likelihood":
+        logw = -len(zval) * (selected_nll - float(selected_nll.min()))
+        logw = np.maximum(logw, -60.0)
+        checkpoint_weights = np.exp(logw - np.logaddexp.reduce(logw))
+    else:
+        checkpoint_weights = np.full(len(order), 1.0 / len(order), dtype=np.float64)
     write_json(
         output / "residual_selection.json",
         {
             "epochs": order,
             "criterion": f"{options['selected_checkpoints']} lowest validation mixture NLL epochs",
-            "density_ensemble": "arithmetic mean",
+            "density_ensemble": ("validation-likelihood weighted mean" if weighting == "validation_likelihood" else "arithmetic mean"),
+            "checkpoint_weighting": weighting,
+            "checkpoint_weights": [float(x) for x in checkpoint_weights],
+            "validation_nll": [float(x) for x in selected_nll],
             "signal_fractions": [history[i]["signal_fraction"] for i in order],
             **(dict(trained_epochs=len(history), maximum_epochs=epochs, stopped_early=stopped,
                     excluded_warmup_epochs=warmup) if control or enhanced else {}),
@@ -515,6 +580,23 @@ def residual_scores(output, order, z, device, *, normalization_checks=None, norm
     if inputs["features"] != z.shape[1]:
         raise ValueError("Scoring feature count differs from training")
     model = build_signal_flow(device, features=z.shape[1], settings=inputs["settings"]).eval()
+    selection_path = output / "residual_selection.json"
+    if selection_path.exists():
+        selection = json.loads(selection_path.read_text())
+        saved_epochs = list(selection.get("epochs", []))
+        saved_weights = np.asarray(selection.get("checkpoint_weights", []), dtype=np.float64)
+        if saved_weights.shape == (len(saved_epochs),) and all(epoch in saved_epochs for epoch in order):
+            checkpoint_weights = np.asarray([saved_weights[saved_epochs.index(epoch)] for epoch in order], dtype=np.float64)
+            checkpoint_weights = checkpoint_weights / checkpoint_weights.sum()
+        else:
+            checkpoint_weights = np.array([], dtype=np.float64)
+    else:
+        checkpoint_weights = np.array([], dtype=np.float64)
+    if checkpoint_weights.shape != (len(order),):
+        checkpoint_weights = np.full(len(order), 1.0 / len(order), dtype=np.float64)
+    if (not np.isfinite(checkpoint_weights).all() or np.any(checkpoint_weights <= 0)
+            or not np.isclose(checkpoint_weights.sum(), 1.0, rtol=1e-8, atol=1e-10)):
+        raise ValueError("Invalid residual checkpoint ensemble weights")
     corrected_background = None
     correction_info = inputs.get("background_correction")
     if correction_info is not None:
@@ -579,12 +661,13 @@ def residual_scores(output, order, z, device, *, normalization_checks=None, norm
                     normalization_checks.append(dict(epoch=epoch, **validate_density_ratio(
                         log_density - log_background.astype(np.float64),
                         stage=f"RIDDLE {output}, checkpoint {epoch}", tests=normalization_tests)))
-                log_sum = log_density if log_sum is None else np.logaddexp(log_sum, log_density)
+                weighted = log_density + math.log(float(checkpoint_weights[i]))
+                log_sum = weighted if log_sum is None else np.logaddexp(log_sum, weighted)
                 if replay: columns.append(log_density)
-    log_signal = log_sum - np.log(len(order))
+    log_signal = log_sum
     if replay:
         from scipy.special import logsumexp
-        log_signal = logsumexp(np.column_stack(columns), axis=1)-np.log(len(order))
+        log_signal = logsumexp(np.column_stack(columns) + np.log(checkpoint_weights)[None, :], axis=1)
     scores = log_signal.astype(np.float64) - log_background.astype(np.float64)
     if not np.isfinite(scores).all():
         raise FloatingPointError("Nonfinite residual ensemble scores")

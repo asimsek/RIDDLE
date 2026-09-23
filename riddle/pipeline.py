@@ -208,7 +208,10 @@ def run(args, contract):
             "hidden_features": settings["riddle"]["flow"]["hidden_features"],
             **settings["riddle"]["training"],
             "gradient_clip": f"flow parameters only; norm {settings['riddle']['training']['gradient_clip_norm']}",
-            "ensemble": f"equal-weight mean signal density over accepted fits and {settings['riddle']['training']['selected_checkpoints']} validation-selected epochs per fit",
+            "ensemble": (
+                f"equal-weight mean over accepted fits; {settings['riddle']['training']['selected_checkpoints']} validation-selected epochs per fit with "
+                + ("validation-likelihood checkpoint weights" if feature_options(settings["riddle"]).get("checkpoint_weighting") == "validation_likelihood" else "equal checkpoint weights")
+            ),
             "settings": settings,
             "implementation": ("riddle_bgcorr_40_reguide_v3_multiwindow_closure" if background_correction is not None
                                else "riddle_bgcorr_gaussian_fallback_v3_multiwindow_closure" if background_correction_decision is not None

@@ -114,6 +114,20 @@ STYLE = {
     "savefig.edgecolor": "white",
 }
 
+METHOD_MARKERS = {
+    "raw": "o",
+    "residual": "s",
+    "ranode": "^",
+}
+
+
+def method_marker(key):
+    return METHOD_MARKERS.get(key, "o")
+
+
+def format_budget_percent(value):
+    return f"{100 * float(value):.1f}%"
+
 
 _PLOT_CACHE = ContextVar("plot_calculation_cache", default=None)
 _FIGURE_EXPORTER = ContextVar("figure_exporter", default=None)
@@ -274,11 +288,85 @@ def sample_fit_scores(sample, key):
 
 
 @cached_plot_calculation
-def fit_histogram(values, edges, mask):
-    """Mean counts per fit, retaining event denominators rather than pooling fits."""
-    values, mask = np.broadcast_arrays(np.atleast_2d(values), np.atleast_2d(mask))
-    counts = np.asarray([np.histogram(v[m], edges)[0] for v, m in zip(values, mask)])
+def fit_histogram(values, edges, mask, weights=None):
+    """Mean counts per fit, optionally with fractional event weights."""
+    values = np.atleast_2d(values)
+    mask = np.atleast_2d(mask)
+    if weights is None:
+        weights = np.where(mask, 1.0, 0.0)
+    else:
+        weights = np.atleast_2d(weights)
+        values, mask, weights = np.broadcast_arrays(values, mask, weights)
+        weights = np.where(mask, weights, 0.0)
+    values, mask, weights = np.broadcast_arrays(values, mask, weights)
+    counts = np.asarray([np.histogram(v[m], edges, weights=w[m])[0] for v, m, w in zip(values, mask, weights)])
     return counts[0] if len(counts) == 1 else counts.mean(axis=0)
+
+
+def _selection_rule(background_scores, budget, *, physical_total=None):
+    scores = np.asarray(background_scores, float)
+    scores = scores[np.isfinite(scores)]
+    scorable = len(scores)
+    total = scorable if physical_total is None else int(physical_total)
+    target = float(total) * float(budget)
+    if total == 0 or target <= 0:
+        return {"mode": "none", "threshold": np.inf, "boundary_weight": 0.0, "selected": 0.0, "total": total}
+    if target > scorable:
+        raise ValueError("Exact background working point exceeds the scorable background population")
+    if target >= scorable:
+        return {"mode": "all", "threshold": -np.inf, "boundary_weight": 1.0, "selected": target, "total": total}
+    unique, counts = np.unique(scores, return_counts=True)
+    order = np.argsort(unique)[::-1]
+    unique, counts = unique[order], counts[order]
+    cumulative = np.cumsum(counts)
+    index = int(np.searchsorted(cumulative, target, side="left"))
+    threshold = float(unique[index])
+    strict = float(cumulative[index - 1]) if index else 0.0
+    equal = float(counts[index])
+    boundary_weight = (target - strict) / equal if equal else 0.0
+    boundary_weight = float(np.clip(boundary_weight, 0.0, 1.0))
+    return {
+        "mode": "threshold",
+        "threshold": threshold,
+        "boundary_weight": boundary_weight,
+        "selected": target,
+        "total": total,
+    }
+
+
+def _apply_selection_rule(scores, rule, mask):
+    scores = np.asarray(scores, float)
+    mask = np.asarray(mask, bool)
+    weights = np.zeros(scores.shape, float)
+    if rule["mode"] == "all":
+        weights[mask & np.isfinite(scores)] = 1.0
+        return weights
+    if rule["mode"] == "none":
+        return weights
+    finite = mask & np.isfinite(scores)
+    threshold = rule["threshold"]
+    weights[finite & (scores > threshold)] = 1.0
+    equal = finite & np.isclose(scores, threshold, rtol=0.0, atol=0.0)
+    if np.any(equal) and rule["boundary_weight"] > 0:
+        weights[equal] = rule["boundary_weight"]
+    return weights
+
+
+def exact_selection_weights(sample, key, budget, *, selection_scope="sr", application_mask=None):
+    fits = sample_fit_scores(sample, key)
+    if application_mask is None:
+        application_mask = np.ones(len(sample["mass"]), dtype=bool)
+    application_mask = np.asarray(application_mask, bool)
+    selection_region = sample_sr(sample, key) if selection_scope == "sr" else np.ones(len(sample["mass"]), bool)
+    physical_background = application_mask & selection_region & (sample["labels"] == 0)
+    scorable_background = physical_background & sample["mask"]
+    total_background = int(physical_background.sum())
+    weights = []
+    for score in fits:
+        rule = _selection_rule(score[scorable_background], budget, physical_total=total_background)
+        weights.append(_apply_selection_rule(score, rule, application_mask & sample["mask"]))
+    weights = np.asarray(weights)
+    return weights[0] if len(weights) == 1 else weights
 
 
 def validate_fit_counts(records):
@@ -486,20 +574,23 @@ def selected(sample, key, cut):
     return sample["mask"] & (sample[key + "_scores"] > cut)
 
 
-def selection_stats(sample, key, cut, edges, confidence):
+def selection_stats(sample, key, cut, edges, confidence, *, budget=None, selection_scope="sr"):
     fits = sample_fit_scores(sample, key)
     if len(fits) > 1:
-        cuts = np.broadcast_to(cut, (len(fits),))
-        rows = [selection_stats({**sample, key + "_scores": score, key + "_fit_scores": score[None, :]},
-                                key, threshold, edges, confidence) for score, threshold in zip(fits, cuts)]
-        out = {"cut": cuts.tolist(), "display_cut": display(key, cuts).tolist(),
+        cuts = np.broadcast_to(cut, (len(fits),)) if budget is None else [None] * len(fits)
+        rows = []
+        for i, score in enumerate(fits):
+            kwargs = {key + "_scores": score, key + "_fit_scores": score[None, :]}
+            rows.append(selection_stats({**sample, **kwargs}, key, cuts[i] if budget is None else None,
+                                        edges, confidence, budget=budget, selection_scope=selection_scope))
+        out = {"cut": None if budget is not None else np.asarray(cuts).tolist(),
+               "display_cut": None if budget is not None else display(key, np.asarray(cuts)).tolist(),
                "status": "available", "fit_count": len(rows), "fits": rows,
                "aggregation": "mean per-fit counts/efficiencies; median per-fit shape diagnostics"}
         for name in ("signal", "background"):
             for suffix in ("", "_passed", "_total"):
                 values = [r[name + suffix] for r in rows]
                 out[name + suffix] = float(np.mean(values)) if all(v is not None for v in values) else None
-            # Fit spread is not a binomial confidence interval on pooled events.
             out[name + "_ci_low"] = out[name + "_ci_high"] = None
         for name in ("total", "passed", "efficiency"):
             out[name] = np.mean([r[name] for r in rows], axis=0).tolist()
@@ -508,27 +599,32 @@ def selection_stats(sample, key, cut, edges, confidence):
             values = [r[name] for r in rows]
             out[name] = float(np.median(values)) if all(v is not None for v in values) else None
         return out
-    keep, region = selected(sample, key, cut), sample_sr(sample, key)
-    out = {"cut": cut, "display_cut": float(display(key, cut)), "status": "available"}
+    region = sample_sr(sample, key) if selection_scope == "sr" else np.ones(len(sample["mass"]), bool)
+    if budget is not None:
+        weights = np.asarray(exact_selection_weights(sample, key, budget, selection_scope=selection_scope))
+        out = {"cut": None, "display_cut": None, "status": "available", "selection_budget": float(budget)}
+    else:
+        weights = selected(sample, key, cut).astype(float)
+        out = {"cut": cut, "display_cut": float(display(key, cut)), "status": "available"}
     for name, label in (("signal", 1), ("background", 0)):
         population = region & (sample["labels"] == label)
-        n, k = int(population.sum()), int((keep & population).sum())
-        lo, hi = interval(k, n, confidence)
-        out.update(
-            {
-                name + "_total": n,
-                name + "_passed": k,
-                name: safe_div(k, n),
-                name + "_ci_low": scalar(lo),
-                name + "_ci_high": scalar(hi),
-            }
-        )
+        n = int(population.sum())
+        k = float(weights[population].sum())
+        lo, hi = interval(int(round(k)), n, confidence)
+        out.update({
+            name + "_total": n,
+            name + "_passed": k,
+            name: safe_div(k, n),
+            name + "_ci_low": scalar(lo),
+            name + "_ci_high": scalar(hi),
+        })
     bmask = sample["labels"] == 0
     mass = sample["mass"].astype(float).copy()
     mass[region] = np.clip(mass[region], 3.3, np.nextafter(3.7, -np.inf))
-    n, k = np.histogram(mass[bmask], edges)[0], np.histogram(mass[bmask & keep], edges)[0]
+    n = np.histogram(mass[bmask], edges)[0]
+    k = np.histogram(mass[bmask], edges, weights=weights[bmask])[0]
     rate = np.divide(k, n, out=np.full(len(n), np.nan), where=n > 0)
-    overall = safe_div(int((bmask & keep).sum()), int(bmask.sum()))
+    overall = safe_div(float(weights[bmask].sum()), int(bmask.sum()))
     rms = np.sqrt(np.nanmean((rate / overall - 1) ** 2)) if overall else None
     valid = (n * (overall or 0) >= 10) & (n * (1 - (overall or 0)) >= 10)
     chi2 = (
@@ -546,7 +642,6 @@ def selection_stats(sample, key, cut, edges, confidence):
         chi2_bins=int(valid.sum()),
     )
     return out
-
 
 def auc_components(labels, scores):
     s, b = np.asarray(scores)[labels == 1], np.asarray(scores)[labels == 0]
@@ -619,9 +714,8 @@ def legend(fig, handles=None, labels=None, *, ax=None, ncols=None, title=None, f
 
 
 def working_point_title(point, scope=None):
-    relation = "<" if slug(point["name"]) == "extra_tight" else "≤"
     scope = "Signal region" if scope and scope.lower() in ("sr", "signal region") else "Full mass range"
-    return f"{scope} | B {relation} {100 * point['validation_background_budget']:g}%"
+    return f"{scope} | B = {format_budget_percent(point['validation_background_budget'])}"
 
 
 def retention_label(truth, passed, total, *, scenario=None):
@@ -637,6 +731,17 @@ def signal_retention_label(key, passed, total, *, scenario=None):
     value = safe_div(passed, total)
     fraction = f"{100 * value:.3g}%" if value is not None else "n/a"
     return f"{METHODS[key][0]} (S: {fraction})"
+
+
+def method_selection_label(point, key, *, scenario=None):
+    row = point["methods"].get(key, {})
+    background = row.get("background")
+    signal = row.get("signal")
+    if scenario == "background_only":
+        return f"{METHODS[key][0]}  B: {100 * background:.3g}%" if background is not None else METHODS[key][0]
+    b_text = f"{100 * background:.3g}%" if background is not None else "n/a"
+    s_text = f"{100 * signal:.3g}%" if signal is not None else "n/a"
+    return f"{METHODS[key][0]}  B: {b_text} | S: {s_text}"
 
 
 def population_legend(fig, columns, title=None, *, ax=None):
@@ -815,7 +920,9 @@ def _save_figure(fig, path):
     path.parent.mkdir(parents=True, exist_ok=True)
     for ax in fig.axes:
         kind = getattr(ax, "_publication_yaxis", None)
-        if kind is not None:
+        # Some publication plots intentionally request an exact axis window.
+        # Do not let the automatic publication-range helper overwrite it.
+        if kind is not None and not getattr(ax, "_publication_fixed_ylim", False):
             publication_ylim(ax, kind)
     place_legend(fig)
     metadata = {"Creator": "RIDDLE publication plotting framework"}
@@ -1004,8 +1111,8 @@ def render_efficiency(bundle, output, args):
         ]
         ymax = max([target * 1.2, *[float(np.nanmax(h)) for h in highs]]) * 100 * 1.08
         for view, keys in VIEWS.items():
-            fig, ax, _ = canvas("Background efficiency [%]", r"$m_{jj}$ [TeV]")
-            ax.axhline(100 * target, color=".6", lw=1, label="Target")
+            fig, ax, _ = canvas("Background efficiency", r"$m_{jj}$ [TeV]")
+            ax.axhline(target, color=".6", lw=1, label="Validation target")
             for key in keys:
                 row = rows[key]
                 if "passed" not in row:
@@ -1016,19 +1123,20 @@ def render_efficiency(bundle, output, args):
                 low, high = retention_interval(row, args.confidence)
                 ax.errorbar(
                     centers,
-                    rate * 100,
+                    rate,
                     xerr=np.diff(edges) / 2,
-                    yerr=None if "fits" in row else np.array([rate - low, high - rate]) * 100,
-                    fmt="o" if key == "raw" else "s",
-                    ms=3,
+                    yerr=None if "fits" in row else np.array([rate - low, high - rate]),
+                    fmt=method_marker(key),
+                    ms=4,
                     color=color,
                     lw=1,
                     label=label,
                 )
                 if "fits" in row and bundle["evaluation"]["test"][key].get("independent_runs", False):
-                    ax.vlines(centers, low * 100, high * 100, color=color, lw=1)
+                    ax.vlines(centers, low, high, color=color, lw=1)
             decorate_mass(ax, edges)
-            ax.set_ylim(0, ymax)
+            ax.set_ylim(0, 0.20)
+            ax._publication_fixed_ylim = True
             legend(fig, title=working_point_title(point))
             save(fig, output / view / "03_mass_sculpting" / f"background_efficiency_{name}")
     for view, keys in VIEWS.items():
@@ -1053,7 +1161,7 @@ def render_efficiency(bundle, output, args):
             if pairs:
                 pairs.sort()
                 label, color, ls = METHODS[key]
-                ax.plot(*np.asarray(pairs).T, marker="o", color=color, ls=ls, label=label)
+                ax.plot(*np.asarray(pairs).T, marker=method_marker(key), color=color, ls=ls, label=label)
         ticks = sorted({100 * p["validation_background_budget"] for p in metrics["working_points"]})
         ax.set(
             xscale="linear",
@@ -1080,7 +1188,7 @@ def render_efficiency(bundle, output, args):
                 ]
                 if pairs:
                     label, color, ls = METHODS[key]
-                    ax.plot(*np.asarray(pairs).T, marker="o", ms=3, color=color, ls=ls, label=label)
+                    ax.plot(*np.asarray(pairs).T, marker=method_marker(key), ms=4, color=color, ls=ls, label=label)
             ax.axhline(1, color=".5", lw=1, ls=":")
             ax.set(xlim=(0.205, 0), ylim=(0, max(1.0, max(finite)) * 1.3))
             legend(fig, title=SCENARIO_LABELS.get(metrics.get("scenario")))
@@ -1108,11 +1216,13 @@ def mass_histograms(bundle, point):
         edges = np.linspace(min(1.0, float(mass.min())), max(9.0, float(mass.max())), 81)
         nominal = {y: np.histogram(mass[labels == y], edges)[0] for y in (0, 1)}
         histograms = {}
+        budget = point["validation_background_budget"]
         for key in METHODS:
-            cut = point["methods"][key].get("cut")
-            if cut is not None:
-                mask = selected(sample, key, cut)
-                histograms[key] = {y: fit_histogram(mass, edges, mask & (labels == y)) for y in (0, 1)}
+            if point["methods"][key].get("status") == "available":
+                weights = exact_selection_weights(sample, key, budget, selection_scope="sr")
+                histograms[key] = {
+                    y: fit_histogram(mass, edges, labels == y, weights=weights) for y in (0, 1)
+                }
         return edges, nominal, histograms
     return None
 
@@ -1186,10 +1296,8 @@ def render_mass(bundle, output):
                     entries.append(
                         (
                             handle,
-                            retention_label(
-                                y, counts.sum() if counts is not None else None, nominal[y].sum(),
-                                scenario=scenario,
-                            ),
+                            (f"B: {100 * point['methods'][key]['background']:.3g}%" if y == 0 and point['methods'][key].get('background') is not None else
+                             (f"S: {100 * point['methods'][key]['signal']:.3g}%" if y == 1 and point['methods'][key].get('signal') is not None else None)),
                         )
                     )
                 columns.append((METHODS[key][0], entries))
@@ -1222,9 +1330,7 @@ def render_mass(bundle, output):
                 for key in keys:
                     if key not in histograms:
                         continue
-                    label = signal_retention_label(
-                        key, histograms[key][1].sum(), nominal[1].sum(), scenario=scenario
-                    )
+                    label = method_selection_label(point, key, scenario=scenario)
                     color, ls = POPULATIONS[key][0]
                     counts = histograms[key][0]
                     rates[key] = bin_ratio(counts, nominal[0])
@@ -1431,6 +1537,25 @@ def render_features(bundle, output):
     if records is None:
         return
     scenario = bundle["metrics"].get("scenario")
+    common_ymax = {}
+    for view, keys in VIEWS.items():
+        for page in records["pages"]:
+            region = "sr" if page["region"].lower() in ("sr", "signal region") else "full"
+            for i, feature in enumerate(page["features"]):
+                feature_id = feature.get("id", FEATURE_IDS[i] if i < len(FEATURE_IDS) else str(i))
+                max_value = max(
+                    [0.0, *[
+                        float(np.max(c["no_cut"]))
+                        for method in keys
+                        for c in feature["methods"][method]["classes"]
+                    ], *[
+                        float(np.max(c["selected"]))
+                        for method in keys
+                        for c in feature["methods"][method]["classes"]
+                        if c["selected"] is not None
+                    ]]
+                )
+                common_ymax[(view, region, feature_id)] = max(common_ymax.get((view, region, feature_id), 0.0), max_value)
     for view, keys in VIEWS.items():
         for page in records["pages"]:
             region = "sr" if page["region"].lower() in ("sr", "signal region") else "full"
@@ -1443,9 +1568,8 @@ def render_features(bundle, output):
             for i, feature in enumerate(page["features"]):
                 is_score = feature["name"] == "Score"
                 edges = np.asarray(feature["edges"])
-                ymax = max(
-                    10, *[max(c["no_cut"]) * 1.3 for v in feature["methods"].values() for c in v["classes"]]
-                )
+                feature_id = feature.get("id", FEATURE_IDS[i] if i < len(FEATURE_IDS) else "deltaR")
+                ymax = max(1.0, common_ymax[(view, region, feature_id)] * 1.10)
                 for kind, ylabel in (("counts", "Events / bin"), ("retention", "Kept / all")):
                     fig, ax, _ = canvas(ylabel, feature["name"])
                     no_cut, columns = [], []
@@ -1470,45 +1594,36 @@ def render_features(bundle, output):
                                 )
                                 text = retention_label(truth, base.sum(), base.sum(), scenario=scenario)
                                 if text is not None and is_score and len(keys) > 1:
-                                    text = (
-                                        text.replace(":", f" ({name}):", 1)
-                                        if ":" in text else f"{text} ({name})"
-                                    )
+                                    text = text.replace(":", f" ({name}):", 1) if ":" in text else f"{text} ({name})"
                                 no_cut.append((handle, text))
                             handle, passed = None, None
                             if cls["selected"] is not None:
-                                kept = np.asarray(cls["selected"])
-                                if np.any(kept > base):
+                                kept = np.asarray(cls["selected"], float)
+                                if np.any(kept > base + 1e-9):
                                     raise ValueError("Selected feature counts exceed no-cut counts")
                                 passed = kept.sum()
                                 values = kept if kind == "counts" else bin_ratio(kept, base)
                                 handle = step(ax, values, edges, color=color, ls=ls, label=f"{name}: {label}")
-                            entries.append((handle, retention_label(
-                                truth, passed, base.sum(), scenario=scenario
-                            )))
+                            row = point["methods"].get(key, {})
+                            exact_text = (
+                                f"B: {100 * row['background']:.3g}%" if truth == 0 and row.get('background') is not None else
+                                (f"S: {100 * row['signal']:.3g}%" if truth == 1 and row.get('signal') is not None else retention_label(truth, passed, base.sum(), scenario=scenario))
+                            )
+                            entries.append((handle, exact_text))
                         columns.append((name, entries))
                     ax.set_xlim(edges[0], edges[-1])
                     if kind == "counts":
                         count_scale(ax, ymax)
                     else:
-                        ax.set_ylim(0, 1.05)
+                        ax.set_ylim(0, 1.0)
                     population_legend(
                         fig,
                         [("No cut", no_cut), *columns],
                         working_point_title(point, "SR" if region == "sr" else "full mass range"),
                     )
-                    save(
-                        fig,
-                        target
-                        / (
-                            feature.get("id", FEATURE_IDS[i] if i < len(FEATURE_IDS) else "deltaR")
-                            + "_"
-                            + kind
-                        ),
-                    )
+                    save(fig, target / (feature_id + "_" + kind))
             if bundle.get("verbose"):
                 print(f"[WORK] {view} features: {region}, {slug(page['working_point'])}", flush=True)
-
 
 def feature_density(values, edges):
     return (
@@ -1734,14 +1849,9 @@ def build_metrics(bundle, confidence):
         point = {"name": name, "validation_background_budget": budget, "methods": {}}
         for key in METHODS:
             chosen = choose_cut(samples["validation"], key, budget, strict=name == "extra_tight")
-            row = {"validation": chosen, "status": chosen["status"]}
-            if chosen["cut"] is not None:
-                row.update(selection_stats(samples["test"], key, chosen["cut"], edges, confidence))
-                row["sr_efficiency"] = {k: row[k] for k in ("signal", "background")}
-            else:
-                bundle["warnings"].append(
-                    f"{METHODS[key][0]} {name}: insufficient validation tail statistics or constant scores"
-                )
+            row = {"validation": chosen, "status": "available", "exact_target": True}
+            row.update(selection_stats(samples["test"], key, None, edges, confidence, budget=budget))
+            row["sr_efficiency"] = {k: row[k] for k in ("signal", "background")}
             point["methods"][key] = row
         points.append(point)
     report = bundle["report"]
@@ -1750,7 +1860,7 @@ def build_metrics(bundle, confidence):
         "scenario": report["scenario"],
         "smoke": report.get("smoke"),
         "working_points": points,
-        "working_point_protocol": "Truth-assisted MC benchmark: validation-SR background cuts, frozen before independent test evaluation; full physical class denominators",
+        "working_point_protocol": "Truth-assisted MC benchmark: exact test-background efficiencies at 0.4%, 1.0%, 5.0% and 10.0% via fractional boundary interpolation; the same score boundary rule is applied to signal and full physical class denominators are retained",
         "oracle_maximum_protocol": "Test-truth-optimized SIC is an oracle benchmark, not a deployable threshold",
         "mass_edges": edges.tolist(),
         "protocol": report.get("protocol", {}),
@@ -1763,7 +1873,7 @@ def build_metrics(bundle, confidence):
         for key in METHODS:
             chosen = choose_cut(samples["validation"], key, budget, strict=budget == 0.004)
             row["methods"][key] = (
-                selection_stats(samples["test"], key, chosen["cut"], edges, confidence)
+                selection_stats(samples["test"], key, chosen["cut"], edges, confidence, budget=budget)
                 if chosen["cut"] is not None
                 else {"status": chosen["status"]}
             )
@@ -1821,8 +1931,8 @@ def feature_records(bundle):
                     edges = np.linspace(*np.asarray([3.3, 3.7], dtype=m.dtype).astype(float), 31)
                 else:
                     low, high = float(physical[i].min()), float(physical[i].max())
-                    width = max((high - low) * 0.001, 1e-5)
-                    edges = np.linspace(low - width, high + width, 41)
+                    bounded = low >= -1e-9 and high <= 1.0 + 1e-9
+                    edges = np.linspace(0.0, 1.0, 41) if bounded else np.linspace(low, high, 41)
                 feature = {"id": ids[i], "name": name, "edges": edges.tolist(), "methods": {}}
                 for key in METHODS:
                     scope = (
@@ -1835,10 +1945,15 @@ def feature_records(bundle):
                     for label in (0, 1):
                         pop = scope & (sample["labels"] == label) & np.isfinite(x)
                         h = fit_histogram(x, edges, pop)
-                        cut = point["methods"][key].get("cut")
+                        budget = point["validation_background_budget"]
                         kept = (
-                            fit_histogram(x, edges, pop & selected(sample, key, cut))
-                            if cut is not None
+                            fit_histogram(
+                                x,
+                                edges,
+                                pop,
+                                weights=exact_selection_weights(sample, key, budget, selection_scope="sr"),
+                            )
+                            if point["methods"][key].get("status") == "available"
                             else None
                         )
                         classes.append(

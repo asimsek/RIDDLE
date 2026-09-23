@@ -124,12 +124,13 @@ def assess_fit(directory, epochs, fractions, validation, device, *, sigma, norma
         ratio = residual_scores(directory, epochs, validation, device)
         mixture = mixture_gain(ratio, coherent_fraction)
         write_json(directory / "coherent_mixture.json", dict(fraction=coherent_fraction,
-                   density="uniform mean of selected checkpoint densities", truth_labels_used=False,
+                   density="checkpoint density mean with weights recorded in residual_selection.json", truth_labels_used=False,
                    profiling_population="internal fit validation; not reserved evidence",
                    validation_sha256=digest(profile_validation), fixed_fraction=fixed_coherent_fraction is not None))
+    ensemble_reference_ratio = residual_scores(directory, epochs, reference, device)
     normalization = dict(status="passed", reference="independent standard normal",
                          reference_seed=3407, reference_samples=len(reference), checkpoints=checks,
-                         ensemble=validate_density_ratio(reference_sum - np.log(len(epochs)),
+                         ensemble=validate_density_ratio(ensemble_reference_ratio,
                              stage=f"{directory} ensemble", tests=normalization_tests))
     if correction is not None:
         normalization.update(reference="q_phi(z|m) samples across the signal-region mass context",
@@ -430,7 +431,7 @@ def train_campaign(
                 internal = np.logaddexp.reduce(ratios, axis=0)-np.log(len(members))
                 if coherent:
                     weight = profile_fraction(internal) if config["fraction"] is None else config["fraction"]
-                    config["coherent_mixture"] = dict(fraction=weight, density="uniform mean over fits and checkpoints",
+                    config["coherent_mixture"] = dict(fraction=weight, density="equal mean over fits; per-fit checkpoint weights recorded by each residual selection",
                         validation_sha256=digest(zselection), selection_events=len(zselection), truth_labels_used=False)
                     evidence_ratio = np.logaddexp.reduce([
                         residual_scores(output / m["directory"], m["epochs"], zval, device) for m in members], axis=0)-np.log(len(members))

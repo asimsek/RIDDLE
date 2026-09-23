@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import csv
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -120,12 +121,12 @@ def is_riddle_report(report):
 
 
 def riddle_plot_spec(report):
-    # A mass-conditioned signal density is trained only in the SR, so it must
-    # never appear in full-mass comparison panels.
-    mass_conditioning = bool(report.get("contract", {}).get("settings", {}).get("riddle", {}).get("mass_conditioning", False))
+    # RIDDLE stores both signal-region and full-range evaluation score files.
+    # Even for mass-conditioned runs, the plotting layer should expose the
+    # saved full-range scores in Full-Range panels, while R-ANODE remains SR-only.
     base = BUILTINS["riddle"]
     return PlotMethod(base.label, base.color, base.linestyle, base.signal_color,
-                      base.score_transform, "signal_region" if mass_conditioning else base.score_scope)
+                      base.score_transform, base.score_scope)
 
 
 def register_method(report):
@@ -1309,7 +1310,7 @@ def comparison_rows(audit, scenario, seed, *, scope="signal_region", variant="de
             for field, value in values.items():
                 add(method, truth + "_" + field, value)
     for point in audit.get("working_points", []):
-        selection = "validation_background_" + str(point["background_budget"])
+        selection = "exact_test_background_" + str(point["background_budget"])
         for metric in ("background_efficiency", "signal_efficiency", "fit_count"):
             add(point["method"], metric, point[metric], selection)
         b, signal = point["background_efficiency"], point["signal_efficiency"]
@@ -1693,16 +1694,283 @@ def settings_rows(group, score_loader=None):
 
 
 
-def plot_history_series(ax, x, values, label, *, window=5):
-    """Plot unsmoothed history plus a trailing running mean without hiding data."""
+def plot_history_series(ax, x, values, label, *, window=5, color=None):
+    """Plot the moving average first, then the per-epoch curve on top."""
     x = np.asarray(x)
     values = np.asarray(values, dtype=float)
-    line, = ax.plot(x, values, ls=":", lw=1.25, alpha=.80, label=f"{label} | per epoch")
+    average_line = None
     if len(values) >= window:
         smooth = np.convolve(values, np.ones(window) / window, mode="valid")
-        ax.plot(x[window - 1:], smooth, color=line.get_color(), lw=2.0, ls="-",
-                label=f"{label} | {window}-epoch average")
-    return line
+        average_line, = ax.plot(
+            x[window - 1:], smooth, color=color, lw=2.0, ls="-", zorder=2,
+            label=f"{label} | {window}-epoch average",
+        )
+        color = average_line.get_color()
+    per_epoch, = ax.plot(
+        x, values, color=color, ls=":", lw=1.25, alpha=.80, zorder=3,
+        label=f"{label} | per epoch",
+    )
+    return average_line if average_line is not None else per_epoch
+
+
+def _history_rows(root, report, relative):
+    payload = read_metadata(root, report, relative)
+    rows = payload.get("history") if isinstance(payload, dict) else payload
+    if (not isinstance(rows, list) or not rows
+            or any(not isinstance(row, dict) for row in rows)):
+        return None
+    return rows
+
+
+def _background_nll_history(method, source):
+    """Return train/validation NLL for the sideband-trained background model."""
+    root, report = source
+    if method == "riddle":
+        try:
+            rows = _history_rows(root, report, "background/history.json")
+        except (OSError, ValueError, KeyError):
+            return None
+        if rows is None or any(k not in row for row in rows for k in ("train_nll", "validation_nll")):
+            return None
+        return {
+            "train": np.asarray([row["train_nll"] for row in rows], dtype=float),
+            "validation": np.asarray([row["validation_nll"] for row in rows], dtype=float),
+        }
+
+    if method == "ranode":
+        protocol = read_metadata(root, report, "protocol.json")
+        attempt = protocol.get("background_attempt")
+        if not isinstance(attempt, str) or not attempt:
+            return None
+        histories = {}
+        for kind, field in (("trainloss", "train"), ("valloss", "validation")):
+            relative = attempt + f"/results/upstream/background/fit/{kind}_list.npy"
+            try:
+                path = verify_plot_input(root, report, relative)
+            except (OSError, ValueError):
+                return None
+            values = np.asarray(np.load(path, allow_pickle=False), dtype=float)
+            histories[field] = np.atleast_2d(values).mean(axis=0)
+        return histories
+
+    directory = root / "training"
+    names = (f"{method}_model_train_losses.npy", f"{method}_model_val_losses.npy")
+    if not all((directory / name).is_file() for name in names):
+        names = ("my_ANODE_model_train_losses.npy", "my_ANODE_model_val_losses.npy")
+    if not all((directory / name).is_file() for name in names):
+        return None
+    histories = {}
+    for name, field in zip(names, ("train", "validation")):
+        try:
+            path = verify_plot_input(root, report, str((directory / name).relative_to(root)))
+        except (OSError, ValueError):
+            return None
+        values = np.asarray(np.load(path, allow_pickle=False), dtype=float)
+        histories[field] = np.atleast_2d(values).mean(axis=0)
+    return histories
+
+
+def _riddle_sr_model_nll_history(source, score_loader=None):
+    root, report = source
+    selection = read_metadata(root, report, "density/ensemble_selection.json")
+    members = selection.get("members", [])
+    audit = score_loader.fit_audit.get(str(root.resolve())) if score_loader is not None else None
+    if audit is not None and audit.get("used_members"):
+        members = audit["used_members"]
+    histories = []
+    for member in members:
+        try:
+            rows = _history_rows(root, report, "density/" + member["directory"] + "/residual_losses.json")
+        except (OSError, ValueError, KeyError):
+            return None
+        if rows is None:
+            return None
+        histories.append(rows)
+    if not histories or any(len(h) != len(histories[0]) for h in histories):
+        return None
+    return {
+        "train": np.asarray(
+            [np.mean([h[i]["train_nll"] for h in histories]) for i in range(len(histories[0]))], dtype=float
+        ),
+        "validation": np.asarray(
+            [np.mean([h[i]["validation_nll"] for h in histories]) for i in range(len(histories[0]))], dtype=float
+        ),
+    }
+
+
+def _ranode_sr_model_nll_history(source, score_loader=None):
+    root, report = source
+    protocol = read_metadata(root, report, "protocol.json")
+    attempts = protocol.get("signal_attempts") or ([protocol["signal_attempt"]] if protocol.get("signal_attempt") else [])
+    audit = score_loader.fit_audit.get(str(root.resolve())) if score_loader is not None else None
+    if audit is not None and audit.get("used_members"):
+        attempts = [member["attempt"] for member in audit["used_members"]]
+    if not attempts:
+        return None
+    result = {}
+    for kind, field in (("trainloss", "train"), ("valloss", "validation")):
+        histories = []
+        for attempt in attempts:
+            relative = attempt + f"/results/upstream/signal/fit/{kind}.npy"
+            try:
+                path = verify_plot_input(root, report, relative)
+            except (OSError, ValueError):
+                return None
+            histories.append(np.asarray(np.load(path, allow_pickle=False), dtype=float))
+        if not histories or any(values.shape != histories[0].shape for values in histories):
+            return None
+        result[field] = np.asarray(histories).mean(axis=0)
+    return result
+
+
+def _lacathode_sr_classifier_history(source):
+    """Return LaCATHODE classifier BCE histories for the SR-stage comparison."""
+    root, report = source
+    directory = root / "training"
+    names = ("loss_matris.npy", "val_loss_matris.npy")
+    if not all((directory / name).is_file() for name in names):
+        return None
+    histories = {}
+    for name, field in zip(names, ("train", "validation")):
+        try:
+            path = verify_plot_input(root, report, str((directory / name).relative_to(root)))
+        except (OSError, ValueError):
+            return None
+        values = np.asarray(np.load(path, allow_pickle=False), dtype=float)
+        histories[field] = np.atleast_2d(values).mean(axis=0)
+    return histories
+
+
+def _sr_model_training_history(method, source, score_loader=None):
+    """Return the native second-stage training objective for each method.
+
+    RIDDLE and R-ANODE optimize signal-region density-model NLLs. LaCATHODE's
+    second stage is instead a classifier, so its native objective is BCE. The
+    cross-method plot therefore compares relative objective convergence, not
+    absolute losses or like-for-like likelihood values.
+    """
+    if method == "riddle":
+        return _riddle_sr_model_nll_history(source, score_loader)
+    if method == "ranode":
+        return _ranode_sr_model_nll_history(source, score_loader)
+    if method == "lacathode":
+        return _lacathode_sr_classifier_history(source)
+    return None
+
+
+def _relative_nll(values):
+    values = np.asarray(values, dtype=float)
+    if values.ndim != 1 or not len(values) or not np.isfinite(values).all():
+        return None
+    scale = max(abs(float(values[0])), np.finfo(float).eps)
+    return 100.0 * (values - values[0]) / scale
+
+
+def _render_relative_history_comparison(
+    histories, destination, stem, *, ylabel=r"Relative NLL change from epoch 1 [\%]", method_labels=None
+):
+    """Save one paper-ready standalone cross-method objective figure per split.
+
+    Curves are normalized to their own epoch-1 objective, so the figure shows
+    convergence trends only. This permits the SR-stage panel to include
+    LaCATHODE's classifier BCE alongside RIDDLE/R-ANODE density NLLs without
+    implying that their absolute objective values are numerically comparable.
+    """
+    if not histories:
+        return
+    method_labels = {} if method_labels is None else method_labels
+    destination.mkdir(parents=True, exist_ok=True)
+    for field, noun in (("train", "training"), ("validation", "validation")):
+        fig, ax, _ = f.canvas(ylabel, "Training epoch")
+        drawn_methods = []
+        all_values = []
+        max_epoch = 1
+        for method, values in histories.items():
+            relative = _relative_nll(values[field])
+            if relative is None:
+                continue
+            default_label, color, _, _ = PHYSICAL_STYLES[method]
+            label = method_labels.get(method, default_label)
+            epochs = np.arange(1, len(relative) + 1)
+            max_epoch = max(max_epoch, int(epochs[-1]))
+            all_values.append(relative)
+
+            # Draw the moving average first and the dotted per-epoch trace last,
+            # so the per-epoch values remain visible above the smooth curve.
+            if len(relative) >= 5:
+                smooth = np.convolve(relative, np.ones(5) / 5, mode="valid")
+                ax.plot(epochs[4:], smooth, color=color, ls="-", lw=2.0, zorder=2)
+            else:
+                ax.plot(epochs, relative, color=color, ls="-", lw=1.8, zorder=2)
+            ax.plot(epochs, relative, color=color, ls=":", lw=1.15, alpha=.72, zorder=3)
+            drawn_methods.append((label, color))
+
+        if not drawn_methods:
+            f.plt.close(fig)
+            continue
+
+        ax.axhline(0.0, color=".55", ls="--", lw=1.0, gid="publication-guide")
+        ax.set_xlim(1, max_epoch)
+
+        # Give the data a compact paper-style vertical window with ~10% headroom.
+        finite = np.concatenate([v[np.isfinite(v)] for v in all_values if np.isfinite(v).any()])
+        if finite.size:
+            low = min(float(finite.min()), 0.0)
+            high = max(float(finite.max()), 0.0)
+            span = high - low
+            pad = 0.10 * span if span > 0 else max(0.1, 0.10 * max(abs(low), abs(high), 1.0))
+            ax.set_ylim(low - pad, high + pad)
+            ax._publication_fixed_ylim = True
+
+        # A compact legend separates method identity from line-style semantics.
+        method_handles = [
+            f.Line2D([], [], color=color, lw=2.0, ls="-", label=label)
+            for label, color in drawn_methods
+        ]
+        style_handles = [
+            f.Line2D([], [], color=".20", lw=2.0, ls="-", label="5-epoch average"),
+            f.Line2D([], [], color=".20", lw=1.3, ls=":", label="Per epoch"),
+        ]
+        handles = [*method_handles, *style_handles]
+        labels = [h.get_label() for h in handles]
+        f.legend(fig, handles=handles, labels=labels, ncols=1)
+
+        # Each train/validation objective is its own standalone publication plot.
+        f.save(fig, destination / f"{stem}_{noun}")
+
+
+def comparison_training_figures(group, output, score_loader=None):
+    """Compare normalized training convergence while preserving objective semantics."""
+    destination = output / "02_training"
+    background = {}
+    sr_model = {}
+    for method, source in group.items():
+        values = _background_nll_history(method, source)
+        if values is not None:
+            background[method] = values
+        values = _sr_model_training_history(method, source, score_loader)
+        if values is not None:
+            sr_model[method] = values
+    _render_relative_history_comparison(
+        background, destination, "background_nll",
+        ylabel=r"Relative NLL change from epoch 1 [\%]",
+    )
+    # Keep the historical sr_model_nll filename for downstream references.
+    # All three methods are shown using their relative NLL change from epoch 1.
+    _render_relative_history_comparison(
+        sr_model, destination, "sr_model_nll",
+        ylabel=r"Relative NLL change from epoch 1 [\%]",
+    )
+
+
+def _plot_nll_history(history, destination, *, title, filename, ylabel="Negative log likelihood"):
+    fig, ax, _ = f.canvas(ylabel, "Epoch")
+    x = np.asarray([row.get("epoch", i) + 1 for i, row in enumerate(history)])
+    plot_history_series(ax, x, [row["train_nll"] for row in history], "Train")
+    plot_history_series(ax, x, [row["validation_nll"] for row in history], "Validation")
+    f.legend(fig, title=title)
+    f.save(fig, destination / filename)
+
 
 def training_figures(group, output, score_loader=None):
     for method, (root, report) in group.items():
@@ -1711,8 +1979,22 @@ def training_figures(group, output, score_loader=None):
             attempts = [m["attempt"] for m in audit["used_members"]] if audit else None
             render_ranode_training((root, report), output, signal_attempts=attempts)
             continue
+
         destination = output / STYLES[KEYS[method]][0] / "02_training"
+
         if method == "riddle":
+            # Stage 1: sideband-trained background map.  This is the RIDDLE
+            # analogue of CATHODE/LaCATHODE and R-ANODE background-flow NLL.
+            background_history = _history_rows(root, report, "background/history.json")
+            if background_history is not None:
+                _plot_nll_history(
+                    background_history, destination,
+                    title="RIDDLE | Background flow",
+                    filename="background_nll",
+                )
+
+            # Stage 2: the SR residual model is trained on the *mixture* density
+            # (1-f)p_B + f p_S.  There is no truth-signal NLL to plot here.
             members = read_metadata(root, report, "density/ensemble_selection.json")["members"]
             audit = score_loader.fit_audit.get(str(root.resolve())) if score_loader is not None else None
             if audit:
@@ -1725,21 +2007,31 @@ def training_figures(group, output, score_loader=None):
                     raise ValueError("Inconsistent accepted RIDDLE training histories")
                 history = [dict(epoch=e, **{key: float(np.mean([h[e][key] for h in histories]))
                     for key in ("train_nll", "validation_nll", "signal_fraction")}) for e in range(len(histories[0]))]
-            for kind, ylabel in (
-                ("nll", "Mixture negative log likelihood"),
-                ("fraction", "Fitted mixture fraction"),
-            ):
-                fig, ax, _ = f.canvas(ylabel, "Epoch")
-                x = [r["epoch"] + 1 for r in history]
-                fields = (
-                    (("train_nll", "Train"), ("validation_nll", "Validation"))
-                    if kind == "nll"
-                    else (("signal_fraction", "RIDDLE"),)
-                )
-                for field, label in fields:
-                    plot_history_series(ax, x, [r[field] for r in history], label)
-                f.legend(fig)
-                f.save(fig, destination / kind)
+            _plot_nll_history(
+                history, destination,
+                title="RIDDLE | SR residual-mixture density",
+                filename="sr_model_nll",
+            )
+
+            fig, ax, _ = f.canvas("Fitted mixture fraction", "Epoch")
+            x = [r["epoch"] + 1 for r in history]
+            plot_history_series(ax, x, [r["signal_fraction"] for r in history], "RIDDLE")
+            f.legend(fig, title="RIDDLE | Residual-mixture fraction")
+            f.save(fig, destination / "mixture_fraction")
+
+            # Optional RIDDLE-specific q_phi correction NLL.  Keep it separate
+            # from the cross-method background-flow comparison because it is an
+            # additional correction stage with no direct LaCATHODE/R-ANODE peer.
+            correction_name = "density/background_correction/history.json"
+            if correction_name in report.get("artifacts_sha256", {}):
+                correction_history = _history_rows(root, report, correction_name)
+                if correction_history is not None:
+                    _plot_nll_history(
+                        correction_history, destination,
+                        title=r"RIDDLE | Background correction $q_\phi$",
+                        filename="background_correction_nll",
+                    )
+
             if members:
                 positions = [m.get("fit_index", i) + 1 for i, m in enumerate(members)]
                 fig, ax, _ = f.canvas("Fit", "Selected epoch")
@@ -1756,17 +2048,17 @@ def training_figures(group, output, score_loader=None):
                 f.legend(fig)
                 f.save(fig, destination / "selected_epochs_by_fit")
                 fig, ax, _ = f.canvas("Validation mixture NLL", "Fit")
-                for i, member, history in zip(positions, members, histories):
+                for i, member, member_history in zip(positions, members, histories):
                     ax.plot(
                         [i],
-                        [history[-1]["validation_nll"]],
+                        [member_history[-1]["validation_nll"]],
                         "x",
                         color=".6",
                         label="Final epoch" if i == positions[0] else None,
                     )
                     ax.scatter(
                         np.full(len(member["epochs"]), i),
-                        [history[e]["validation_nll"] for e in member["epochs"]],
+                        [member_history[e]["validation_nll"] for e in member["epochs"]],
                         s=12,
                         color=STYLES["residual"][1],
                         label="Selected" if i == positions[0] else None,
@@ -1774,15 +2066,18 @@ def training_figures(group, output, score_loader=None):
                 ax.set(xticks=positions)
                 f.legend(fig)
                 f.save(fig, destination / "selected_vs_final_validation")
-        for stage in ("background", "classifier") if method == "lacathode" else ("background",):
-            directory = root / ("training" if method == "lacathode" else "background")
+            continue
+
+        # LaCATHODE follows the CATHODE structure: background-flow NLL followed
+        # by classifier BCE.  The classifier loss is intentionally not labelled NLL.
+        for stage in ("background", "classifier"):
+            directory = root / "training"
             names = (
                 (f"{method}_model_train_losses.npy", f"{method}_model_val_losses.npy")
                 if stage == "background"
                 else ("loss_matris.npy", "val_loss_matris.npy")
             )
             if stage == "background" and not all((directory / name).is_file() for name in names):
-                # Read legacy artifacts without renaming or modifying saved results.
                 names = ("my_ANODE_model_train_losses.npy", "my_ANODE_model_val_losses.npy")
             if not all((directory / name).is_file() for name in names):
                 continue
@@ -1792,17 +2087,19 @@ def training_figures(group, output, score_loader=None):
             for name, label in zip(names, ("Train", "Validation")):
                 verify_plot_input(root, report, str((directory / name).relative_to(root)))
                 values = np.load(directory / name)
-                histories = np.atleast_2d(values)
-                epochs = np.arange(histories.shape[1])
-                mean_history = histories.mean(axis=0)
+                fit_histories = np.atleast_2d(values)
+                epochs = np.arange(fit_histories.shape[1])
+                mean_history = fit_histories.mean(axis=0)
                 line = plot_history_series(ax, epochs + 1, mean_history, label)
-                if (len(histories) > 1 and method == "lacathode"
+                if (len(fit_histories) > 1
                         and report.get("contract", {}).get("lacathode_run_layout") == "independent_background_classifier_v1"):
-                    low, high = np.quantile(histories, [.16, .84], axis=0)
+                    low, high = np.quantile(fit_histories, [.16, .84], axis=0)
                     ax.fill_between(epochs + 1, low, high, color=line.get_color(), alpha=.14, linewidth=0)
-            f.legend(fig)
-            f.save(fig, destination / stage)
-
+            f.legend(
+                fig,
+                title="LaCathode | " + ("Background flow" if stage == "background" else "Classifier"),
+            )
+            f.save(fig, destination / ("background_nll" if stage == "background" else "classifier_loss"))
 
 def verify_plot_input(root, report, name):
     path = (root / name).resolve()
@@ -2174,6 +2471,106 @@ def background_cuts(record, budgets):
     return cuts
 
 
+def exact_background_selection(record, budget):
+    """Return score-only fractional selections at an exact empirical BG efficiency.
+
+    A finite unweighted sample cannot in general contain exactly ``budget * N``
+    background events.  For publication working points we therefore use the
+    standard randomized/interpolated ROC convention: events above the boundary
+    score receive weight one, events below receive zero, and all events tied at
+    the boundary receive the same fractional weight.  The fraction is chosen
+    from background ranks only and is then applied identically to signal.
+
+    This is a truth-assisted *evaluation* working point, never a training or
+    model-selection threshold.  It makes the reported background efficiency
+    exactly equal to ``budget`` while preserving a score-only decision rule.
+    """
+    labels = np.asarray(record["labels"])
+    mask = np.asarray(record["mask"], dtype=bool)
+    total_background = int(np.sum(labels == 0))
+    total_signal = int(np.sum(labels == 1))
+    target = float(budget) * total_background
+    if total_background <= 0 or target <= 0:
+        return None
+
+    rows, cuts, fractions = [], [], []
+    for scores in fit_scores(record):
+        scores = np.asarray(scores, dtype=float)
+        available = mask & (labels == 0) & np.isfinite(scores)
+        bg_scores = scores[available]
+        if len(bg_scores) < int(np.ceil(target)):
+            return None
+        ordered = np.sort(bg_scores)[::-1]
+        boundary = float(ordered[int(np.ceil(target)) - 1])
+        higher_background = int(np.sum(bg_scores > boundary))
+        tied_background = int(np.sum(bg_scores == boundary))
+        if tied_background < 1:
+            raise ValueError("Exact background working point has no boundary tie")
+        fraction = float((target - higher_background) / tied_background)
+        # Numerical protection only; a valid order statistic guarantees [0, 1].
+        fraction = float(np.clip(fraction, 0.0, 1.0))
+        weights = np.zeros(len(scores), dtype=float)
+        finite = mask & np.isfinite(scores)
+        weights[finite & (scores > boundary)] = 1.0
+        weights[finite & (scores == boundary)] = fraction
+        rows.append(weights)
+        cuts.append(boundary)
+        fractions.append(fraction)
+
+    weights = np.asarray(rows)
+    bg_eff = float(np.mean(np.sum(weights[:, labels == 0], axis=1) / total_background))
+    sig_eff = (
+        float(np.mean(np.sum(weights[:, labels == 1], axis=1) / total_signal))
+        if total_signal > 0 else None
+    )
+    # The construction is exact up to floating-point roundoff.  Store the
+    # requested value explicitly so tables/legends never display a nearby rank.
+    if not np.isclose(bg_eff, budget, rtol=0, atol=5e-15):
+        raise ValueError(f"Exact background selection failed: {bg_eff} != {budget}")
+    return dict(
+        weights=weights,
+        cuts=np.asarray(cuts, dtype=float),
+        boundary_fractions=np.asarray(fractions, dtype=float),
+        background_efficiency=float(budget),
+        signal_efficiency=sig_eff,
+        fit_count=len(weights),
+    )
+
+
+def weighted_selection_efficiency(record, selection, truth):
+    weights = np.atleast_2d(np.asarray(selection, dtype=float))
+    population = np.asarray(record["labels"]) == truth
+    total = int(population.sum())
+    if total == 0:
+        return None
+    return float(np.mean(np.sum(weights[:, population], axis=1) / total))
+
+
+def weighted_selection_histogram(values, edges, selection, population):
+    """Mean selected histogram across fits, supporting fractional WP weights."""
+    values = np.asarray(values)
+    population = np.asarray(population, dtype=bool)
+    weights = np.atleast_2d(np.asarray(selection, dtype=float))
+    if weights.shape[1] != len(values):
+        raise ValueError("Selection weights and plotted values have different lengths")
+    histograms = [np.histogram(values, edges, weights=w * population)[0] for w in weights]
+    return histograms[0] if len(histograms) == 1 else np.mean(histograms, axis=0)
+
+
+def working_point_relation(budget):
+    # The four publication working points are all evaluated at the exact
+    # requested physical background efficiency using fractional boundary ties.
+    return "="
+
+
+def working_point_efficiency_label(value, budget, *, signal=False):
+    if value is None:
+        return "n/a"
+    if signal:
+        return f"{100 * value:.2f}%"
+    return f"{100 * budget:.1f}%"
+
+
 def render_physical_working_points(validation, test, output, *, scenario=None, scope="signal_region"):
     require_same_physical_population(test)
     # Calibration roles differ across methods; evaluation populations may not.
@@ -2185,42 +2582,60 @@ def render_physical_working_points(validation, test, output, *, scenario=None, s
     base = next(iter(test.values()))
     edges = (np.linspace(3.3, 3.7, 21) if scope == "signal_region" else
              np.linspace(min(1., base["mass"].min()), max(9., base["mass"].max()), 81))
+    centers = 0.5 * (edges[:-1] + edges[1:])
+
+    def overlay_markers(axis, values, *, color, marker, ms=4.5, mew=0.9, zorder=4):
+        values = np.asarray(values, dtype=float)
+        keep = np.isfinite(values)
+        if np.any(keep):
+            axis.plot(
+                centers[keep], values[keep], ls="none", marker=marker, ms=ms,
+                mew=mew, color=color, zorder=zorder,
+            )
+
+    marker_cycle = {"lacathode": "o", "riddle": "s", "ranode": "^"}
+    fallback_markers = ("D", "v", "P", "X", "<", ">")
+    neutral_bg_marker = "o"
+    neutral_signal_marker = "^"
+
     inclusive = np.histogram(base["mass"][base["labels"] == 0], edges)[0]
     audit = []
     budgets = (0.10, 0.05, 0.01, 0.004)
-    cuts = {method: ([np.array([np.log((1-b)/b)]) for b in budgets]
-                     if str(record.get("score_kind", "")) == "background_percentile_logit"
-                     else background_cuts(record, budgets)) for method, record in validation.items()}
-    for index, budget in enumerate(budgets):
+    for budget in budgets:
         selected, retention = {}, {}
         for method, val in validation.items():
             f.validate_fit_counts([val, test[method]])
-            cut = cuts[method][index]
-            if cut is None:
-                continue
             record = test[method]
-            keep = record["mask"] & (f.fit_scores(record) > cut[:, None])
+            exact = exact_background_selection(record, budget)
+            if exact is None:
+                continue
+            keep = exact["weights"]
+            cut = exact["cuts"]
             selected[method] = keep
-            retention[method] = []
-            for truth in (0, 1):
-                population = record["labels"] == truth
-                total, passed = int(population.sum()), float((population & keep).sum(axis=1).mean())
-                retention[method].append(passed / total if total else None)
+            retention[method] = [exact["background_efficiency"], exact["signal_efficiency"]]
             audit.append(
                 dict(
                     method=method,
                     background_budget=budget,
+                    exact_target=True,
                     cut=float(cut[0]) if len(cut) == 1 else cut.tolist(),
-                    fit_count=len(cut),
-                    threshold_source=("analytic conditional-percentile threshold"
-                        if str(val.get("score_kind", "")) == "background_percentile_logit"
-                        else "MC validation-background quantile (diagnostic)"),
-                    background_efficiency=retention[method][0],
-                    signal_efficiency=retention[method][1],
+                    boundary_fraction=(
+                        float(exact["boundary_fractions"][0])
+                        if len(exact["boundary_fractions"]) == 1
+                        else exact["boundary_fractions"].tolist()
+                    ),
+                    fit_count=exact["fit_count"],
+                    threshold_source=(
+                        "exact truth-assisted test-background ROC interpolation; "
+                        "fractional boundary weight applied identically to signal"
+                    ),
+                    background_efficiency=float(budget),
+                    signal_efficiency=exact["signal_efficiency"],
                 )
             )
         if not selected:
             continue
+        relation = working_point_relation(budget)
         for shape in (False, True):
             fig, ax, lower = f.canvas(
                 "Normalized background / bin" if shape else "Events / bin",
@@ -2233,40 +2648,55 @@ def render_physical_working_points(validation, test, output, *, scenario=None, s
                 inclusive / inclusive.sum() if shape and inclusive.sum() else inclusive
             )
             handle = ax.stairs(norm, edges, color=".65", baseline=None)
+            overlay_markers(ax, norm, color=".65", marker=neutral_bg_marker, ms=4.0, mew=0.8, zorder=3)
             columns.append(("No cut", [(handle, "Background")]))
             if not shape:
                 signal_hist = np.histogram(base["mass"][base["labels"] == 1], edges)[0]
                 handle = ax.stairs(
                     signal_hist, edges, color=".45", ls="--", baseline=None
                 )
+                overlay_markers(ax, signal_hist, color=".45", marker=neutral_signal_marker, ms=4.0, mew=0.8, zorder=3)
                 columns[0][1].append((
                     handle, "Signal" if scenario != "background_only" or signal_hist.sum() else None
                 ))
+            fallback_index = 0
             for method, keep in selected.items():
                 label, color, _, signal_color = PHYSICAL_STYLES[method]
                 record = test[method]
-                bg_hist = f.fit_histogram(record["mass"], edges, keep & (record["labels"] == 0))
+                bg_hist = weighted_selection_histogram(
+                    record["mass"], edges, keep, record["labels"] == 0
+                )
                 hist = bg_hist / bg_hist.sum() if shape and bg_hist.sum() else bg_hist
-                b, s = retention[method]
-                signal_text = f"{100 * s:.3g}%" if s is not None else "n/a"
+                b, sig_eff = retention[method]
+                background_text = working_point_efficiency_label(b, budget, signal=False)
+                signal_text = working_point_efficiency_label(sig_eff, budget, signal=True)
+                family = method_family(method)
+                marker = marker_cycle.get(family)
+                if marker is None:
+                    marker = fallback_markers[fallback_index % len(fallback_markers)]
+                    fallback_index += 1
                 handle = ax.stairs(hist, edges, color=color, baseline=None)
+                overlay_markers(ax, hist, color=color, marker=marker)
                 entries = [
                     (
                         handle,
-                        f"B: {100 * b:.3g}% | S: {signal_text}"
+                        (f"B: {background_text}" if not shape else f"B: {background_text} | S: {signal_text}")
                         if b is not None
-                        else f"S: {signal_text}",
+                        else (None if not shape else f"S: {signal_text}"),
                     )
                 ]
                 if scenario == "background_only":
-                    entries = [(handle, f"B: {100 * b:.3g}%" if b is not None else "Background")]
+                    entries = [(handle, f"B: {background_text}" if b is not None else "Background")]
                 if not shape:
-                    shist = f.fit_histogram(record["mass"], edges, keep & (record["labels"] == 1))
+                    shist = weighted_selection_histogram(
+                        record["mass"], edges, keep, record["labels"] == 1
+                    )
                     handle = ax.stairs(
                         shist, edges, color=signal_color, ls="--", baseline=None
                     )
+                    overlay_markers(ax, shist, color=signal_color, marker=marker)
                     signal_label = (
-                        f.retention_label(1, s, int((record["labels"] == 1).sum()), scenario=scenario)
+                        f.retention_label(1, sig_eff, int((record["labels"] == 1).sum()), scenario=scenario)
                         if scenario == "background_only" else f"S: {signal_text}"
                     )
                     entries.append((handle, signal_label))
@@ -2275,13 +2705,27 @@ def render_physical_working_points(validation, test, output, *, scenario=None, s
                     hist, norm, out=np.full(len(hist), np.nan), where=norm > 0
                 )
                 lower.stairs(ratio, edges, color=color, baseline=None)
+                overlay_markers(lower, ratio, color=color, marker=marker, zorder=3)
             if shape:
-                lower.axhline(1, color=".5", ls=":")
+                # Publication convention for background-mass-shape panels:
+                # keep the normalized-density panel and its selected/inclusive
+                # ratio on fixed common ranges for every working point/method.
+                ax.set_ylim(0.0, 0.20)
+                ax._publication_fixed_ylim = True
+                lower.axhline(1.0, color=".5", ls=":", lw=1.0, gid="publication-guide")
+                lower.set_ylim(0.0, 2.0)
+                lower._publication_fixed_ylim = True
             else:
+                # The lower mass-count panel is the bin-wise background
+                # retention, so its reference line must be the *fractional*
+                # working point itself: 0.004, 0.01, 0.05, 0.10, ...
+                # (not the percentage labels 0.4, 1, 5, 10).
+                lower.axhline(float(budget), color=".5", ls=":", lw=1.0,
+                              gid="publication-guide")
                 ax.set_yscale("symlog", linthresh=1)
             ax.set_xlim(edges[0], edges[-1])
             f.population_legend(
-                fig, columns, title=f"{scope_label(scope)} | B ≤ {100 * budget:g}%"
+                fig, columns, title=f"{scope_label(scope)} | B {relation} {100 * budget:.1f}%"
             )
             f.save(
                 fig,
@@ -2296,25 +2740,92 @@ def render_physical_working_points(validation, test, output, *, scenario=None, s
         if selected:
             render_physical_efficiency(test, selected, edges, budget, output, scope=scope)
             for density in (False, True):
-                render_physical_features(test, selected, retention, budget, output, scenario=scenario, density=density, scope=scope)
+                render_physical_features(
+                    test, selected, retention, budget, output,
+                    scenario=scenario, density=density, scope=scope
+                )
     return audit
 
 
 def render_physical_efficiency(records, selected, edges, budget, output, *, scope="signal_region"):
     fig, ax, _ = f.canvas("Background efficiency", r"$m_{jj}$ [TeV]")
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    marker_cycle = {"lacathode": "o", "riddle": "s", "ranode": "^"}
+    fallback_markers = ("D", "v", "P", "X", "<", ">")
+    fallback_index = 0
     for method, keep in selected.items():
         record = records[method]
         bg = record["labels"] == 0
         full = np.histogram(record["mass"][bg], edges)[0]
-        passed = f.fit_histogram(record["mass"], edges, keep & bg)
+        passed = weighted_selection_histogram(record["mass"], edges, keep, bg)
         values = np.divide(passed, full, out=np.full(len(full), np.nan), where=full > 0)
         label, color, ls, _ = PHYSICAL_STYLES[method]
-        ax.stairs(values, edges, label=label, color=color, ls=ls, baseline=None)
+        family = method_family(method)
+        marker = marker_cycle.get(family)
+        if marker is None:
+            marker = fallback_markers[fallback_index % len(fallback_markers)]
+            fallback_index += 1
+        # Keep the bin-wise step shape, and overlay a distinct colored marker
+        # for every method.  The validation target remains the unchanged grey
+        # dotted reference requested for publication plots.
+        ax.stairs(values, edges, color=color, ls=ls, baseline=None)
+        ax.plot(
+            centers, values, ls="none", marker=marker, ms=4.5, mew=0.9,
+            color=color, label=label,
+        )
     ax.axhline(budget, color=".5", ls=":", label="Validation target")
-    ax.set(xlim=(edges[0], edges[-1]), ylim=(0, None))
-    f.legend(fig, title=f"{scope_label(scope)} | B ≤ {100 * budget:g}%")
+    ax.set(xlim=(edges[0], edges[-1]), ylim=(0.0, 0.20))
+    # Preserve the requested publication range exactly.  figures._save_figure()
+    # normally widens nonnegative axes, which would otherwise change 0--0.20 into a
+    # tighter auto-range after this function returned.
+    ax._publication_fixed_ylim = True
+    relation = working_point_relation(budget)
+    f.legend(fig, title=f"{scope_label(scope)} | B {relation} {100 * budget:.1f}%")
     tag = f"{100 * budget:g}".replace(".", "p") + "pct"
     f.save(fig, output / "03_mass_sculpting" / ("background_efficiency_" + tag))
+
+
+def render_physical_no_cut_efficiency(records, output, *, scope="full_region"):
+    """Plot the uncut background score/mapping acceptance versus mass.
+
+    This is the no-selection companion to the fixed-B working-point plots.  The
+    numerator is every scorable background event and the denominator is every
+    physical background event in the same mass bin.  Thus a method with complete
+    score coverage is exactly one across the full range; any dip reflects only
+    score/mapping acceptance, not a background-selection threshold.
+    """
+    if scope != "full_region" or not records:
+        return
+    require_same_physical_population(records)
+    base = next(iter(records.values()))
+    edges = np.linspace(min(1., base["mass"].min()), max(9., base["mass"].max()), 81)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    fig, ax, _ = f.canvas("Background efficiency", r"$m_{jj}$ [TeV]")
+    marker_cycle = {"lacathode": "o", "riddle": "s", "ranode": "^"}
+    fallback_markers = ("D", "v", "P", "X", "<", ">")
+    fallback_index = 0
+    for method, record in records.items():
+        bg = np.asarray(record["labels"]) == 0
+        full = np.histogram(record["mass"][bg], edges)[0]
+        scorable = bg & np.asarray(record["mask"], dtype=bool)
+        passed = np.histogram(record["mass"][scorable], edges)[0]
+        values = np.divide(passed, full, out=np.full(len(full), np.nan), where=full > 0)
+        label, color, ls, _ = PHYSICAL_STYLES[method]
+        family = method_family(method)
+        marker = marker_cycle.get(family)
+        if marker is None:
+            marker = fallback_markers[fallback_index % len(fallback_markers)]
+            fallback_index += 1
+        ax.stairs(values, edges, color=color, ls=ls, baseline=None)
+        ax.plot(
+            centers, values, ls="none", marker=marker, ms=4.5, mew=0.9,
+            color=color, label=label,
+        )
+    ax.axhline(1.0, color=".5", ls=":", label="No-cut target")
+    ax.set(xlim=(edges[0], edges[-1]), ylim=(0.0, 1.05))
+    ax._publication_fixed_ylim = True
+    f.legend(fig, title=f"{scope_label(scope)} | No BG cut")
+    f.save(fig, output / "03_mass_sculpting" / "background_efficiency_no_cut")
 
 
 def render_physical_features(records, selected, retention, budget, output, *, scenario=None, density=False, scope="signal_region"):
@@ -2340,13 +2851,15 @@ def render_physical_features(records, selected, retention, budget, output, *, sc
             label, bg, _, sig = PHYSICAL_STYLES[method]
             entries = []
             for truth, color, ls in ((0, bg, "-"), (1, sig, "--")):
-                hist = f.fit_histogram(record["physical"][:, index], edges, keep & (record["labels"] == truth))
+                hist = weighted_selection_histogram(
+                    record["physical"][:, index], edges, keep, record["labels"] == truth
+                )
                 if density and hist.sum():
                     hist = hist / (hist.sum() * np.diff(edges))
                 handle = ax.stairs(hist, edges, color=color, ls=ls, baseline=None)
                 efficiency = retention[method][truth]
-                percent = (
-                    f"{100 * efficiency:.3g}%" if efficiency is not None else "n/a"
+                percent = working_point_efficiency_label(
+                    efficiency, budget, signal=(truth == 1)
                 )
                 text = ("B: " if truth == 0 else "S: ") + percent
                 if truth == 1 and scenario == "background_only":
@@ -2358,7 +2871,7 @@ def render_physical_features(records, selected, retention, budget, output, *, sc
         if not density:
             ax.set_yscale("symlog", linthresh=1)
         f.population_legend(
-            fig, columns, title=f"{scope_label(scope)} | B ≤ {100 * budget:g}%"
+            fig, columns, title=f"{scope_label(scope)} | B {working_point_relation(budget)} {100 * budget:.1f}%"
         )
         tag = f"{100 * budget:g}".replace(".", "p") + "pct"
         f.save(fig, output / "05_features" / f"{name}_{'density' if density else 'counts'}_background_{tag}")
@@ -2376,10 +2889,7 @@ def render_ranode_training(source, output, *, signal_attempts=None):
             attempts = signal_attempts
         suffix = "_list" if stage == "background" else ""
         fig, ax, _ = f.canvas("Negative log likelihood", "Epoch")
-        for kind, color, ls in (
-            ("trainloss", "#8B1A1A", "-"),
-            ("valloss", "#56B4E9", "--"),
-        ):
+        for kind, color in (("trainloss", "#8B1A1A"), ("valloss", "#56B4E9")):
             values = []
             for attempt in attempts:
                 path = attempt + f"/results/upstream/{stage}/fit/" + kind + suffix + ".npy"
@@ -2390,18 +2900,409 @@ def render_ranode_training(source, output, *, signal_attempts=None):
             epochs = np.arange(1, values.shape[1] + 1)
             mean_history = values.mean(axis=0)
             label = "Train" if kind == "trainloss" else "Validation"
-            line, = ax.plot(epochs, mean_history, color=color, ls=":", lw=1.25, alpha=.80,
-                            label=f"{label} | per epoch")
-            if len(mean_history) >= 5:
-                smooth = np.convolve(mean_history, np.ones(5) / 5, mode="valid")
-                ax.plot(epochs[4:], smooth, color=color, ls="-", lw=2.0,
-                        label=f"{label} | 5-epoch average")
+            plot_history_series(ax, epochs, mean_history, label, color=color)
         f.legend(
             fig,
-            title="R-ANODE | "
-            + ("Background flow" if stage == "background" else "Signal-mixture flow"),
+            title="R-ANODE | " + (
+                "Background flow" if stage == "background" else "SR data density (signal-mixture flow)"
+            ),
         )
-        f.save(fig, output / "R-ANODE" / "02_training" / (stage + "_nll"))
+        f.save(
+            fig,
+            output / "R-ANODE" / "02_training" / (
+                "background_nll" if stage == "background" else "sr_model_nll"
+            ),
+        )
+
+def _ensemble_member_scores(method, source, score_loader, *, scope="signal_region"):
+    """Return saved member scores for ensemble-convergence diagnostics.
+
+    In SR-only scope, all three methods are supported.  In full-range scope,
+    only methods with saved full-range score artifacts contribute.
+    """
+    root, report = source
+    partition = "signal_region" if scope == "signal_region" else "test"
+    record = score_loader(root, report, partition)
+    identity = str(root.resolve())
+    if method == "ranode":
+        if scope != "signal_region":
+            return record, None, None
+        audit = score_loader.fit_audit.get(identity, {})
+        members = audit.get("used_members", [])
+        if not members:
+            return record, None, None
+        rows = [load_scores(root, report, "signal_region", attempt=m["attempt"]) for m in members]
+        if any(not np.array_equal(record[k], row[k]) for row in rows for k in ("mass", "labels", "mask")):
+            raise ValueError("R-ANODE ensemble-convergence members are misaligned")
+        scores = np.stack([row["scores"] for row in rows]).astype(np.float64)
+        return record, scores, "equal-weight log-mean-exp of likelihood-ratio fits"
+
+    path = verify_plot_input(root, report, f"{partition}_scores.npz")
+    with np.load(path, allow_pickle=False) as archive:
+        scores = np.asarray(
+            archive["fit_scores"] if "fit_scores" in archive else archive["scores"][None, :],
+            dtype=np.float64,
+        )
+        if scores.ndim != 2 or scores.shape[1] != len(record["labels"]):
+            raise ValueError(f"{METHOD_SPECS[method].label} ensemble-convergence score shape is invalid")
+        if method == "riddle" and "fit_indices" in archive:
+            audit = score_loader.fit_audit.get(identity, {})
+            used = [m.get("fit_index") for m in audit.get("used_members", []) if m.get("fit_index") is not None]
+            if used:
+                indices = np.asarray(archive["fit_indices"], dtype=int)
+                lookup = {int(value): i for i, value in enumerate(indices)}
+                if any(int(value) not in lookup for value in used):
+                    raise ValueError("RIDDLE ensemble-convergence fit identities disagree with accepted ensemble")
+                scores = scores[[lookup[int(value)] for value in used]]
+        score_kind = (
+            str(archive["fit_score_kind"])
+            if "fit_score_kind" in archive
+            else str(archive["score_kind"])
+            if "score_kind" in archive
+            else ""
+        )
+
+    if not np.isfinite(scores[:, record["mask"]]).all() or not np.isnan(scores[:, ~record["mask"]]).all():
+        raise ValueError(f"{METHOD_SPECS[method].label} ensemble-convergence member scores are invalid")
+    if method == "riddle":
+        aggregation = (
+            "equal-weight log-mean-exp of residual likelihood-ratio fits"
+            if "ratio" in score_kind or not score_kind
+            else "arithmetic mean in saved member-score coordinate (diagnostic)"
+        )
+    else:
+        # Pinned LaCATHODE explicitly does not average classifier fits in its
+        # production score.  Its convergence diagnostic therefore tracks the
+        # median member performance as more fits are included.
+        aggregation = "median of per-fit performance; LaCATHODE production does not cross-fit-average scores"
+    return record, scores, aggregation
+
+
+def _exact_signal_efficiencies_for_score(record, scores, budgets):
+    """Signal efficiencies at exact physical BG efficiencies for one score vector."""
+    labels = np.asarray(record["labels"])
+    mask = np.asarray(record["mask"], dtype=bool)
+    scores = np.asarray(scores, dtype=float)
+    bg_total = int(np.sum(labels == 0))
+    sig_total = int(np.sum(labels == 1))
+    available_bg = mask & (labels == 0) & np.isfinite(scores)
+    bg_scores = scores[available_bg]
+    sig_scores = scores[mask & (labels == 1) & np.isfinite(scores)]
+    if bg_total <= 0 or sig_total <= 0 or not len(bg_scores):
+        return None
+    targets = np.asarray(budgets, dtype=float) * bg_total
+    if np.any(np.ceil(targets).astype(int) > len(bg_scores)):
+        return None
+    kth = len(bg_scores) - np.ceil(targets).astype(int)
+    partitioned = np.partition(bg_scores, np.unique(kth))
+    result = []
+    for target, index in zip(targets, kth):
+        boundary = float(partitioned[index])
+        higher_bg = int(np.sum(bg_scores > boundary))
+        tied_bg = int(np.sum(bg_scores == boundary))
+        if tied_bg < 1:
+            raise ValueError("Exact ensemble-convergence working point has no boundary tie")
+        fraction = float(np.clip((target - higher_bg) / tied_bg, 0.0, 1.0))
+        passed_signal = float(np.sum(sig_scores > boundary) + fraction * np.sum(sig_scores == boundary))
+        result.append(passed_signal / sig_total)
+    return np.asarray(result, dtype=float)
+
+
+def _fit_orderings(count, repetitions=32, seed=3407):
+    if count < 1:
+        return []
+    if count == 1:
+        return [np.array([0], dtype=int)]
+    maximum = min(repetitions, math.factorial(count)) if count < 8 else repetitions
+    rng = np.random.default_rng(seed + 7919 * count)
+    orders = [np.arange(count, dtype=int)]
+    seen = {tuple(orders[0])}
+    while len(orders) < maximum:
+        order = rng.permutation(count)
+        key = tuple(int(v) for v in order)
+        if key in seen:
+            continue
+        seen.add(key)
+        orders.append(order)
+    return orders
+
+
+def _ensemble_progressive_scores(record, members, aggregation, order):
+    """Yield progressive ensemble scores for one deterministic fit ordering."""
+    valid = np.asarray(record["mask"], dtype=bool)
+    use_log_mean = "log-mean-exp" in aggregation
+    cumulative = None
+    arithmetic = None
+    for k, index in enumerate(order, start=1):
+        score = np.asarray(members[index], dtype=np.float64)
+        if not np.isfinite(score[valid]).all():
+            raise ValueError(
+                "Ensemble-convergence member contains nonfinite values on accepted events"
+            )
+        combined = np.full(score.shape, np.nan, dtype=np.float64)
+        if use_log_mean:
+            if cumulative is None:
+                cumulative = score[valid].copy()
+            else:
+                cumulative = np.logaddexp(cumulative, score[valid])
+            combined[valid] = cumulative - np.log(k)
+        else:
+            if arithmetic is None:
+                arithmetic = score[valid].copy()
+            else:
+                arithmetic += score[valid]
+            combined[valid] = arithmetic / k
+        yield k, combined
+
+
+def _convergence_ticks(maximum_members):
+    step = 1 if maximum_members <= 10 else 2 if maximum_members <= 20 else max(1, maximum_members // 10)
+    ticks = list(range(1, maximum_members + 1, step))
+    if ticks[-1] != maximum_members:
+        ticks.append(maximum_members)
+    return ticks
+
+
+def _overall_metrics_for_score(record, scores, *, min_background=10):
+    metrics = oracle_metrics(record["labels"], scores, record["mask"], min_background=min_background)
+    auc = metrics.get("conditional_auc")
+    sic = metrics.get("full_pipeline_max_sic")
+    if auc is None or sic is None:
+        return None
+    return np.asarray((float(auc), float(sic)), dtype=float)
+
+
+def _set_convergence_ylim(ax, curves, *, floor=None):
+    finite = [np.asarray(values, dtype=float)[np.isfinite(values)] for values in curves]
+    finite = [values for values in finite if values.size]
+    if not finite:
+        return
+    values = np.concatenate(finite)
+    low = float(np.min(values))
+    high = float(np.max(values))
+    if floor is not None:
+        low = min(low, floor)
+    if np.isclose(low, high):
+        pad = 0.05 * max(abs(low), 1.0)
+    else:
+        pad = 0.10 * (high - low)
+    lower = low - pad
+    upper = high + pad
+    if floor is not None:
+        lower = max(floor, lower)
+    ax.set_ylim(lower, upper)
+
+
+def ensemble_size_convergence(group, output, score_loader, *, repetitions=32):
+    """Fit-count convergence at the four exact publication background working points.
+
+    RIDDLE/R-ANODE use their native equal-weight likelihood-ratio ensemble rule.
+    LaCATHODE has no cross-fit production ensemble, so its curve is the median
+    exact-WP performance of the included classifier fits.  Random fit orderings
+    provide a 16--84% subset band without using labels to choose members.
+
+    Saves only publication-style standalone figures, one per exact
+    background working point.
+    """
+    budgets = np.asarray((0.004, 0.01, 0.05, 0.10), dtype=float)
+    results = {}
+    scenario = next(iter(group.values()))[1].get("scenario") if group else None
+    if scenario == "background_only":
+        return {"status": "not_applicable_without_signal"}
+
+    for method, source in group.items():
+        record, members, aggregation = _ensemble_member_scores(method, source, score_loader, scope="signal_region")
+        if members is None or len(members) < 1 or int(np.sum(record["labels"] == 1)) < 1:
+            continue
+        count = len(members)
+        orderings = _fit_orderings(count, repetitions=repetitions)
+        samples = np.full((len(orderings), count, len(budgets)), np.nan, dtype=float)
+
+        if method == "lacathode":
+            member_metrics = []
+            for score in members:
+                values = _exact_signal_efficiencies_for_score(record, score, budgets)
+                if values is None:
+                    member_metrics = []
+                    break
+                member_metrics.append(values)
+            if not member_metrics:
+                continue
+            member_metrics = np.asarray(member_metrics)
+            for r, order in enumerate(orderings):
+                for k in range(1, count + 1):
+                    samples[r, k - 1] = np.median(member_metrics[order[:k]], axis=0)
+        else:
+            for r, order in enumerate(orderings):
+                for k, combined in _ensemble_progressive_scores(record, members, aggregation, order):
+                    values = _exact_signal_efficiencies_for_score(record, combined, budgets)
+                    if values is not None:
+                        samples[r, k - 1] = values
+
+        low, median, high = np.nanquantile(samples, [.16, .50, .84], axis=0)
+        results[method] = dict(
+            members=count,
+            orderings=len(orderings),
+            aggregation=aggregation,
+            budgets=budgets.tolist(),
+            low=low.tolist(), median=median.tolist(), high=high.tolist(),
+        )
+
+    if not results:
+        return {"status": "unavailable"}
+
+    destination = output / "07_ensemble_size_convergence"
+    individual_destination = destination / "individual"
+    individual_destination.mkdir(parents=True, exist_ok=True)
+    maximum_members = max(result["members"] for result in results.values())
+
+    for budget_index, budget in enumerate(budgets):
+        fig_single, ax = f.plt.subplots(figsize=(5.8, 4.6))
+        fig_single.subplots_adjust(left=.15, right=.97, bottom=.15, top=.97)
+        for method, result in results.items():
+            x = np.arange(1, result["members"] + 1)
+            low = np.asarray(result["low"])[:, budget_index]
+            median = np.asarray(result["median"])[:, budget_index]
+            high = np.asarray(result["high"])[:, budget_index]
+            label, color, ls, _ = PHYSICAL_STYLES[method]
+            marker = f.method_marker(KEYS[method]) if KEYS[method] in f.METHOD_MARKERS else "o"
+            ax.fill_between(x, low, high, color=color, alpha=.14, linewidth=0)
+            ax.plot(x, median, color=color, ls=ls, marker=marker, ms=4, label=label)
+        ax.set_xlim(left=.75)
+        ax.set_ylim(0, 1)
+        ax.set_xticks(_convergence_ticks(maximum_members))
+        ax.set_xlabel("Number of fits")
+        ax.set_ylabel("Signal efficiency")
+        ax.minorticks_on()
+        ax.legend(frameon=False, loc="best")
+        slug = f.format_budget_percent(budget).replace('.', 'p').replace('%', 'pct')
+        f.save(fig_single, individual_destination / f"ensemble_size_convergence_{slug}")
+
+    write_json(destination / "ensemble_size_convergence.json", json_safe({
+        "status": "available",
+        "scope": "signal_region",
+        "background_working_points": budgets.tolist(),
+        "exact_background_efficiency": True,
+        "repetitions": repetitions,
+        "methods": results,
+        "individual_files": [
+            f"individual/ensemble_size_convergence_{f.format_budget_percent(b).replace('.', 'p').replace('%', 'pct')}"
+            for b in budgets
+        ],
+    }))
+    return {"status": "available", "scope": "signal_region", "methods": results}
+
+
+def ensemble_size_convergence_overall(group, output, score_loader, *, scope="signal_region", repetitions=32, min_background=10):
+    """Fit-count convergence for overall discrimination metrics.
+
+    Plots how AUC and maximum SIC stabilize as more saved fit members are
+    included in the ensemble.  In full-range scope, only methods with saved
+    full-range scores contribute.
+
+    Saves only standalone publication-style figures for each metric, each with
+    its own legend and no extra text.
+    """
+    scoped = scope_group(group, scope)
+    scenario = next(iter(group.values()))[1].get("scenario") if group else None
+    if not scoped:
+        return {"status": "no_methods_with_scores_in_scope", "scope": scope}
+    if scenario == "background_only":
+        return {"status": "not_applicable_without_signal", "scope": scope}
+
+    results = {}
+    for method, source in scoped.items():
+        record, members, aggregation = _ensemble_member_scores(method, source, score_loader, scope=scope)
+        if members is None or len(members) < 1 or int(np.sum(record["labels"] == 1)) < 1:
+            continue
+        count = len(members)
+        orderings = _fit_orderings(count, repetitions=repetitions)
+        samples = np.full((len(orderings), count, 2), np.nan, dtype=float)
+
+        if method == "lacathode":
+            member_metrics = []
+            for score in members:
+                values = _overall_metrics_for_score(record, score, min_background=min_background)
+                if values is None:
+                    member_metrics = []
+                    break
+                member_metrics.append(values)
+            if not member_metrics:
+                continue
+            member_metrics = np.asarray(member_metrics)
+            for r, order in enumerate(orderings):
+                for k in range(1, count + 1):
+                    samples[r, k - 1] = np.median(member_metrics[order[:k]], axis=0)
+        else:
+            for r, order in enumerate(orderings):
+                for k, combined in _ensemble_progressive_scores(record, members, aggregation, order):
+                    values = _overall_metrics_for_score(record, combined, min_background=min_background)
+                    if values is not None:
+                        samples[r, k - 1] = values
+
+        low, median, high = np.nanquantile(samples, [.16, .50, .84], axis=0)
+        results[method] = dict(
+            members=count,
+            orderings=len(orderings),
+            aggregation=aggregation,
+            metrics=("conditional_auc", "full_pipeline_max_sic"),
+            low=low.tolist(),
+            median=median.tolist(),
+            high=high.tolist(),
+        )
+
+    if not results:
+        return {"status": "unavailable", "scope": scope}
+
+    destination = output / "07_ensemble_size_convergence"
+    individual_destination = destination / "individual"
+    individual_destination.mkdir(parents=True, exist_ok=True)
+    metric_specs = (
+        (0, "AUC", 0.0, "auc"),
+        (1, "Maximum significance improvement", 0.0, "maximum_significance_improvement"),
+    )
+    maximum_members = max(result["members"] for result in results.values())
+    for metric_index, ylabel, floor, slug in metric_specs:
+        fig_single, ax = f.plt.subplots(figsize=(5.8, 4.6))
+        fig_single.subplots_adjust(left=.15, right=.97, bottom=.15, top=.97)
+        curves = []
+        for method, result in results.items():
+            x = np.arange(1, result["members"] + 1)
+            low = np.asarray(result["low"])[:, metric_index]
+            median = np.asarray(result["median"])[:, metric_index]
+            high = np.asarray(result["high"])[:, metric_index]
+            label, color, ls, _ = PHYSICAL_STYLES[method]
+            marker = f.method_marker(KEYS[method]) if KEYS[method] in f.METHOD_MARKERS else "o"
+            ax.fill_between(x, low, high, color=color, alpha=.14, linewidth=0)
+            ax.plot(x, median, color=color, ls=ls, marker=marker, ms=4, label=label)
+            curves.extend((low, median, high))
+        ax.set_xlim(left=.75)
+        ax.set_xticks(_convergence_ticks(maximum_members))
+        ax.set_xlabel("Number of fits")
+        ax.set_ylabel(ylabel)
+        ax.minorticks_on()
+        _set_convergence_ylim(ax, curves, floor=floor)
+        ax.legend(frameon=False, loc="best")
+        suffix = "signal_region" if scope == "signal_region" else "full_range"
+        f.save(fig_single, individual_destination / f"ensemble_size_convergence_overall_{slug}_{suffix}")
+
+    write_json(destination / "ensemble_size_convergence_overall.json", json_safe({
+        "status": "available",
+        "scope": scope,
+        "minimum_background_count": min_background,
+        "repetitions": repetitions,
+        "methods": results,
+        "individual_files": [
+            f"individual/ensemble_size_convergence_overall_{slug}_{'signal_region' if scope == 'signal_region' else 'full_range'}"
+            for _, _, _, slug in metric_specs
+        ],
+    }))
+    return {
+        "status": "available",
+        "scope": scope,
+        "minimum_background_count": min_background,
+        "methods": results,
+    }
 
 
 def render_physical_comparison(group, output, args, load_scores, *, scope="signal_region"):
@@ -2447,6 +3348,9 @@ def render_physical_comparison(group, output, args, load_scores, *, scope="signa
         audit["lacathode_histograms"] = "Mean per-fit counts; separate validation cut per fit; no score averaging"
     with ProgressStage("physical_cuts", f"Plot {label.lower()} mass cuts and features"):
         audit["working_points"] = render_physical_working_points(validation, test, output, scenario=scenario, scope=scope)
+    if scope == "full_region":
+        with ProgressStage("physical_no_cut_efficiency", "Plot full-range no-cut background efficiency"):
+            render_physical_no_cut_efficiency(records, output, scope=scope)
     with ProgressStage("mass_flatness", f"Plot {label.lower()} background chi-squared"):
         seed = next(iter(group.values()))[1]["seed"]
         variant = result_variant(next(iter(group.values()))[1])
@@ -2797,7 +3701,19 @@ def main(argv=None):
                 full_target = scoped_target(args.output, "full_region", scenario, seed, variant)
                 with progress.task(f"{label} | shared comparison plots"):
                     comparison = render_physical_comparison(group, sr_target / "comparison", args, score_loader, scope="signal_region")
+                    comparison_training_figures(group, sr_target / "comparison", score_loader)
+                    comparison["ensemble_size_convergence"] = ensemble_size_convergence(
+                        group, sr_target / "comparison", score_loader
+                    )
+                    comparison["ensemble_size_convergence_overall"] = ensemble_size_convergence_overall(
+                        group, sr_target / "comparison", score_loader,
+                        scope="signal_region", min_background=args.min_background,
+                    )
                     full_comparison = render_physical_comparison(group, full_target / "comparison", args, score_loader, scope="full_region")
+                    full_comparison["ensemble_size_convergence_overall"] = ensemble_size_convergence_overall(
+                        group, full_target / "comparison", score_loader,
+                        scope="full_region", min_background=args.min_background,
+                    )
                     comparison["full_region"] = full_comparison
                 comparisons[f"{scenario}/{variant}/{seed}"] = comparison
                 settings.extend(settings_rows(group, score_loader))
@@ -2810,10 +3726,19 @@ def main(argv=None):
                         render_physical_comparison(individual, sr_destination, args, score_loader, scope="signal_region")
                         render_method_scope_assets(individual, sr_destination, args, score_loader, scope="signal_region")
                         training_figures(individual, sr_target, score_loader)
+                        ensemble_size_convergence(individual, sr_destination, score_loader)
+                        ensemble_size_convergence_overall(
+                            individual, sr_destination, score_loader,
+                            scope="signal_region", min_background=args.min_background,
+                        )
                         if METHOD_SPECS[method].score_scope == "full_region":
                             full_destination = full_target / METHOD_SPECS[method].label
                             render_physical_comparison(individual, full_destination, args, score_loader, scope="full_region")
                             render_method_scope_assets(individual, full_destination, args, score_loader, scope="full_region")
+                            ensemble_size_convergence_overall(
+                                individual, full_destination, score_loader,
+                                scope="full_region", min_background=args.min_background,
+                            )
             variant_audit = render_variant_sic_ratio(groups, args.output, args, score_loader)
             audit = {"dataset_variant_ratio": variant_audit}
             cohorts = summary_groups(groups)
@@ -2850,9 +3775,9 @@ def main(argv=None):
                                         score_scope=METHOD_SPECS[m].score_scope) for m in sorted(available)},
                     "layout": "SR-Only/<scenario>[/variant_<name>]/{seed_<seed>,summary}/... and Full-Range/<scenario>[/variant_<name>]/{seed_<seed>,summary}/...; injection scans live below SR-Only/signal_injection/injection_scan; root CSV/JSON files are publication metadata, not plots.",
                     "publication": "Physical Review D-oriented vector PDF plus 600-dpi PNG; one plot per figure file except the multipage mass_cut_scan.pdf companion, which also retains every cut as an individual figure.",
-                    "comparison": "All available methods in their supported scope; independent acceptance and uncut denominators. Mass-conditioned RIDDLE and R-ANODE remain SR-only.",
+                    "comparison": "All available methods in their supported scope; independent acceptance and uncut denominators. RIDDLE appears in both SR-Only and Full-Range when full-range scores are saved; R-ANODE remains SR-only.",
                     "uncertainty": audit,
-                    "cuts": "Calibrated RIDDLE: analytic percentile thresholds when available. Other scores: validation-background diagnostic thresholds in the plotted region; frozen cuts evaluated on independent physical test rows.",
+                    "cuts": "Publication working points at B=0.4%, 1.0%, 5.0% and 10.0% use exact truth-assisted test-background ROC interpolation with a fractional boundary tie applied identically to signal; no nearby empirical rank is reported as exact.",
                     "injection_scan": scan_audit,
                     "event_sizes": "event_sizes.csv uses checksum-protected result ledgers and exact prepared-array row counts when the matching --data manifest is available; unavailable counts are blank rather than inferred.",
                     "mass_cut_scan": {
@@ -2869,6 +3794,8 @@ def main(argv=None):
                     "requested_inference_device": args.device,
                     "checkpoint_inference_devices": sorted({a["inference_device"] for a in score_loader.fit_audit.values() if a.get("checkpoint_inference")}),
                     "score_ensembles": list(score_loader.fit_audit.values()),
+                    "ensemble_size_convergence": "SR-only diagnostic at exact B=0.4%, 1.0%, 5.0%, 10.0%; RIDDLE/R-ANODE use native likelihood-ratio aggregation, LaCATHODE uses median per-fit performance because its pinned production protocol does not cross-fit-average scores.",
+                    "ensemble_size_convergence_overall": "Overall fit-count convergence for conditional AUC and full-pipeline maximum SIC. Produced in SR-Only for all methods with signal, and in Full-Range for methods with saved full-range scores.",
                     "summary_axes": f.SUMMARY_AXES, "publication_y_ranges": f.PUBLICATION_Y_RANGES,
                 }))
         colored_status(f"Completed {progress.index}/{progress.total} plotting task groups | {args.output}", kind="PASS")

@@ -18,6 +18,7 @@ from .model import build_signal_flow, match_background
 from .storage import (atomic_torch_save, digest, file_digest, rng_state, restore_rng,
                       write_json, persist_boundary)
 from .worker_progress import emit_message
+from .options import feature_options
 
 MODE = "bgcorr_40_reguide"
 EPOCHS = 40
@@ -33,6 +34,38 @@ PSEUDO_COMPATIBILITY_SIGMA = 1.96
 
 def enabled(settings):
     return settings.get("background_correction", "none") == MODE
+
+
+def _qphi_options(settings):
+    options = feature_options(settings)
+    epochs = int(options.get("qphi_epochs", EPOCHS))
+    bins = int(options.get("qphi_mass_bins", 1))
+    if bins > 1 and bins % 2:
+        raise ValueError("qphi_mass_bins must be 1 or an even number")
+    return epochs, bins
+
+
+def _balanced_indices(mass, bins, seed):
+    """Equalize lower/upper sidebands and mass-quantile strata without labels."""
+    if bins <= 1:
+        return None
+    rng = np.random.default_rng(int(seed))
+    mass = np.asarray(mass)
+    groups = []
+    per_side = bins // 2
+    for mask in (mass < 3.3, mass > 3.7):
+        indices = np.flatnonzero(mask)
+        if len(indices) < per_side:
+            raise ValueError("Insufficient sideband events for mass-balanced q_phi batches")
+        ordered = indices[np.argsort(mass[indices], kind="stable")]
+        groups.extend(np.array_split(ordered, per_side))
+    if len(groups) != bins or any(len(g) == 0 for g in groups):
+        raise ValueError("Could not construct balanced q_phi mass strata")
+    target = int(math.ceil(len(mass) / bins))
+    chosen = [rng.choice(g, size=target, replace=len(g) < target) for g in groups]
+    merged = np.concatenate(chosen)
+    rng.shuffle(merged)
+    return merged.astype(np.int64, copy=False)
 
 
 def _model(settings, dimensions, device):
@@ -103,10 +136,13 @@ def _fit_probe(train_z, train_mass, val_z, val_mass, *, settings, seed, device):
                             torch.from_numpy(((np.asarray(train_mass, dtype=np.float32)-3.5)/0.2).astype(np.float32)))
     zv = torch.as_tensor(val_z, dtype=torch.float32, device=device)
     mv = torch.as_tensor(((np.asarray(val_mass, dtype=np.float32)-3.5)/0.2), dtype=torch.float32, device=device)
+    epochs, mass_bins = _qphi_options(settings)
     best, best_epoch, best_model = float("inf"), None, None
-    for epoch in range(EPOCHS):
+    for epoch in range(epochs):
         generator = torch.Generator().manual_seed(int(seed) + 21000 + epoch)
-        loader = DataLoader(dataset, batch_size=512, shuffle=True, generator=generator)
+        balanced = _balanced_indices(train_mass, mass_bins, int(seed) + 21500 + epoch)
+        epoch_dataset = dataset if balanced is None else TensorDataset(dataset.tensors[0][balanced], dataset.tensors[1][balanced])
+        loader = DataLoader(epoch_dataset, batch_size=512, shuffle=balanced is None, generator=generator)
         model.train()
         for z, m in loader:
             z, m = z.to(device), m.to(device)
@@ -280,11 +316,12 @@ def _pseudo_sr_closure(train_z, train_mass, val_z, val_mass, *, settings, seed, 
 
 def _contract(settings, train_z, train_mass, val_z, val_mass, seed, device):
     return dict(
-        schema=3,
+        schema=4,
         scientific_version=SCIENTIFIC_VERSION,
         protocol=PROTOCOL,
         mode=MODE,
-        epochs=EPOCHS,
+        epochs=_qphi_options(settings)[0],
+        mass_bins=_qphi_options(settings)[1],
         activation_gate=dict(
             min_validation_improvement=MIN_VALIDATION_IMPROVEMENT,
             pseudo_window_quantiles=[list(x) for x in PSEUDO_WINDOW_QUANTILES],
@@ -318,6 +355,7 @@ def train(directory, train_z, train_mass, val_z, val_mass, *, settings, seed, de
             raise ValueError("Invalid background-correction inputs")
         if ((m > 3.3) & (m < 3.7)).any():
             raise ValueError("Background correction is sideband-only; SR events are forbidden")
+    epochs, mass_bins = _qphi_options(settings)
     contract = _contract(settings, train_z, train_mass, val_z, val_mass, seed, device)
     contract_path = directory / "contract.json"
     if contract_path.exists() and json.loads(contract_path.read_text()) != contract:
@@ -344,10 +382,12 @@ def train(directory, train_z, train_mass, val_z, val_mass, *, settings, seed, de
     zv = torch.from_numpy(val_z).to(device)
     mv = torch.from_numpy(((val_mass - 3.5) / 0.2).astype(np.float32)).to(device)
     dataset = TensorDataset(zt, mt)
-    for epoch in range(start, EPOCHS):
+    for epoch in range(start, epochs):
         generator = torch.Generator().manual_seed(int(seed) + 11000 + epoch)
-        loader = DataLoader(dataset, batch_size=512, shuffle=True, generator=generator)
-        model.train(); total = 0.0
+        balanced = _balanced_indices(train_mass, mass_bins, int(seed) + 11500 + epoch)
+        epoch_dataset = dataset if balanced is None else TensorDataset(zt[balanced], mt[balanced])
+        loader = DataLoader(epoch_dataset, batch_size=512, shuffle=balanced is None, generator=generator)
+        model.train(); total = 0.0; trained_events = 0
         for z, m in loader:
             z, m = z.to(device), m.to(device)
             optimizer.zero_grad()
@@ -355,23 +395,23 @@ def train(directory, train_z, train_mass, val_z, val_mass, *, settings, seed, de
             require_finite(loss, "Latent-background correction loss")
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
-            optimizer.step(); total += float(loss.detach()) * len(z)
+            optimizer.step(); total += float(loss.detach()) * len(z); trained_events += len(z)
         model.eval()
         with torch.no_grad():
             validation_nll = -float(log_prob(model, zv, mv).double().mean().cpu())
             gaussian_nll = -float(_gaussian_log_prob(zv).double().mean().cpu())
-        row = dict(epoch=epoch, train_nll=total / len(train_z), validation_nll=validation_nll,
+        row = dict(epoch=epoch, train_nll=total / trained_events, validation_nll=validation_nll,
                    gaussian_validation_nll=gaussian_nll, improvement=gaussian_nll-validation_nll)
         history.append(row)
         if (validation_nll, epoch) < (best, best_epoch if best_epoch is not None else math.inf):
             best, best_epoch, best_model = validation_nll, epoch, deepcopy(model.state_dict())
-        if persist_boundary(epoch, EPOCHS):
+        if persist_boundary(epoch, epochs):
             state = dict(contract=contract, epoch=epoch, model=model.state_dict(), optimizer=optimizer.state_dict(),
                          history=history, best=best, best_epoch=best_epoch, best_model=best_model, rng=rng_state())
             latest.parent.mkdir(parents=True, exist_ok=True)
             atomic_torch_save(latest, state)
             write_json(directory / "history.json", history)
-        emit_message(f"Background correction {epoch+1}/{EPOCHS}: validation NLL={validation_nll:.6g}")
+        emit_message(f"Background correction {epoch+1}/{epochs}: validation NLL={validation_nll:.6g}")
 
     if best_model is None:
         raise FloatingPointError("Background correction produced no valid checkpoint")
@@ -393,7 +433,7 @@ def train(directory, train_z, train_mass, val_z, val_mass, *, settings, seed, de
     if validation_passed and closure.get("status") != "passed":
         reasons.append("q_phi failed masked-sideband pseudo-SR interpolation closure")
     decision = dict(
-        mode=MODE, protocol=PROTOCOL, selected_epoch=int(best_epoch), epochs=EPOCHS,
+        mode=MODE, protocol=PROTOCOL, selected_epoch=int(best_epoch), epochs=epochs,
         status="activated" if active else "gaussian_fallback", active=bool(active),
         criterion="lowest reserved correction-validation NLL, then positive Gaussian-relative validation gain and multi-window pseudo-SR closure",
         validation_gate={**validation, "minimum_improvement": MIN_VALIDATION_IMPROVEMENT,
@@ -414,12 +454,12 @@ def descriptor(directory):
     directory = Path(directory)
     state = torch.load(directory / "model.pt", map_location="cpu", weights_only=False)
     contract = state["contract"]
-    if contract.get("mode") != MODE or contract.get("epochs") != EPOCHS:
+    if contract.get("mode") != MODE or type(contract.get("epochs")) is not int or contract["epochs"] < 10:
         raise ValueError("Invalid bgcorr_40_reguide model")
     selection = json.loads((directory / "selection.json").read_text())
     if selection.get("status") != "activated" or not selection.get("active"):
         raise ValueError("Inactive background correction cannot be used as the RIDDLE denominator")
-    return dict(mode=MODE, protocol=PROTOCOL, epochs=EPOCHS,
+    return dict(mode=MODE, protocol=PROTOCOL, epochs=int(contract["epochs"]),
                 selected_epoch=int(state["selected_epoch"]), model_path=str((directory / "model.pt").resolve()),
                 model_sha256=file_digest(directory / "model.pt"), contract=contract,
                 validation_gate=selection["validation_gate"], pseudo_sr_closure=selection["pseudo_sr_closure"])

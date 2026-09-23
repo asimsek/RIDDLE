@@ -41,10 +41,22 @@ def validate_residual(value):
         integer(e[name], name, 2)
     for name in ("guide_warmup_epochs", "hard_start_epoch"):
         integer(e[name], name, 0)
-    for name in ("hard_pool_fraction", "hard_sampling_fraction"):
+    for name in ("guide_folds",):
+        integer(e[name], name, 2)
+    for name in ("guide_reference_multiplier", "tail_candidate_multiplier", "qphi_mass_bins"):
+        integer(e[name], name, 1)
+    integer(e["qphi_epochs"], "qphi_epochs", 10)
+    for name in ("guide_mass_conditioning", "guide_refresh_reference", "guide_ratio_calibration", "tail_rank"):
+        if type(e[name]) is not bool:
+            raise ValueError(f"{name} must be boolean")
+    for name in ("hard_pool_fraction", "hard_sampling_fraction", "tail_hard_fraction"):
         number(e[name], name, maximum=1)
-    for name in ("contrastive_strength", "rosenblatt_bound"):
+    for name in ("contrastive_strength", "rosenblatt_bound", "tail_temperature", "responsibility_temperature"):
         number(e[name], name)
+    for name in ("tail_strength", "tail_margin"):
+        number(e[name], name, strict=False)
+    if e["checkpoint_weighting"] not in ("uniform", "validation_likelihood"):
+        raise ValueError("checkpoint_weighting must be uniform or validation_likelihood")
     if e["guided_fit"] and e["hard_bg"] and e["hard_start_epoch"] >= e["guide_epochs"]:
         raise ValueError("Hard-background mining must start before the last guide epoch")
     if isinstance(value, dict) and "fits" in value:
