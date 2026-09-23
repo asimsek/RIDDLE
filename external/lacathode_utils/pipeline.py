@@ -27,7 +27,7 @@ def run_settings(runs=None, epochs=None, background="independent"):
     }
     if type(values["pipeline_runs"]) is not int or not 1 <= values["pipeline_runs"] < 2**32:
         raise ValueError("LaCathode --runs must be a positive integer")
-    # The pinned selector uses argpartition(losses, 10), requiring more than ten epochs.
+    # The pinned selector requires more than ten epochs for argpartition index 10.
     if type(values["classifier_epochs"]) is not int or values["classifier_epochs"] < 11:
         raise ValueError("LaCathode --epochs must be at least 11 for its upstream ten-checkpoint selector")
     if background == "fixed":

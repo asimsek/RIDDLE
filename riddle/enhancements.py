@@ -26,7 +26,7 @@ def save_torch(path, value):
 
 
 def load_torch(path, device="cpu"):
-    # Recovery files are produced locally and include optimizer/RNG state.
+    # Recovery files include optimizer and RNG state.
     return torch.load(path, map_location=device, weights_only=False)
 
 
@@ -533,7 +533,7 @@ def tail_ranking_loss(positive_ratio, negative_ratio, weights, mean_weight, *, m
     """Weighted pairwise ranking loss against final-score hard background samples."""
     if temperature <= 0:
         raise ValueError("Tail ranking temperature must be positive")
-    # Matrix size is O(batch * hard negatives), intentionally small in the ablation profile.
+
     difference = (positive_ratio[:, None] - negative_ratio[None, :] - float(margin)) / float(temperature)
     per_positive = nn.functional.softplus(-difference).mean(dim=1)
     return (weights * per_positive).mean() / mean_weight
@@ -544,20 +544,24 @@ def contrastive_loss(positive, negative, weights, mean_weight):
 
 
 def standard_normal_log_prob(z):
-    # Keep the per-coordinate float32 reduction used by the validated study.
-    # Algebraically equivalent reductions can change EM weights/checkpoints.
+    # Keep the validated float32 reduction because alternatives change EM weights.
+
     return -.5 * (z.square() + math.log(2 * math.pi)).sum(-1)
 
 
 def mixture_gain(ratio, fraction):
     ratio = np.asarray(ratio, dtype=np.float64)
-    if not np.isfinite(ratio).all() or not 0 <= fraction <= 1:
+    fraction = np.asarray(fraction, dtype=np.float64)
+    if not np.isfinite(ratio).all() or not np.isfinite(fraction).all():
         raise ValueError("Invalid density ratio/fraction")
-    if fraction == 0:
-        return np.zeros_like(ratio)
-    if fraction == 1:
-        return ratio.copy()
-    return np.logaddexp(math.log1p(-fraction), math.log(fraction)+ratio)
+    try:
+        fraction = np.broadcast_to(fraction, ratio.shape)
+    except ValueError as error:
+        raise ValueError("Density ratio and fraction are not broadcast-compatible") from error
+    if np.any(fraction < 0) or np.any(fraction > 1):
+        raise ValueError("Invalid density ratio/fraction")
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.logaddexp(np.log1p(-fraction), np.log(fraction) + ratio)
 
 
 def profile_fraction(ratio):

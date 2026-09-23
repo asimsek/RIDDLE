@@ -23,7 +23,7 @@ def assess_closure(logits, mass, *, targets=(.10, .05, .01, .004), bins_per_side
         selected = logits > np.log((1-target)/target)
         for i, ix in enumerate([np.arange(len(mass)), *bins]):
             k, n = int(selected[ix].sum()), len(ix)
-            # Sparse tails cannot establish closure. Do not call them passed.
+            # Sparse tails cannot establish closure.
             sufficient = n*target >= 10 and n*(1-target) >= 10
             eligible += int(sufficient)
             p = float(binomtest(k, n, target).pvalue)

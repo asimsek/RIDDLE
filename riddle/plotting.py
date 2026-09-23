@@ -26,22 +26,22 @@ from .production import validate_score_record, region_acceptance
 from .evaluation import common_acceptance_auc, population_metadata, riddle_score_scope
 
 
-# Physical comparisons, per-method figures and summaries share numerical work.
+
 efficiency_curve = f.cached_plot_calculation(efficiency_curve)
 oracle_metrics = f.cached_plot_calculation(oracle_metrics)
 roc_curve = f.cached_plot_calculation(roc_curve)
 
 
-# Presentation metadata; result discovery, not this registry, defines the cohort.
-#
-# New methods use result.json plus checksum-protected signal_region, validation
-# and test score NPZs (mass, labels, physical, mask, scores, saved SR membership).
-# Higher scores must mean more signal-like; unscored rows contain NaN. Latents are
-# optional. Optional fit_scores retain the same fit order across partitions.
-# Optional result.json['plotting'] sets label, color, linestyle, signal_color and
-# score_transform ('identity' or 'sigmoid', for display only), and score_scope
-# ('full_region' by default, or 'signal_region'). No method list in
-# the comparison renderers needs editing to include a new compatible result.
+
+
+
+
+
+
+
+
+
+
 @dataclass(frozen=True)
 class PlotMethod:
     label: str
@@ -61,10 +61,10 @@ BUILTINS = {
     "riddle": PlotMethod("RIDDLE", "#D55E00", "--", "#009E73", "sigmoid"),
     "ranode": PlotMethod("R-ANODE", "#8B1A1A", "-.", "#56B4E9", "sigmoid", "signal_region"),
 }
-# Mass-conditioned RIDDLE is serialized as riddlev2 (latent input) or riddlev3
-# (physical input).  They are scientific RIDDLE protocols, not independent
-# plotting methods.  Canonicalize them so comparisons, safeguards, labels and
-# training diagnostics all use the RIDDLE code path.
+# Canonicalize mass-conditioned RIDDLE IDs onto the shared plotting path.
+
+
+
 RIDDLE_METHOD_IDS = frozenset(("riddle", "riddlev2", "riddlev3"))
 METHOD_SPECS = dict(BUILTINS)
 
@@ -122,8 +122,8 @@ def is_riddle_report(report):
 
 
 def riddle_plot_spec(report):
-    # A full-length NPZ is not a full-domain score: mass-conditioned results
-    # intentionally contain NaNs outside their trained SR.
+    # Treat NaNs outside the trained SR as intentionally unscored.
+
     base = BUILTINS["riddle"]
     return PlotMethod(base.label, base.color, base.linestyle, base.signal_color,
                       base.score_transform, riddle_score_scope(report))
@@ -170,10 +170,10 @@ def register_method(report):
 KEYS = {"lacathode": "raw", "riddle": "residual", "ranode": "ranode"}
 STYLES = dict(f.METHODS)
 STYLES["ranode"] = ("R-ANODE", "#8B1A1A", "-.")
-# Figure-level population styles are separate from method line styles.  Keep
-# them synchronized for every plotting key so individual representation plots
-# (input/latent background-vs-signal densities, pairs and correlations) work
-# for R-ANODE and for dynamically registered future methods as well.
+
+
+
+
 POPULATION_STYLES = dict(f.POPULATIONS)
 POPULATION_STYLES["ranode"] = {
     0: (BUILTINS["ranode"].color, "-"),
@@ -339,8 +339,8 @@ class PlotProgress:
 def methods(keys, *, view=None):
     previous = f.METHODS, f.VIEWS, f.POPULATIONS
     f.METHODS = {k: STYLES[k] for k in keys}
-    # Every active figure key must have population styling.  Built-ins are
-    # pre-populated; dynamically registered methods are added lazily below.
+
+
     missing = [k for k in keys if k not in POPULATION_STYLES]
     if missing:
         reverse_keys = {plot_key: method for method, plot_key in KEYS.items()}
@@ -374,7 +374,7 @@ def discover(root, requested=None, *, scan=False):
             continue
         if method == "riddle" and "protocol.json" in report.get("artifacts_sha256", {}):
             protocol = read_metadata(path.parent, report, "protocol.json")
-            # Read-only resolved metadata; do not rewrite historical artifacts.
+
             report = {**report, "score_scope": riddle_score_scope({**report, "protocol": protocol})}
         spec = register_method(report)
         METHOD_SPECS[method] = spec
@@ -426,9 +426,9 @@ def load_scores(root, report, name, *, attempt=None, for_rebuild=False):
         if method == "lacathode" or "latent" in archive:
             fields += ("latent",)
         data = {k: archive[k] for k in fields}
-        # Physical-input RIDDLE stores the density coordinates explicitly rather
-        # than calling them latents.  Keep them available for validation without
-        # relabelling them as z in representation plots.
+
+
+
         if method == "riddle" and "density_inputs" in archive:
             data["density_inputs"] = archive["density_inputs"]
             if "background_log_density" in archive:
@@ -499,8 +499,8 @@ def load_scores(root, report, name, *, attempt=None, for_rebuild=False):
     if for_rebuild:
         if method != "riddle":
             raise ValueError("Only RIDDLE checkpoint reconstruction may defer score validation")
-        # Validate all event identities/features, even when an old ensemble's
-        # predictions are unusable. Actual rebuilt predictions are checked below.
+
+
         evidence = {**data, "scores": np.where(data["mask"], 0., np.nan)}
         evidence.pop("fit_scores", None)
         validate_score_record(evidence, method="riddle", stage=str(path))
@@ -574,7 +574,7 @@ def ranode_plot_ensemble(root, report):
     additional_exclusions = False
     for index, attempt in enumerate(attempts):
         member = {"fit_index": indices.get(attempt, index), "attempt": attempt}
-        # Integrity errors are intentionally outside the numerical-failure catch.
+        # Let integrity errors propagate outside numerical-failure handling.
         verify_plot_input(root, report, str(Path(attempt) / "results/upstream/signal/fit/samples.npy"))
         try:
             validate_mass_normalization(root / attempt)
@@ -615,7 +615,7 @@ def ranode_plot_ensemble(root, report):
                 record["scores"][record["mask"]] = combined[partition] - np.log(len(accepted))
             validate_score_record(record, method="ranode", stage=f"Rebuilt {root}/{partition}")
     else:
-        # Preserve the exact saved predictions when every fit passes.
+
         base = {p: load_scores(root, report, p) for p in partitions}
     for record in base.values():
         record["plot_ensemble"] = audit
@@ -654,7 +654,7 @@ def riddle_plot_predictions(root, report, member, groups, *, device="cpu"):
     relative = Path("density") / member["directory"]
     inputs = read_metadata(root, report, str(relative / "residual_training_inputs.json"))
     version = report["contract"]["scientific_version"]
-    if version not in (2, 3, 4) or inputs.get("scientific_version") != version:
+    if version not in (2, 3, 4, 5) or inputs.get("scientific_version") != version:
         raise ValueError("Unsupported or inconsistent RIDDLE checkpoint protocol")
     paths = [verify_plot_input(root, report, str(relative / f"residual_epoch_{e}.pt"))
              for e in member["epochs"]]
@@ -686,8 +686,8 @@ def riddle_plot_predictions(root, report, member, groups, *, device="cpu"):
     completed = 0
     with torch.no_grad(), ProgressStage("plot_riddle_inference", "Evaluate saved RIDDLE fit", total, "prediction") as progress:
         for path, epoch, weight in zip(paths, member["epochs"], member["signal_fractions"]):
-            # Stage checkpoint tensors on CPU, then copy into the model on the
-            # selected device. Keep only one inference batch in GPU memory.
+            # Stage checkpoints on CPU and move one inference batch at a time to GPU.
+
             checkpoint = torch.load(path, map_location="cpu", weights_only=True)
             if checkpoint.get("scientific_version") != version or checkpoint.get("epoch") != epoch:
                 raise ValueError("RIDDLE checkpoint identity differs from saved selection")
@@ -709,8 +709,14 @@ def riddle_plot_predictions(root, report, member, groups, *, device="cpu"):
                                            tests=member["normalization_tests"])
                 sums[key] = ratio if key not in sums else np.logaddexp(sums[key], ratio)
                 if key == "reserved_validation":
-                    weighted = np.logaddexp(np.log1p(-weight) if weight < 1 else -np.inf,
-                                            (np.log(weight) if weight > 0 else -np.inf) + ratio)
+                    if checkpoint.get("mass_fraction_state") is not None:
+                        from .mass_fraction import probabilities as mass_fraction_probabilities
+                        mixture_weight = mass_fraction_probabilities(
+                            checkpoint["mass_fraction_state"], z[:, -1], inputs["settings"])
+                    else:
+                        mixture_weight = weight
+                    from .enhancements import mixture_gain
+                    weighted = mixture_gain(ratio, mixture_weight)
                     mixture = weighted if mixture is None else np.logaddexp(mixture, weighted)
     count = len(paths)
     return {key: value - np.log(count) for key, value in sums.items()}, (
@@ -731,8 +737,8 @@ def riddle_plot_ensemble(root, report, *, io_workers=2, device="cpu"):
     selection = read_metadata(root, report, "density/ensemble_selection.json")
     require_complete_ensemble(selection)
     if "method_health.json" in report.get("artifacts_sha256", {}):
-        # A calibrated score is tied to its exact frozen ensemble. Removing fits
-        # after calibration would silently change the method and invalidate u.
+        # Calibration is valid only for the exact frozen ensemble.
+
         health = read_metadata(root, report, "method_health.json")
         if not fit_acceptance(health)["fit_valid"]:
             raise NumericalFitError("Invalid saved RIDDLE ensemble; rerun training rather than recalibrating while plotting")
@@ -751,7 +757,7 @@ def riddle_plot_ensemble(root, report, *, io_workers=2, device="cpu"):
     if digest(validation) != inputs.get("selection_sha256"):
         raise ValueError("Reserved RIDDLE validation events differ from the training selection")
     reference = np.random.default_rng(3407).standard_normal((8192, validation.shape[1])).astype(np.float32)
-    # Match the production validation rule; legacy runs predate this setting.
+
     policy = inputs.get("settings", {}).get("fit_recovery", {})
     sigma = policy.get("validation_sigma", 2.0)
     members = [dict(m, fit_index=m.get("fit_index", i)) for i, m in enumerate(selection["members"])]
@@ -772,8 +778,8 @@ def riddle_plot_ensemble(root, report, *, io_workers=2, device="cpu"):
     try:
         torch.set_num_threads(io_workers)
         if cuda_devices:
-            # Keep full float32 model evaluation; likelihood aggregation and
-            # safeguard statistics remain float64 on CPU as before.
+
+
             torch.backends.cuda.matmul.allow_tf32 = False
         with torch.random.fork_rng(devices=cuda_devices):
             for member in members:
@@ -791,7 +797,7 @@ def riddle_plot_ensemble(root, report, *, io_workers=2, device="cpu"):
                     dict(normalization_status="passed", quality=quality))))
             if accepted:
                 base = {p: load_scores(root, report, p, for_rebuild=True) for p in audit["partitions"]}
-                # Keep the saved prediction exactly when no fit was rejected and it is usable.
+
                 valid_saved_scores = all(np.isfinite(r["scores"][r["mask"]]).all()
                                          and np.isnan(r["scores"][~r["mask"]]).all() for r in base.values())
                 if excluded or not valid_saved_scores:
@@ -1034,9 +1040,9 @@ def make_bundle(group, confidence, score_loader=None):
                     values = record["latent"]
                 else:
                     continue
-                # The extra coordinate in mass-conditioned RIDDLE is a context
-                # variable, not a learned latent feature.  Do not publish it as
-                # a fictitious z_5 in representation figures.
+                # Treat mass as context, not as an extra latent coordinate.
+
+
                 if (method == "riddle" and
                         method_report.get("contract", {}).get("settings", {}).get("riddle", {}).get("mass_conditioning", False)):
                     values = values[..., :-1]
@@ -1072,7 +1078,7 @@ def render_bundle(bundle, target, args):
             f.render_features,
         ):
             if renderer is f.render_mass_scan:
-                renderer(bundle, target)  # This renderer reports its own 70-cut progress.
+                renderer(bundle, target)
                 continue
             with ProgressStage(renderer.__name__, renderer.__name__.replace("render_", "Plot ")):
                 renderer(bundle, target, args) if renderer in (
@@ -1170,7 +1176,7 @@ def render_injection_scan(groups, output, args, score_loader=None):
             if method == "ranode":
                 from external.ranode_utils.data import scientific_version
                 expected_protocol = scientific_version(inputs.get("variant", "default"))
-            allowed_protocols = (2, 3, 4) if method == "riddle" else (expected_protocol,)
+            allowed_protocols = (2, 3, 4, 5) if method == "riddle" else (expected_protocol,)
             if method in BUILTINS and report["contract"].get("scientific_version") not in allowed_protocols:
                 raise ValueError(f"Injection scans require protocol in {allowed_protocols!r} for {method}")
             point = inputs["injection_scan"]
@@ -1405,8 +1411,8 @@ def render_variant_sic_ratio(groups, output, args, score_loader):
                     continue
                 base = score_loader(*default, "signal_region")
                 shifted = score_loader(*alternate, "signal_region")
-                # Same truth-labelled evaluation population size is required;
-                # features may intentionally differ for the alternate dataset.
+
+
                 if not np.array_equal(base["labels"], shifted["labels"]):
                     colored_status(
                         f"{METHOD_SPECS[method].label} seed {seed}: skip {variant}/default ratio with different SR labels",
@@ -1653,8 +1659,8 @@ def event_size_rows(groups, score_loader, *, data_root=None):
                              "train_events": "", "train_sample": "",
                              "validation_events": "", "validation_sample": "",
                              "generated_reference_samples": "", "notes": "No method-specific event ledger available"})
-    # Collapse identical event accounting across repeated seeds while preserving
-    # which seeds contributed to the paper table.
+
+
     collapsed = {}
     for row in rows:
         key = tuple((k, str(v)) for k, v in row.items() if k != "seed")
@@ -1933,8 +1939,8 @@ def _render_relative_history_comparison(
             max_epoch = max(max_epoch, int(epochs[-1]))
             all_values.append(relative)
 
-            # Draw the moving average first and the dotted per-epoch trace last,
-            # so the per-epoch values remain visible above the smooth curve.
+
+
             if len(relative) >= 5:
                 smooth = np.convolve(relative, np.ones(5) / 5, mode="valid")
                 ax.plot(epochs[4:], smooth, color=color, ls="-", lw=2.0, zorder=2)
@@ -1950,7 +1956,7 @@ def _render_relative_history_comparison(
         ax.axhline(0.0, color=".55", ls="--", lw=1.0, gid="publication-guide")
         ax.set_xlim(1, max_epoch)
 
-        # Give the data a compact paper-style vertical window with ~10% headroom.
+
         finite = np.concatenate([v[np.isfinite(v)] for v in all_values if np.isfinite(v).any()])
         if finite.size:
             low = min(float(finite.min()), 0.0)
@@ -1960,7 +1966,7 @@ def _render_relative_history_comparison(
             ax.set_ylim(low - pad, high + pad)
             ax._publication_fixed_ylim = True
 
-        # A compact legend separates method identity from line-style semantics.
+
         method_handles = [
             f.Line2D([], [], color=color, lw=2.0, ls="-", label=label)
             for label, color in drawn_methods
@@ -1973,7 +1979,7 @@ def _render_relative_history_comparison(
         labels = [h.get_label() for h in handles]
         f.legend(fig, handles=handles, labels=labels, ncols=1)
 
-        # Each train/validation objective is its own standalone publication plot.
+
         f.save(fig, destination / f"{stem}_{noun}")
 
 
@@ -1993,8 +1999,8 @@ def comparison_training_figures(group, output, score_loader=None):
         background, destination, "background_nll",
         ylabel=r"Relative NLL change from epoch 1 [\%]",
     )
-    # Keep the historical sr_model_nll filename for downstream references.
-    # All three methods are shown using their relative NLL change from epoch 1.
+
+
     _render_relative_history_comparison(
         sr_model, destination, "sr_model_nll",
         ylabel=r"Relative NLL change from epoch 1 [\%]",
@@ -2021,8 +2027,8 @@ def training_figures(group, output, score_loader=None):
         destination = output / STYLES[KEYS[method]][0] / "02_training"
 
         if method == "riddle":
-            # Stage 1: sideband-trained background map.  This is the RIDDLE
-            # analogue of CATHODE/LaCATHODE and R-ANODE background-flow NLL.
+
+
             background_history = _history_rows(root, report, "background/history.json")
             if background_history is not None:
                 _plot_nll_history(
@@ -2031,8 +2037,8 @@ def training_figures(group, output, score_loader=None):
                     filename="background_nll",
                 )
 
-            # Stage 2: the SR residual model is trained on the *mixture* density
-            # (1-f)p_B + f p_S.  There is no truth-signal NLL to plot here.
+
+
             members = read_metadata(root, report, "density/ensemble_selection.json")["members"]
             audit = score_loader.fit_audit.get(str(root.resolve())) if score_loader is not None else None
             if audit:
@@ -2057,9 +2063,9 @@ def training_figures(group, output, score_loader=None):
             f.legend(fig, title="RIDDLE | Residual-mixture fraction")
             f.save(fig, destination / "mixture_fraction")
 
-            # Optional RIDDLE-specific q_phi correction NLL.  Keep it separate
-            # from the cross-method background-flow comparison because it is an
-            # additional correction stage with no direct LaCATHODE/R-ANODE peer.
+
+
+
             correction_name = "density/background_correction/history.json"
             if correction_name in report.get("artifacts_sha256", {}):
                 correction_history = _history_rows(root, report, correction_name)
@@ -2106,8 +2112,8 @@ def training_figures(group, output, score_loader=None):
                 f.save(fig, destination / "selected_vs_final_validation")
             continue
 
-        # LaCATHODE follows the CATHODE structure: background-flow NLL followed
-        # by classifier BCE.  The classifier loss is intentionally not labelled NLL.
+
+
         for stage in ("background", "classifier"):
             directory = root / "training"
             names = (
@@ -2558,7 +2564,7 @@ def exact_background_selection(record, budget):
         if tied_background < 1:
             raise ValueError("Exact background working point has no boundary tie")
         fraction = float((target - higher_background) / tied_background)
-        # Numerical protection only; a valid order statistic guarantees [0, 1].
+
         fraction = float(np.clip(fraction, 0.0, 1.0))
         weights = np.zeros(len(scores), dtype=float)
         finite = mask & np.isfinite(scores)
@@ -2574,8 +2580,8 @@ def exact_background_selection(record, budget):
         float(np.mean(np.sum(weights[:, labels == 1], axis=1) / total_signal))
         if total_signal > 0 else None
     )
-    # The construction is exact up to floating-point roundoff.  Store the
-    # requested value explicitly so tables/legends never display a nearby rank.
+
+
     if not np.isclose(bg_eff, budget, rtol=0, atol=5e-15):
         raise ValueError(f"Exact background selection failed: {bg_eff} != {budget}")
     return dict(
@@ -2609,8 +2615,8 @@ def weighted_selection_histogram(values, edges, selection, population):
 
 
 def working_point_relation(budget):
-    # The four publication working points are all evaluated at the exact
-    # requested physical background efficiency using fractional boundary ties.
+    # Evaluate publication working points at exact physical background efficiency.
+
     return "="
 
 
@@ -2624,9 +2630,9 @@ def working_point_efficiency_label(value, budget, *, signal=False):
 
 def render_physical_working_points(validation, test, output, *, scenario=None, scope="signal_region"):
     require_same_physical_population(test)
-    # Calibration roles differ across methods; evaluation populations may not.
-    # Select each validation region independently, without aligning unrelated
-    # held-out rows or requiring them to match another method's training roles.
+    # Select each method's validation region independently.
+
+
     validation = {m: physical_sr_record(r, scope_region({m: r}, scope)) for m, r in validation.items()}
     test = {m: physical_sr_record(r, scope_region(test, scope)) for m, r in test.items()}
     require_same_physical_population(test)
@@ -2759,19 +2765,19 @@ def render_physical_working_points(validation, test, output, *, scenario=None, s
                 lower.stairs(ratio, edges, color=color, baseline=None)
                 overlay_markers(lower, ratio, color=color, marker=marker, zorder=3)
             if shape:
-                # Publication convention for background-mass-shape panels:
-                # keep the normalized-density panel and its selected/inclusive
-                # ratio on fixed common ranges for every working point/method.
+
+
+
                 ax.set_ylim(0.0, 0.20)
                 ax._publication_fixed_ylim = True
                 lower.axhline(1.0, color=".5", ls=":", lw=1.0, gid="publication-guide")
                 lower.set_ylim(0.0, 2.0)
                 lower._publication_fixed_ylim = True
             else:
-                # The lower mass-count panel is the bin-wise background
-                # retention, so its reference line must be the *fractional*
-                # working point itself: 0.004, 0.01, 0.05, 0.10, ...
-                # (not the percentage labels 0.4, 1, 5, 10).
+
+
+
+
                 lower.axhline(float(budget), color=".5", ls=":", lw=1.0,
                               gid="publication-guide")
                 ax.set_yscale("symlog", linthresh=1)
@@ -2817,9 +2823,9 @@ def render_physical_efficiency(records, selected, edges, budget, output, *, scop
         if marker is None:
             marker = fallback_markers[fallback_index % len(fallback_markers)]
             fallback_index += 1
-        # Keep the bin-wise step shape, and overlay a distinct colored marker
-        # for every method.  The validation target remains the unchanged grey
-        # dotted reference requested for publication plots.
+
+
+
         ax.stairs(values, edges, color=color, ls=ls, baseline=None)
         ax.plot(
             centers, values, ls="none", marker=marker, ms=4.5, mew=0.9,
@@ -2827,9 +2833,9 @@ def render_physical_efficiency(records, selected, edges, budget, output, *, scop
         )
     ax.axhline(budget, color=".5", ls=":", label="Validation target")
     ax.set(xlim=(edges[0], edges[-1]), ylim=(0.0, 0.20))
-    # Preserve the requested publication range exactly.  figures._save_figure()
-    # normally widens nonnegative axes, which would otherwise change 0--0.20 into a
-    # tighter auto-range after this function returned.
+
+
+
     ax._publication_fixed_ylim = True
     relation = working_point_relation(budget)
     f.legend(fig, title=f"{scope_label(scope)} | B {relation} {100 * budget:.1f}%")
@@ -3023,9 +3029,9 @@ def _ensemble_member_scores(method, source, score_loader, *, scope="signal_regio
             else "arithmetic mean in saved member-score coordinate (diagnostic)"
         )
     else:
-        # Pinned LaCATHODE explicitly does not average classifier fits in its
-        # production score.  Its convergence diagnostic therefore tracks the
-        # median member performance as more fits are included.
+        # Use median member performance because pinned LaCATHODE does not average fits.
+
+
         aggregation = "median of per-fit performance; LaCATHODE production does not cross-fit-average scores"
     return record, scores, aggregation
 
@@ -3569,8 +3575,8 @@ def physical_mass_summary(groups, output, args, score_loader, *, scenario="backg
             for i, score_group in enumerate(run_score_groups(method, record)):
                 per_fit = [physical_mass_values(mass, mask, scores[pop], edges, full, f.EFFICIENCIES)
                            for scores in score_group]
-                # Reduce shared-background classifier fits within each complete
-                # run; the outer bands then contain only independent runs.
+                # Aggregate classifier fits within complete runs before uncertainty bands.
+
                 curves[method].append(np.median([v for v, _ in per_fit], axis=0).tolist())
                 efficiencies[method].append(np.median([e for _, e in per_fit], axis=0).tolist())
                 source = score_variation_source(method, record)
@@ -3643,7 +3649,7 @@ def refresh_plot_scopes(output, groups, scan_groups):
         for scope in ("signal_region", "full_region"):
             scopes.add(scoped_target(output, scope, scenario, seed, variant))
             scopes.add(scoped_target(output, scope, scenario, variant=variant) / "summary")
-        # Obsolete pre-v4.5 publication layout.
+
         scopes.add(output / scenario / f"seed_{seed:03d}")
         scopes.add(output / scenario / "summary")
     for identity in scan_groups:

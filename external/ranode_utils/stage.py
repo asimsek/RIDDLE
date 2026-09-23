@@ -5,6 +5,7 @@ import os
 import random
 import runpy
 import sys
+import traceback
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -17,6 +18,43 @@ from .ensemble import signal_fit_health
 from .variants import background_diagnostics, extend_delta_r, model_config
 from riddle.worker_progress import emit_progress as stage_progress
 from riddle.production import NumericalFitError
+
+
+def nflows_spline_sampling_failure(error):
+    if not isinstance(error, AssertionError):
+        return False
+    frames = traceback.extract_tb(error.__traceback__)
+    paths = [(Path(frame.filename).as_posix(), frame.name) for frame in frames]
+    spline = any(
+        path.endswith("/nflows/transforms/splines/rational_quadratic.py")
+        and name == "rational_quadratic_spline"
+        for path, name in paths
+    )
+    sampling = any(
+        path.endswith("/nflows/flows/base.py") and name == "_sample"
+        for path, name in paths
+    )
+    inverse = any(
+        path.endswith("/nflows/transforms/autoregressive.py")
+        and name == "_elementwise_inverse"
+        for path, name in paths
+    )
+    return spline and sampling and inverse
+
+
+def write_numerical_failure(request, error, *, error_type=None, reason=None):
+    from riddle.storage import write_json
+
+    receipt = dict(
+        kind="numerical",
+        stage=request["stage"],
+        fit_index=request["fit_index"],
+        error=str(error),
+        error_type=error_type or type(error).__name__,
+    )
+    if reason is not None:
+        receipt["reason"] = reason
+    write_json(Path(request["attempt"]) / "fit_failure.json", receipt)
 
 
 @contextmanager
@@ -104,7 +142,7 @@ def execute_script(path, *, cpu_background=False, variant="default"):
     elif variant == "deltaR":
         tree = extend_delta_r(tree, path.name)
     if cpu_background:
-        # The upstream background launcher hardcodes CUDA; only its device switch changes on CPU.
+        # Switch only the upstream device flag when the pinned launcher runs on CPU.
         assignments = [
             node
             for node in tree.body
@@ -121,7 +159,7 @@ def execute_script(path, *, cpu_background=False, variant="default"):
             raise ValueError("Unrecognized upstream background device switch")
         assignments[0].value = ast.copy_location(ast.Constant(False), assignments[0].value)
     namespace = {"__name__": "__main__", "__file__": str(path)}
-    exec(compile(ast.fix_missing_locations(tree), str(path), "exec"), namespace)  # noqa: S102 -- verified pinned source
+    exec(compile(ast.fix_missing_locations(tree), str(path), "exec"), namespace)  # noqa: S102
     return namespace
 
 
@@ -296,13 +334,22 @@ def main():
 
 
 if __name__ == "__main__":
-    from riddle.production import NumericalFitError
-    from riddle.storage import write_json
     request = json.loads(sys.argv[1])
     try:
         main()
     except (NumericalFitError, FloatingPointError) as error:
-        write_json(Path(request["attempt"]) / "fit_failure.json", dict(
-            kind="numerical", stage=request["stage"], fit_index=request["fit_index"],
-            error=str(error), error_type=type(error).__name__))
+        write_numerical_failure(request, error)
+        raise SystemExit(86) from error
+    except AssertionError as error:
+        if not nflows_spline_sampling_failure(error):
+            raise
+        numerical = NumericalFitError(
+            "nflows rational-quadratic spline inverse produced an invalid discriminant during signal-flow sampling"
+        )
+        write_numerical_failure(
+            request,
+            numerical,
+            error_type=type(error).__name__,
+            reason="nflows_rational_quadratic_spline_inverse_discriminant",
+        )
         raise SystemExit(86) from error

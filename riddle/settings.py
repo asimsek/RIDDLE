@@ -76,18 +76,31 @@ def validate_residual(value):
         if "runs" in value:
             raise ValueError("Use fits, or the legacy runs key, not both")
         value["runs"] = value.pop("fits")
-    # Older configuration files acquire the current, recorded recovery policy.
+
     value.setdefault("fit_recovery", {"max_retries": 2, "validation_sigma": 2.0})
-    # production_v2 is the HC-derived production baseline: study mapping roles
-    # with the normal production residual/member policy.
+
+
     from .roles import DEFAULT_POLICY
     value.setdefault("data_policy", DEFAULT_POLICY)
-    # Production must never silently finalize fewer residual members than were
-    # requested.  Diagnostics can still opt into ``partial`` explicitly.
+    # Require every requested residual member unless partial diagnostics are explicit.
+
     value.setdefault("ensemble_completion", "strict")
-    # Optional pilot ablation; the resolved data policy is always explicit.
+    # Learn a smooth f(m) from latent residual responsibilities.
+
+
+    value.setdefault("mass_fraction", {
+        "enabled": True,
+        "control_points": 5,
+        "smoothness": 0.0001,
+        "variation": 0.0002,
+        "damping": 0.5,
+        "min_fraction": 1e-5,
+        "max_fraction": 0.5,
+        "max_iterations": 100,
+    })
+
     extra = "".join(" " + k for k in ("mass_conditioning", "input_space", "optimization", "data_policy", "ensemble_completion", "background_correction") if k in value)
-    keys(value, "runs epochs fractions initialization flow training fit_recovery enhancements" + extra, "RIDDLE")
+    keys(value, "runs epochs fractions initialization flow training fit_recovery enhancements mass_fraction" + extra, "RIDDLE")
     if "data_policy" in value:
         from .roles import policy_parts, DIAGNOSTIC_POLICIES
         policy_parts(value["data_policy"])
@@ -97,6 +110,30 @@ def validate_residual(value):
         raise ValueError("ensemble_completion must be strict or partial")
     if "mass_conditioning" in value and type(value["mass_conditioning"]) is not bool:
         raise ValueError("mass_conditioning must be boolean")
+    mf = value["mass_fraction"]
+    keys(mf, "enabled control_points smoothness variation damping min_fraction max_fraction max_iterations", "mass fraction")
+    if type(mf["enabled"]) is not bool:
+        raise ValueError("mass_fraction.enabled must be boolean")
+    integer(mf["control_points"], "mass_fraction.control_points", 3)
+    if mf["control_points"] % 2 == 0:
+        raise ValueError("mass_fraction.control_points must be odd so one control point is at the SR center")
+    number(mf["smoothness"], "mass_fraction.smoothness", strict=False)
+    number(mf["variation"], "mass_fraction.variation", strict=False)
+    number(mf["damping"], "mass_fraction.damping", maximum=1.00000001)
+    if mf["damping"] > 1:
+        raise ValueError("mass_fraction.damping must be at most 1")
+    number(mf["min_fraction"], "mass_fraction.min_fraction", maximum=1)
+    number(mf["max_fraction"], "mass_fraction.max_fraction", maximum=1)
+    if mf["min_fraction"] >= mf["max_fraction"]:
+        raise ValueError("mass_fraction min_fraction must be smaller than max_fraction")
+    integer(mf["max_iterations"], "mass_fraction.max_iterations", 10)
+    if mf["enabled"]:
+        if not value.get("mass_conditioning"):
+            raise ValueError("The v5.3 f(m) method requires mass_conditioning=true")
+        if not e["guided_fit"]:
+            raise ValueError("The v5.3 f(m) method requires guided_fit=true")
+        if value.get("input_space") == "physical":
+            raise ValueError("The v5.3 f(m) method is defined for mapped latent-space RIDDLE")
     correction = value.get("background_correction", "none")
     if correction not in ("none", "bgcorr_40_reguide"):
         raise ValueError("background_correction must be none or bgcorr_40_reguide")

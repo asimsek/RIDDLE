@@ -83,8 +83,8 @@ def check_contract(previous, current, *, allow_code_change=False, allow_device_c
             _linux_runtime(values["previous"]) is not None
             and _linux_runtime(values["previous"]) == _linux_runtime(values["current"])
         ):
-            # Containers share their node's kernel; rescheduling must not reject
-            # an otherwise identical runtime. Keep the full strings in history.
+            # Ignore node-kernel string changes when the numerical runtime is otherwise identical.
+
             kind, allowed = "host", True
         elif reuse_completed and path in thread_fields and all(
             type(values[key]) is int and values[key] > 0 for key in ("previous", "current")
@@ -148,8 +148,8 @@ def inspect_resume(output, contract, *, resume=False, **policy):
         changes = check_contract(saved["contract"], contract,
                                  reuse_completed=saved.get("completed") is True, **policy)
         if saved.get("completed") is True:
-            # Completed artifacts, not obsolete training recovery state, are
-            # verified by the caller before it returns without running training.
+
+
             return saved, changes
     stage = "background" if contract["method"] == "riddle" else "training"
     stage_path = output / stage / ".resume/contract.json"

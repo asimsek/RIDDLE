@@ -3,11 +3,11 @@ import torch
 from .integrity import require_finite
 
 
-# Keep every finite event when applying a preprocessing transform learned on a
-# separate reference sample.  Values outside the fitted min/max range are
-# saturated only for the numerically singular logit step instead of being
-# deleted.  This is especially important for anomaly searches, where tail
-# events can be the signal-like population of interest.
+# Keep finite tail events and clip only at the singular logit boundary.
+
+
+
+
 LOGIT_EPS = 1.0e-6
 
 
@@ -166,16 +166,16 @@ def logit_transform(data, datamax, datamin, domain_cut=False, fiducial_cut=False
         mask = torch.prod((data2 > 0.05) & (data2 < 0.95), 1).type(torch.bool)
         data3 = data2[mask]
     elif domain_cut and not tail_safe:
-        # Preserve the historical reference-fit behavior.  The result-affecting
-        # problem was applying these fitted limits as an acceptance cut to
-        # independent validation/SR/test events.
+
+
+
         mask = torch.prod((data2 > 0) & (data2 < 1), 1).type(torch.bool)
         data3 = data2[mask]
     else:
-        # Once preprocessing is frozen on a separate reference sample,
-        # production RIDDLE uses a non-rejecting tail-safe transform: all finite
-        # rows survive and only the unit-interval coordinate is saturated before
-        # the logit.  This avoids preferentially dropping anomalous tail events.
+
+
+
+
         mask = torch.ones(data2.shape[0], dtype=torch.bool, device=data2.device)
         data3 = _clip_unit_interval(data2)
     data4 = torch.log(data3 / (1 - data3))

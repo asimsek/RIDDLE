@@ -20,12 +20,13 @@ from .model import (
 from .integrity import SCIENTIFIC_VERSION, ordered_epochs
 from .options import feature_options, effective_features
 
-ENHANCED_TRAINING_PROTOCOL = "study_parity_validation_rng_v2"
+ENHANCED_TRAINING_PROTOCOL = "riddle_v5_3_smooth_mass_fraction_v1"
 
 
 def enhanced_epoch(model, logit, ztrain, optimizer, options, additions, *, epoch, seed, guide,
-                   fixed_fraction=False, progress=None, background_model=None):
-    """Guided EM/mixture fitting with an optional corrected q_phi(z|m) denominator."""
+                   fixed_fraction=False, progress=None, background_model=None,
+                   mass_fraction_state=None, mass_fraction_settings=None):
+    """Guided EM/mixture fitting with optional smooth f(m) and q_phi(z|m)."""
     from .enhancements import (chunks, contrastive_loss, clip_gradients, standard_normal_log_prob,
                                sharpen_responsibilities, tail_ranking_loss)
     from .integrity import mixture_log_density, require_finite
@@ -47,19 +48,42 @@ def enhanced_epoch(model, logit, ztrain, optimizer, options, additions, *, epoch
     model.eval()
     guided = additions["guided_fit"]
     warm = guided and epoch < additions["guide_warmup_epochs"]
+    mass_fraction_active = mass_fraction_state is not None
+    if mass_fraction_active:
+        if not conditional or fixed_fraction or mass_fraction_settings is None:
+            raise ValueError("Smooth f(m) requires learned, mass-conditioned residual fitting")
+        from .mass_fraction import logits as mass_fraction_logits
+
     if warm:
         if guide is None:
             raise ValueError("Guided warm-up requires frozen event responsibilities")
         weights = torch.as_tensor(guide).detach().cpu()
     else:
         logs = chunks(lambda x: signal_log_prob(model, x), z, device=device)
-        old_logit = logit.detach().cpu()
-        weights = (torch.nn.functional.logsigmoid(old_logit)+logs-mixture_log_density(logs, logb, old_logit)).exp().detach().float()
+        if mass_fraction_active:
+            gate_logit = torch.from_numpy(
+                mass_fraction_logits(mass_fraction_state, ztrain[:, -1], mass_fraction_settings)
+            ).to(dtype=torch.float64)
+        else:
+            gate_logit = logit.detach().cpu()
+        weights = (torch.nn.functional.logsigmoid(gate_logit) + logs
+                   - mixture_log_density(logs, logb, gate_logit)).exp().detach().float()
         if guided and not fixed_fraction:
-            fraction = float(weights.double().mean().clamp(1e-8, 1-1e-8))
+            if mass_fraction_active:
+                from .mass_fraction import fit as fit_mass_fraction, state_summary
+                mass_fraction_state = fit_mass_fraction(
+                    ztrain[:, -1], weights.numpy(), mass_fraction_state, mass_fraction_settings,
+                    source="alternating_latent_responsibilities",
+                )
+                summary = state_summary(mass_fraction_state, ztrain[:, -1], mass_fraction_settings)
+                fraction = float(summary["mean"])
+            else:
+                fraction = float(weights.double().mean().clamp(1e-8, 1-1e-8))
             with torch.no_grad():
                 logit.fill_(np.log(fraction/(1-fraction)))
     if (not warm) and float(additions.get("responsibility_temperature", 1.0)) < 1.0:
+        # Fit f(m) from unsharpened responsibilities; sharpening only guides the density update.
+
         weights = sharpen_responsibilities(weights, float(additions["responsibility_temperature"]))
     if weights.shape != (len(z),):
         raise ValueError("Residual responsibilities must have one entry per training event")
@@ -84,8 +108,8 @@ def enhanced_epoch(model, logit, ztrain, optimizer, options, additions, *, epoch
                 -mixture_log_density(log_signal, lb, logit).mean())
         nc = torch.zeros((), device=device)
         if additions["contrastive_fit"]:
-            # Reference samples must come from the same denominator that defines
-            # the density ratio.  Mass is context only and never a guide input.
+            # Sample references from the same denominator while keeping mass as context only.
+
             model.eval()
             if background_model is not None:
                 from .background_correction import sample as sample_background, log_prob as corrected_log_prob
@@ -165,16 +189,29 @@ def enhanced_epoch(model, logit, ztrain, optimizer, options, additions, *, epoch
         if progress:
             progress(step+1, len(loader))
     model.eval()
-    nll = -float(mixture_log_density(chunks(lambda x: signal_log_prob(model, x), z, device=device), logb,
-                                     logit.detach().cpu()).double().mean())
-    return nll, dict(train_objective=total/len(z), contrastive_loss=contrast/len(z),
-                     tail_rank_loss=tail_total/len(z),
-                     responsibility_temperature=float(additions.get("responsibility_temperature", 1.0)),
-                     phase="guided_initialization" if warm else "alternating_mixture" if guided else "mixture_likelihood",
-                     effective_residual_events=float(weights.sum().square()/weights.square().sum()))
+    signal_values = chunks(lambda x: signal_log_prob(model, x), z, device=device)
+    if mass_fraction_active:
+        gate_logit = torch.from_numpy(
+            mass_fraction_logits(mass_fraction_state, ztrain[:, -1], mass_fraction_settings)
+        ).to(dtype=torch.float64)
+    else:
+        gate_logit = logit.detach().cpu()
+    nll = -float(mixture_log_density(signal_values, logb, gate_logit).double().mean())
+    diagnostics = dict(train_objective=total/len(z), contrastive_loss=contrast/len(z),
+                       tail_rank_loss=tail_total/len(z),
+                       responsibility_temperature=float(additions.get("responsibility_temperature", 1.0)),
+                       phase="guided_initialization" if warm else "alternating_mass_fraction" if mass_fraction_active else "alternating_mixture" if guided else "mixture_likelihood",
+                       effective_residual_events=float(weights.sum().square()/weights.square().sum()))
+    if mass_fraction_active:
+        from .mass_fraction import state_summary
+        summary = state_summary(mass_fraction_state, ztrain[:, -1], mass_fraction_settings)
+        diagnostics.update(mass_fraction_mean=summary["mean"], mass_fraction_min=summary["minimum"],
+                           mass_fraction_max=summary["maximum"], mass_fraction_roughness=summary["roughness"],
+                           mass_fraction_updates=summary["updates"])
+    return nll, diagnostics, mass_fraction_state
 
 
-def _cpu_residual_payload(model, logit, epoch):
+def _cpu_residual_payload(model, logit, epoch, mass_fraction_state=None):
     return {
         "model": {
             key: value.detach().cpu().clone() if isinstance(value, torch.Tensor) else value
@@ -183,10 +220,11 @@ def _cpu_residual_payload(model, logit, epoch):
         "fraction_logit": logit.detach().cpu().clone(),
         "epoch": int(epoch),
         "scientific_version": SCIENTIFIC_VERSION,
+        "mass_fraction_state": deepcopy(mass_fraction_state),
     }
 
 
-def _offer_candidate(candidates, count, epoch, validation_nll, model, logit):
+def _offer_candidate(candidates, count, epoch, validation_nll, model, logit, mass_fraction_state=None):
     key = (float(validation_nll), int(epoch))
     if len(candidates) >= count:
         worst = max((c["validation_nll"], c["epoch"]) for c in candidates)
@@ -197,7 +235,7 @@ def _offer_candidate(candidates, count, epoch, validation_nll, model, logit):
         "validation_nll": float(validation_nll),
         "filename": f"residual_epoch_{epoch}.pt",
         "sha256": None,
-        "payload": _cpu_residual_payload(model, logit, epoch),
+        "payload": _cpu_residual_payload(model, logit, epoch, mass_fraction_state),
     })
     candidates.sort(key=lambda c: (c["validation_nll"], c["epoch"]))
     if len(candidates) > count:
@@ -368,10 +406,14 @@ def train_residual(
     initial_fraction = float(logit.sigmoid().detach())
     if active["guided_fit"]:
         logit.requires_grad_(False)
+    from .mass_fraction import is_enabled as mass_fraction_enabled, initial_state as initial_mass_fraction_state
+    mass_fraction_active = mass_fraction_enabled(settings, fraction)
+    mass_fraction_state = (initial_mass_fraction_state(initial_fraction, settings)
+                           if mass_fraction_active else None)
     optimizer = residual_optimizer(model, logit, options)
     scheduler = None
     if control.get("lr_factor", 1) < 1:
-        # Only the flow learning rate changes; fraction learning stays unchanged.
+
         minimum = [control["min_lr"]] + [options["learning_rate"]] * (len(optimizer.param_groups) - 1)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode="min", factor=control["lr_factor"], patience=control["lr_patience"],
@@ -381,6 +423,12 @@ def train_residual(
         model.load_state_dict(checkpoint["model"])
         with torch.no_grad():
             logit.copy_(checkpoint["fraction_logit"].to(device))
+        saved_mass_fraction = checkpoint.get("mass_fraction_state")
+        if mass_fraction_active and saved_mass_fraction is None:
+            raise ValueError("v5.3 recovery checkpoint is missing its smooth f(m) state")
+        if not mass_fraction_active and saved_mass_fraction is not None:
+            raise ValueError("Recovery checkpoint has an unexpected smooth f(m) state")
+        mass_fraction_state = deepcopy(saved_mass_fraction)
         optimizer.load_state_dict(checkpoint["optimizer"])
         if scheduler is not None:
             scheduler.load_state_dict(checkpoint["scheduler"])
@@ -410,6 +458,16 @@ def train_residual(
                                     batch_size=options["batch_size"],
                                     context=(ztrain[:, -1] if mass_conditioning else None), device=device)
         restore_rng(before)
+        if mass_fraction_active and checkpoint is None:
+            from .mass_fraction import fit as fit_mass_fraction, state_summary
+            mass_fraction_state = fit_mass_fraction(
+                ztrain[:, -1], torch.as_tensor(guide).detach().cpu().numpy(),
+                mass_fraction_state, settings, source="cross_fitted_mass_blind_guide",
+            )
+            initial_summary = state_summary(mass_fraction_state, ztrain[:, -1], settings)
+            with torch.no_grad():
+                f0 = float(initial_summary["mean"])
+                logit.fill_(np.log(f0/(1-f0)))
     write_json(
         output / "residual_training_inputs.json",
         {
@@ -422,11 +480,19 @@ def train_residual(
             "truth_labels_used": False,
             "mass_input_used": mass_conditioning,
             "initial_fraction": initial_fraction,
-            "fraction_mode": "learned" if fraction is None else "fixed",
+            "fraction_mode": ("learned_smooth_f(m)" if mass_fraction_active else
+                              "learned_global" if fraction is None else "fixed_global"),
             "initialization": initialization,
             "settings": settings,
             "effective_features": active,
-            "fraction_estimator": "guided responsibilities" if active["guided_fit"] else "gradient likelihood",
+            "fraction_estimator": ("five-control-point smooth logistic f(m) from latent responsibilities; excluded from final score"
+                                   if mass_fraction_active else
+                                   "guided responsibilities" if active["guided_fit"] else "gradient likelihood"),
+            "mass_fraction": (None if not mass_fraction_active else {
+                "enabled": True, "settings": settings["mass_fraction"],
+                "training_evidence": "latent residual responsibilities only; no mjj count/bump density",
+                "final_score_uses_fraction": False,
+            }),
             "enhanced_training_protocol": ENHANCED_TRAINING_PROTOCOL if enhanced else None,
             "features": ztrain.shape[1],
             "background_correction": (None if corrected_background is None else {
@@ -454,8 +520,8 @@ def train_residual(
     try:
         for epoch in range(start, epochs):
             if fraction is None and not active["guided_fit"]:
-                # Optimizer retains the fraction parameter, but receives no gradient
-                # during warm-up. No optimizer state is created for it until release.
+                # Freeze fraction gradients during warm-up.
+
                 logit.requires_grad_(epoch >= warmup)
             losses = {}
             flow_lr = optimizer.param_groups[0]["lr"]
@@ -463,15 +529,16 @@ def train_residual(
             for part, loader, opt in (("train", train_loader, optimizer), ("validation", val_loader, None)):
                 progress.substep(part.title(), 0, len(loader))
                 if part == "train" and enhanced:
-                    losses["train_nll"], diagnostics = enhanced_epoch(
+                    losses["train_nll"], diagnostics, mass_fraction_state = enhanced_epoch(
                         model, logit, ztrain, optimizer, options, additions, epoch=epoch, seed=seed, guide=guide,
                         fixed_fraction=fraction is not None, background_model=corrected_background,
+                        mass_fraction_state=mass_fraction_state, mass_fraction_settings=settings,
                         progress=lambda done, total: progress.substep("Train", done, total))
                     continue
                 if part == "validation" and enhanced:
-                    # DataLoader iteration draws a base seed even without shuffle.
-                    # Validation must not perturb the next training permutation or
-                    # dropout stream. Match the study's chunked, float64 reduction.
+                    # Preserve training RNG state while computing validation losses.
+
+
                     from .enhancements import chunks, standard_normal_log_prob
                     from .integrity import mixture_log_density
                     model.eval()
@@ -484,9 +551,16 @@ def train_residual(
                             valid_latent, valid[:, -1], device=device)
                     else:
                         log_background = standard_normal_log_prob(valid_latent)
+                    if mass_fraction_active:
+                        from .mass_fraction import logits as mass_fraction_logits
+                        validation_logit = torch.from_numpy(
+                            mass_fraction_logits(mass_fraction_state, zval[:, -1], settings)
+                        ).to(dtype=torch.float64)
+                    else:
+                        validation_logit = logit.detach().cpu()
                     losses["validation_nll"] = -float(mixture_log_density(
                         chunks(lambda x: signal_log_prob(model, x), valid, device=device), log_background,
-                        logit.detach().cpu()).double().mean())
+                        validation_logit).double().mean())
                     continue
                 losses[part + "_nll"] = train_epoch(
                     model,
@@ -496,7 +570,13 @@ def train_residual(
                     lambda done, total: progress.substep(part.title(), done, total),
                     gradient_clip_norm=options["gradient_clip_norm"],
                 )
-            fitted_fraction = float(logit.sigmoid().detach())
+            if mass_fraction_active:
+                from .mass_fraction import state_summary
+                fitted_fraction = float(state_summary(mass_fraction_state, ztrain[:, -1], settings)["mean"])
+                with torch.no_grad():
+                    logit.fill_(np.log(fitted_fraction/(1-fitted_fraction)))
+            else:
+                fitted_fraction = float(logit.sigmoid().detach())
             if not np.isfinite([*losses.values(), fitted_fraction]).all():
                 raise FloatingPointError("Nonfinite residual training state")
             row = {"epoch": epoch, **losses, "signal_fraction": fitted_fraction, **diagnostics}
@@ -515,7 +595,8 @@ def train_residual(
                            and stale >= control["early_stopping_patience"])
             if epoch >= warmup:
                 _offer_candidate(
-                    candidates, options["selected_checkpoints"], epoch, losses["validation_nll"], model, logit
+                    candidates, options["selected_checkpoints"], epoch, losses["validation_nll"], model, logit,
+                    mass_fraction_state
                 )
             durable = persist_boundary(epoch, epochs) or stopped
             if durable:
@@ -526,6 +607,7 @@ def train_residual(
                     "epoch": epoch,
                     "model": model.state_dict(),
                     "fraction_logit": logit.detach(),
+                    "mass_fraction_state": deepcopy(mass_fraction_state),
                     "optimizer": optimizer.state_dict(),
                     "rng": rng_state(),
                     "history": history,
@@ -548,8 +630,8 @@ def train_residual(
             if stopped:
                 break
     except BaseException:
-        # A controlled shutdown never publishes history newer than the last
-        # durable resume point. At most nine epochs are intentionally replayed.
+        # Publish history only through the last durable recovery point.
+
         write_json(output / "residual_losses.json", {"history": durable_history})
         raise
     write_json(output / "residual_losses.json", {"history": history})
@@ -577,10 +659,40 @@ def train_residual(
             "checkpoint_weights": [float(x) for x in checkpoint_weights],
             "validation_nll": [float(x) for x in selected_nll],
             "signal_fractions": [history[i]["signal_fraction"] for i in order],
+            "mass_fraction": ({
+                "enabled": True,
+                "model": "five-control-point natural-cubic logistic spline",
+                "training_evidence": "latent residual responsibilities only",
+                "final_score_uses_fraction": False,
+                "selected_states": [
+                    torch.load(output / f"residual_epoch_{epoch}.pt", map_location="cpu", weights_only=True).get("mass_fraction_state")
+                    for epoch in order
+                ],
+            } if mass_fraction_active else {"enabled": False}),
             **(dict(trained_epochs=len(history), maximum_epochs=epochs, stopped_early=stopped,
                     excluded_warmup_epochs=warmup) if control or enhanced else {}),
         },
     )
+    if mass_fraction_active:
+        from .mass_fraction import probabilities as mass_fraction_probabilities
+        selected = json.loads((output / "residual_selection.json").read_text())["mass_fraction"]["selected_states"]
+        context_grid = np.linspace(-1.0, 1.0, 101, dtype=np.float64)
+        curves = np.stack([mass_fraction_probabilities(state, context_grid, settings) for state in selected])
+        ensemble_curve = np.average(curves, axis=0, weights=checkpoint_weights)
+        write_json(output / "mass_fraction_curve.json", {
+            "schema": 1,
+            "model": "smooth training-only f(mjj)",
+            "context_definition": "(mjj - 3.5 TeV) / 0.2 TeV",
+            "context": context_grid.tolist(),
+            "mjj_tev": (3.5 + 0.2*context_grid).tolist(),
+            "ensemble_fraction": ensemble_curve.tolist(),
+            "checkpoint_epochs": order,
+            "checkpoint_weights": [float(x) for x in checkpoint_weights],
+            "checkpoint_fractions": curves.tolist(),
+            "truth_labels_used": False,
+            "mjj_count_density_used": False,
+            "included_in_final_score": False,
+        })
     return order, history
 
 
@@ -635,10 +747,10 @@ def residual_scores(output, order, z, device, *, normalization_checks=None, norm
             lambda x, c: corrected_log_prob(corrected_background, x, c),
             values[:, :-1], values[:, -1], device=device, size=8192).numpy()
     elif replay:
-        # Historical diagnostic replay uses the independent study arithmetic.
-        # Both production_v1 and the HC-derived production_v2 use the normal
-        # production scoring path so multi-fit production is not treated as a
-        # study-replay diagnostic.
+
+
+
+
         from .enhancements import standard_normal_log_prob
         log_background = standard_normal_log_prob(torch.from_numpy(z).double()).numpy()
     else:
@@ -685,6 +797,51 @@ def residual_scores(output, order, z, device, *, normalization_checks=None, norm
     if not np.isfinite(scores).all():
         raise FloatingPointError("Nonfinite residual ensemble scores")
     return scores
+
+
+def residual_fraction_probabilities(output, order, z, *, return_checkpoints=False):
+    """Evaluate the training-only mixture gate for saved residual checkpoints.
+
+    This helper is used for validation/configuration likelihood accounting only.
+    The exported RIDDLE anomaly score never multiplies by f(m).
+    """
+    output = Path(output)
+    z = np.asarray(z, dtype=np.float32)
+    if z.ndim != 2 or not len(z) or not np.isfinite(z).all():
+        raise ValueError("Mass-fraction evaluation requires finite residual inputs")
+    inputs = json.loads((output / "residual_training_inputs.json").read_text())
+    settings = inputs["settings"]
+    selection_path = output / "residual_selection.json"
+    checkpoint_weights = np.full(len(order), 1.0 / len(order), dtype=np.float64)
+    if selection_path.exists():
+        selection = json.loads(selection_path.read_text())
+        saved_epochs = list(selection.get("epochs", []))
+        saved_weights = np.asarray(selection.get("checkpoint_weights", []), dtype=np.float64)
+        if saved_weights.shape == (len(saved_epochs),) and all(epoch in saved_epochs for epoch in order):
+            checkpoint_weights = np.asarray([saved_weights[saved_epochs.index(epoch)] for epoch in order], dtype=np.float64)
+            checkpoint_weights /= checkpoint_weights.sum()
+    curves = []
+    for epoch in order:
+        checkpoint = torch.load(output / f"residual_epoch_{epoch}.pt", map_location="cpu", weights_only=True)
+        if checkpoint.get("scientific_version") != SCIENTIFIC_VERSION or checkpoint.get("epoch") != epoch:
+            raise ValueError("Mass-fraction checkpoint identity differs from selection")
+        state = checkpoint.get("mass_fraction_state")
+        if state is not None:
+            if not settings.get("mass_conditioning", False):
+                raise ValueError("Saved f(m) gate requires mass-conditioned inputs")
+            from .mass_fraction import probabilities
+            curve = probabilities(state, z[:, -1], settings)
+        else:
+            scalar = float(torch.sigmoid(checkpoint["fraction_logit"].double()).item())
+            curve = np.full(len(z), scalar, dtype=np.float64)
+        curves.append(np.asarray(curve, dtype=np.float64))
+    curves = np.stack(curves)
+    if return_checkpoints:
+        return curves, checkpoint_weights
+    result = np.average(curves, axis=0, weights=checkpoint_weights)
+    if not np.isfinite(result).all() or np.any(result <= 0) or np.any(result >= 1):
+        raise FloatingPointError("Invalid saved residual mixture fraction")
+    return result
 
 
 

@@ -50,7 +50,7 @@ def concurrent_environment(mode, device):
         import re
         if not re.fullmatch(r"(?:GPU|MIG)-[0-9a-fA-F-]{36}", visible):
             raise RuntimeError("Cannot verify the allocated GPU identity for MPS")
-        # UUIDs retain their meaning even when the MPS server renumbers devices.
+
         env = {"CUDA_VISIBLE_DEVICES": visible}
         root = Path(tempfile.gettempdir()) / f"ranode-mps-{os.getuid()}-{visible}"
         configured = os.environ.get("CUDA_MPS_PIPE_DIRECTORY")

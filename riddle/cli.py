@@ -215,8 +215,8 @@ def run_campaign(args):
             if method == "lacathode":
                 options.update(run_overrides)
             elif method == "riddle":
-                # Internal training/contract keys retain their historical
-                # spelling so existing ensemble checkpoints stay readable.
+
+
                 options["runs"] = args.fits
             env = os.environ.copy()
             if args.device == "cpu":

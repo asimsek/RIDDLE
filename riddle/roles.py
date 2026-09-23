@@ -1,13 +1,13 @@
-"""Versioned, truth-independent source-role policies for protocol reproduction."""
+"""Truth-independent source-role policies for protocol reproduction."""
 from pathlib import Path
 import numpy as np
 
 POLICIES = {
     'production_v1': ('production', 'production'),
-    # HC production baseline: validated study mapping policy with the normal
-    # production residual/member policy.  Unlike the one-fit HC diagnostic,
-    # this retrains the study-policy map for each run and preserves the normal
-    # per-fit production ensemble behavior.
+
+
+
+
     'production_v2': ('study', 'production'),
     'study_replay_v1': ('study', 'study'),
     'mapping_hybrid_v1': ('production', 'study'),
@@ -32,7 +32,7 @@ def validate_replay_batch(policy, batch_size):
 
 
 def override_roles(sources, roles, seed, policy, batch_size):
-    """Preserve production_v1 exactly; production_v2 promotes the HC study-map/production-residual combination."""
+    """Apply the configured mapping and residual role policy."""
     mapping, residual = policy_parts(policy)
     validate_replay_batch(policy, batch_size)
     roles = {k: dict(source=v['source'], indices=v['indices'].copy()) for k,v in roles.items()}
@@ -51,7 +51,7 @@ def override_roles(sources, roles, seed, policy, batch_size):
         roles.pop('calibration_train'); roles.pop('calibration_val')
     if residual == 'study':
         from .campaign import member_split
-        # The historical study used this source split before mapping rejection.
+
         a,b,_ = member_split(len(sources['innerdata_train']),seed,0,batch_size=256)
         if len(a)%512 == 1:
             b,a = np.r_[a[-1],b],a[:-1]
@@ -67,7 +67,7 @@ def override_roles(sources, roles, seed, policy, batch_size):
 def attach_source_ids(data, roles, mapped):
     path = Path(data)/'event_ids.npz'
     if not path.exists():
-        return  # Legacy/synthetic callers may not provide physical event identities.
+        return
     with np.load(path,allow_pickle=False) as ids:
         for name,role in roles.items():
             item = mapped[name]
@@ -98,11 +98,11 @@ def finalize_mapped(mapped, seed, policy, batch_size):
                 mapped[target].update(source=item['source'],source_indices=item['source_indices'][accepted])
     if residual == 'study':
         train,val = mapped['signal_train'],mapped['signal_val']
-        # Historical robustness shared-input preparation moves a final singleton
-        # to the END of validation, after mapping acceptance (distinct from source split).
+
+
         if len(train['z'])%batch_size == 1:
-            # Move the corresponding source row as well as its accepted latent.
-            # Rejected rows keep their original order and remain auditable.
+
+
             if 'mask' in train:
                 source_index=np.flatnonzero(train['mask'])[-1]
                 for key in ('rows','mask','source_ids','source_indices'):

@@ -31,8 +31,8 @@ def ledger(path):
 def environment(path):
     from scripts.riddle_protocol_environment import snapshot
     value = snapshot()
-    # Hostname is the pod name. The node, CPU flags, libraries, thread settings
-    # and all numerical settings remain strict across restarts and jobs.
+
+
     stable = {k:v for k,v in value.items() if k != 'hostname'}
     path = Path(path)
     if path.exists() and read(path)['numerical'] != stable:

@@ -156,8 +156,8 @@ def run(args, contract):
                 if partition in evaluation_ids: arrays["event_ids"] = evaluation_ids[partition]
                 exports[partition] = arrays
             if active["score_flow"]:
-                # A failed density evaluation in calibration/closure spends the
-                # same bounded fit retry budget as any other required export.
+                # Apply the same bounded retry budget to required density evaluations.
+
                 for role in ("calibration_train", "calibration_val", "closure"):
                     calibration_raw[role] = ensemble_predict(output / "density", development[role]["z"], args.device)
         except MemberScoreError as error:
@@ -223,9 +223,9 @@ def run(args, contract):
                 + ("validation-likelihood checkpoint weights" if feature_options(settings["riddle"]).get("checkpoint_weighting") == "validation_likelihood" else "equal checkpoint weights")
             ),
             "settings": settings,
-            "implementation": ("riddle_bgcorr_40_reguide_v3_multiwindow_closure" if background_correction is not None
-                               else "riddle_bgcorr_gaussian_fallback_v3_multiwindow_closure" if background_correction_decision is not None
-                               else "riddle_default_six_features_v2_hc_baseline"),
+            "implementation": ("riddle_v5_3_smooth_fm_bgcorr_40_reguide" if background_correction is not None
+                               else "riddle_v5_3_smooth_fm_gaussian_fallback" if background_correction_decision is not None
+                               else "riddle_v5_3_smooth_fm"),
             "data_policy": ("mapping_component_diagnostic_v1" if getattr(args,"mapping_experiment",None)
                             else settings["riddle"].get("data_policy", DEFAULT_POLICY)),
             "requested_features": {k: feature_options(settings["riddle"])[k] for k in active},
@@ -271,6 +271,12 @@ def run(args, contract):
             "fit_recovery": settings["riddle"]["fit_recovery"],
             "initialization": settings["riddle"]["initialization"],
             "fractions": args.fractions,
+            "mass_fraction": ({
+                **settings["riddle"]["mass_fraction"],
+                "role": "training-only smooth f(mjj) gate learned from latent residual responsibilities",
+                "uses_mjj_event_count_density": False,
+                "included_in_final_score": False,
+            } if settings["riddle"].get("mass_fraction", {}).get("enabled", False) else {"enabled": False}),
             "selected_checkpoints": result["selected_checkpoints"],
             "acceleration": execution_report(acceleration),
             **({"name": ("RIDDLE bgcorr_40_reguide" if background_correction is not None else
@@ -282,6 +288,8 @@ def run(args, contract):
                           "log(mean signal density p(z|mjj)) - log standard-normal latent density"),
                 "background": ("shared sideband-trained q_phi(z|mjj); no mass PDF factor" if background_correction is not None else
                                "standard-normal latent density conditional on mass; no mass PDF factor"),
+                "mixture_fraction": ("smooth f(mjj) learned from latent responsibilities; training only; excluded from score"
+                                     if settings["riddle"].get("mass_fraction", {}).get("enabled", False) else "global fraction"),
                 "context_features": ["mjj"], "scope": "signal_region"} if mass_conditioning else {}),
             **({"name": "RIDDLE physical + mass (CPU pilot)", "input_space": "physical",
                 "inputs": "Logit-standardized physical features plus mass context; no learned latent transform in signal inputs",

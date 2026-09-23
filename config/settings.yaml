@@ -11,6 +11,15 @@ riddle:
   fits: 10
   epochs: 100
   fractions: [learned]
+  mass_fraction:
+    enabled: true
+    control_points: 5
+    smoothness: 0.0001
+    variation: 0.0002
+    damping: 0.5
+    min_fraction: 0.00001
+    max_fraction: 0.5
+    max_iterations: 100
   initialization: background
   enhancements:
     rosenblatt: true

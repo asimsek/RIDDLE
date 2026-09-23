@@ -10,7 +10,7 @@ from .data import input_features
 
 
 def background_diagnostics(tree, features):
-    # Upstream samples omit mass; its diagnostic loop assumes an extra column.
+
     loops = [node for node in tree.body if isinstance(node, ast.For)
              and ast.dump(node.target) == ast.dump(ast.Name(id="i", ctx=ast.Store()))
              and ast.dump(node.iter) == ast.dump(ast.parse("range(5)", mode="eval").body)]

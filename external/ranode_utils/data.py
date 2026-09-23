@@ -98,7 +98,7 @@ def validate(root):
         for p in ("train", "val", "test")
     ):
         raise ValueError("Signal found in background-only physical data")
-    # Refuse ambiguous membership rather than silently assigning duplicate rows.
+    # Reject ambiguous memberships instead of assigning duplicate rows.
     train = row_keys(
         np.concatenate([arrays[f"{r}data_train.npy"] for r in ("inner", "outer")])
     )

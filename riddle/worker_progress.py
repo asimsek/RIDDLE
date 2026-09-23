@@ -306,8 +306,8 @@ class WorkerDisplay:
                 self.activity.bar.reset()
                 self.activity.bar.set_description_str(f"  {self.phase_label}", refresh=False)
                 self.activity.bar.update(initial)
-        # Epoch completions are the durable log records; heartbeats must not
-        # repeat their counters or recalculate an ETA mid-epoch.
+        # Keep heartbeat updates separate from durable epoch counters.
+
         if self.activity.unit == "epoch":
             self.activity.report_every = 1
         elif "report_every" in event:

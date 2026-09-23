@@ -44,8 +44,8 @@ SUMMARY_AXES = {
     "sic": dict(xscale="log", xlim=(1e-4, 1), yscale="linear"),
     "mass_flatness": dict(xscale="linear", xlim=(0.20, 0.01), yscale="log"),
 }
-# Shared by individual, comparison and summary panels, including new methods.
-# These are minimum display ranges; data and drawn bands can always expand them.
+
+
 PUBLICATION_Y_RANGES = {
     "mass_flatness": (0.5, 350.0),
     "sic": (0.0, 2.0),
@@ -183,13 +183,13 @@ def cached_plot_calculation(function):
     return calculate
 
 
-# The same saved fits appear in ROC, SIC, rejection and individual plots.
+
 roc_curve = cached_plot_calculation(roc_curve)
 roc_auc_score = cached_plot_calculation(roc_auc_score)
 
 
 def _export_worker_init():
-    # Export workers do no inference; avoid multiplying BLAS threads by workers.
+    # Disable inference work in export workers to avoid BLAS oversubscription.
     from threadpoolctl import threadpool_limits
 
     threadpool_limits(limits=1)
@@ -227,13 +227,13 @@ class FigureExporter:
         if self.pool is None:
             _save_figure(fig, path)
             return
-        # Snapshot before closing/reusing artists; workers receive no score data
-        # or inference runtime and never access the parent pyplot globals.
+
+
         try:
             payload = pickle.dumps(fig, protocol=pickle.HIGHEST_PROTOCOL)
         except (pickle.PicklingError, AttributeError, TypeError):
-            # Custom axes may contain local callbacks. Preserve their original
-            # renderer instead of making serialization a plotting requirement.
+
+
             _save_figure(fig, path)
             return
         while self.pending and (len(self.pending) >= self.max_pending
@@ -272,8 +272,8 @@ def plot_resources(*, workers=1, cache_mb=1024):
 def fit_scores(record):
     if (record.get("plot_saved_ensemble", False) or
             str(record.get("fit_score_kind", "")) == "member_ratio_mapped_by_frozen_ensemble_calibrator"):
-        # Component densities are not independent calibrated methods. Averaging
-        # their histograms/efficiencies does not evaluate the saved ensemble.
+        # Evaluate calibrated ensembles instead of averaging component densities.
+
         return record["scores"][None, :]
     return record.get("fit_scores", record["scores"][None, :])
 
@@ -395,8 +395,8 @@ def fit_curve_summary(curves, run_groups=None):
         groups = np.asarray(run_groups)
         if groups.shape != (len(curves),):
             raise ValueError("Each curve needs a complete-run identity")
-        # Shared-background LaCathode classifier fits retain their median
-        # prediction, but only complete runs enter the uncertainty percentiles.
+        # Use median classifier predictions and complete runs for LaCATHODE uncertainty.
+
         rejection = np.asarray([np.median(rejection[groups == key], axis=0) for key in np.unique(groups)])
         sic = np.asarray([np.median(sic[groups == key], axis=0) for key in np.unique(groups)])
     return signal, np.percentile(rejection, [16, 50, 84], axis=0), np.percentile(sic, [16, 50, 84], axis=0)
@@ -431,7 +431,7 @@ def draw_fit_curves(ax, curves, metric, label, color, linestyle, *, uncertainty_
     else:
         x, y = 1 / rejection, sic
     if band and run_count > 1:
-        # Parametric ribbon at fixed signal efficiency, retaining upstream axes.
+
         ax.fill(np.r_[x[0], x[2, ::-1]], np.r_[y[0], y[2, ::-1]],
                 color=color, alpha=.18, linewidth=0)
     ax.plot(x[1], y[1], label=label, color=color, ls=linestyle)
@@ -856,9 +856,9 @@ def place_axis_legend(fig, ax, spec):
         transform = ax.yaxis.get_transform()
         low, high = transform.transform(ax.get_ylim())
         ax.set_ylim(*transform.inverted().transform([low, high + 0.3 * (high - low)]))
-    # A crowded panel should never make the plotting campaign fail.  If an
-    # overlap-free internal position does not exist, use a compact external
-    # legend; bbox_inches="tight" keeps it in both vector and raster exports.
+
+
+
     ax.set_ylim(original_ylim)
     item = ax.legend(
         spec["handles"], spec["labels"], loc="upper left", bbox_to_anchor=(1.02, 1.0),
@@ -920,8 +920,8 @@ def _save_figure(fig, path):
     path.parent.mkdir(parents=True, exist_ok=True)
     for ax in fig.axes:
         kind = getattr(ax, "_publication_yaxis", None)
-        # Some publication plots intentionally request an exact axis window.
-        # Do not let the automatic publication-range helper overwrite it.
+        # Preserve explicitly requested axis windows.
+
         if kind is not None and not getattr(ax, "_publication_fixed_ylim", False):
             publication_ylim(ax, kind)
     place_legend(fig)
@@ -1401,7 +1401,7 @@ def strict_cut_histograms(values, edges, scores, mask, thresholds):
     cumulative = np.cumsum(counts.reshape(-1, bins)[::-1], axis=0)[::-1][1:]
     result = np.empty_like(cumulative)
     result[order] = cumulative
-    # A NaN threshold never passes, irrespective of its sorted position.
+    # A NaN threshold never passes.
     result[np.isnan(thresholds)] = 0
     return result
 
@@ -1424,8 +1424,8 @@ def mass_scan_histograms(sample, keys, cuts=SCORE_CUTS):
             raise ValueError("Mass-scan score thresholds must be strictly between zero and one")
     histograms = {}
     for key in keys:
-        # Retain the scalar logit calculation and stored-array precision, so
-        # events exactly at a cut fail identically to selected().
+        # Match stored score precision so events at a cut are classified identically.
+
         thresholds = np.asarray([logit(cut) if key == "residual" else cut for cut in cuts],
                                 dtype=sample[key + "_scores"].dtype)
         fits = sample_fit_scores(sample, key)

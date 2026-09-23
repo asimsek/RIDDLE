@@ -34,9 +34,9 @@ def split_roles(data, seed, *, calibration):
             if len(indices) < 2:
                 raise ValueError(f"Too few events for independent {name}")
             roles[name] = dict(source=source, indices=indices)
-    # Keep upstream populations fixed when disabling Score flow. Otherwise its
-    # off-switch also changes the background map and every downstream model.
-    # Reserved calibration rows stay unused when calibration is disabled.
+    # Keep upstream populations fixed when disabling score-flow ablations.
+
+
     assign("outerdata_train", ("map_train", "calibration_train"), (.75, .25), 100)
     assign("outerdata_val", ("map_val", "calibration_val", "closure"), (.5, .25, .25), 101)
     assign("innerdata_train", ("residual_train",), (1.,), 102)
@@ -66,7 +66,7 @@ class Mapper:
         self.model.eval().requires_grad_(False)
 
     def map(self, rows):
-        # Erase truth before the preprocessing API, including for evaluation.
+        # Remove truth labels before preprocessing.
         clean = np.asarray(rows, dtype=np.float32).copy(); clean[:, -1] = 0
         prepared = load_dataset(clean, external_datadict=self.reference)
         x, m = prepared["tensor2"], prepared["labels"]
@@ -91,7 +91,7 @@ def prepare(data, output, seed, device, *, background, options, data_policy=None
         from .mapping_experiment import mapping_inputs
         roles, experiment_reference = mapping_inputs(experiment, roles, sources, device)
     arrays = {k: sources[v["source"]][v["indices"]] for k, v in roles.items()}
-    # Only mass and observables enter fitting or its reproducibility contract.
+    # Only mass and observables enter fitting and reproducibility checks.
     clean = {}
     for name, rows in arrays.items():
         clean[name] = rows.copy(); clean[name][:, -1] = 0

@@ -8,7 +8,7 @@ DEFAULT_ENHANCEMENTS = {
     "hard_start_epoch": 5, "hard_pool_fraction": 0.25, "hard_sampling_fraction": 0.5,
     "contrastive_strength": 1.0, "score_flow_epochs": 60,
     "rosenblatt_bins": 12, "rosenblatt_hidden": 64, "rosenblatt_bound": 8.0,
-    # Tail-sensitivity ablations.  Defaults reproduce the v4.6 nominal path.
+
     "guide_folds": 2,
     "guide_mass_conditioning": False,
     "guide_reference_multiplier": 1,
@@ -34,7 +34,7 @@ def feature_options(settings):
 def effective_features(settings):
     options = feature_options(settings)
     result = {name: options[name] for name in FEATURES}
-    # Mining belongs to the guide. Turning off the guide alone must be usable.
+
     result["hard_bg"] = result["hard_bg"] and result["guided_fit"]
     return result
 

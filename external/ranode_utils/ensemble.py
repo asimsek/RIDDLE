@@ -9,7 +9,7 @@ import numpy as np
 from riddle.production import NumericalFitError
 
 
-MASS_BINS = np.linspace(3.3, 3.7, 50)  # Pinned scripts/r_anode.py mass marginal.
+MASS_BINS = np.linspace(3.3, 3.7, 50)
 
 
 def validate_upstream_likelihood(namespace):
@@ -67,7 +67,7 @@ def validate_result_normalization(root, report):
 
     protocol = json.loads(verified("protocol.json").read_text())
     attempts = protocol.get("signal_attempts", [])
-    # Older single-fit adapter releases used signal_attempt.
+
     if not attempts and protocol.get("signal_attempt"):
         attempts = [protocol["signal_attempt"]]
     requested = protocol.get("valid_runs", protocol.get("requested_runs", 1))
@@ -116,7 +116,7 @@ def selected_epochs(attempt, epochs, *, safeguards=True):
 def combine_fits(attempts, output, *, requested_runs, safeguards=True):
     if not attempts or len(attempts) != requested_runs or len(set(attempts)) != requested_runs:
         raise ValueError("All requested R-ANODE fits must complete before ensembling")
-    # Validate every denominator before writing any ensemble partition.
+    # Validate every denominator before writing ensemble outputs.
     for attempt in attempts:
         mass_normalization_check(attempt, safeguards=safeguards)
     fields = ("mass", "physical", "labels", "scores", "mask", "is_signal_region")

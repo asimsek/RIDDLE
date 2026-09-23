@@ -5,7 +5,7 @@ import json
 import numpy as np
 import torch
 
-SCIENTIFIC_VERSION = 4
+SCIENTIFIC_VERSION = 5
 
 
 def require_finite(value, stage):
@@ -39,7 +39,7 @@ def ordered_epochs(losses, count, *, initial_entry=False):
     if losses.ndim != 1 or type(count) is not int or count < 1:
         raise ValueError("Invalid checkpoint selection request")
     require_finite(losses, "Checkpoint validation losses")
-    # Entry zero is an untrained diagnostic, never a saved checkpoint.
+    # Checkpoint entry zero is an untrained diagnostic.
     trained = losses[1:] if initial_entry else losses
     if len(trained) < count:
         raise ValueError("Not enough trained checkpoints for selection")

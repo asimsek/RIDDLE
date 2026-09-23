@@ -20,13 +20,13 @@ PROTOCOL = {
     "weight_decay": 0.01,
     "fraction_weight_decay": 0.0,
     "mixture_loss": "logaddexp with log-sigmoid weights; no density floor",
-    "fraction_interpretation": "fitted mixture parameter, not an unbiased contamination measurement",
+    "fraction_interpretation": "v5.3 default is a smooth mass-dependent training gate f(m), not an unbiased contamination measurement",
     "gradient_clip": "flow parameters only; norm 1",
     "selected_checkpoints": 10,
-    "inputs": "saved real-data SR latents; no mass or truth labels",
-    "background": "standard-normal latent base; no mass PDF",
+    "inputs": "saved real-data SR latents with mjj as conditional context; no truth labels",
+    "background": "conditional latent background q_B(z|m); no mass PDF factor in the anomaly score",
     "ensemble": "arithmetic mean of ten signal densities; validation mixture NLL selection",
-    "score": "log(mean signal density) - log standard-normal density",
+    "score": "log(mean p_signal(z|m)) - log q_B(z|m); learned f(m) is excluded from the final score",
     "scan_score": "sigmoid(log density ratio); monotone display coordinate, not signal probability",
 }
 
@@ -96,8 +96,8 @@ def initial_fraction_logit(seed, device="cpu"):
 
 def background_log_prob(z, *, mass_conditioning=False, physical_inputs=False):
     if physical_inputs:
-        # Cached frozen p_B in exactly the same preprocessed coordinates as p_S.
-        # This column is bookkeeping and is never passed to the signal network.
+        # Cache p_B in the same preprocessed coordinates as p_S.
+
         return z[..., -1]
     if mass_conditioning:
         z = z[..., :-1]

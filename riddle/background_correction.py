@@ -25,8 +25,8 @@ EPOCHS = 40
 PROTOCOL = "shared_sideband_qphi_reguide_independent_diagnostic"
 CLOSURE_SCOPE = "correction_only_interpolation_on_fixed_upstream_map; not_full_search_closure"
 MIN_VALIDATION_IMPROVEMENT = 0.0
-# Three localized interpolation probes per sideband.  Quantile windows are
-# deliberately separated and leave training support on both sides of every gap.
+# Leave training support on both sides of each interpolation gap.
+
 PSEUDO_WINDOW_QUANTILES = ((0.15, 0.30), (0.425, 0.575), (0.70, 0.85))
 MIN_PSEUDO_WINDOW_EVENTS = 30
 MIN_POSITIVE_WINDOWS_PER_SIDE = 2

@@ -183,8 +183,8 @@ class Mapper:
             features, mask = self.physical(original)
             real.append(np.column_stack((original[mask, 0], features, np.ones(mask.sum()),
                                          original[mask, -1])).astype(np.float32))
-        # Reference rows never train the residual model; preserve their positions
-        # in the common shuffle so v2/v3 reserve exactly the same real events.
+        # Keep reference-row positions fixed so compared protocols reserve identical real events.
+
         placeholders = np.zeros((reference_samples, real[0].shape[1]), dtype=np.float32)
         count = int(len(real[0]) / (len(real[0]) + len(real[1])) * reference_samples)
         train = np.concatenate((placeholders[:count], real[0]))

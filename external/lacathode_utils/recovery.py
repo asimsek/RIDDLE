@@ -102,7 +102,7 @@ class EpochRecovery:
                     verify_artifacts(self.root, state["files"], "Verify classifier fit recovery")
                     self.files.update(state["files"])
                 elif index == 0 and self.state and self.state["phase"] == "classifier":
-                    state = self.state  # Resume pre-multifit classifier checkpoints.
+                    state = self.state
                 self.path, self.state, self.next_epochs, self.classifier_run = path, state, {}, index
                 if state and state["kind"] == "complete":
                     restore_rng(state["rng"])

@@ -38,7 +38,7 @@ class MADE(nn.Module):
         super(MADE, self).__init__()
         if type(pre_exp_tanh) is not bool:
             raise ValueError("pre_exp_tanh must be boolean")
-        # An explicit bound takes precedence; the legacy switch means tanh(a).
+        # Explicit bounds override the tanh compatibility switch.
         if affine_log_scale_bound is None and pre_exp_tanh:
             affine_log_scale_bound = 1.
         if affine_log_scale_bound is not None and (

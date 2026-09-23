@@ -9,7 +9,8 @@ from riddle.worker_progress import emit_message
 from riddle.storage import atomic_write, write_json
 from riddle.storage import digest, file_digest
 from .model import PROTOCOL as SINGLE_PROTOCOL, background_log_prob, real_sr_latents
-from .training import train_residual, residual_scores, residual_background_log_prob, residual_background_sample
+from .training import (train_residual, residual_scores, residual_background_log_prob, residual_background_sample,
+                       residual_fraction_probabilities)
 from .integrity import SCIENTIFIC_VERSION
 from .production import (PRODUCTION_POLICY, EVIDENCE_GATED_POLICY, fit_acceptance,
                          require_complete_members, require_complete_ensemble)
@@ -46,7 +47,7 @@ def reject_scoring_member(output, member, error):
                        error_type=type(error).__name__)
         state["invalidated_receipt"] = True
         write_json(root / "attempts.json", state)
-        # The ledger is authoritative if a process is interrupted between these writes.
+
         (root / "fit.json").unlink(missing_ok=True)
     selection = json.loads((output / "ensemble_selection.json").read_text())
     selection["status"] = "incomplete"
@@ -91,29 +92,31 @@ def assess_fit(directory, epochs, fractions, validation, device, *, sigma, norma
     if background_reference is not None:
         reference = np.asarray(background_reference)
     elif correction is not None:
-        # Match the validated bgcorr study: sample the actual q_phi denominator
-        # across the full SR context range, not a Gaussian proxy.
+        # Sample the fitted q_phi denominator across the full SR context range.
+
         contexts = np.random.default_rng(3407).uniform(-1.0, 1.0, 8192).astype(np.float32)
         reference = residual_background_sample(directory, contexts, len(contexts), 3408, device)
     else:
         reference = np.random.default_rng(3407).standard_normal((8192, validation.shape[1])).astype(np.float32)
         if mass_conditioning:
-            # Gaussian latents at reserved-data masses, independent of the latents.
-            # The conditional denominator has no Gaussian density factor for mass.
+
+
             reference[:, -1] = np.random.default_rng(3408).choice(validation[:, -1], len(reference))
     if reference.shape != (8192, validation.shape[1]) or not np.isfinite(reference).all():
         raise ValueError("Invalid background normalization reference")
     rows = np.concatenate((validation, reference))
     mixture, reference_sum, checks = None, None, []
+    checkpoint_fractions, _ = residual_fraction_probabilities(
+        directory, epochs, validation, return_checkpoints=True)
     with torch.random.fork_rng(devices=[] if str(device) == "cpu" else None):
-        for epoch, weight in zip(epochs, fractions):
+        for epoch, weight in zip(epochs, checkpoint_fractions):
             ratio = residual_scores(directory, [epoch], rows, device)
             valid, normal = ratio[:len(validation)], ratio[len(validation):]
             checks.append(dict(epoch=epoch, **validate_density_ratio(
                 normal, stage=f"{directory} checkpoint {epoch}", tests=normalization_tests)))
             reference_sum = normal if reference_sum is None else np.logaddexp(reference_sum, normal)
-            weighted = np.logaddexp(np.log1p(-weight) if weight < 1 else -np.inf,
-                                    (np.log(weight) if weight > 0 else -np.inf) + valid)
+            from .enhancements import mixture_gain
+            weighted = mixture_gain(valid, weight)
             mixture = weighted if mixture is None else np.logaddexp(mixture, weighted)
     mixture -= np.log(len(epochs))
     if profile_validation is not None:
@@ -226,7 +229,7 @@ def train_member(rows, validation, output, *, relative, index, fraction, epochs,
         if state.pop("invalidated_receipt", False):
             terminal.unlink(missing_ok=True)
             write_json(state_path, state)
-        # Verify every recorded attempt, including numerical failures, on resume.
+
         for attempt in state["attempts"]:
             directory = Path(output) / attempt["directory"]
             if attempt.get("artifacts_sha256") is not None:
@@ -276,9 +279,11 @@ def train_member(rows, validation, output, *, relative, index, fraction, epochs,
                             rows[b], mass_conditioning=settings.get("mass_conditioning", False),
                             physical_inputs=settings.get("input_space") == "physical"),
                         "fixed_coherent_fraction": fraction}
-                       if effective_features(settings)["coherent_mixture"] else {}),
+                       if (effective_features(settings)["coherent_mixture"]
+                           and not (settings.get("mass_fraction", {}).get("enabled", False) and fraction is None))
+                       else {}),
                     **({"background_reference": background_reference} if background_reference is not None else {}))
-                # Kept alongside the selected density for configuration selection, never test labels.
+
                 from .storage import save_array
                 atomic_write(directory / "validation_log_mixture_ratio.npy", lambda p: save_array(p, mixture))
                 assessment = fit_acceptance(dict(quality=quality, normalization=normalization))
@@ -347,7 +352,7 @@ def train_campaign(
         raise ValueError("Coherent mixture requires separate internal selection and reserved evidence populations")
     if mass_conditioning:
         rows = train[train[:, -2] == 1].copy()
-        rows[:, -1] = 0  # Truth is never used by the density fit.
+        rows[:, -1] = 0  # Truth labels are excluded from density fitting.
     else:
         rows = np.column_stack((np.full(len(ztrain), 3.5), ztrain,
                                 np.ones(len(ztrain)), np.zeros(len(ztrain)))).astype(np.float32)
@@ -423,24 +428,56 @@ def train_campaign(
             combined = np.logaddexp.reduce(mixtures, axis=0) - np.log(len(members))
             selection_gain = None
             if zselection is not None:
-                # A single ensemble density and coefficient, profiled on a common
-                # sample withheld from every member, never on evidence/test rows.
                 from .enhancements import profile_fraction, mixture_gain
                 ratios = [residual_scores(output / m["directory"], m["epochs"], zselection, device)
                           for m in members]
-                internal = np.logaddexp.reduce(ratios, axis=0)-np.log(len(members))
+                mass_fraction_mode = bool(settings.get("mass_fraction", {}).get("enabled", False)
+                                          and config["fraction"] is None)
                 if coherent:
-                    weight = profile_fraction(internal) if config["fraction"] is None else config["fraction"]
-                    config["coherent_mixture"] = dict(fraction=weight, density="equal mean over fits; per-fit checkpoint weights recorded by each residual selection",
-                        validation_sha256=digest(zselection), selection_events=len(zselection), truth_labels_used=False)
-                    evidence_ratio = np.logaddexp.reduce([
-                        residual_scores(output / m["directory"], m["epochs"], zval, device) for m in members], axis=0)-np.log(len(members))
-                    combined = mixture_gain(evidence_ratio, weight)
-                    selection_gain = mixture_gain(internal, weight)
+                    evidence_ratios = [residual_scores(
+                        output / m["directory"], m["epochs"], zval, device) for m in members]
+                    if mass_fraction_mode:
+                        selection_fractions = [residual_fraction_probabilities(
+                            output / m["directory"], m["epochs"], zselection) for m in members]
+                        evidence_fractions = [residual_fraction_probabilities(
+                            output / m["directory"], m["epochs"], zval) for m in members]
+                        selection_terms = [mixture_gain(ratio, fraction)
+                                           for ratio, fraction in zip(ratios, selection_fractions)]
+                        evidence_terms = [mixture_gain(ratio, fraction)
+                                          for ratio, fraction in zip(evidence_ratios, evidence_fractions)]
+                        selection_gain = np.logaddexp.reduce(selection_terms, axis=0) - np.log(len(members))
+                        combined = np.logaddexp.reduce(evidence_terms, axis=0) - np.log(len(members))
+                        selection_fraction = np.mean(np.stack(selection_fractions), axis=0)
+                        config["coherent_mixture"] = dict(
+                            mode="smooth_f(m)",
+                            density="equal mean of per-fit mixture densities with each fit's selected f(m) gate",
+                            validation_sha256=digest(zselection), selection_events=len(zselection),
+                            truth_labels_used=False, final_score_uses_fraction=False,
+                            selection_fraction_mean=float(selection_fraction.mean()),
+                            selection_fraction_min=float(selection_fraction.min()),
+                            selection_fraction_max=float(selection_fraction.max()),
+                        )
+                    else:
+                        internal = np.logaddexp.reduce(ratios, axis=0)-np.log(len(members))
+                        evidence_ratio = np.logaddexp.reduce(evidence_ratios, axis=0)-np.log(len(members))
+                        weight = profile_fraction(internal) if config["fraction"] is None else config["fraction"]
+                        config["coherent_mixture"] = dict(fraction=weight, density="equal mean over fits; per-fit checkpoint weights recorded by each residual selection",
+                            validation_sha256=digest(zselection), selection_events=len(zselection), truth_labels_used=False)
+                        combined = mixture_gain(evidence_ratio, weight)
+                        selection_gain = mixture_gain(internal, weight)
                 else:
-                    # Preserve checkpoint-specific fractions when coherence is disabled.
-                    terms = [mixture_gain(residual_scores(output / m["directory"], [e], zselection, device), w)
-                             for m in members for e, w in zip(m["epochs"], m["signal_fractions"])]
+                    if mass_fraction_mode:
+                        terms = []
+                        for m in members:
+                            curves, _ = residual_fraction_probabilities(
+                                output / m["directory"], m["epochs"], zselection, return_checkpoints=True)
+                            for e, curve in zip(m["epochs"], curves):
+                                terms.append(mixture_gain(
+                                    residual_scores(output / m["directory"], [e], zselection, device), curve))
+                    else:
+
+                        terms = [mixture_gain(residual_scores(output / m["directory"], [e], zselection, device), w)
+                                 for m in members for e, w in zip(m["epochs"], m["signal_fractions"])]
                     selection_gain = np.logaddexp.reduce(terms, axis=0)-np.log(len(terms))
             from .production import validation_improvement
             config["health"] = dict(normalization_status="passed",

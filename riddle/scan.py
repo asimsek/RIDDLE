@@ -98,7 +98,7 @@ def prepare_scan(args):
             for scenario in ("signal_injection",):
                 validate(stage / scenario)
             os.rename(stage, destination)
-        # Each point is atomic and self-describing; this inventory also includes resumed points.
+
         write_json(
             root / "scan_inputs.json",
             {
@@ -117,7 +117,7 @@ def run_scan(args):
 
     plan = points(args)
     data_root, output_root = args.data.resolve(), args.output.resolve()
-    # Validate the entire request before starting any expensive stage.
+
     for point in plan:
         manifest = validate(
             data_root / point_name(point) / "signal_injection",

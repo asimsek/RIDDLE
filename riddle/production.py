@@ -79,7 +79,7 @@ def fit_acceptance(health):
                 fit_status="valid_" + evidence if valid else "invalid_or_incomplete",
                 evidence_status=evidence, calibration_status=calibration,
                 deployment_status=deployment, production_ready=False,
-                # Compatibility alias: numerical acceptance, NOT production certification.
+                # This alias records numerical acceptance, not production certification.
                 production_guard_would_accept=valid)
 
 

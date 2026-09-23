@@ -154,7 +154,7 @@ def settings(path, *, runs=None, epochs=None):
         raise ValueError(
             "R-ANODE config requires background_epochs, signal_epochs, fit_index and optional fits/split_mode"
         )
-    value.setdefault("runs", 1)  # Older single-fit configuration files retain their meaning.
+    value.setdefault("runs", 1)
     value.setdefault("split_mode", "fixed")
     if value["split_mode"] not in ("fixed", "resample_training"):
         raise ValueError("R-ANODE split_mode must be fixed or resample_training")
@@ -263,7 +263,7 @@ def stage_failure(options):
 
 def reject_signal_fit(args, index, error):
     if not safeguards_active(args):
-        # The control must never quietly become a filtered ensemble.
+        # Keep the control ensemble unfiltered.
         raise error
     attempt = Path(error.attempt)
     relative = attempt.relative_to(args.output)
@@ -782,7 +782,7 @@ def run(args):
         final_progress.update(1, force=True)
         verify(args.sources)
         final_progress.update(2, force=True)
-        # Accepted predictions and exclusion evidence are fingerprinted separately.
+
         artifacts = [
             p
             for p in args.output.iterdir()
@@ -791,7 +791,7 @@ def run(args):
         ]
         hashes = {p.name: digest(p) for p in artifacts}
         if latent is not None:
-            # The result remains auditable after the source RIDDLE run is moved.
+
             latent_inputs(latent, inputs, original_arrays,
                           expected_digest=contract["settings"]["latent_manifest_sha256"])
             hashes.update({str(p.relative_to(args.output)): digest(p) for p in latent.rglob("*") if p.is_file()})
