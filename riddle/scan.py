@@ -119,7 +119,10 @@ def run_scan(args):
     data_root, output_root = args.data.resolve(), args.output.resolve()
     # Validate the entire request before starting any expensive stage.
     for point in plan:
-        manifest = validate(data_root / point_name(point) / "signal_injection")
+        manifest = validate(
+            data_root / point_name(point) / "signal_injection",
+            require_event_ids="riddle" in args.methods,
+        )
         if manifest.get("injection_scan") != point:
             raise ValueError(
                 "Prepared point differs from configured scan; prepare the matching scan first"

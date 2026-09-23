@@ -4,7 +4,20 @@ from pathlib import Path
 
 import yaml
 
-DEFAULT_PATH = Path(__file__).resolve().parents[1] / "config/settings.yaml"
+def default_config_path(name):
+    """Locate bundled configuration files."""
+    import sysconfig
+    if name not in ("settings.yaml", "datasets.yaml"):
+        raise ValueError("Unknown bundled configuration")
+    candidates = (Path(__file__).resolve().parents[1] / "config" / name,
+                  Path(sysconfig.get_path("data")) / "config" / name)
+    for path in candidates:
+        if path.is_file():
+            return path
+    raise FileNotFoundError(f"Bundled {name} missing; reinstall riddle-lhco or use its source tree")
+
+
+DEFAULT_PATH = default_config_path("settings.yaml")
 
 
 def keys(mapping, expected, label):

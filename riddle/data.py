@@ -190,7 +190,7 @@ def prepare(args):
         os.rename(stage, root)
 
 
-def validate(directory):
+def validate(directory, *, require_event_ids=False):
     directory = Path(directory)
     manifest = json.loads((directory / "inputs.json").read_text())
     variant = manifest.get("variant", "default")
@@ -205,6 +205,8 @@ def validate(directory):
         or set(manifest.get("files", {})) != set(DATA_FILES)
     ):
         raise ValueError("Invalid prepared LHCO manifest")
+    if require_event_ids and manifest["schema"] != 2:
+        raise ValueError("RIDDLE production training requires schema-2 prepared data with event identities")
     verify_artifacts(directory, manifest["files"], "Verify prepared LHCO arrays")
     counts = {part: np.zeros(2, dtype=np.int64) for part in ("train", "val", "test")}
     sr_counts = np.zeros(2, dtype=np.int64)
@@ -233,6 +235,8 @@ def validate(directory):
             sr_counts += np.bincount(array[region, -1].astype(int), minlength=2)
     if manifest["schema"] == 2:
         id_path = directory / "event_ids.npz"
+        if not id_path.is_file():
+            raise ValueError("Schema-2 prepared data is missing event identities")
         if file_digest(id_path) != manifest.get("event_ids_sha256"):
             raise ValueError("Prepared event identities changed")
         with np.load(id_path, allow_pickle=False) as ids:

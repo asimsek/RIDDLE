@@ -115,7 +115,7 @@ def main():
         record(audit_environment)
     if args.device != "cpu" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but unavailable; refusing CPU fallback")
-    inputs = validate(args.data)
+    inputs = validate(args.data, require_event_ids=args.method == "riddle")
     if args.method == "riddle":
         from .settings import input_features
 
@@ -148,6 +148,8 @@ def main():
         from .production import PRODUCTION_POLICY
 
         contract["riddle_production_policy"] = PRODUCTION_POLICY
+        contract["riddle_score_scope"] = ("signal_region" if args.settings["riddle"].get("mass_conditioning")
+                                          else "full_region")
         if mapping_experiment is not None:
             contract["mapping_experiment"] = mapping_experiment
     if args.method == "lacathode":
@@ -196,7 +198,8 @@ def main():
     if args.method == "lacathode" and getattr(args, "lacathode_replica", False):
         report.update(campaign_seed=args.campaign_seed, run_index=args.run_index)
     if args.method == "riddle":
-        report.update(campaign_seed=getattr(args, "campaign_seed", args.seed),
+        report.update(score_scope=contract["riddle_score_scope"],
+                      campaign_seed=getattr(args, "campaign_seed", args.seed),
                       run_index=getattr(args, "run_index", 0),
                       independent_run_count=getattr(args, "independent_run_count", 1),
                       ensemble_fits=args.runs)

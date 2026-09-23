@@ -22,7 +22,8 @@ from .storage import atomic_write, file_digest, locked, write_json
 from .progress import set_verbosity, colored_status, verbosity, _duration
 from .worker_progress import ProgressStage, local_progress
 from .metrics import acceptance_report, efficiency_curve, oracle_metrics
-from .production import validate_score_record
+from .production import validate_score_record, region_acceptance
+from .evaluation import common_acceptance_auc, population_metadata, riddle_score_scope
 
 
 # Physical comparisons, per-method figures and summaries share numerical work.
@@ -121,12 +122,11 @@ def is_riddle_report(report):
 
 
 def riddle_plot_spec(report):
-    # RIDDLE stores both signal-region and full-range evaluation score files.
-    # Even for mass-conditioned runs, the plotting layer should expose the
-    # saved full-range scores in Full-Range panels, while R-ANODE remains SR-only.
+    # A full-length NPZ is not a full-domain score: mass-conditioned results
+    # intentionally contain NaNs outside their trained SR.
     base = BUILTINS["riddle"]
     return PlotMethod(base.label, base.color, base.linestyle, base.signal_color,
-                      base.score_transform, base.score_scope)
+                      base.score_transform, riddle_score_scope(report))
 
 
 def register_method(report):
@@ -372,6 +372,10 @@ def discover(root, requested=None, *, scan=False):
         point = report.get("contract", {}).get("inputs", {}).get("injection_scan")
         if bool(point) != scan:
             continue
+        if method == "riddle" and "protocol.json" in report.get("artifacts_sha256", {}):
+            protocol = read_metadata(path.parent, report, "protocol.json")
+            # Read-only resolved metadata; do not rewrite historical artifacts.
+            report = {**report, "score_scope": riddle_score_scope({**report, "protocol": protocol})}
         spec = register_method(report)
         METHOD_SPECS[method] = spec
         KEYS.setdefault(method, "method_" + method)
@@ -429,7 +433,8 @@ def load_scores(root, report, name, *, attempt=None, for_rebuild=False):
             data["density_inputs"] = archive["density_inputs"]
             if "background_log_density" in archive:
                 data["background_log_density"] = archive["background_log_density"]
-        for key in ("raw_scores", "score_kind", "fit_score_kind"):
+        for key in ("raw_scores", "score_kind", "fit_score_kind", "event_ids",
+                    "preprocessing_mask", "score_domain_mask", "score_scope"):
             if key in archive:
                 data[key] = archive[key]
         if "fit_scores" in archive:
@@ -459,6 +464,11 @@ def load_scores(root, report, name, *, attempt=None, for_rebuild=False):
             data["is_signal_region"] = validate_region(archive["is_signal_region"], len(data["mass"]))
             if name == "signal_region" and not data["is_signal_region"].all():
                 raise ValueError("RIDDLE signal-region evaluation contains non-SR events")
+            expected_scope = riddle_score_scope(report)
+            if "score_scope" in data and str(np.asarray(data["score_scope"]).item()) != expected_scope:
+                raise ValueError("Score artifact scope disagrees with the RIDDLE result contract")
+            if expected_scope == "signal_region" and (data["mask"] & ~data["is_signal_region"]).any():
+                raise ValueError("SR-only RIDDLE result contains scored sideband events")
     n = len(data["mass"])
     contract = report.get("contract", {})
     inputs = contract.get("inputs", {})
@@ -637,7 +647,7 @@ def resolve_plot_device(requested):
 
 
 def riddle_plot_predictions(root, report, member, groups, *, device="cpu"):
-    """Read-only v2/v3 inference; production training/resume version rules stay strict."""
+    """Read saved checkpoints without modifying production artifacts."""
     import torch
     from .model import build_signal_flow, background_log_prob, signal_log_prob
 
@@ -1077,7 +1087,17 @@ def render_bundle(bundle, target, args):
             f.render_representation(representation, target)
     with ProgressStage("evaluation_plots", "Plot signal-region performance"):
         render_full_pipeline(bundle, target, args)
-    bundle["metrics"]["mapping_acceptance"] = bundle["acceptance"]
+    bundle["metrics"]["scoring_acceptance"] = bundle["acceptance"]
+    keys_to_methods = {KEYS[method]: method for method in group}
+    bundle["metrics"]["mapping_acceptance"] = {
+        partition: {key: (region_acceptance(record["labels"], record["preprocessing_mask"], record["is_signal_region"])
+                          if "preprocessing_mask" in record else
+                          bundle["acceptance"][partition][key] if keys_to_methods[key] != "riddle"
+                          or riddle_plot_spec(group["riddle"][1]).score_scope == "full_region" else None)
+                    for key, record in records.items()}
+        for partition, records in bundle["evaluation"].items()
+    }
+    bundle["metrics"]["mapping_acceptance_note"] = "null means the preprocessing/domain split is unavailable for legacy SR-only RIDDLE scores"
     write_json(target / "metrics.json", json_safe(bundle["metrics"]))
 
 
@@ -1543,13 +1563,31 @@ def event_size_rows(groups, score_loader, *, data_root=None):
                              "validation_sample": "sideband data (" + roles.get("map_val", {}).get("source", "prepared") + ")",
                              "generated_reference_samples": "", "notes": "Background transformation/map"})
                 if "correction_train" in roles:
+                    correction_path = "density/background_correction/selection.json"
+                    correction = (read_metadata(root, report, correction_path)
+                                  if correction_path in report.get("artifacts_sha256", {}) else {})
+                    gap = correction.get("pseudo_sr_closure", {})
+                    gap_events = sum(int(w.get("events", 0)) for w in gap.get("windows", [])
+                                     if "improvement" in w)
+                    gap_note = (f"masked-gap evaluation: {gap_events} correction_val events; fixed upstream map; "
+                                "not full-search closure")
+                    independent = correction.get("independent_closure_diagnostic", {})
                     rows.append({**base, "component": "Background correction", "model_type": "conditional density estimator",
                                  "train_events": roles["correction_train"].get("events"),
                                  "train_sample": "sideband data (" + roles["correction_train"].get("source", "prepared") + ")",
                                  "validation_events": roles.get("correction_val", {}).get("events"),
                                  "validation_sample": "sideband data (" + roles.get("correction_val", {}).get("source", "prepared") + ")",
                                  "generated_reference_samples": "",
-                                 "notes": f"pseudo-SR closure events={roles.get('closure', {}).get('events', '')}"})
+                                 "notes": gap_note})
+                    rows.append({**base, "component": "Reserved sideband closure role",
+                                 "model_type": "diagnostic only", "train_events": 0,
+                                 "train_sample": "not used for training",
+                                 "validation_events": independent.get("events") if independent.get("status") == "evaluated" else None,
+                                 "validation_sample": "reserved closure role; no checkpoint or activation selection",
+                                 "generated_reference_samples": "",
+                                 "notes": (f"Reserved role size={roles.get('closure', {}).get('events', '')}; "
+                                           f"independent q_phi diagnostic status={independent.get('status', 'not recorded')}; "
+                                           "not the masked-gap gate or a full-search closure test")})
                 selection = (read_metadata(root, report, "density/ensemble_selection.json")
                              if "density/ensemble_selection.json" in report.get("artifacts_sha256", {}) else {})
                 members = selection.get("members", [])
@@ -2269,6 +2307,10 @@ def random_reference(mass, trials=100, *, mode="bootstrap"):
 
 def require_same_physical_population(records):
     base = next(iter(records.values()))
+    identified = [r for r in records.values() if "event_ids" in r]
+    if identified and any(not np.array_equal(identified[0]["event_ids"], r["event_ids"])
+                          for r in identified[1:]):
+        raise ValueError("Comparison evaluation event identities differ")
     if any(
         any(not np.array_equal(base[k], r[k]) for k in ("mass", "labels", "physical"))
         for r in records.values()
@@ -2303,8 +2345,12 @@ def scope_label(scope):
 
 
 def scope_group(group, scope):
+    if scope not in ("signal_region", "full_region"):
+        raise ValueError("Unknown comparison scope")
     return {method: source for method, source in group.items()
-            if scope == "signal_region" or METHOD_SPECS[method].score_scope == "full_region"}
+            if scope == "signal_region" or
+            (riddle_plot_spec(source[1]).score_scope if method_family(method) == "riddle"
+             else METHOD_SPECS[method].score_scope) == "full_region"}
 
 
 def scope_region(records, scope):
@@ -2445,6 +2491,11 @@ def physical_sr_record(record, sr=None):
     if sr is None:
         sr = (record["mass"] > 3.3) & (record["mass"] < 3.7)
     result = {k: record[k][sr] for k in ("mass", "labels", "physical", "scores", "mask")}
+    for key in ("event_ids", "preprocessing_mask", "score_domain_mask", "is_signal_region"):
+        if key in record:
+            result[key] = record[key][sr]
+    if "score_scope" in record:
+        result["score_scope"] = record["score_scope"]
     if "fit_scores" in record:
         result["fit_scores"] = record["fit_scores"][:, sr]
     for key in ("independent_runs", "run_seeds", "score_kind", "fit_score_kind", "plot_saved_ensemble"):
@@ -2617,6 +2668,7 @@ def render_physical_working_points(validation, test, output, *, scenario=None, s
                 dict(
                     method=method,
                     background_budget=budget,
+                    evaluation_population=population_metadata(record, "test", scope),
                     exact_target=True,
                     cut=float(cut[0]) if len(cut) == 1 else cut.tolist(),
                     boundary_fraction=(
@@ -3144,6 +3196,8 @@ def ensemble_size_convergence(group, output, score_loader, *, repetitions=32):
             members=count,
             orderings=len(orderings),
             aggregation=aggregation,
+            evaluation_population=population_metadata(record, "signal_region", "signal_region",
+                threshold_source="truth-assisted interpolation on this evaluation's background; not a deployment threshold"),
             budgets=budgets.tolist(),
             low=low.tolist(), median=median.tolist(), high=high.tolist(),
         )
@@ -3245,6 +3299,8 @@ def ensemble_size_convergence_overall(group, output, score_loader, *, scope="sig
             members=count,
             orderings=len(orderings),
             aggregation=aggregation,
+            evaluation_population=population_metadata(record, "signal_region" if scope == "signal_region" else "test", scope,
+                threshold_source="oracle maximum on this evaluation; not a deployment threshold"),
             metrics=("conditional_auc", "full_pipeline_max_sic"),
             low=low.tolist(),
             median=median.tolist(),
@@ -3332,6 +3388,12 @@ def render_physical_comparison(group, output, args, load_scores, *, scope="signa
             "score_ensembles": {m: r["plot_ensemble"] for m, r in records.items() if "plot_ensemble" in r},
             "methods": render_physical_curves(records, output / "01_performance", scenario, args.min_background, scope=scope),
         }
+    common_auc = common_acceptance_auc(records, scope_region(records, scope))
+    audit["common_acceptance_auc"] = common_auc
+    for method, metrics in audit["methods"].items():
+        metrics["evaluation_population"] = population_metadata(records[method], partition, scope,
+            threshold_source="oracle test-sample ROC/SIC; not a deployable threshold")
+        metrics["common_acceptance_auc"] = common_auc["methods"].get(method)
     with ProgressStage("physical_scores", f"Plot {label.lower()} scores"):
         render_physical_scores(records, output / "01_performance", scenario, scope=scope)
     validation = {
@@ -3731,7 +3793,7 @@ def main(argv=None):
                             individual, sr_destination, score_loader,
                             scope="signal_region", min_background=args.min_background,
                         )
-                        if METHOD_SPECS[method].score_scope == "full_region":
+                        if scope_group(individual, "full_region"):
                             full_destination = full_target / METHOD_SPECS[method].label
                             render_physical_comparison(individual, full_destination, args, score_loader, scope="full_region")
                             render_method_scope_assets(individual, full_destination, args, score_loader, scope="full_region")
@@ -3770,12 +3832,15 @@ def main(argv=None):
                         (args.output / filename).unlink(missing_ok=True)
                 write_json(args.output / "comparison.json", json_safe(comparisons))
                 write_json(args.output / "plot_manifest.json", json_safe({
-                    "schema": 4,
+                    "schema": 5,
                     "methods": {m: dict(label=METHOD_SPECS[m].label, score_transform=METHOD_SPECS[m].score_transform,
-                                        score_scope=METHOD_SPECS[m].score_scope) for m in sorted(available)},
+                                        score_scopes=sorted({
+                                            riddle_plot_spec(g[m][1]).score_scope if m == "riddle" else METHOD_SPECS[m].score_scope
+                                            for g in [*groups.values(), *scan_groups.values()] if m in g
+                                        })) for m in sorted(available)},
                     "layout": "SR-Only/<scenario>[/variant_<name>]/{seed_<seed>,summary}/... and Full-Range/<scenario>[/variant_<name>]/{seed_<seed>,summary}/...; injection scans live below SR-Only/signal_injection/injection_scan; root CSV/JSON files are publication metadata, not plots.",
                     "publication": "Physical Review D-oriented vector PDF plus 600-dpi PNG; one plot per figure file except the multipage mass_cut_scan.pdf companion, which also retains every cut as an individual figure.",
-                    "comparison": "All available methods in their supported scope; independent acceptance and uncut denominators. RIDDLE appears in both SR-Only and Full-Range when full-range scores are saved; R-ANODE remains SR-only.",
+                    "comparison": "All available methods in their supported scope; independent acceptance and uncut denominators. RIDDLE appears in Full-Range only when its declared and validated score domain covers the full range, not merely when an NPZ includes sideband rows; R-ANODE remains SR-only.",
                     "uncertainty": audit,
                     "cuts": "Publication working points at B=0.4%, 1.0%, 5.0% and 10.0% use exact truth-assisted test-background ROC interpolation with a fractional boundary tie applied identically to signal; no nearby empirical rank is reported as exact.",
                     "injection_scan": scan_audit,

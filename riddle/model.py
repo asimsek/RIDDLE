@@ -142,7 +142,7 @@ def real_sr_latents(rows, *, mass_conditioning=False, physical_inputs=False):
         raise ValueError("Invalid data/reference rows")
     selected = rows[:, -2] == 1
     real = rows[selected]
-    if len(real) < 2 or np.any((real[:, 0] < 3.3) | (real[:, 0] > 3.7)):
+    if len(real) < 2 or not np.all((real[:, 0] > 3.3) & (real[:, 0] < 3.7)):
         raise ValueError("Expected at least two real signal-region training rows")
     z = np.ascontiguousarray(real[:, 1:-2])
     if physical_inputs:

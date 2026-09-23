@@ -7,6 +7,7 @@ import re
 import subprocess
 import sys
 from .resume import add_resume_options, resume_policy
+from .settings import default_config_path
 
 ROOT = Path(__file__).resolve().parents[1]
 METHODS = ("lacathode", "riddle", "ranode")
@@ -47,7 +48,7 @@ def parser():
     setup.add_argument("--ranode-sources", type=Path, default=ROOT / "external/ranode")
     prep = subs.add_parser("prepare", help="Download, verify and prepare LHCO data")
     prep.add_argument("--dataset", choices=["lhco"], default="lhco")
-    prep.add_argument("--catalog", type=Path, default=ROOT / "config/datasets.yaml")
+    prep.add_argument("--catalog", type=Path, default=default_config_path("datasets.yaml"))
     prep.add_argument("--output", type=Path, default=Path("data/lhco"))
     prep.add_argument("--variant", choices=["default", "shifted", "deltaR"], default="default")
     prep.add_argument("--io-workers", type=positive, default=4)
@@ -56,7 +57,7 @@ def parser():
     prep_scan = subs.add_parser("prepare-scan", parents=[deepcopy(prep)], add_help=False,
                                 help="Prepare independently partitioned injection strengths")
     prep_scan.set_defaults(output=Path("data/injection_scan"))
-    prep_scan.add_argument("--config", type=Path, default=ROOT / "config/settings.yaml")
+    prep_scan.add_argument("--config", type=Path, default=default_config_path("settings.yaml"))
     prep_scan.add_argument("--signal-events", type=seeds, help="Subset of configured total signal counts")
     prep_scan.add_argument("--replicas", type=seeds, help="Zero-based replica indices, e.g. 0-9")
     for command in ("run", "scan"):
@@ -69,7 +70,7 @@ def parser():
         run.add_argument("--ranode-sources", type=Path, default=ROOT / "external/ranode")
         run.add_argument("--ranode-config", type=Path, default=ROOT / "external/ranode_utils/ranode.yaml",
                          help="R-ANODE settings (default: external/ranode_utils/ranode.yaml)")
-        run.add_argument("--config", type=Path, default=ROOT / "config/settings.yaml")
+        run.add_argument("--config", type=Path, default=default_config_path("settings.yaml"))
         run.add_argument("--device", default="cpu")
         run.add_argument(
             "--workers",
@@ -172,7 +173,7 @@ def run_campaign(args):
             manifest, _ = validate_ranode(args.data / scenario)
         else:
             from .data import validate
-            manifest = validate(args.data / scenario)
+            manifest = validate(args.data / scenario, require_event_ids="riddle" in args.methods)
         if "riddle" in args.methods:
             input_features(args.settings, manifest)
         if "ranode" in args.methods:

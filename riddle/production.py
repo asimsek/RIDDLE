@@ -108,12 +108,46 @@ def score_diagnostics(scores, *, stage, probability=False, summarize=True):
     return summary
 
 
+def scoring_masks(preprocessing_mask, region, score_scope):
+    """Separate mapping acceptance from intentional score-domain eligibility."""
+    preprocessing_mask = np.asarray(preprocessing_mask)
+    if preprocessing_mask.ndim != 1 or preprocessing_mask.dtype != bool:
+        raise ValueError("Preprocessing acceptance must be a one-dimensional boolean mask")
+    region = validate_region(region, len(preprocessing_mask))
+    if score_scope not in ("signal_region", "full_region"):
+        raise ValueError("Unrecognized score scope")
+    domain = region.copy() if score_scope == "signal_region" else np.ones_like(region)
+    return preprocessing_mask.copy(), domain, preprocessing_mask & domain
+
+
 def validate_score_record(record, *, method, stage):
     """Shared producer/consumer check, including members before any averaging."""
     mask, scores = np.asarray(record["mask"]), np.asarray(record["scores"])
     if mask.dtype != bool or mask.ndim != 1 or scores.shape != mask.shape:
         raise ValueError(f"{stage}: invalid score/mapping shapes")
     n = len(mask)
+    scope_keys = ("preprocessing_mask", "score_domain_mask", "score_scope")
+    if any(key in record for key in scope_keys):
+        if not all(key in record for key in (*scope_keys, "is_signal_region")):
+            raise ValueError(f"{stage}: incomplete preprocessing/score-domain metadata")
+        scope_value = np.asarray(record["score_scope"])
+        if scope_value.ndim != 0:
+            raise ValueError(f"{stage}: score scope must be scalar")
+        pre, domain, expected = scoring_masks(record["preprocessing_mask"],
+                                             record["is_signal_region"], str(scope_value.item()))
+        saved_domain = np.asarray(record["score_domain_mask"])
+        if (pre.shape != mask.shape or saved_domain.shape != mask.shape
+                or saved_domain.dtype != bool or not np.array_equal(saved_domain, domain)
+                or not np.array_equal(mask, expected)):
+            raise ValueError(f"{stage}: score mask must equal preprocessing acceptance AND score domain")
+    if "is_signal_region" in record:
+        validate_region(record["is_signal_region"], n)
+    if "event_ids" in record:
+        event_ids = np.asarray(record["event_ids"])
+        valid_ids = ((event_ids.shape == (n,) and event_ids.dtype.kind in "uiUS")
+                     or (event_ids.shape == (n, 2) and event_ids.dtype == np.uint64))
+        if not valid_ids or len(np.unique(event_ids, axis=0)) != n:
+            raise ValueError(f"{stage}: invalid or duplicate evaluation event identities")
     for key in ("mass", "labels"):
         if np.asarray(record[key]).shape != (n,):
             raise ValueError(f"{stage}: misaligned {key}")
@@ -142,6 +176,13 @@ def validate_score_record(record, *, method, stage):
             raise ValueError(f"{stage}: invalid raw density-score alignment")
         score_diagnostics(raw[mask], stage=stage+" raw density ratio")
     summary["rejected_events"] = int((~mask).sum())
+    if "preprocessing_mask" in record:
+        pre = np.asarray(record["preprocessing_mask"])
+        domain = np.asarray(record["score_domain_mask"])
+        summary.update(preprocessing_rejected_events=int((~pre).sum()),
+                       outside_score_domain_events=int((~domain).sum()),
+                       mapped_but_outside_score_domain_events=int((pre & ~domain).sum()),
+                       score_scope=str(np.asarray(record["score_scope"]).item()))
     if "fit_scores" in record:
         fits = record["fit_scores"]
         if fits.ndim != 2 or fits.shape[1:] != (n,) or not len(fits) or not np.isnan(fits[:, ~mask]).all():

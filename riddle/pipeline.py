@@ -9,7 +9,7 @@ from .campaign import (train_campaign, ensemble_predict, fractions, PROTOCOL, va
 from .runtime import ordered_map
 from .settings import input_features
 from .resume import resume_policy
-from .production import evaluation_rows, region_acceptance, PRODUCTION_POLICY
+from .production import evaluation_rows, region_acceptance, scoring_masks, PRODUCTION_POLICY
 from .roles import DEFAULT_POLICY
 from .integrity import require_finite
 from .options import effective_features, feature_options
@@ -27,6 +27,7 @@ def run(args, contract):
     development = None
     mass_conditioning = settings["riddle"].get("mass_conditioning", False)
     physical_inputs = settings["riddle"].get("input_space") == "physical"
+    score_scope = "signal_region" if mass_conditioning else "full_region"
     if enhanced:
         from .mapping import prepare as prepare_mapping
         if getattr(args, "mapping_experiment", None) is not None:
@@ -55,7 +56,7 @@ def run(args, contract):
     if settings["riddle"].get("background_correction", "none") == "bgcorr_40_reguide":
         if development is None:
             raise ValueError("bgcorr_40_reguide requires the enhanced mapping pipeline and reserved correction roles")
-        for role in ("correction_train", "correction_val"):
+        for role in ("correction_train", "correction_val", "closure"):
             if role not in development:
                 raise ValueError(f"Missing reserved {role} role required by bgcorr_40_reguide")
         from .background_correction import train as train_background_correction
@@ -63,7 +64,8 @@ def run(args, contract):
             output / "density" / "background_correction",
             development["correction_train"]["z"], development["correction_train"]["mass"],
             development["correction_val"]["z"], development["correction_val"]["mass"],
-            settings=settings["riddle"], seed=(int(args.seed)+91000) % 2**32, device=args.device)
+            settings=settings["riddle"], seed=(int(args.seed)+91000) % 2**32, device=args.device,
+            closure_z=development["closure"]["z"], closure_mass=development["closure"]["mass"])
         background_correction = background_correction_decision["descriptor"]
     acceptance, mapped = {}, {}
     evaluation_ids = {}
@@ -88,16 +90,14 @@ def run(args, contract):
         if source_event_ids is not None:
             evaluation_ids[partition] = (np.concatenate([development[k]["source_ids"] for k in ("evidence", "closure")])
                 if enhanced and partition == "validation" else np.concatenate([source_event_ids[n] for n in names]))
-        z, mask = mapper.physical(rows) if physical_inputs else mapper.map(rows)
+        z, preprocessing_mask = mapper.physical(rows) if physical_inputs else mapper.map(rows)
+        preprocessing_mask, score_domain_mask, mask = scoring_masks(preprocessing_mask, region, score_scope)
         if mass_conditioning:
             from .model import with_mass_context
-            # This pilot learns p(z|m) only inside the SR. Keep sideband rows in
-            # exports, but do not extrapolate an untrained signal density there.
-            z = z[region[mask]]
-            mask = mask & region
+            z = z[score_domain_mask[preprocessing_mask]]
             z = (np.column_stack((with_mass_context(z[:, :-1], rows[mask, 0]), z[:, -1])).astype(np.float32)
                  if physical_inputs else with_mass_context(z, rows[mask, 0]))
-        mapped[partition] = (rows, region, z, mask)
+        mapped[partition] = (rows, region, z, mask, preprocessing_mask, score_domain_mask)
     while True:
         result = train_campaign(
             training,
@@ -123,10 +123,15 @@ def run(args, contract):
         exports = {}
         calibration_raw = {}
         try:
-            for partition, (rows, region, z, mask) in mapped.items():
+            for partition, (rows, region, z, mask, preprocessing_mask, score_domain_mask) in mapped.items():
                 scores, fit_scores = ensemble_predict(output / "density", z, args.device, return_members=True)
                 require_finite(scores, "RIDDLE ensemble scores")
-                acceptance[partition] = region_acceptance(rows[:, -1], mask, region)
+                acceptance[partition] = {
+                    **region_acceptance(rows[:, -1], mask, region),
+                    "preprocessing": region_acceptance(rows[:, -1], preprocessing_mask, region),
+                    "score_scope": score_scope,
+                    "legacy_fields": "full and signal_region count effective scored events, not preprocessing alone",
+                }
                 aligned = np.full(len(rows), np.nan, dtype=scores.dtype)
                 aligned[mask] = scores
                 aligned_fits = np.full((len(fit_scores), len(rows)), np.nan, dtype=fit_scores.dtype)
@@ -136,6 +141,9 @@ def run(args, contract):
                     is_signal_region=region,
                     labels=rows[:, -1].astype(np.int8),
                     mask=mask,
+                    preprocessing_mask=preprocessing_mask,
+                    score_domain_mask=score_domain_mask,
+                    score_scope=np.array(score_scope),
                     scores=aligned,
                     physical=rows[:, 1:-1],
                     **({"density_inputs": z[:, :-1], "background_log_density": z[:, -1]}
@@ -201,6 +209,8 @@ def run(args, contract):
         {
             **PROTOCOL,
             "production_policy": PRODUCTION_POLICY,
+            "score_scope": score_scope,
+            "score_mask_definition": "preprocessing_mask AND score_domain_mask",
             "input_features": input_features(settings, contract["inputs"]),
             "features": dimensions,
             "layers": settings["riddle"]["flow"]["layers"],
@@ -234,6 +244,8 @@ def run(args, contract):
                 "model_sha256": background_correction["model_sha256"],
                 "validation_gate": background_correction["validation_gate"],
                 "pseudo_sr_closure": background_correction["pseudo_sr_closure"],
+                "independent_closure_diagnostic": background_correction.get("independent_closure_diagnostic"),
+                "full_search_closure_status": "not_evaluated",
                 "training_roles": ["correction_train", "correction_val"],
                 "shared_across_residual_fits": True,
                 "guide": "retrained against q_phi(z|m) samples at matched masses",

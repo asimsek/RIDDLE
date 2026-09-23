@@ -22,7 +22,8 @@ from .options import feature_options
 
 MODE = "bgcorr_40_reguide"
 EPOCHS = 40
-PROTOCOL = "shared_sideband_qphi_reguide_v3_multiwindow_closure"
+PROTOCOL = "shared_sideband_qphi_reguide_independent_diagnostic"
+CLOSURE_SCOPE = "correction_only_interpolation_on_fixed_upstream_map; not_full_search_closure"
 MIN_VALIDATION_IMPROVEMENT = 0.0
 # Three localized interpolation probes per sideband.  Quantile windows are
 # deliberately separated and leave training support on both sides of every gap.
@@ -86,11 +87,15 @@ def log_prob(model, latent, context):
 def sample(model, context, dimensions, seed, device):
     """Sample q_phi(z|m) at matched mass contexts without perturbing caller RNG."""
     context = torch.as_tensor(context, dtype=torch.float32, device=device).reshape(-1, 1)
-    devices = [] if str(device) == "cpu" else [torch.device(device).index or 0]
-    with torch.random.fork_rng(devices=devices):
-        torch.manual_seed(int(seed))
-        if str(device).startswith("cuda"):
-            torch.cuda.manual_seed_all(int(seed))
+    target = torch.device(device)
+    if target.type not in ("cpu", "cuda"):
+        raise ValueError("Corrected-background sampling supports CPU and CUDA devices")
+    index = (torch.cuda.current_device() if target.index is None else target.index) if target.type == "cuda" else None
+    devices = [] if index is None else [index]
+    with torch.random.fork_rng(devices=devices), torch.no_grad():
+        torch.random.default_generator.manual_seed(int(seed))
+        if index is not None:
+            torch.cuda.default_generators[index].manual_seed(int(seed))
         values = model.sample(1, context=context)
     if values.ndim == 3 and values.shape[1] == 1:
         values = values[:, 0, :]
@@ -107,7 +112,7 @@ def _gaussian_log_prob(latent):
 
 
 def _validation_metrics(model, latent, mass, device):
-    """Compare q_phi with the Gaussian latent denominator on independent rows."""
+    """Compare q_phi with Gaussian on caller-specified rows (not necessarily independent)."""
     z = torch.as_tensor(latent, dtype=torch.float32, device=device)
     m = torch.as_tensor(((np.asarray(mass, dtype=np.float32) - 3.5) / 0.2),
                         dtype=torch.float32, device=device)
@@ -155,6 +160,7 @@ def _fit_probe(train_z, train_mass, val_z, val_mass, *, settings, seed, device):
         model.eval()
         with torch.no_grad():
             validation_nll = -float(log_prob(model, zv, mv).double().mean().cpu())
+        require_finite(validation_nll, "Background-correction checkpoint validation NLL")
         if (validation_nll, epoch) < (best, best_epoch if best_epoch is not None else math.inf):
             best, best_epoch, best_model = validation_nll, epoch, deepcopy(model.state_dict())
     if best_model is None:
@@ -298,6 +304,12 @@ def _pseudo_sr_closure(train_z, train_mass, val_z, val_mass, *, settings, seed, 
     return dict(
         status="passed" if passed else "failed",
         protocol="masked_sideband_multiwindow_interpolation_v2",
+        scope=CLOSURE_SCOPE,
+        upstream_map_refitted=False,
+        evaluation_role="correction_val",
+        reserved_closure_role_used=False,
+        evaluated_events=sum(int(r.get("events", 0)) for r in reports if "improvement" in r),
+        evaluated_windows=sum("improvement" in r for r in reports),
         truth_labels_used=False,
         gap_quantiles=[list(x) for x in PSEUDO_WINDOW_QUANTILES],
         windows_per_side=windows_per_side,
@@ -314,7 +326,8 @@ def _pseudo_sr_closure(train_z, train_mass, val_z, val_mass, *, settings, seed, 
     )
 
 
-def _contract(settings, train_z, train_mass, val_z, val_mass, seed, device):
+def _contract(settings, train_z, train_mass, val_z, val_mass, seed, device,
+              closure_z=None, closure_mass=None):
     return dict(
         schema=4,
         scientific_version=SCIENTIFIC_VERSION,
@@ -336,12 +349,15 @@ def _contract(settings, train_z, train_mass, val_z, val_mass, seed, device):
         hashes={
             "train_z": digest(train_z), "train_mass": digest(train_mass),
             "validation_z": digest(val_z), "validation_mass": digest(val_mass),
+            "independent_closure_z": None if closure_z is None else digest(closure_z),
+            "independent_closure_mass": None if closure_mass is None else digest(closure_mass),
         },
     )
 
 
-def train(directory, train_z, train_mass, val_z, val_mass, *, settings, seed, device):
-    """Fit q_phi and activate it only after independent validation and gap closure."""
+def train(directory, train_z, train_mass, val_z, val_mass, *, settings, seed, device,
+          closure_z=None, closure_mass=None):
+    """Fit q_phi, apply selection gates, and audit reserved sideband rows."""
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     train_z = np.ascontiguousarray(train_z, dtype=np.float32)
@@ -355,8 +371,19 @@ def train(directory, train_z, train_mass, val_z, val_mass, *, settings, seed, de
             raise ValueError("Invalid background-correction inputs")
         if ((m > 3.3) & (m < 3.7)).any():
             raise ValueError("Background correction is sideband-only; SR events are forbidden")
+    if (closure_z is None) != (closure_mass is None):
+        raise ValueError("Provide both reserved closure latents and masses, or neither")
+    if closure_z is not None:
+        closure_z = np.ascontiguousarray(closure_z, dtype=np.float32)
+        closure_mass = np.ascontiguousarray(closure_mass, dtype=np.float32)
+        if (closure_z.ndim != 2 or closure_z.shape[1:] != train_z.shape[1:]
+                or len(closure_z) < 2 or closure_mass.shape != (len(closure_z),)
+                or not np.isfinite(closure_z).all() or not np.isfinite(closure_mass).all()
+                or ((closure_mass > 3.3) & (closure_mass < 3.7)).any()):
+            raise ValueError("Invalid reserved sideband closure inputs")
     epochs, mass_bins = _qphi_options(settings)
-    contract = _contract(settings, train_z, train_mass, val_z, val_mass, seed, device)
+    contract = _contract(settings, train_z, train_mass, val_z, val_mass, seed, device,
+                         closure_z, closure_mass)
     contract_path = directory / "contract.json"
     if contract_path.exists() and json.loads(contract_path.read_text()) != contract:
         raise ValueError("Background-correction inputs/settings changed; use a new output directory")
@@ -403,6 +430,7 @@ def train(directory, train_z, train_mass, val_z, val_mass, *, settings, seed, de
         row = dict(epoch=epoch, train_nll=total / trained_events, validation_nll=validation_nll,
                    gaussian_validation_nll=gaussian_nll, improvement=gaussian_nll-validation_nll)
         history.append(row)
+        require_finite(validation_nll, "Background-correction checkpoint validation NLL")
         if (validation_nll, epoch) < (best, best_epoch if best_epoch is not None else math.inf):
             best, best_epoch, best_model = validation_nll, epoch, deepcopy(model.state_dict())
         if persist_boundary(epoch, epochs):
@@ -424,14 +452,19 @@ def train(directory, train_z, train_mass, val_z, val_mass, *, settings, seed, de
         closure = _pseudo_sr_closure(train_z, train_mass, val_z, val_mass,
                                      settings=settings, seed=(int(seed)+40000) % 2**32, device=device)
     else:
-        closure = dict(status="not_run", reason="reserved validation did not beat Gaussian",
-                       truth_labels_used=False, protocol="masked_sideband_multiwindow_interpolation_v2")
+        closure = dict(status="not_run", reason="correction-selection validation did not beat Gaussian",
+                       truth_labels_used=False, protocol="masked_sideband_multiwindow_interpolation_v2",
+                       scope=CLOSURE_SCOPE, upstream_map_refitted=False,
+                       evaluation_role="correction_val", reserved_closure_role_used=False,
+                       evaluated_events=0, evaluated_windows=0)
     active = validation_passed and closure.get("status") == "passed"
     reasons = []
     if not validation_passed:
         reasons.append("q_phi did not improve reserved validation NLL over Gaussian")
     if validation_passed and closure.get("status") != "passed":
         reasons.append("q_phi failed masked-sideband pseudo-SR interpolation closure")
+    independent = independent_closure_diagnostic(model, closure_z, closure_mass, device,
+                                                selected_denominator="q_phi(z|m)" if active else "standard_normal(z)")
     decision = dict(
         mode=MODE, protocol=PROTOCOL, selected_epoch=int(best_epoch), epochs=epochs,
         status="activated" if active else "gaussian_fallback", active=bool(active),
@@ -439,6 +472,9 @@ def train(directory, train_z, train_mass, val_z, val_mass, *, settings, seed, de
         validation_gate={**validation, "minimum_improvement": MIN_VALIDATION_IMPROVEMENT,
                          "status": "passed" if validation_passed else "failed"},
         pseudo_sr_closure=closure,
+        independent_closure_diagnostic=independent,
+        validation_scope="correction-validation is also used for checkpoint selection",
+        full_search_closure_status="not_evaluated",
         truth_labels_used=False, training_region="reserved sidebands",
         denominator="q_phi(z|m)" if active else "standard_normal(z)",
         fallback_reason="; ".join(reasons) if reasons else None,
@@ -448,6 +484,23 @@ def train(directory, train_z, train_mass, val_z, val_mass, *, settings, seed, de
                  "Background correction failed safety gates; using Gaussian denominator", level=0)
     return dict(requested_mode=MODE, active=bool(active), descriptor=descriptor(directory) if active else None,
                 selection=decision)
+
+
+def independent_closure_diagnostic(model, latent, mass, device, *, selected_denominator):
+    """No-retuning audit of the already selected q_phi candidate on reserved rows."""
+    info = dict(role="closure", scope="fixed_map_sideband_density_diagnostic_not_full_search",
+                used_for_training=False, used_for_checkpoint_selection=False,
+                used_for_activation_gate=False, truth_labels_used=False,
+                selected_denominator=selected_denominator,
+                interpretation="Gaussian-relative NLL diagnostic; not a tail-selection or discovery test")
+    if latent is None:
+        return dict(info, status="unavailable", events=0, reason="reserved closure role not supplied")
+    metrics = _validation_metrics(model, latent, mass, device)
+    sides = {}
+    for name, keep in (("lower", mass <= 3.3), ("upper", mass >= 3.7)):
+        if keep.any():
+            sides[name] = _validation_metrics(model, latent[keep], mass[keep], device)
+    return dict(info, status="evaluated", events=len(latent), candidate_qphi=metrics, sides=sides)
 
 
 def descriptor(directory):
@@ -462,7 +515,8 @@ def descriptor(directory):
     return dict(mode=MODE, protocol=PROTOCOL, epochs=int(contract["epochs"]),
                 selected_epoch=int(state["selected_epoch"]), model_path=str((directory / "model.pt").resolve()),
                 model_sha256=file_digest(directory / "model.pt"), contract=contract,
-                validation_gate=selection["validation_gate"], pseudo_sr_closure=selection["pseudo_sr_closure"])
+                validation_gate=selection["validation_gate"], pseudo_sr_closure=selection["pseudo_sr_closure"],
+                independent_closure_diagnostic=selection.get("independent_closure_diagnostic"))
 
 
 def load(description, settings, features, device):
@@ -502,7 +556,8 @@ def load_local(directory, settings, features, device):
     if not path.exists():
         return None
     saved = torch.load(path, map_location=device, weights_only=False)
-    if saved.get("mode") != MODE or saved.get("protocol") != PROTOCOL:
+    readable = (PROTOCOL, "shared_sideband_qphi_reguide_v3_multiwindow_closure")
+    if saved.get("mode") != MODE or saved.get("protocol") not in readable:
         raise ValueError("Invalid fit-local background correction")
     model = _model(settings, features, device)
     model.load_state_dict(saved["model"])

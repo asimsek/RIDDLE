@@ -18,10 +18,11 @@ dependencies = {file = ["requirements.txt"]}
 test = ["pytest>=7.4,<9"]
 
 [tool.setuptools.packages.find]
-include = ["riddle*", "external", "external.lacathode_utils*"]
+include = ["riddle*", "external", "external.lacathode_utils*", "external.ranode_utils*"]
 
 [tool.setuptools.package-data]
 "external.lacathode_utils" = ["source_hashes.json"]
+"external.ranode_utils" = ["ranode.yaml"]
 
 [tool.setuptools.data-files]
 "config" = ["config/settings.yaml", "config/datasets.yaml"]

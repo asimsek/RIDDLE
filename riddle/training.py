@@ -30,6 +30,9 @@ def enhanced_epoch(model, logit, ztrain, optimizer, options, additions, *, epoch
                                sharpen_responsibilities, tail_ranking_loss)
     from .integrity import mixture_log_density, require_finite
     device = logit.device
+    if (np.asarray(ztrain).ndim != 2 or not len(ztrain)
+            or not np.isfinite(ztrain).all()):
+        raise ValueError("Enhanced residual fitting requires finite, nonempty two-dimensional inputs")
     z = torch.from_numpy(ztrain)
     conditional = bool(getattr(model, "mass_conditioning", False))
     latent = z[:, :-1] if conditional else z
@@ -45,7 +48,9 @@ def enhanced_epoch(model, logit, ztrain, optimizer, options, additions, *, epoch
     guided = additions["guided_fit"]
     warm = guided and epoch < additions["guide_warmup_epochs"]
     if warm:
-        weights = guide
+        if guide is None:
+            raise ValueError("Guided warm-up requires frozen event responsibilities")
+        weights = torch.as_tensor(guide).detach().cpu()
     else:
         logs = chunks(lambda x: signal_log_prob(model, x), z, device=device)
         old_logit = logit.detach().cpu()
@@ -56,6 +61,12 @@ def enhanced_epoch(model, logit, ztrain, optimizer, options, additions, *, epoch
                 logit.fill_(np.log(fraction/(1-fraction)))
     if (not warm) and float(additions.get("responsibility_temperature", 1.0)) < 1.0:
         weights = sharpen_responsibilities(weights, float(additions["responsibility_temperature"]))
+    if weights.shape != (len(z),):
+        raise ValueError("Residual responsibilities must have one entry per training event")
+    require_finite(weights, "Residual responsibilities")
+    if bool(((weights < 0) | (weights > 1)).any()):
+        raise ValueError("Residual responsibilities must lie in [0,1]")
+    weights = weights.detach()
     mean_weight = float(weights.double().mean())
     if mean_weight <= 0 or not np.isfinite(mean_weight):
         raise FloatingPointError("Invalid residual responsibilities")
@@ -146,6 +157,8 @@ def enhanced_epoch(model, logit, ztrain, optimizer, options, additions, *, epoch
         require_finite(loss, "Residual objective")
         loss.backward()
         if logit.requires_grad:
+            if logit.grad is None:
+                raise FloatingPointError("Missing mixture-fraction gradient; optimizer not updated")
             require_finite(logit.grad, "Mixture-fraction gradient")
         clip_gradients(model.parameters(), options["gradient_clip_norm"])
         optimizer.step(); total += float(loss.detach())*len(xb); contrast += float(nc.detach())*len(xb); tail_total += float(tail.detach())*len(xb)
