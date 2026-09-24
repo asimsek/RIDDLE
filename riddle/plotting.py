@@ -2354,9 +2354,8 @@ def scope_group(group, scope):
     if scope not in ("signal_region", "full_region"):
         raise ValueError("Unknown comparison scope")
     return {method: source for method, source in group.items()
-            if scope == "signal_region" or
-            (riddle_plot_spec(source[1]).score_scope if method_family(method) == "riddle"
-             else METHOD_SPECS[method].score_scope) == "full_region"}
+            if scope == "signal_region" or method_family(method) == "riddle"
+            or METHOD_SPECS[method].score_scope == "full_region"}
 
 
 def scope_region(records, scope):
@@ -3846,7 +3845,7 @@ def main(argv=None):
                                         })) for m in sorted(available)},
                     "layout": "SR-Only/<scenario>[/variant_<name>]/{seed_<seed>,summary}/... and Full-Range/<scenario>[/variant_<name>]/{seed_<seed>,summary}/...; injection scans live below SR-Only/signal_injection/injection_scan; root CSV/JSON files are publication metadata, not plots.",
                     "publication": "Physical Review D-oriented vector PDF plus 600-dpi PNG; one plot per figure file except the multipage mass_cut_scan.pdf companion, which also retains every cut as an individual figure.",
-                    "comparison": "All available methods in their supported scope; independent acceptance and uncut denominators. RIDDLE appears in Full-Range only when its declared and validated score domain covers the full range, not merely when an NPZ includes sideband rows; R-ANODE remains SR-only.",
+                    "comparison": "All available methods in their supported scope; independent acceptance and uncut denominators. RIDDLE is included in Full-Range using its saved score mask, so intentionally unscored sideband events remain rejected; R-ANODE remains SR-only.",
                     "uncertainty": audit,
                     "cuts": "Publication working points at B=0.4%, 1.0%, 5.0% and 10.0% use exact truth-assisted test-background ROC interpolation with a fractional boundary tie applied identically to signal; no nearby empirical rank is reported as exact.",
                     "injection_scan": scan_audit,
