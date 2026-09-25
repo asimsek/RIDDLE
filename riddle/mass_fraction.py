@@ -170,8 +170,8 @@ def fit(context, responsibilities, state, settings, *, source="residual_responsi
     evidence.  Event counts in the mjj spectrum are never fit as a bump model.
     A five-control-point natural cubic spline (default) supplies the only mass
     dependence. Weak first- and second-difference penalties plus a damped EM
-    update suppress noisy trends/wiggles; a final common logit shift preserves the
-    mean responsibility exactly (up to configured probability bounds).
+    update suppress noisy trends/wiggles while damping the global fraction mean
+    toward the current responsibility mean.
     """
     from scipy.optimize import minimize
 
@@ -222,8 +222,11 @@ def fit(context, responsibilities, state, settings, *, source="residual_responsi
 
     fitted = _mean_shift(np.asarray(result.x, dtype=np.float64), basis, target, cfg)
     damping = float(cfg["damping"])
+    low, high = float(_logit(cfg["min_fraction"])), float(_logit(cfg["max_fraction"]))
+    old_mean = float(_expit(np.clip(basis @ old, low, high)).mean())
+    damped_target = (1.0-damping)*old_mean + damping*target
     controls = (1.0-damping)*old + damping*fitted
-    controls = _mean_shift(controls, basis, target, cfg)
+    controls = _mean_shift(controls, basis, damped_target, cfg)
 
     values = np.clip(basis @ controls, float(_logit(cfg["min_fraction"])),
                      float(_logit(cfg["max_fraction"])))

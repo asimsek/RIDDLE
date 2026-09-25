@@ -20,7 +20,39 @@ from .model import (
 from .integrity import SCIENTIFIC_VERSION, ordered_epochs
 from .options import feature_options, effective_features
 
-ENHANCED_TRAINING_PROTOCOL = "riddle_v5_3_smooth_mass_fraction_no_guide_init_v1"
+ENHANCED_TRAINING_PROTOCOL = "riddle_v5_5_balanced_qphi_mass_aware_tail_v2"
+
+
+def _equal_count_groups(values, bins):
+    if values.ndim != 1 or not len(values):
+        raise ValueError("Tail mass grouping requires a nonempty one-dimensional context")
+    count = min(int(bins), len(values))
+    if count <= 1:
+        return torch.zeros(len(values), dtype=torch.long, device=values.device)
+    order = torch.argsort(values.detach(), stable=True)
+    ranks = torch.arange(len(values), device=values.device)
+    groups = torch.empty(len(values), dtype=torch.long, device=values.device)
+    groups[order] = torch.div(ranks * count, len(values), rounding_mode="floor")
+    return groups.clamp_max(count - 1)
+
+
+def _hard_tail_indices(scores, fraction, groups=None):
+    if scores.ndim != 1 or not len(scores):
+        raise ValueError("Tail hard-background selection requires nonempty one-dimensional scores")
+    if not 0 < fraction <= 1:
+        raise ValueError("Tail hard-background fraction must lie in (0,1]")
+    if groups is None:
+        count = max(1, int(math.ceil(len(scores) * fraction)))
+        return torch.argsort(scores, descending=True, stable=True)[:count]
+    if groups.shape != scores.shape:
+        raise ValueError("Tail hard-background groups must align with scores")
+    selected = []
+    for group in torch.unique(groups, sorted=True):
+        indices = torch.nonzero(groups == group, as_tuple=False).flatten()
+        count = max(1, int(math.ceil(len(indices) * fraction)))
+        local = torch.argsort(scores[indices], descending=True, stable=True)[:count]
+        selected.append(indices[local])
+    return torch.cat(selected)
 
 
 def enhanced_epoch(model, logit, ztrain, optimizer, options, additions, *, epoch, seed, guide,
@@ -141,8 +173,15 @@ def enhanced_epoch(model, logit, ztrain, optimizer, options, additions, *, epoch
                     candidate_context = candidate_context.repeat(
                         int(np.ceil(candidate_count / max(1, len(candidate_context))))
                     )[:candidate_count]
+                positive_groups = _equal_count_groups(xb[:, -1], int(additions.get("tail_mass_bins", 8)))
+                candidate_groups = positive_groups.repeat_interleave(multiplier)[:candidate_count]
+                if len(candidate_groups) < candidate_count:
+                    candidate_groups = candidate_groups.repeat(
+                        int(np.ceil(candidate_count / max(1, len(candidate_groups))))
+                    )[:candidate_count]
             else:
                 candidate_context = None
+                positive_groups = candidate_groups = None
             model.eval()
             if background_model is not None:
                 from .background_correction import sample as sample_background, log_prob as corrected_log_prob
@@ -165,18 +204,21 @@ def enhanced_epoch(model, logit, ztrain, optimizer, options, additions, *, epoch
                     candidate_logb = standard_normal_log_prob(candidate)
                 with torch.no_grad():
                     candidate_ratio = signal_log_prob(model, candidate) - candidate_logb
-            hard_count = max(1, int(math.ceil(candidate_count * float(additions.get("tail_hard_fraction", .10)))))
-            hard_indices = torch.argsort(candidate_ratio, descending=True, stable=True)[:hard_count]
+            hard_indices = _hard_tail_indices(
+                candidate_ratio, float(additions.get("tail_hard_fraction", .10)), candidate_groups
+            )
             hard_candidate = candidate[hard_indices]
             hard_logb = candidate_logb[hard_indices]
-            model.train()
+            hard_groups = None if candidate_groups is None else candidate_groups[hard_indices]
             hard_ratio = signal_log_prob(model, hard_candidate) - hard_logb
-            positive_ratio = log_signal - lb
+            positive_ratio = signal_log_prob(model, xb) - lb
             tail = tail_ranking_loss(
                 positive_ratio, hard_ratio, w, mean_weight,
                 margin=float(additions.get("tail_margin", 0.0)),
                 temperature=float(additions.get("tail_temperature", 1.0)),
+                positive_groups=positive_groups, negative_groups=hard_groups,
             )
+            model.train()
             loss = loss + float(additions.get("tail_strength", .20)) * tail
         require_finite(loss, "Residual objective")
         loss.backward()

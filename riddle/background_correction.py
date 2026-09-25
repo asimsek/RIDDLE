@@ -22,7 +22,7 @@ from .options import feature_options
 
 MODE = "bgcorr_40_reguide"
 EPOCHS = 40
-PROTOCOL = "shared_sideband_qphi_reguide_independent_diagnostic"
+PROTOCOL = "shared_sideband_qphi_balanced_validation_reguide_independent_diagnostic"
 CLOSURE_SCOPE = "correction_only_interpolation_on_fixed_upstream_map; not_full_search_closure"
 MIN_VALIDATION_IMPROVEMENT = 0.0
 # Leave training support on both sides of each interpolation gap.
@@ -46,27 +46,42 @@ def _qphi_options(settings):
     return epochs, bins
 
 
-def _balanced_indices(mass, bins, seed):
-    """Equalize lower/upper sidebands and mass-quantile strata without labels."""
+def _mass_strata(mass, bins):
     if bins <= 1:
-        return None
-    rng = np.random.default_rng(int(seed))
+        return [np.arange(len(mass), dtype=np.int64)]
     mass = np.asarray(mass)
     groups = []
     per_side = bins // 2
     for mask in (mass < 3.3, mass > 3.7):
         indices = np.flatnonzero(mask)
         if len(indices) < per_side:
-            raise ValueError("Insufficient sideband events for mass-balanced q_phi batches")
+            raise ValueError("Insufficient sideband events for mass-balanced q_phi strata")
         ordered = indices[np.argsort(mass[indices], kind="stable")]
         groups.extend(np.array_split(ordered, per_side))
     if len(groups) != bins or any(len(g) == 0 for g in groups):
         raise ValueError("Could not construct balanced q_phi mass strata")
+    return [np.asarray(group, dtype=np.int64) for group in groups]
+
+
+def _balanced_indices(mass, bins, seed):
+    """Equalize lower/upper sidebands and mass-quantile strata without labels."""
+    if bins <= 1:
+        return None
+    rng = np.random.default_rng(int(seed))
+    groups = _mass_strata(mass, bins)
     target = int(math.ceil(len(mass) / bins))
     chosen = [rng.choice(g, size=target, replace=len(g) < target) for g in groups]
     merged = np.concatenate(chosen)
     rng.shuffle(merged)
     return merged.astype(np.int64, copy=False)
+
+
+def _equal_stratum_mean(values, mass, bins):
+    values = np.asarray(values, dtype=np.float64)
+    if values.shape != (len(mass),) or not np.isfinite(values).all():
+        raise ValueError("Invalid q_phi validation values")
+    groups = _mass_strata(mass, bins)
+    return float(np.mean([values[group].mean() for group in groups]))
 
 
 def _model(settings, dimensions, device):
@@ -159,10 +174,13 @@ def _fit_probe(train_z, train_mass, val_z, val_mass, *, settings, seed, device):
             optimizer.step()
         model.eval()
         with torch.no_grad():
-            validation_nll = -float(log_prob(model, zv, mv).double().mean().cpu())
-        require_finite(validation_nll, "Background-correction checkpoint validation NLL")
-        if (validation_nll, epoch) < (best, best_epoch if best_epoch is not None else math.inf):
-            best, best_epoch, best_model = validation_nll, epoch, deepcopy(model.state_dict())
+            validation_log_prob = log_prob(model, zv, mv).double().cpu().numpy()
+        validation_nll = -float(validation_log_prob.mean())
+        selection_nll = -_equal_stratum_mean(validation_log_prob, val_mass, mass_bins)
+        require_finite(validation_nll, "Background-correction validation NLL")
+        require_finite(selection_nll, "Background-correction checkpoint selection NLL")
+        if (selection_nll, epoch) < (best, best_epoch if best_epoch is not None else math.inf):
+            best, best_epoch, best_model = selection_nll, epoch, deepcopy(model.state_dict())
     if best_model is None:
         raise FloatingPointError("Pseudo-SR closure produced no valid checkpoint")
     model.load_state_dict(best_model)
@@ -425,21 +443,30 @@ def train(directory, train_z, train_mass, val_z, val_mass, *, settings, seed, de
             optimizer.step(); total += float(loss.detach()) * len(z); trained_events += len(z)
         model.eval()
         with torch.no_grad():
-            validation_nll = -float(log_prob(model, zv, mv).double().mean().cpu())
-            gaussian_nll = -float(_gaussian_log_prob(zv).double().mean().cpu())
+            validation_log_prob = log_prob(model, zv, mv).double().cpu().numpy()
+            gaussian_log_prob = _gaussian_log_prob(zv).double().cpu().numpy()
+        validation_nll = -float(validation_log_prob.mean())
+        gaussian_nll = -float(gaussian_log_prob.mean())
+        balanced_validation_nll = -_equal_stratum_mean(validation_log_prob, val_mass, mass_bins)
+        balanced_gaussian_nll = -_equal_stratum_mean(gaussian_log_prob, val_mass, mass_bins)
         row = dict(epoch=epoch, train_nll=total / trained_events, validation_nll=validation_nll,
-                   gaussian_validation_nll=gaussian_nll, improvement=gaussian_nll-validation_nll)
+                   balanced_validation_nll=balanced_validation_nll,
+                   gaussian_validation_nll=gaussian_nll,
+                   balanced_gaussian_validation_nll=balanced_gaussian_nll,
+                   improvement=gaussian_nll-validation_nll,
+                   balanced_improvement=balanced_gaussian_nll-balanced_validation_nll)
         history.append(row)
-        require_finite(validation_nll, "Background-correction checkpoint validation NLL")
-        if (validation_nll, epoch) < (best, best_epoch if best_epoch is not None else math.inf):
-            best, best_epoch, best_model = validation_nll, epoch, deepcopy(model.state_dict())
+        require_finite(validation_nll, "Background-correction validation NLL")
+        require_finite(balanced_validation_nll, "Background-correction checkpoint selection NLL")
+        if (balanced_validation_nll, epoch) < (best, best_epoch if best_epoch is not None else math.inf):
+            best, best_epoch, best_model = balanced_validation_nll, epoch, deepcopy(model.state_dict())
         if persist_boundary(epoch, epochs):
             state = dict(contract=contract, epoch=epoch, model=model.state_dict(), optimizer=optimizer.state_dict(),
                          history=history, best=best, best_epoch=best_epoch, best_model=best_model, rng=rng_state())
             latest.parent.mkdir(parents=True, exist_ok=True)
             atomic_torch_save(latest, state)
             write_json(directory / "history.json", history)
-        emit_message(f"Background correction {epoch+1}/{epochs}: validation NLL={validation_nll:.6g}")
+        emit_message(f"Background correction {epoch+1}/{epochs}: balanced validation NLL={balanced_validation_nll:.6g}; natural validation NLL={validation_nll:.6g}")
 
     if best_model is None:
         raise FloatingPointError("Background correction produced no valid checkpoint")
@@ -468,12 +495,14 @@ def train(directory, train_z, train_mass, val_z, val_mass, *, settings, seed, de
     decision = dict(
         mode=MODE, protocol=PROTOCOL, selected_epoch=int(best_epoch), epochs=epochs,
         status="activated" if active else "gaussian_fallback", active=bool(active),
-        criterion="lowest reserved correction-validation NLL, then positive Gaussian-relative validation gain and multi-window pseudo-SR closure",
+        checkpoint_selection=dict(metric="equal_mass_stratum_validation_nll", mass_bins=mass_bins,
+                                  selected_nll=float(best)),
+        criterion="lowest equal-mass-stratum correction-validation NLL, then positive Gaussian-relative natural validation gain and multi-window pseudo-SR closure",
         validation_gate={**validation, "minimum_improvement": MIN_VALIDATION_IMPROVEMENT,
                          "status": "passed" if validation_passed else "failed"},
         pseudo_sr_closure=closure,
         independent_closure_diagnostic=independent,
-        validation_scope="correction-validation is also used for checkpoint selection",
+        validation_scope="correction-validation is used for checkpoint selection with equal mass-stratum weighting and recorded separately with natural event weighting",
         full_search_closure_status="not_evaluated",
         truth_labels_used=False, training_region="reserved sidebands",
         denominator="q_phi(z|m)" if active else "standard_normal(z)",

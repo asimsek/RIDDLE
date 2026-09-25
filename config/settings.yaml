@@ -38,6 +38,20 @@ riddle:
     rosenblatt_bins: 12
     rosenblatt_hidden: 64
     rosenblatt_bound: 8.0
+    guide_folds: 5
+    guide_mass_conditioning: false
+    guide_reference_multiplier: 4
+    guide_refresh_reference: true
+    guide_ratio_calibration: true
+    responsibility_temperature: 0.85
+    qphi_mass_bins: 4
+    tail_rank: false
+    tail_candidate_multiplier: 8
+    tail_hard_fraction: 0.01
+    tail_strength: 0.005
+    tail_margin: 0.0
+    tail_temperature: 1.0
+    tail_mass_bins: 8
   fit_recovery:
     max_retries: 2
     validation_sigma: 2.0

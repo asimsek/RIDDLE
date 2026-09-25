@@ -529,18 +529,34 @@ def sharpen_responsibilities(weights, temperature):
     return sharpened
 
 
-def tail_ranking_loss(positive_ratio, negative_ratio, weights, mean_weight, *, margin=0.0, temperature=1.0):
+def tail_ranking_loss(positive_ratio, negative_ratio, weights, mean_weight, *, margin=0.0, temperature=1.0,
+                      positive_groups=None, negative_groups=None):
     """Weighted pairwise ranking loss against final-score hard background samples."""
     if temperature <= 0:
         raise ValueError("Tail ranking temperature must be positive")
-
-    difference = (positive_ratio[:, None] - negative_ratio[None, :] - float(margin)) / float(temperature)
-    per_positive = nn.functional.softplus(-difference).mean(dim=1)
-    return (weights * per_positive).mean() / mean_weight
+    if (positive_groups is None) != (negative_groups is None):
+        raise ValueError("Tail ranking groups must be supplied together")
+    if positive_groups is None:
+        difference = (positive_ratio[:, None] - negative_ratio[None, :] - float(margin)) / float(temperature)
+        per_positive = nn.functional.softplus(-difference).mean(dim=1)
+        return (weights * per_positive).mean() / mean_weight
+    if positive_groups.shape != positive_ratio.shape or negative_groups.shape != negative_ratio.shape:
+        raise ValueError("Tail ranking groups must align with their scores")
+    total = positive_ratio.new_zeros(())
+    for group in torch.unique(positive_groups, sorted=True):
+        positive_mask = positive_groups == group
+        negative_mask = negative_groups == group
+        if not bool(negative_mask.any()):
+            raise ValueError("Tail ranking mass stratum has no hard background sample")
+        difference = (positive_ratio[positive_mask, None] - negative_ratio[None, negative_mask]
+                      - float(margin)) / float(temperature)
+        per_positive = nn.functional.softplus(-difference).mean(dim=1)
+        total = total + (weights[positive_mask] * per_positive).sum()
+    return total / (float(len(weights)) * mean_weight)
 
 def contrastive_loss(positive, negative, weights, mean_weight):
     return .5*((weights*nn.functional.softplus(-positive)).mean()/mean_weight
-               + nn.functional.softplus(negative).mean())
+               + (weights*nn.functional.softplus(negative)).mean()/mean_weight)
 
 
 def standard_normal_log_prob(z):
