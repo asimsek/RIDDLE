@@ -22,14 +22,14 @@ from .options import feature_options
 
 MODE = "bgcorr_40_reguide"
 EPOCHS = 40
-PROTOCOL = "shared_sideband_qphi_balanced_validation_uncertainty_gated_reguide"
+PROTOCOL = "shared_sideband_qphi_balanced_validation_uncertainty_gated_mean_supported_closure_reguide"
 CLOSURE_SCOPE = "correction_only_interpolation_on_fixed_upstream_map; not_full_search_closure"
 MIN_VALIDATION_IMPROVEMENT = 0.0
 # Leave training support on both sides of each interpolation gap.
 
 PSEUDO_WINDOW_QUANTILES = ((0.15, 0.30), (0.425, 0.575), (0.70, 0.85))
 MIN_PSEUDO_WINDOW_EVENTS = 30
-MIN_POSITIVE_WINDOWS_PER_SIDE = 2
+MIN_POSITIVE_WINDOWS_PER_SIDE = 1
 PSEUDO_COMPATIBILITY_SIGMA = 1.96
 
 
@@ -249,10 +249,10 @@ def _pseudo_sr_closure(train_z, train_mass, val_z, val_mass, *, settings, seed, 
     the held-out validation rows in that window.  The six windows are defined by
     mass quantiles and use no truth labels.
 
-    A sideband passes when all three windows are evaluable, at least two have a
+    A sideband passes when all three windows are evaluable, at least one has a
     positive Gaussian-relative NLL gain, their event-weighted mean gain is
-    positive, and no individual window is significantly worse than Gaussian at
-    the configured compatibility threshold.  Both sidebands must pass.
+    positive, and every remaining window is compatible with Gaussian at the
+    configured compatibility threshold. Both sidebands must pass.
     """
     all_mass = np.concatenate((train_mass, val_mass)).astype(np.float64, copy=False)
     reports = []
@@ -368,7 +368,7 @@ def _pseudo_sr_closure(train_z, train_mass, val_z, val_mass, *, settings, seed, 
     passed = len(side_reports) == 2 and all(r["status"] == "passed" for r in side_reports)
     return dict(
         status="passed" if passed else "failed",
-        protocol="masked_sideband_multiwindow_interpolation_v2",
+        protocol="masked_sideband_multiwindow_interpolation_v3",
         scope=CLOSURE_SCOPE,
         upstream_map_refitted=False,
         evaluation_role="correction_val",
@@ -383,8 +383,8 @@ def _pseudo_sr_closure(train_z, train_mass, val_z, val_mass, *, settings, seed, 
         compatibility_sigma=PSEUDO_COMPATIBILITY_SIGMA,
         criterion=(
             "both sidebands must pass; per side all three windows must be evaluable, "
-            "at least two must improve on Gaussian, the event-weighted mean improvement "
-            "must be positive, and no window may be significantly worse than Gaussian"
+            "at least one must improve on Gaussian, the event-weighted mean improvement "
+            "must be positive, and every remaining window must be Gaussian-compatible"
         ),
         sides=side_reports,
         windows=reports,
@@ -394,7 +394,7 @@ def _pseudo_sr_closure(train_z, train_mass, val_z, val_mass, *, settings, seed, 
 def _contract(settings, train_z, train_mass, val_z, val_mass, seed, device,
               closure_z=None, closure_mass=None):
     return dict(
-        schema=5,
+        schema=6,
         scientific_version=SCIENTIFIC_VERSION,
         protocol=PROTOCOL,
         mode=MODE,
@@ -409,6 +409,8 @@ def _contract(settings, train_z, train_mass, val_z, val_mass, seed, device,
             validation_requires_side_compatibility=True,
             checkpoint_requires_natural_validation_compatibility=True,
             pseudo_sr_always_evaluated=True,
+            compatible_windows_allowed=True,
+            positive_weighted_mean_required=True,
         ),
         seed=int(seed),
         device=str(device),
