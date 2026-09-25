@@ -20,7 +20,7 @@ from .model import (
 from .integrity import SCIENTIFIC_VERSION, ordered_epochs
 from .options import feature_options, effective_features
 
-ENHANCED_TRAINING_PROTOCOL = "riddle_v5_3_smooth_mass_fraction_v1"
+ENHANCED_TRAINING_PROTOCOL = "riddle_v5_3_smooth_mass_fraction_no_guide_init_v1"
 
 
 def enhanced_epoch(model, logit, ztrain, optimizer, options, additions, *, epoch, seed, guide,
@@ -458,16 +458,6 @@ def train_residual(
                                     batch_size=options["batch_size"],
                                     context=(ztrain[:, -1] if mass_conditioning else None), device=device)
         restore_rng(before)
-        if mass_fraction_active and checkpoint is None:
-            from .mass_fraction import fit as fit_mass_fraction, state_summary
-            mass_fraction_state = fit_mass_fraction(
-                ztrain[:, -1], torch.as_tensor(guide).detach().cpu().numpy(),
-                mass_fraction_state, settings, source="cross_fitted_mass_blind_guide",
-            )
-            initial_summary = state_summary(mass_fraction_state, ztrain[:, -1], settings)
-            with torch.no_grad():
-                f0 = float(initial_summary["mean"])
-                logit.fill_(np.log(f0/(1-f0)))
     write_json(
         output / "residual_training_inputs.json",
         {
