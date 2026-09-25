@@ -22,7 +22,7 @@ from .options import feature_options
 
 MODE = "bgcorr_40_reguide"
 EPOCHS = 40
-PROTOCOL = "shared_sideband_qphi_balanced_validation_reguide_independent_diagnostic"
+PROTOCOL = "shared_sideband_qphi_balanced_validation_uncertainty_gated_reguide"
 CLOSURE_SCOPE = "correction_only_interpolation_on_fixed_upstream_map; not_full_search_closure"
 MIN_VALIDATION_IMPROVEMENT = 0.0
 # Leave training support on both sides of each interpolation gap.
@@ -146,6 +146,39 @@ def _validation_metrics(model, latent, mass, device):
     )
 
 
+def _gaussian_gate(metrics):
+    improvement = float(metrics["improvement"])
+    standard_error = metrics.get("improvement_standard_error")
+    positive = improvement > MIN_VALIDATION_IMPROVEMENT
+    if positive:
+        compatible = True
+    elif standard_error is None or not np.isfinite(standard_error) or standard_error <= 0:
+        compatible = False
+    else:
+        compatible = (improvement + PSEUDO_COMPATIBILITY_SIGMA * float(standard_error)
+                      >= MIN_VALIDATION_IMPROVEMENT)
+    status = "passed" if positive else ("compatible" if compatible else "failed")
+    return dict(
+        **metrics,
+        minimum_improvement=MIN_VALIDATION_IMPROVEMENT,
+        compatibility_sigma=PSEUDO_COMPATIBILITY_SIGMA,
+        positive=bool(positive),
+        gaussian_compatible=bool(compatible),
+        status=status,
+    )
+
+
+def _validation_side_gates(model, latent, mass, device):
+    sides = {}
+    for name, keep in (("lower", mass <= 3.3), ("upper", mass >= 3.7)):
+        if not np.any(keep):
+            sides[name] = dict(status="failed", events=0, gaussian_compatible=False,
+                               positive=False, reason="no events")
+        else:
+            sides[name] = _gaussian_gate(_validation_metrics(model, latent[keep], mass[keep], device))
+    return sides
+
+
 def _fit_probe(train_z, train_mass, val_z, val_mass, *, settings, seed, device):
     """Deterministic auxiliary fit used only for masked-mass interpolation closure."""
     torch.manual_seed(int(seed)); np.random.seed(int(seed) % 2**32)
@@ -157,7 +190,10 @@ def _fit_probe(train_z, train_mass, val_z, val_mass, *, settings, seed, device):
     zv = torch.as_tensor(val_z, dtype=torch.float32, device=device)
     mv = torch.as_tensor(((np.asarray(val_mass, dtype=np.float32)-3.5)/0.2), dtype=torch.float32, device=device)
     epochs, mass_bins = _qphi_options(settings)
-    best, best_epoch, best_model = float("inf"), None, None
+    with torch.no_grad():
+        gaussian_log_prob = _gaussian_log_prob(zv).double().cpu().numpy()
+    best_any, best_any_epoch, best_any_model = float("inf"), None, None
+    best_eligible, best_eligible_epoch, best_eligible_model = float("inf"), None, None
     for epoch in range(epochs):
         generator = torch.Generator().manual_seed(int(seed) + 21000 + epoch)
         balanced = _balanced_indices(train_mass, mass_bins, int(seed) + 21500 + epoch)
@@ -177,14 +213,32 @@ def _fit_probe(train_z, train_mass, val_z, val_mass, *, settings, seed, device):
             validation_log_prob = log_prob(model, zv, mv).double().cpu().numpy()
         validation_nll = -float(validation_log_prob.mean())
         selection_nll = -_equal_stratum_mean(validation_log_prob, val_mass, mass_bins)
+        gain = validation_log_prob - gaussian_log_prob
+        gate = _gaussian_gate(dict(
+            events=int(len(gain)), qphi_nll=validation_nll,
+            gaussian_nll=-float(gaussian_log_prob.mean()),
+            improvement=float(gain.mean()),
+            improvement_standard_error=(float(gain.std(ddof=1) / math.sqrt(len(gain)))
+                                        if len(gain) > 1 else None),
+        ))
         require_finite(validation_nll, "Background-correction validation NLL")
         require_finite(selection_nll, "Background-correction checkpoint selection NLL")
-        if (selection_nll, epoch) < (best, best_epoch if best_epoch is not None else math.inf):
-            best, best_epoch, best_model = selection_nll, epoch, deepcopy(model.state_dict())
+        if (selection_nll, epoch) < (best_any, best_any_epoch if best_any_epoch is not None else math.inf):
+            best_any, best_any_epoch, best_any_model = selection_nll, epoch, deepcopy(model.state_dict())
+        if gate["gaussian_compatible"] and (
+                (selection_nll, epoch)
+                < (best_eligible, best_eligible_epoch if best_eligible_epoch is not None else math.inf)):
+            best_eligible = selection_nll
+            best_eligible_epoch = epoch
+            best_eligible_model = deepcopy(model.state_dict())
+    use_eligible = best_eligible_model is not None
+    best = best_eligible if use_eligible else best_any
+    best_epoch = best_eligible_epoch if use_eligible else best_any_epoch
+    best_model = best_eligible_model if use_eligible else best_any_model
     if best_model is None:
         raise FloatingPointError("Pseudo-SR closure produced no valid checkpoint")
     model.load_state_dict(best_model)
-    return model.eval().requires_grad_(False), int(best_epoch), float(best)
+    return model.eval().requires_grad_(False), int(best_epoch), float(best), bool(use_eligible)
 
 
 def _pseudo_sr_closure(train_z, train_mass, val_z, val_mass, *, settings, seed, device):
@@ -254,28 +308,21 @@ def _pseudo_sr_closure(train_z, train_mass, val_z, val_mass, *, settings, seed, 
                 continue
 
             probe_index = side_index * windows_per_side + window_index
-            probe, selected_epoch, selection_nll = _fit_probe(
+            probe, selected_epoch, selection_nll, checkpoint_eligible = _fit_probe(
                 train_z[train_keep], train_mass[train_keep],
                 val_z[val_keep], val_mass[val_keep],
                 settings=settings, seed=(int(seed) + 3000 + probe_index) % 2**32,
                 device=device,
             )
             metrics = _validation_metrics(probe, val_z[val_gap], val_mass[val_gap], device)
-            improvement = metrics["improvement"]
-            standard_error = metrics["improvement_standard_error"]
-            positive = improvement > MIN_VALIDATION_IMPROVEMENT
-            if positive:
-                compatible = True
-            elif standard_error is None or not np.isfinite(standard_error) or standard_error <= 0:
-                compatible = False
-            else:
-                compatible = (improvement + PSEUDO_COMPATIBILITY_SIGMA * standard_error
-                              >= MIN_VALIDATION_IMPROVEMENT)
-            status = "passed" if positive else ("compatible" if compatible else "failed")
+            gate = _gaussian_gate(metrics)
+            improvement = gate["improvement"]
+            status = gate["status"]
             reports.append(dict(
-                **base, status=status, positive=bool(positive),
-                gaussian_compatible=bool(compatible), selected_epoch=selected_epoch,
-                selection_nll=selection_nll, **counts, **metrics,
+                **base, selected_epoch=selected_epoch,
+                selection_nll=selection_nll,
+                checkpoint_gaussian_compatible=bool(checkpoint_eligible),
+                **counts, **gate,
             ))
             emit_message(
                 f"Background pseudo-SR closure {side_name} {base['position']} "
@@ -347,7 +394,7 @@ def _pseudo_sr_closure(train_z, train_mass, val_z, val_mass, *, settings, seed, 
 def _contract(settings, train_z, train_mass, val_z, val_mass, seed, device,
               closure_z=None, closure_mass=None):
     return dict(
-        schema=4,
+        schema=5,
         scientific_version=SCIENTIFIC_VERSION,
         protocol=PROTOCOL,
         mode=MODE,
@@ -359,6 +406,9 @@ def _contract(settings, train_z, train_mass, val_z, val_mass, seed, device,
             minimum_pseudo_window_events=MIN_PSEUDO_WINDOW_EVENTS,
             minimum_positive_windows_per_side=MIN_POSITIVE_WINDOWS_PER_SIDE,
             compatibility_sigma=PSEUDO_COMPATIBILITY_SIGMA,
+            validation_requires_side_compatibility=True,
+            checkpoint_requires_natural_validation_compatibility=True,
+            pseudo_sr_always_evaluated=True,
         ),
         seed=int(seed),
         device=str(device),
@@ -410,7 +460,9 @@ def train(directory, train_z, train_mass, val_z, val_mass, *, settings, seed, de
     torch.manual_seed(int(seed)); np.random.seed(int(seed) % 2**32)
     model = _model(settings, train_z.shape[1], device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=settings["training"]["learning_rate"], weight_decay=1e-4)
-    history, start, best, best_epoch, best_model = [], 0, float("inf"), None, None
+    history, start = [], 0
+    best_any, best_any_epoch, best_any_model = float("inf"), None, None
+    best_eligible, best_eligible_epoch, best_eligible_model = float("inf"), None, None
     latest = directory / ".resume/latest.pt"
     if latest.exists():
         state = torch.load(latest, map_location=device, weights_only=False)
@@ -419,7 +471,12 @@ def train(directory, train_z, train_mass, val_z, val_mass, *, settings, seed, de
         model.load_state_dict(state["model"])
         optimizer.load_state_dict(state["optimizer"])
         history, start = state["history"], state["epoch"] + 1
-        best, best_epoch, best_model = state["best"], state["best_epoch"], state["best_model"]
+        best_any = state["best_any"]
+        best_any_epoch = state["best_any_epoch"]
+        best_any_model = state["best_any_model"]
+        best_eligible = state["best_eligible"]
+        best_eligible_epoch = state["best_eligible_epoch"]
+        best_eligible_model = state["best_eligible_model"]
         restore_rng(state["rng"])
 
     zt = torch.from_numpy(train_z)
@@ -449,60 +506,111 @@ def train(directory, train_z, train_mass, val_z, val_mass, *, settings, seed, de
         gaussian_nll = -float(gaussian_log_prob.mean())
         balanced_validation_nll = -_equal_stratum_mean(validation_log_prob, val_mass, mass_bins)
         balanced_gaussian_nll = -_equal_stratum_mean(gaussian_log_prob, val_mass, mass_bins)
+        gain = validation_log_prob - gaussian_log_prob
+        improvement = float(gain.mean())
+        improvement_standard_error = (float(gain.std(ddof=1) / math.sqrt(len(gain)))
+                                      if len(gain) > 1 else None)
+        epoch_gate = _gaussian_gate(dict(
+            events=int(len(gain)), qphi_nll=validation_nll, gaussian_nll=gaussian_nll,
+            improvement=improvement, improvement_standard_error=improvement_standard_error,
+        ))
         row = dict(epoch=epoch, train_nll=total / trained_events, validation_nll=validation_nll,
                    balanced_validation_nll=balanced_validation_nll,
                    gaussian_validation_nll=gaussian_nll,
                    balanced_gaussian_validation_nll=balanced_gaussian_nll,
-                   improvement=gaussian_nll-validation_nll,
+                   improvement=improvement,
+                   improvement_standard_error=improvement_standard_error,
+                   gaussian_compatible=epoch_gate["gaussian_compatible"],
                    balanced_improvement=balanced_gaussian_nll-balanced_validation_nll)
         history.append(row)
         require_finite(validation_nll, "Background-correction validation NLL")
         require_finite(balanced_validation_nll, "Background-correction checkpoint selection NLL")
-        if (balanced_validation_nll, epoch) < (best, best_epoch if best_epoch is not None else math.inf):
-            best, best_epoch, best_model = balanced_validation_nll, epoch, deepcopy(model.state_dict())
+        if (balanced_validation_nll, epoch) < (best_any, best_any_epoch if best_any_epoch is not None else math.inf):
+            best_any, best_any_epoch, best_any_model = balanced_validation_nll, epoch, deepcopy(model.state_dict())
+        if epoch_gate["gaussian_compatible"] and (
+                (balanced_validation_nll, epoch)
+                < (best_eligible, best_eligible_epoch if best_eligible_epoch is not None else math.inf)):
+            best_eligible = balanced_validation_nll
+            best_eligible_epoch = epoch
+            best_eligible_model = deepcopy(model.state_dict())
         if persist_boundary(epoch, epochs):
-            state = dict(contract=contract, epoch=epoch, model=model.state_dict(), optimizer=optimizer.state_dict(),
-                         history=history, best=best, best_epoch=best_epoch, best_model=best_model, rng=rng_state())
+            state = dict(
+                contract=contract, epoch=epoch, model=model.state_dict(), optimizer=optimizer.state_dict(),
+                history=history, best_any=best_any, best_any_epoch=best_any_epoch,
+                best_any_model=best_any_model, best_eligible=best_eligible,
+                best_eligible_epoch=best_eligible_epoch, best_eligible_model=best_eligible_model,
+                rng=rng_state(),
+            )
             latest.parent.mkdir(parents=True, exist_ok=True)
             atomic_torch_save(latest, state)
             write_json(directory / "history.json", history)
-        emit_message(f"Background correction {epoch+1}/{epochs}: balanced validation NLL={balanced_validation_nll:.6g}; natural validation NLL={validation_nll:.6g}")
+        emit_message(
+            f"Background correction {epoch+1}/{epochs}: balanced validation NLL={balanced_validation_nll:.6g}; "
+            f"natural validation NLL={validation_nll:.6g}; natural gate={epoch_gate['status']}"
+        )
 
+    use_eligible = best_eligible_model is not None
+    best = best_eligible if use_eligible else best_any
+    best_epoch = best_eligible_epoch if use_eligible else best_any_epoch
+    best_model = best_eligible_model if use_eligible else best_any_model
     if best_model is None:
         raise FloatingPointError("Background correction produced no valid checkpoint")
     selected = {"model": best_model, "selected_epoch": best_epoch, "contract": contract}
     atomic_torch_save(directory / "model.pt", selected)
     model.load_state_dict(best_model); model.eval().requires_grad_(False)
-    validation = _validation_metrics(model, val_z, val_mass, device)
-    validation_passed = validation["improvement"] > MIN_VALIDATION_IMPROVEMENT
-    if validation_passed:
-        closure = _pseudo_sr_closure(train_z, train_mass, val_z, val_mass,
-                                     settings=settings, seed=(int(seed)+40000) % 2**32, device=device)
-    else:
-        closure = dict(status="not_run", reason="correction-selection validation did not beat Gaussian",
-                       truth_labels_used=False, protocol="masked_sideband_multiwindow_interpolation_v2",
-                       scope=CLOSURE_SCOPE, upstream_map_refitted=False,
-                       evaluation_role="correction_val", reserved_closure_role_used=False,
-                       evaluated_events=0, evaluated_windows=0)
+
+    validation = _gaussian_gate(_validation_metrics(model, val_z, val_mass, device))
+    validation_sides = _validation_side_gates(model, val_z, val_mass, device)
+    overall_compatible = bool(validation["gaussian_compatible"])
+    sides_compatible = all(v.get("gaussian_compatible", False) for v in validation_sides.values())
+    validation_passed = overall_compatible and sides_compatible
+
+    closure = _pseudo_sr_closure(
+        train_z, train_mass, val_z, val_mass,
+        settings=settings, seed=(int(seed)+40000) % 2**32, device=device,
+    )
+
     active = validation_passed and closure.get("status") == "passed"
     reasons = []
-    if not validation_passed:
-        reasons.append("q_phi did not improve reserved validation NLL over Gaussian")
-    if validation_passed and closure.get("status") != "passed":
+    if not overall_compatible:
+        reasons.append("q_phi is significantly worse than Gaussian on reserved validation")
+    failed_sides = [name for name, gate in validation_sides.items()
+                    if not gate.get("gaussian_compatible", False)]
+    if failed_sides:
+        reasons.append("q_phi is significantly worse than Gaussian on validation sideband(s): "
+                       + ", ".join(failed_sides))
+    if closure.get("status") != "passed":
         reasons.append("q_phi failed masked-sideband pseudo-SR interpolation closure")
-    independent = independent_closure_diagnostic(model, closure_z, closure_mass, device,
-                                                selected_denominator="q_phi(z|m)" if active else "standard_normal(z)")
+    independent = independent_closure_diagnostic(
+        model, closure_z, closure_mass, device,
+        selected_denominator="q_phi(z|m)" if active else "standard_normal(z)",
+    )
     decision = dict(
         mode=MODE, protocol=PROTOCOL, selected_epoch=int(best_epoch), epochs=epochs,
         status="activated" if active else "gaussian_fallback", active=bool(active),
-        checkpoint_selection=dict(metric="equal_mass_stratum_validation_nll", mass_bins=mass_bins,
-                                  selected_nll=float(best)),
-        criterion="lowest equal-mass-stratum correction-validation NLL, then positive Gaussian-relative natural validation gain and multi-window pseudo-SR closure",
-        validation_gate={**validation, "minimum_improvement": MIN_VALIDATION_IMPROVEMENT,
-                         "status": "passed" if validation_passed else "failed"},
+        checkpoint_selection=dict(
+            metric="equal_mass_stratum_validation_nll",
+            eligibility="Gaussian-compatible natural validation",
+            eligible_checkpoint_found=bool(use_eligible),
+            mass_bins=mass_bins, selected_nll=float(best),
+        ),
+        criterion=(
+            "best equal-mass-stratum checkpoint among Gaussian-compatible natural-validation epochs; "
+            "selected checkpoint must be Gaussian-compatible globally and on each sideband, and both "
+            "sidebands must pass the three-window pseudo-SR interpolation closure"
+        ),
+        validation_gate=dict(
+            **validation,
+            sides=validation_sides,
+            side_compatibility_required=True,
+            activation_eligible=bool(validation_passed),
+        ),
         pseudo_sr_closure=closure,
         independent_closure_diagnostic=independent,
-        validation_scope="correction-validation is used for checkpoint selection with equal mass-stratum weighting and recorded separately with natural event weighting",
+        validation_scope=(
+            "correction-validation selects checkpoints with equal mass-stratum weighting; "
+            "Gaussian compatibility is evaluated with natural event weighting globally and per sideband"
+        ),
         full_search_closure_status="not_evaluated",
         truth_labels_used=False, training_region="reserved sidebands",
         denominator="q_phi(z|m)" if active else "standard_normal(z)",
