@@ -4,10 +4,12 @@ The correction q_phi(z|m) is trained once per RIDDLE method run on the reserved
 correction sidebands.  Every residual fit in that run reuses the same frozen
 q_phi for initialization, guide construction, likelihood ratios and scoring.
 """
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from copy import deepcopy
 from pathlib import Path
 import json
 import math
+import multiprocessing as mp
 
 import numpy as np
 import torch
@@ -241,6 +243,24 @@ def _fit_probe(train_z, train_mass, val_z, val_mass, *, settings, seed, device):
     return model.eval().requires_grad_(False), int(best_epoch), float(best), bool(use_eligible)
 
 
+def _pseudo_probe_worker(task):
+    threads = task.get("torch_threads")
+    if threads is not None:
+        torch.set_num_threads(int(threads))
+    probe, selected_epoch, selection_nll, checkpoint_eligible = _fit_probe(
+        task["train_z"], task["train_mass"], task["val_z"], task["val_mass"],
+        settings=task["settings"], seed=task["seed"], device=task["device"],
+    )
+    metrics = _validation_metrics(probe, task["gap_z"], task["gap_mass"], task["device"])
+    gate = _gaussian_gate(metrics)
+    return dict(
+        **task["base"], selected_epoch=selected_epoch,
+        selection_nll=selection_nll,
+        checkpoint_gaussian_compatible=bool(checkpoint_eligible),
+        **task["counts"], **gate,
+    )
+
+
 def _pseudo_sr_closure(train_z, train_mass, val_z, val_mass, *, settings, seed, device):
     """Test q_phi interpolation in three artificial gaps on each side of the SR.
 
@@ -256,6 +276,7 @@ def _pseudo_sr_closure(train_z, train_mass, val_z, val_mass, *, settings, seed, 
     """
     all_mass = np.concatenate((train_mass, val_mass)).astype(np.float64, copy=False)
     reports = []
+    tasks = []
     sides = (
         ("lower", all_mass < 3.3, lambda x: x < 3.3),
         ("upper", all_mass > 3.7, lambda x: x > 3.7),
@@ -265,6 +286,7 @@ def _pseudo_sr_closure(train_z, train_mass, val_z, val_mass, *, settings, seed, 
         "upper": ("inner", "middle", "outer"),
     }
     windows_per_side = len(PSEUDO_WINDOW_QUANTILES)
+    parallelism = int(feature_options(settings).get("pseudo_sr_parallel_probes", 3))
 
     for side_index, (side_name, combined_side, side_selector) in enumerate(sides):
         values = all_mass[combined_side]
@@ -308,28 +330,50 @@ def _pseudo_sr_closure(train_z, train_mass, val_z, val_mass, *, settings, seed, 
                 continue
 
             probe_index = side_index * windows_per_side + window_index
-            probe, selected_epoch, selection_nll, checkpoint_eligible = _fit_probe(
-                train_z[train_keep], train_mass[train_keep],
-                val_z[val_keep], val_mass[val_keep],
-                settings=settings, seed=(int(seed) + 3000 + probe_index) % 2**32,
-                device=device,
-            )
-            metrics = _validation_metrics(probe, val_z[val_gap], val_mass[val_gap], device)
-            gate = _gaussian_gate(metrics)
-            improvement = gate["improvement"]
-            status = gate["status"]
-            reports.append(dict(
-                **base, selected_epoch=selected_epoch,
-                selection_nll=selection_nll,
-                checkpoint_gaussian_compatible=bool(checkpoint_eligible),
-                **counts, **gate,
+            tasks.append(dict(
+                base=base,
+                counts=counts,
+                train_z=np.ascontiguousarray(train_z[train_keep], dtype=np.float32),
+                train_mass=np.ascontiguousarray(train_mass[train_keep], dtype=np.float32),
+                val_z=np.ascontiguousarray(val_z[val_keep], dtype=np.float32),
+                val_mass=np.ascontiguousarray(val_mass[val_keep], dtype=np.float32),
+                gap_z=np.ascontiguousarray(val_z[val_gap], dtype=np.float32),
+                gap_mass=np.ascontiguousarray(val_mass[val_gap], dtype=np.float32),
+                settings=settings,
+                seed=(int(seed) + 3000 + probe_index) % 2**32,
+                device=str(device),
+                torch_threads=None,
             ))
-            emit_message(
-                f"Background pseudo-SR closure {side_name} {base['position']} "
-                f"[{window_index+1}/{windows_per_side}]: improvement={improvement:.6g} "
-                f"({status})"
-            )
 
+    if tasks:
+        workers = min(parallelism, len(tasks))
+        if workers == 1:
+            completed = [_pseudo_probe_worker(task) for task in tasks]
+            for report in completed:
+                reports.append(report)
+                emit_message(
+                    f"Background pseudo-SR closure {report['side']} {report['position']} "
+                    f"[{report['window']}/{windows_per_side}]: improvement={report['improvement']:.6g} "
+                    f"({report['status']})"
+                )
+        else:
+            child_threads = max(1, int(torch.get_num_threads()) // workers)
+            for task in tasks:
+                task["torch_threads"] = child_threads
+            context = mp.get_context("spawn")
+            with ProcessPoolExecutor(max_workers=workers, mp_context=context) as executor:
+                futures = [executor.submit(_pseudo_probe_worker, task) for task in tasks]
+                for future in as_completed(futures):
+                    report = future.result()
+                    reports.append(report)
+                    emit_message(
+                        f"Background pseudo-SR closure {report['side']} {report['position']} "
+                        f"[{report['window']}/{windows_per_side}]: improvement={report['improvement']:.6g} "
+                        f"({report['status']})"
+                    )
+
+    side_order = {"lower": 0, "upper": 1}
+    reports.sort(key=lambda r: (side_order[r["side"]], int(r["window"])))
     side_reports = []
     for side_name, _, _ in sides:
         windows = [r for r in reports if r["side"] == side_name]
@@ -378,6 +422,7 @@ def _pseudo_sr_closure(train_z, train_mass, val_z, val_mass, *, settings, seed, 
         truth_labels_used=False,
         gap_quantiles=[list(x) for x in PSEUDO_WINDOW_QUANTILES],
         windows_per_side=windows_per_side,
+        parallel_probes=parallelism,
         minimum_gap_events=MIN_PSEUDO_WINDOW_EVENTS,
         minimum_positive_windows_per_side=MIN_POSITIVE_WINDOWS_PER_SIDE,
         compatibility_sigma=PSEUDO_COMPATIBILITY_SIGMA,
@@ -389,7 +434,6 @@ def _pseudo_sr_closure(train_z, train_mass, val_z, val_mass, *, settings, seed, 
         sides=side_reports,
         windows=reports,
     )
-
 
 def _contract(settings, train_z, train_mass, val_z, val_mass, seed, device,
               closure_z=None, closure_mass=None):

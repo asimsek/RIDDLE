@@ -26,6 +26,7 @@ DEFAULT_ENHANCEMENTS = {
     "responsibility_temperature": 0.7,
     "qphi_epochs": 40,
     "qphi_mass_bins": 4,
+    "pseudo_sr_parallel_probes": 3,
     "checkpoint_weighting": "uniform",
 }
 

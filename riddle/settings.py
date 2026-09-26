@@ -56,8 +56,10 @@ def validate_residual(value):
         integer(e[name], name, 0)
     for name in ("guide_folds",):
         integer(e[name], name, 2)
-    for name in ("guide_reference_multiplier", "tail_candidate_multiplier", "tail_mass_bins", "qphi_mass_bins"):
+    for name in ("guide_reference_multiplier", "tail_candidate_multiplier", "tail_mass_bins", "qphi_mass_bins", "pseudo_sr_parallel_probes"):
         integer(e[name], name, 1)
+    if e["pseudo_sr_parallel_probes"] > 6:
+        raise ValueError("pseudo_sr_parallel_probes must be at most 6")
     integer(e["qphi_epochs"], "qphi_epochs", 10)
     for name in ("guide_mass_conditioning", "guide_refresh_reference", "guide_ratio_calibration", "tail_rank",
                  "contrastive_positive_weighted", "contrastive_negative_weighted"):
