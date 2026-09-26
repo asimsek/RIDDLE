@@ -6,7 +6,9 @@ DEFAULT_ENHANCEMENTS = {
     **{name: True for name in FEATURES},
     "guide_epochs": 20, "guide_warmup_epochs": 10,
     "hard_start_epoch": 5, "hard_pool_fraction": 0.25, "hard_sampling_fraction": 0.5,
-    "contrastive_strength": 1.0, "score_flow_epochs": 60,
+    "contrastive_strength": 1.0,
+    "contrastive_positive_weighted": True, "contrastive_negative_weighted": False,
+    "score_flow_epochs": 60,
     "rosenblatt_bins": 12, "rosenblatt_hidden": 64, "rosenblatt_bound": 8.0,
 
     "guide_folds": 5,

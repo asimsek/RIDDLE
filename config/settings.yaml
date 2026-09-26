@@ -34,6 +34,8 @@ riddle:
     hard_pool_fraction: 0.25
     hard_sampling_fraction: 0.5
     contrastive_strength: 1.0
+    contrastive_positive_weighted: true
+    contrastive_negative_weighted: false
     score_flow_epochs: 60
     rosenblatt_bins: 12
     rosenblatt_hidden: 64
@@ -43,7 +45,7 @@ riddle:
     guide_reference_multiplier: 4
     guide_refresh_reference: true
     guide_ratio_calibration: true
-    responsibility_temperature: 0.85
+    responsibility_temperature: 1.0
     qphi_mass_bins: 4
     tail_rank: false
     tail_candidate_multiplier: 8

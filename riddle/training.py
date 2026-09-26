@@ -20,7 +20,7 @@ from .model import (
 from .integrity import SCIENTIFIC_VERSION, ordered_epochs
 from .options import feature_options, effective_features
 
-ENHANCED_TRAINING_PROTOCOL = "riddle_v5_5_balanced_qphi_mass_aware_tail_v2"
+ENHANCED_TRAINING_PROTOCOL = "riddle_v5_5_configurable_contrastive_weighting_v3"
 
 
 def _equal_count_groups(values, bins):
@@ -160,7 +160,11 @@ def enhanced_epoch(model, logit, ztrain, optimizer, options, additions, *, epoch
                     ref = torch.randn(xb.shape, generator=gen).to(device)
                     ref_logb = standard_normal_log_prob(ref)
             both = signal_log_prob(model, torch.cat((xb, ref)))
-            nc = contrastive_loss(both[:len(xb)]-lb, both[len(xb):]-ref_logb, w, mean_weight)
+            nc = contrastive_loss(
+                both[:len(xb)]-lb, both[len(xb):]-ref_logb, w, mean_weight,
+                positive_weighted=additions["contrastive_positive_weighted"],
+                negative_weighted=additions["contrastive_negative_weighted"],
+            )
             loss = loss + additions["contrastive_strength"]*nc
             model.train()
         tail = torch.zeros((), device=device)

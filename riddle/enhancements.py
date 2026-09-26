@@ -554,9 +554,13 @@ def tail_ranking_loss(positive_ratio, negative_ratio, weights, mean_weight, *, m
         total = total + (weights[positive_mask] * per_positive).sum()
     return total / (float(len(weights)) * mean_weight)
 
-def contrastive_loss(positive, negative, weights, mean_weight):
-    return .5*((weights*nn.functional.softplus(-positive)).mean()/mean_weight
-               + (weights*nn.functional.softplus(negative)).mean()/mean_weight)
+def contrastive_loss(positive, negative, weights, mean_weight, *, positive_weighted=True,
+                     negative_weighted=False):
+    positive_loss = ((weights*nn.functional.softplus(-positive)).mean()/mean_weight
+                     if positive_weighted else nn.functional.softplus(-positive).mean())
+    negative_loss = ((weights*nn.functional.softplus(negative)).mean()/mean_weight
+                     if negative_weighted else nn.functional.softplus(negative).mean())
+    return .5*(positive_loss + negative_loss)
 
 
 def standard_normal_log_prob(z):

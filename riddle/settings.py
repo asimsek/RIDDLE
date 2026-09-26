@@ -59,7 +59,8 @@ def validate_residual(value):
     for name in ("guide_reference_multiplier", "tail_candidate_multiplier", "tail_mass_bins", "qphi_mass_bins"):
         integer(e[name], name, 1)
     integer(e["qphi_epochs"], "qphi_epochs", 10)
-    for name in ("guide_mass_conditioning", "guide_refresh_reference", "guide_ratio_calibration", "tail_rank"):
+    for name in ("guide_mass_conditioning", "guide_refresh_reference", "guide_ratio_calibration", "tail_rank",
+                 "contrastive_positive_weighted", "contrastive_negative_weighted"):
         if type(e[name]) is not bool:
             raise ValueError(f"{name} must be boolean")
     for name in ("hard_pool_fraction", "hard_sampling_fraction", "tail_hard_fraction"):
