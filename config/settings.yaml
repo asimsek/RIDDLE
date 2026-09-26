@@ -49,7 +49,7 @@ riddle:
     responsibility_temperature: 1.0
     qphi_mass_bins: 1
     pseudo_sr_parallel_probes: 3
-    tail_rank: false
+    tail_rank: true
     tail_candidate_multiplier: 8
     tail_hard_fraction: 0.01
     tail_strength: 0.005
