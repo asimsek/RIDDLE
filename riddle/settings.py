@@ -114,7 +114,10 @@ def validate_residual(value):
     if "mass_conditioning" in value and type(value["mass_conditioning"]) is not bool:
         raise ValueError("mass_conditioning must be boolean")
     mf = value["mass_fraction"]
-    keys(mf, "enabled control_points smoothness variation damping min_fraction max_fraction max_iterations", "mass fraction")
+    mf.setdefault("update_mode", "mean_damped")
+    keys(mf, "enabled control_points smoothness variation damping min_fraction max_fraction max_iterations update_mode", "mass fraction")
+    if mf["update_mode"] not in ("mean_matched", "mean_damped"):
+        raise ValueError("mass_fraction.update_mode must be mean_matched or mean_damped")
     if type(mf["enabled"]) is not bool:
         raise ValueError("mass_fraction.enabled must be boolean")
     integer(mf["control_points"], "mass_fraction.control_points", 3)

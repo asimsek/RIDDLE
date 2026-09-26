@@ -33,11 +33,12 @@ def _expit(value):
 
 def _config(settings):
     cfg = dict(settings.get("mass_fraction", {}))
+    cfg.setdefault("update_mode", "mean_damped")
     required = {
         "enabled", "control_points", "smoothness", "variation", "damping",
-        "min_fraction", "max_fraction", "max_iterations",
+        "min_fraction", "max_fraction", "max_iterations", "update_mode",
     }
-    if set(cfg) != required:
+    if set(cfg) != required or cfg["update_mode"] not in ("mean_matched", "mean_damped"):
         raise ValueError("Invalid mass-fraction configuration")
     return cfg
 
@@ -169,9 +170,9 @@ def fit(context, responsibilities, state, settings, *, source="residual_responsi
     The soft labels are residual responsibilities computed from z-space density
     evidence.  Event counts in the mjj spectrum are never fit as a bump model.
     A five-control-point natural cubic spline (default) supplies the only mass
-    dependence. Weak first- and second-difference penalties plus a damped EM
-    update suppress noisy trends/wiggles while damping the global fraction mean
-    toward the current responsibility mean.
+    dependence. Weak first- and second-difference penalties suppress noisy
+    trends/wiggles; the configured update mode selects direct mean matching or a damped
+    mean update.
     """
     from scipy.optimize import minimize
 
@@ -222,11 +223,14 @@ def fit(context, responsibilities, state, settings, *, source="residual_responsi
 
     fitted = _mean_shift(np.asarray(result.x, dtype=np.float64), basis, target, cfg)
     damping = float(cfg["damping"])
-    low, high = float(_logit(cfg["min_fraction"])), float(_logit(cfg["max_fraction"]))
-    old_mean = float(_expit(np.clip(basis @ old, low, high)).mean())
-    damped_target = (1.0-damping)*old_mean + damping*target
     controls = (1.0-damping)*old + damping*fitted
-    controls = _mean_shift(controls, basis, damped_target, cfg)
+    if cfg["update_mode"] == "mean_matched":
+        controls = _mean_shift(controls, basis, target, cfg)
+    else:
+        low, high = float(_logit(cfg["min_fraction"])), float(_logit(cfg["max_fraction"]))
+        old_mean = float(_expit(np.clip(basis @ old, low, high)).mean())
+        damped_target = (1.0-damping)*old_mean + damping*target
+        controls = _mean_shift(controls, basis, damped_target, cfg)
 
     values = np.clip(basis @ controls, float(_logit(cfg["min_fraction"])),
                      float(_logit(cfg["max_fraction"])))

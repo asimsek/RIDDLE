@@ -20,6 +20,7 @@ riddle:
     min_fraction: 0.00001
     max_fraction: 0.5
     max_iterations: 100
+    update_mode: mean_matched
   initialization: background
   enhancements:
     rosenblatt: true
@@ -40,13 +41,13 @@ riddle:
     rosenblatt_bins: 12
     rosenblatt_hidden: 64
     rosenblatt_bound: 8.0
-    guide_folds: 5
+    guide_folds: 2
     guide_mass_conditioning: false
-    guide_reference_multiplier: 4
-    guide_refresh_reference: true
-    guide_ratio_calibration: true
+    guide_reference_multiplier: 1
+    guide_refresh_reference: false
+    guide_ratio_calibration: false
     responsibility_temperature: 1.0
-    qphi_mass_bins: 4
+    qphi_mass_bins: 1
     pseudo_sr_parallel_probes: 3
     tail_rank: false
     tail_candidate_multiplier: 8
