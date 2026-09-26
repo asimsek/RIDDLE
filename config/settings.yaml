@@ -61,7 +61,7 @@ riddle:
     validation_sigma: 2.0
   flow:
     layers: 6
-    hidden_features: 64
+    hidden_features: 96
     num_blocks: 2
     use_residual_blocks: false
     use_batch_norm: true
