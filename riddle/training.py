@@ -20,7 +20,61 @@ from .model import (
 from .integrity import SCIENTIFIC_VERSION, ordered_epochs
 from .options import feature_options, effective_features
 
-ENHANCED_TRAINING_PROTOCOL = "riddle_v5_5_configurable_contrastive_weighting_v3"
+ENHANCED_TRAINING_PROTOCOL = "riddle_v5_5_configurable_contrastive_weighting_v4"
+
+
+def _initialize_from_corrected_background(model, background, validation_inputs):
+    source = background.state_dict()
+    target = model.state_dict()
+    if source.keys() != target.keys():
+        raise ValueError("q_phi and residual flow structures differ beyond hidden width")
+    initial_key = next((k for k in source if k.endswith("autoregressive_net.initial_layer.weight")), None)
+    if initial_key is None:
+        raise ValueError("Cannot identify q_phi hidden width")
+    source_hidden = int(source[initial_key].shape[0])
+    target_hidden = int(target[initial_key].shape[0])
+    if source_hidden > target_hidden:
+        raise ValueError("q_phi hidden width cannot exceed residual hidden width for background initialization")
+    if source_hidden == target_hidden:
+        model.load_state_dict(source)
+    else:
+        widened = {}
+        for key, target_tensor in target.items():
+            source_tensor = source[key].to(device=target_tensor.device, dtype=target_tensor.dtype)
+            if source_tensor.shape == target_tensor.shape:
+                widened[key] = source_tensor.clone()
+                continue
+            value = target_tensor.clone()
+            if source_tensor.ndim == 1 and source_tensor.shape[0] == source_hidden and target_tensor.shape[0] == target_hidden:
+                value[:source_hidden] = source_tensor
+            elif (source_tensor.ndim == 2 and source_tensor.shape == (source_hidden, source_hidden)
+                  and target_tensor.shape == (target_hidden, target_hidden)):
+                value[:source_hidden, :source_hidden] = source_tensor
+                if key.endswith(".weight"):
+                    value[:source_hidden, source_hidden:] = 0
+            elif (source_tensor.ndim == 2 and source_tensor.shape[0] == source_hidden
+                  and target_tensor.shape[0] == target_hidden and source_tensor.shape[1] == target_tensor.shape[1]):
+                value[:source_hidden, :] = source_tensor
+            elif (source_tensor.ndim == 2 and source_tensor.shape[1] == source_hidden
+                  and target_tensor.shape[1] == target_hidden and source_tensor.shape[0] == target_tensor.shape[0]):
+                value[:, :source_hidden] = source_tensor
+                if key.endswith(".weight"):
+                    value[:, source_hidden:] = 0
+            else:
+                raise ValueError(
+                    f"Unsupported q_phi-to-residual widening for {key}: "
+                    f"{tuple(source_tensor.shape)} -> {tuple(target_tensor.shape)}"
+                )
+            widened[key] = value
+        model.load_state_dict(widened)
+    probe = torch.as_tensor(validation_inputs[:min(512, len(validation_inputs))], dtype=torch.float32, device=next(model.parameters()).device)
+    model.eval()
+    background.eval()
+    with torch.no_grad():
+        difference = (signal_log_prob(model, probe).double() - signal_log_prob(background, probe).double()).abs().max().item()
+    if not np.isfinite(difference) or difference > 1e-5:
+        raise ValueError(f"q_phi-to-residual initialization failed density-preservation check: max |Delta log p|={difference:.6g}")
+    return source_hidden, target_hidden
 
 
 def _equal_count_groups(values, bins):
@@ -432,7 +486,7 @@ def train_residual(
         corrected_background = load_background_correction(
             background_correction, settings, ztrain.shape[1]-1, device
         )
-        model.load_state_dict(corrected_background.state_dict())
+        _initialize_from_corrected_background(model, corrected_background, zval)
     if corrected_background is None:
         if initialization in ("background", "identity"):
             from .model import match_background

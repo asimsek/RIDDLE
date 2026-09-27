@@ -48,6 +48,7 @@ riddle:
     guide_ratio_calibration: false
     responsibility_temperature: 1.0
     qphi_mass_bins: 1
+    qphi_hidden_features: 64
     pseudo_sr_parallel_probes: 3
     tail_rank: true
     tail_candidate_multiplier: 8

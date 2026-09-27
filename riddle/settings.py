@@ -56,7 +56,7 @@ def validate_residual(value):
         integer(e[name], name, 0)
     for name in ("guide_folds",):
         integer(e[name], name, 2)
-    for name in ("guide_reference_multiplier", "tail_candidate_multiplier", "tail_mass_bins", "qphi_mass_bins", "pseudo_sr_parallel_probes"):
+    for name in ("guide_reference_multiplier", "tail_candidate_multiplier", "tail_mass_bins", "qphi_mass_bins", "qphi_hidden_features", "pseudo_sr_parallel_probes"):
         integer(e[name], name, 1)
     if e["pseudo_sr_parallel_probes"] > 6:
         raise ValueError("pseudo_sr_parallel_probes must be at most 6")
@@ -195,6 +195,8 @@ def validate_residual(value):
     )
     for k in ("layers", "hidden_features", "num_blocks", "num_bins"):
         integer(f[k], k)
+    if value.get("background_correction") == "bgcorr_40_reguide" and e["qphi_hidden_features"] > f["hidden_features"]:
+        raise ValueError("qphi_hidden_features cannot exceed residual flow hidden_features")
     for k in ("use_residual_blocks", "use_batch_norm", "random_mask"):
         if type(f[k]) is not bool:
             raise ValueError(f"{k} must be boolean")

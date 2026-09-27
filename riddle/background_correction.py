@@ -24,7 +24,7 @@ from .options import feature_options
 
 MODE = "bgcorr_40_reguide"
 EPOCHS = 40
-PROTOCOL = "shared_sideband_qphi_balanced_validation_uncertainty_gated_mean_supported_closure_reguide"
+PROTOCOL = "shared_sideband_qphi_balanced_validation_uncertainty_gated_mean_supported_closure_reguide_decoupled_width"
 CLOSURE_SCOPE = "correction_only_interpolation_on_fixed_upstream_map; not_full_search_closure"
 MIN_VALIDATION_IMPROVEMENT = 0.0
 # Leave training support on both sides of each interpolation gap.
@@ -86,11 +86,18 @@ def _equal_stratum_mean(values, mass, bins):
     return float(np.mean([values[group].mean() for group in groups]))
 
 
+def _qphi_flow(settings):
+    flow = deepcopy(settings["flow"])
+    flow["hidden_features"] = int(feature_options(settings)["qphi_hidden_features"])
+    return flow
+
+
 def _model(settings, dimensions, device):
     cfg = deepcopy(settings)
     cfg["mass_conditioning"] = True
     cfg["enhancements"] = deepcopy(cfg.get("enhancements", {}))
     cfg["enhancements"]["score_flow"] = False
+    cfg["flow"] = _qphi_flow(settings)
     model = build_signal_flow(device, features=dimensions + 1, settings=cfg)
     match_background(model)
     return model
@@ -438,7 +445,7 @@ def _pseudo_sr_closure(train_z, train_mass, val_z, val_mass, *, settings, seed, 
 def _contract(settings, train_z, train_mass, val_z, val_mass, seed, device,
               closure_z=None, closure_mass=None):
     return dict(
-        schema=6,
+        schema=7,
         scientific_version=SCIENTIFIC_VERSION,
         protocol=PROTOCOL,
         mode=MODE,
@@ -458,7 +465,7 @@ def _contract(settings, train_z, train_mass, val_z, val_mass, seed, device,
         ),
         seed=int(seed),
         device=str(device),
-        flow=settings["flow"],
+        flow=_qphi_flow(settings),
         learning_rate=settings["training"]["learning_rate"],
         hashes={
             "train_z": digest(train_z), "train_mass": digest(train_mass),
