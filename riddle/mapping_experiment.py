@@ -100,7 +100,7 @@ def validate_worker(args):
 def prepare_frozen(data, output, seed, device, *, background, options, data_policy,
                    residual_batch_size, experiment):
     """Map persisted source roles with a verified model, without fitting a map."""
-    from .mapping import Mapper, split_roles
+    from .mapping import Mapper, _map_roles_by_source, split_roles
     from .roles import attach_source_ids, validate_member_split
     spec = experiment
     output, bank = Path(output), Path(spec['bank'])
@@ -132,11 +132,8 @@ def prepare_frozen(data, output, seed, device, *, background, options, data_poli
             raise ValueError('Invalid fixed source assignment: '+k)
     if not np.array_equal(np.sort(np.r_[parts['signal_train'],parts['signal_val']]),np.arange(len(sources['innerdata_train']))):
         raise ValueError('Fixed residual roles must cover the source exactly once')
-    mapper = Mapper(output, device); mapped = {}
-    for name, role in roles.items():
-        rows = sources[role['source']][role['indices']]
-        z, mask = mapper.map(rows)
-        mapped[name] = dict(z=z, mass=rows[mask,0], rows=rows, mask=mask)
+    mapper = Mapper(output, device)
+    mapped, _ = _map_roles_by_source(mapper, sources, roles)
     attach_source_ids(data, roles, mapped)
     train, val = mapped['signal_train'], mapped['signal_val']
     if len(train['z']) % residual_batch_size == 1:

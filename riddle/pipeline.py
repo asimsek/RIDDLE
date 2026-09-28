@@ -1,6 +1,7 @@
+import json
 import numpy as np
 
-from riddle.storage import atomic_write, save_npz, write_json
+from riddle.storage import atomic_write, save_npz, write_json, digest, file_digest
 from riddle.recovery import EpochRecovery
 from riddle.acceleration import install_tensor_batches, execution_report
 from .latent import prepare, Mapper
@@ -23,7 +24,8 @@ def run(args, contract):
     recovery = EpochRecovery(latent_root, contract, args.resume, **resume_policy(args))
     settings = args.settings
     active = effective_features(settings["riddle"])
-    enhanced = any(active.values())
+    core = settings["riddle"].get("core", "residual")
+    enhanced = any(active.values()) or settings["riddle"].get("background_correction") == "bgcorr_40_reguide"
     development = None
     mass_conditioning = settings["riddle"].get("mass_conditioning", False)
     physical_inputs = settings["riddle"].get("input_space") == "physical"
@@ -46,6 +48,15 @@ def run(args, contract):
     )
     if not enhanced:
         mapper = Mapper(args.data, latent_root, selection["inference_mapping_epoch"], args.device)
+    mapping_identity = {
+        "training_latents_sha256": digest(training),
+        "validation_latents_sha256": digest(validation),
+        "selection": selection,
+    }
+    for name in ("model.pt", "preprocessing.pt", "mapping_settings.json"):
+        path = latent_root / name
+        if path.is_file():
+            mapping_identity[name] = file_digest(path)
     background_reference = None
     if physical_inputs:
         training, validation = mapper.physical_development(args.data, settings["background"]["reference_samples"])
@@ -118,16 +129,24 @@ def run(args, contract):
             **({"background_correction": background_correction} if background_correction is not None else {}),
             **({"member_splits": development.get("member_splits"),
                 "source_ids": development["residual_train"].get("ids")} if enhanced else {}),
+            mapping_identity=mapping_identity,
         )
         validate_normalization(output / "density", dimensions + int(mass_conditioning) + int(physical_inputs), args.device)
         exports = {}
         calibration_raw = {}
         try:
             for partition, (rows, region, z, mask, preprocessing_mask, score_domain_mask) in mapped.items():
-                scores, fit_scores, accepted_fit_scores = ensemble_predict(
-                    output / "density", z, args.device, return_members=True, return_accepted_members=True
+                prediction = ensemble_predict(
+                    output / "density", z, args.device, return_members=True, return_accepted_members=True,
+                    return_raw=core == "stein_witness", scoring_settings=settings["riddle"],
                 )
+                if core == "stein_witness":
+                    scores, raw_scores, fit_scores, accepted_fit_scores = prediction
+                else:
+                    scores, fit_scores, accepted_fit_scores = prediction
+                    raw_scores = scores
                 require_finite(scores, "RIDDLE ensemble scores")
+                require_finite(raw_scores, "RIDDLE discriminating raw scores")
                 acceptance[partition] = {
                     **region_acceptance(rows[:, -1], mask, region),
                     "preprocessing": region_acceptance(rows[:, -1], preprocessing_mask, region),
@@ -136,6 +155,8 @@ def run(args, contract):
                 }
                 aligned = np.full(len(rows), np.nan, dtype=scores.dtype)
                 aligned[mask] = scores
+                aligned_raw = np.full(len(rows), np.nan, dtype=raw_scores.dtype)
+                aligned_raw[mask] = raw_scores
                 aligned_fits = np.full((len(fit_scores), len(rows)), np.nan, dtype=fit_scores.dtype)
                 aligned_fits[:, mask] = fit_scores
                 aligned_accepted_fits = np.full((len(accepted_fit_scores), len(rows)), np.nan, dtype=accepted_fit_scores.dtype)
@@ -149,6 +170,7 @@ def run(args, contract):
                     score_domain_mask=score_domain_mask,
                     score_scope=np.array(score_scope),
                     scores=aligned,
+                    raw_scores=aligned_raw,
                     physical=rows[:, 1:-1],
                     **({"density_inputs": z[:, :-1], "background_log_density": z[:, -1]}
                        if physical_inputs else {"latent": z}),
@@ -160,8 +182,18 @@ def run(args, contract):
                     accepted_fit_indices=np.array([m["fit_index"] for m in result["accepted_members"]], dtype=np.int64),
                     accepted_fit_seeds=np.array([m["seed"] for m in result["accepted_members"]], dtype=np.uint32),
                     accepted_fit_directories=np.array([m["directory"] for m in result["accepted_members"]]),
-                    accepted_fit_score_kind=np.array("log_density_ratio"),
+                    accepted_fit_score_kind=np.array(
+                        f"stein_{settings['riddle']['stein']['scoring']['mode']}" if core == "stein_witness"
+                        else "log_density_ratio"
+                    ),
                 )
+                if core == "stein_witness":
+                    arrays["score_kind"] = np.array(
+                        "stein_" + settings["riddle"]["stein"]["scoring"]["final_transform"]
+                    )
+                    arrays["fit_score_kind"] = np.array(
+                        f"stein_{settings['riddle']['stein']['scoring']['mode']}"
+                    )
                 if partition in evaluation_ids: arrays["event_ids"] = evaluation_ids[partition]
                 exports[partition] = arrays
             if active["score_flow"]:
@@ -204,8 +236,9 @@ def run(args, contract):
         atomic_write(output / "calibration/closure_scores.npz", lambda p: save_npz(p, mass=closure["mass"], scores=score, raw_scores=raw))
     else:
         for arrays in exports.values():
-            arrays["raw_scores"] = arrays["scores"].copy()
-            arrays["score_kind"] = np.array("log_density_ratio")
+            if core != "stein_witness":
+                arrays["raw_scores"] = arrays["scores"].copy()
+                arrays["score_kind"] = np.array("log_density_ratio")
     from .production import fit_acceptance
     health = dict(result["health"], calibration_status=calibration_status)
     health.update(fit_acceptance(health))
@@ -213,6 +246,8 @@ def run(args, contract):
     for partition, arrays in exports.items():
         atomic_write(output / f"{partition}_scores.npz", lambda p: save_npz(p, **arrays))
     write_json(output / "mapping_acceptance.json", acceptance)
+    stein_scoring = (json.loads((output / "density/stein_scoring_calibration.json").read_text())
+                     if core == "stein_witness" else None)
     write_json(
         output / "protocol.json",
         {
@@ -222,19 +257,29 @@ def run(args, contract):
             "score_mask_definition": "preprocessing_mask AND score_domain_mask",
             "input_features": input_features(settings, contract["inputs"]),
             "features": dimensions,
-            "layers": settings["riddle"]["flow"]["layers"],
-            "blocks": settings["riddle"]["flow"]["num_blocks"],
-            "hidden_features": settings["riddle"]["flow"]["hidden_features"],
+            "core": core,
+            "mixture_loss": (None if core == "stein_witness" else PROTOCOL.get("mixture_loss")),
+            "fraction_interpretation": ("not used by stein_witness" if core == "stein_witness" else PROTOCOL.get("fraction_interpretation")),
+            "scan_score": ("configured q-anchored Stein event score; CDF-based modes are already in [0,1]"
+                           if core == "stein_witness" else PROTOCOL.get("scan_score")),
+            "objective": ("neural Stein witness objective against the fixed latent background score field" if core == "stein_witness" else "residual mixture likelihood"),
+            "layers": (settings["riddle"]["stein"]["hidden_layers"] if core == "stein_witness" else settings["riddle"]["flow"]["layers"]),
+            "blocks": (None if core == "stein_witness" else settings["riddle"]["flow"]["num_blocks"]),
+            "hidden_features": (settings["riddle"]["stein"]["hidden_features"] if core == "stein_witness" else settings["riddle"]["flow"]["hidden_features"]),
             **settings["riddle"]["training"],
-            "gradient_clip": f"flow parameters only; norm {settings['riddle']['training']['gradient_clip_norm']}",
+            "gradient_clip": f"{'witness' if core == 'stein_witness' else 'flow'} parameters only; norm {settings['riddle']['training']['gradient_clip_norm']}",
             "ensemble": (
-                f"equal-weight mean over {result['valid_runs']} selected fits from {result['accepted_runs']} safeguard-valid fits; "
-                f"{settings['riddle']['training']['selected_checkpoints']} validation-selected epochs per fit with "
-                + ("validation-likelihood checkpoint weights" if feature_options(settings["riddle"]).get("checkpoint_weighting") == "validation_likelihood" else "equal checkpoint weights")
+                (f"arithmetic mean over {result['valid_runs']} selected Stein-witness fits from {result['accepted_runs']} safeguard-valid fits; "
+                 f"{settings['riddle']['training']['selected_checkpoints']} validation-selected epochs per fit with equal checkpoint weights")
+                if core == "stein_witness" else
+                (f"equal-weight mean over {result['valid_runs']} selected fits from {result['accepted_runs']} safeguard-valid fits; "
+                 f"{settings['riddle']['training']['selected_checkpoints']} validation-selected epochs per fit with "
+                 + ("validation-likelihood checkpoint weights" if feature_options(settings["riddle"]).get("checkpoint_weighting") == "validation_likelihood" else "equal checkpoint weights"))
             ),
             "ensemble_fit_selection": result["ensemble_fit_selection"],
             "settings": settings,
-            "implementation": ("riddle_v5_3_smooth_fm_bgcorr_40_reguide" if background_correction is not None
+            "implementation": ("riddle_stein_witness_v6_0_qanchored_scoring" if core == "stein_witness" else
+                               "riddle_v5_3_smooth_fm_bgcorr_40_reguide" if background_correction is not None
                                else "riddle_v5_3_smooth_fm_gaussian_fallback" if background_correction_decision is not None
                                else "riddle_v5_3_smooth_fm"),
             "data_policy": ("mapping_component_diagnostic_v1" if getattr(args,"mapping_experiment",None)
@@ -245,9 +290,16 @@ def run(args, contract):
                 if settings['riddle'].get('data_policy') == 'study_replay_v1' else
                 "Disjoint mapping, residual development, common mixture-selection, reserved evidence, calibration training/validation, and sideband closure roles; final test untouched")} if enhanced else {}),
             "feature_dependencies": {"hard_bg": "inactive when guided_fit is disabled"},
-            "score": ("log p_signal(z|mjj) ensemble - log q_phi(z|mjj)" if background_correction is not None else
+            "score": (f"Stein {settings['riddle']['stein']['scoring']['mode']} with "
+                      f"{settings['riddle']['stein']['scoring']['final_transform']} final transform"
+                      if core == "stein_witness" else
+                      "log p_signal(z|mjj) ensemble - log q_phi(z|mjj)" if background_correction is not None else
                       "logit conditional background percentile" if active["score_flow"] else "log mean residual/background density ratio"),
-            "raw_score": ("log p_signal(z|mjj) ensemble - log q_phi(z|mjj)" if background_correction is not None else
+            "raw_score": ((f"Stein {settings['riddle']['stein']['scoring']['mode']} ensemble score"
+                           if settings['riddle']['stein']['scoring']['final_transform'] == "identity"
+                           else "conditional background CDF of the configured Stein ensemble score")
+                          if core == "stein_witness" else
+                          "log p_signal(z|mjj) ensemble - log q_phi(z|mjj)" if background_correction is not None else
                           "log mean residual/background density ratio"),
             "background_correction": (None if background_correction is None else {
                 "mode": background_correction["mode"], "protocol": background_correction["protocol"],
@@ -259,13 +311,15 @@ def run(args, contract):
                 "full_search_closure_status": "not_evaluated",
                 "training_roles": ["correction_train", "correction_val"],
                 "shared_across_residual_fits": True,
-                "guide": "retrained against q_phi(z|m) samples at matched masses",
-                "residual_initialization": "q_phi",
+                "guide": ("not used by stein_witness" if core == "stein_witness" else "retrained against q_phi(z|m) samples at matched masses"),
+                "residual_initialization": ("zero Stein witness" if core == "stein_witness" else "q_phi"),
                 "denominator": "q_phi(z|m)",
             }),
             "background_correction_decision": (None if background_correction_decision is None else
                                                 background_correction_decision["selection"]),
-            "fit_score_note": "Individual density scores through the frozen ensemble calibrator; not independently calibrated member models" if active["score_flow"] else "individual density ratios",
+            "fit_score_note": ("per-fit Stein scores after per-checkpoint q-normalization and checkpoint averaging"
+                               if core == "stein_witness" else
+                               "Individual density scores through the frozen ensemble calibrator; not independently calibrated member models" if active["score_flow"] else "individual density ratios"),
             "coherent_mixture": result.get("coherent_mixture"),
             "calibration_status": calibration_status,
             "flow_selection": selection,
@@ -290,18 +344,26 @@ def run(args, contract):
                 "uses_mjj_event_count_density": False,
                 "included_in_final_score": False,
             } if settings["riddle"].get("mass_fraction", {}).get("enabled", False) else {"enabled": False}),
+            "stein": (settings["riddle"]["stein"] if core == "stein_witness" else None),
+            "stein_scoring": stein_scoring,
             "selected_checkpoints": result["selected_checkpoints"],
             "acceleration": execution_report(acceleration),
             **({"name": ("RIDDLE bgcorr_40_reguide" if background_correction is not None else
                          "RIDDLE bgcorr Gaussian fallback" if background_correction_decision is not None else
                          "RIDDLE + mass-conditioned residual"),
                 "mass_conditioning": True,
-                "inputs": "SR latents plus mass context (mjj - 3.5 TeV) / 0.2 TeV; no truth labels",
-                "score": ("log(mean signal density p(z|mjj)) - log q_phi(z|mjj)" if background_correction is not None else
+                "inputs": ("SR latents only for the Stein witness; mjj context is used only by q_phi(z|mjj); no truth labels"
+                           if core == "stein_witness" else
+                           "SR latents plus mass context (mjj - 3.5 TeV) / 0.2 TeV; no truth labels"),
+                "score": (f"{settings['riddle']['stein']['scoring']['mode']} Stein score with "
+                          f"{settings['riddle']['stein']['scoring']['final_transform']} final calibration"
+                          if core == "stein_witness" else
+                          "log(mean signal density p(z|mjj)) - log q_phi(z|mjj)" if background_correction is not None else
                           "log(mean signal density p(z|mjj)) - log standard-normal latent density"),
                 "background": ("shared sideband-trained q_phi(z|mjj); no mass PDF factor" if background_correction is not None else
                                "standard-normal latent density conditional on mass; no mass PDF factor"),
-                "mixture_fraction": ("smooth f(mjj) learned from latent responsibilities; training only; excluded from score"
+                "mixture_fraction": ("not used" if core == "stein_witness" else
+                                     "smooth f(mjj) learned from latent responsibilities; training only; excluded from score"
                                      if settings["riddle"].get("mass_fraction", {}).get("enabled", False) else "global fraction"),
                 "context_features": ["mjj"], "scope": "signal_region"} if mass_conditioning else {}),
             **({"name": "RIDDLE physical + mass (CPU pilot)", "input_space": "physical",

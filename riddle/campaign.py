@@ -20,10 +20,34 @@ PROTOCOL = {
     **SINGLE_PROTOCOL,
     "name": "RIDDLE",
     "campaign_version": SCIENTIFIC_VERSION,
-    "ensemble": "equal-weight mean signal density over label-free validation-selected accepted fits and validation-selected epochs per fit",
+    "ensemble": "core-dependent equal-weight ensemble over label-free validation-selected accepted fits and validation-selected epochs per fit",
     "splits": "80/20 resamples of development training rows; reserved validation reserved for configuration/cuts",
     "failures": "bounded fresh retries for numerical failures only; retain inconclusive evidence without retries",
 }
+
+
+def _fit_training_settings(settings):
+    value = deepcopy(settings)
+    if value.get("core", "residual") == "stein_witness":
+        value.pop("ensemble_fit_selection", None)
+        value.pop("ensemble_fit_count", None)
+        value.pop("ensemble_completion", None)
+        if isinstance(value.get("stein"), dict):
+            value["stein"].pop("scoring", None)
+            value["stein"].pop("ensemble_fit_selection", None)
+    return value
+
+
+def _compatible_identity(saved, current, *, allow_new_mapping_identity=False):
+    saved = deepcopy(saved)
+    current = deepcopy(current)
+    saved_settings = saved.pop("settings", None)
+    current_settings = current.pop("settings", None)
+    if allow_new_mapping_identity and "mapping_identity" not in saved:
+        current.pop("mapping_identity", None)
+    if saved != current:
+        return False
+    return _fit_training_settings(saved_settings or {}) == _fit_training_settings(current_settings or {})
 
 
 class MemberScoreError(FloatingPointError):
@@ -52,6 +76,9 @@ def reject_scoring_member(output, member, error):
     selection = json.loads((output / "ensemble_selection.json").read_text())
     selection["status"] = "incomplete"
     write_json(output / "ensemble_selection.json", selection)
+    for name in ("stein_scoring_ensemble_reference.json", "stein_scoring_ensemble_reference.npz",
+                 "stein_scoring_calibration.json"):
+        (output / name).unlink(missing_ok=True)
     emit_message(f"RIDDLE fit {member['fit_index']:03d}: numerical scoring failure; "
                  "retry within the original attempt budget", kind="WARNING", level=0)
 
@@ -89,22 +116,61 @@ def assess_fit(directory, epochs, fractions, validation, device, *, sigma, norma
 
     correction_inputs = json.loads((Path(directory) / "residual_training_inputs.json").read_text())
     correction = correction_inputs.get("background_correction")
+    core = correction_inputs.get("core", correction_inputs.get("settings", {}).get("core", "residual"))
     if background_reference is not None:
         reference = np.asarray(background_reference)
-    elif correction is not None:
-        # Sample the fitted q_phi denominator across the full SR context range.
-
-        contexts = np.random.default_rng(3407).uniform(-1.0, 1.0, 8192).astype(np.float32)
+    elif mass_conditioning:
+        contexts = np.random.default_rng(3407).choice(validation[:, -1], 8192, replace=True).astype(np.float32)
         reference = residual_background_sample(directory, contexts, len(contexts), 3408, device)
     else:
         reference = np.random.default_rng(3407).standard_normal((8192, validation.shape[1])).astype(np.float32)
-        if mass_conditioning:
-
-
-            reference[:, -1] = np.random.default_rng(3408).choice(validation[:, -1], len(reference))
     if reference.shape != (8192, validation.shape[1]) or not np.isfinite(reference).all():
         raise ValueError("Invalid background normalization reference")
     rows = np.concatenate((validation, reference))
+    if core == "stein_witness":
+        from .production import score_diagnostics, validation_witness_improvement
+        from .stein import stein_identity_diagnostics
+        checks = []
+        for epoch in epochs:
+            values = residual_scores(directory, [epoch], rows, device, stein_mode="potential_raw")
+            checks.append(dict(epoch=epoch, kind="stein_witness_reference",
+                               **score_diagnostics(values[len(validation):],
+                                                   stage=f"{directory} Stein checkpoint {epoch}")))
+        valid_scores = residual_scores(directory, epochs, validation, device, stein_mode="potential_raw")
+        reference_scores = residual_scores(directory, epochs, reference, device, stein_mode="potential_raw")
+        closure_count = int(correction_inputs["settings"]["stein"]["closure_samples"])
+        if mass_conditioning:
+            closure_contexts = np.random.default_rng(3410).choice(
+                validation[:, -1], closure_count, replace=True
+            ).astype(np.float32)
+            closure_reference = residual_background_sample(
+                directory, closure_contexts, closure_count, 3411, device
+            )
+        else:
+            closure_reference = np.random.default_rng(3411).standard_normal(
+                (closure_count, validation.shape[1])
+            ).astype(np.float32)
+        closure = stein_identity_diagnostics(directory, epochs, closure_reference, device)
+        normalization = dict(
+            status=closure["status"], reference="fixed latent background witness reference",
+            reference_seed=3407, reference_samples=len(reference), checkpoints=checks,
+            ensemble=score_diagnostics(reference_scores, stage=f"{directory} Stein ensemble reference"),
+            score_kind="stein_witness", stein_identity_closure=closure,
+            closure_reference_seed=3411, closure_mass_context_seed=3410,
+        )
+        if correction is not None:
+            normalization.update(reference="q_phi(z|m) samples at reserved-validation mass contexts",
+                                 reference_seed=3408, mass_context_seed=3407, conditional_density=True,
+                                 background_correction=correction["mode"],
+                                 background_sha256=correction["source_sha256"])
+        elif mass_conditioning:
+            normalization.update(reference="standard-normal latent samples at reserved-validation masses",
+                                 mass_context_seed=3408, conditional_density=True)
+        quality = validation_witness_improvement(valid_scores, reference_scores, sigma=sigma)
+        health = dict(quality=quality, normalization=normalization)
+        health.update(fit_acceptance(health))
+        write_json(directory / "fit_health.json", health)
+        return quality, normalization, valid_scores
     mixture, reference_sum, checks = None, None, []
     checkpoint_fractions, _ = residual_fraction_probabilities(
         directory, epochs, validation, return_checkpoints=True)
@@ -201,7 +267,7 @@ def train_member(rows, validation, output, *, relative, index, fraction, epochs,
     with locked(root / ".resume/fit.lock"):
         if state_path.exists():
             state = json.loads(state_path.read_text())
-            if state["identity"] != identity:
+            if not _compatible_identity(state["identity"], identity):
                 raise ValueError("Fit inputs or retry policy changed; use a new output directory")
             attempts = state.get("attempts")
             if (not isinstance(attempts, list) or len(attempts) > len(seeds)
@@ -270,7 +336,9 @@ def train_member(rows, validation, output, *, relative, index, fraction, epochs,
                     checkpoint=checkpoint, fraction=fraction, initialization=initialization,
                     progress_label=f"{label} | Attempt {number + 1}/{len(seeds)}", settings=settings,
                     background_correction=background_correction)
-                weights = [history[e]["signal_fraction"] for e in order]
+                stein_core = settings.get("core", "residual") == "stein_witness"
+                weights = ([0.0 for _ in order] if stein_core else
+                           [history[e]["signal_fraction"] for e in order])
                 quality, normalization, mixture = assess_fit(
                     directory, order, weights, validation, device,
                     sigma=policy["validation_sigma"], normalization_tests=normalization_tests,
@@ -285,7 +353,9 @@ def train_member(rows, validation, output, *, relative, index, fraction, epochs,
                     **({"background_reference": background_reference} if background_reference is not None else {}))
 
                 from .storage import save_array
-                atomic_write(directory / "validation_log_mixture_ratio.npy", lambda p: save_array(p, mixture))
+                validation_name = ("validation_witness_scores.npy" if stein_core else
+                                   "validation_log_mixture_ratio.npy")
+                atomic_write(directory / validation_name, lambda p: save_array(p, mixture))
                 assessment = fit_acceptance(dict(quality=quality, normalization=normalization))
                 if not assessment["fit_valid"]:
                     raise NumericalFitError("Incomplete or invalid fit health assessment")
@@ -323,7 +393,7 @@ def train_campaign(
     train, validation, output, *, epochs=DEFAULTS["riddle"]["epochs"],
     runs=DEFAULTS["riddle"]["runs"], seed=0, device="cpu", fraction_values=(None,),
     initialization="background", started=None, workers=1, io_workers=2, torch_threads=2, settings=None, background_reference=None,
-    background_correction=None, selection_validation=None, member_splits=None, source_ids=None,
+    background_correction=None, selection_validation=None, member_splits=None, source_ids=None, mapping_identity=None,
 ):
     settings = deepcopy(DEFAULTS["riddle"] if settings is None else settings)
     settings.update(epochs=epochs, runs=runs, initialization=initialization)
@@ -360,6 +430,8 @@ def train_campaign(
                     training_sha256=digest(ztrain), selection_sha256=digest(zval),
                     epochs=epochs, runs=runs, seed=seed, fractions=list(fraction_values),
                     initialization=initialization, settings=settings)
+    if mapping_identity is not None:
+        identity["mapping_identity"] = mapping_identity
     if background_reference is not None:
         identity["background_reference_sha256"] = digest(background_reference)
     if background_correction is not None:
@@ -375,8 +447,9 @@ def train_campaign(
         identity["explicit_splits"] = {str(i): {k:digest(v) for k,v in split.items()} for i,split in member_splits.items()}
     if source_ids is not None: identity["source_ids_sha256"] = digest(source_ids)
     identity_path = output / "ensemble_inputs.json"
-    if identity_path.exists() and json.loads(identity_path.read_text()) != identity:
-        raise ValueError("Residual ensemble inputs/settings changed; use a new output")
+    if identity_path.exists() and not _compatible_identity(
+            json.loads(identity_path.read_text()), identity, allow_new_mapping_identity=True):
+        raise ValueError("Residual ensemble training inputs/settings changed; use a new output")
     write_json(identity_path, identity)
     tags = ["learned" if f is None else "fraction_" + str(f).replace(".", "p") for f in fraction_values]
     total = runs * len(tags)
@@ -410,11 +483,15 @@ def train_campaign(
         excluded = [m for m in receipts if m["status"] == "excluded"]
         failures.extend(dict(configuration=tag, fit_index=m["fit_index"], **attempt)
                         for m in receipts for attempt in m["attempts"] if attempt["status"] != "completed")
+        fit_selection_mode = (settings["stein"]["ensemble_fit_selection"]
+                              if settings.get("core") == "stein_witness" else settings["ensemble_fit_selection"])
         members, unselected, fit_selection = select_ensemble_members(
-            accepted_members, mode=settings["ensemble_fit_selection"], fit_count=settings["ensemble_fit_count"]
+            accepted_members, mode=fit_selection_mode, fit_count=settings["ensemble_fit_count"]
         ) if accepted_members else ([], [], dict(
-            mode=settings["ensemble_fit_selection"], fit_count=settings["ensemble_fit_count"], candidate_fits=0,
-            selected_fits=0, ranking_metric="reserved_validation_mean_log_likelihood_gain",
+            mode=fit_selection_mode, fit_count=settings["ensemble_fit_count"], candidate_fits=0,
+            selected_fits=0, ranking_metric=("reserved_validation_mean_witness_gain"
+                                                if settings.get("core") == "stein_witness"
+                                                else "reserved_validation_mean_log_likelihood_gain"),
             ranking_direction="descending", truth_labels_used=False, selected_fit_indices=[],
             selected_fit_indices_by_rank=[], unselected_fit_indices=[], ranking=[]))
         config = dict(name=tag, fraction=fraction_values[tags.index(tag)], members=members,
@@ -433,6 +510,51 @@ def train_campaign(
                     recorded.append(info["source_sha256"])
                 if set(recorded) != {background_correction["model_sha256"]}:
                     raise ValueError("Accepted RIDDLE members do not share one coherent q_phi denominator")
+            if settings.get("core", "residual") == "stein_witness":
+                witnesses = [np.load(output / m["directory"] / "validation_witness_scores.npy") for m in members]
+                combined = np.mean(np.stack(witnesses), axis=0)
+                contexts = np.random.default_rng(73407).choice(zval[:, -1], 8192, replace=True).astype(np.float32)
+                reference = residual_background_sample(
+                    output / members[0]["directory"], contexts, len(contexts), 73408, device
+                )
+                reference_scores = np.mean(np.stack([
+                    residual_scores(output / member["directory"], member["epochs"], reference, device,
+                                    stein_mode="potential_raw")
+                    for member in members
+                ]), axis=0)
+                from .production import validation_witness_improvement
+                member_normalizations = [
+                    json.loads((output / member["directory"] / "fit_health.json").read_text())["normalization"]
+                    for member in members
+                ]
+                normalization_status = (
+                    "passed" if all(item.get("status") == "passed" for item in member_normalizations) else "failed"
+                )
+                config["health"] = dict(
+                    normalization_status=normalization_status,
+                    normalization=dict(
+                        status=normalization_status,
+                        reference="selected-member Stein identity closures",
+                        member_statuses=[item.get("status") for item in member_normalizations],
+                        member_closures=[item.get("stein_identity_closure") for item in member_normalizations],
+                    ),
+                    quality=validation_witness_improvement(
+                        combined, reference_scores, sigma=settings["fit_recovery"]["validation_sigma"]
+                    ),
+                )
+                config["health"].update(fit_acceptance(config["health"]))
+                config["selection_nll"] = -float(config["health"]["quality"]["mean_witness_gain"])
+                histories = [json.loads((output / m["directory"] / "residual_losses.json").read_text())["history"]
+                             for m in members]
+                config["history"] = [dict(
+                    epoch=e,
+                    train_nll=float(np.mean([h[e]["train_nll"] for h in histories if e < len(h)])),
+                    validation_nll=float(np.mean([h[e]["validation_nll"] for h in histories if e < len(h)])),
+                    signal_fraction=0.0,
+                    contributing_fits=sum(e < len(h) for h in histories),
+                ) for e in range(max(map(len, histories)))]
+                configs.append(config)
+                continue
             mixtures = [np.load(output / m["directory"] / "validation_log_mixture_ratio.npy") for m in members]
             combined = np.logaddexp.reduce(mixtures, axis=0) - np.log(len(members))
             selection_gain = None
@@ -512,8 +634,13 @@ def train_campaign(
                       "epochs": background_correction["epochs"], "selected_epoch": background_correction["selected_epoch"],
                       "model_sha256": background_correction["model_sha256"]}),
                   failures=failures, fit_recovery=settings["fit_recovery"],
-                  selection=("label-free reserved-validation likelihood ranks fits when requested; internal selection likelihood chooses configurations; no truth or test-score selection"
-                             if zselection is not None else "label-free reserved-validation mixture likelihood ranks fits/configurations; no truth or test-score selection"))
+                  selection=(("label-free reserved-validation Stein witness discrepancy ranks fits; no truth or test-score selection"
+                              if settings.get("core") == "stein_witness" else
+                              "label-free reserved-validation likelihood ranks fits when requested; internal selection likelihood chooses configurations; no truth or test-score selection")
+                             if zselection is not None else
+                             ("label-free reserved-validation Stein witness discrepancy ranks fits; no truth or test-score selection"
+                              if settings.get("core") == "stein_witness" else
+                              "label-free reserved-validation mixture likelihood ranks fits/configurations; no truth or test-score selection")))
     result['ensemble_completion'] = settings.get('ensemble_completion', 'partial')
     write_json(output / "numerical_failures.json", {"failures": failures})
     if not usable:
@@ -539,6 +666,16 @@ def train_campaign(
         write_json(output / "coherent_mixture.json", chosen["coherent_mixture"])
     require_complete_ensemble(result)
     write_json(output / "ensemble_selection.json", result)
+    if settings.get("core") == "stein_witness":
+        from .stein_scoring import prepare_reference, write_root_provenance
+
+        scoring_mapping = (mapping_identity if mapping_identity is not None else {
+            "training_latents_sha256": digest(ztrain), "validation_latents_sha256": digest(zval)
+        })
+        prepare_reference(output, chosen["accepted_members"], zval, device, settings, scoring_mapping)
+        write_root_provenance(
+            output, chosen["members"], chosen["accepted_members"], settings, scoring_mapping
+        )
     write_json(output / "residual_losses.json", dict(history=chosen["history"], aggregation="mean over selected ensemble fits"))
     emit_message(
         f"RIDDLE: {result['accepted_runs']}/{runs} fits passed safeguards; "
@@ -566,6 +703,8 @@ def validate_normalization(output, features, device):
                 expected.update(fit_acceptance(expected))
             if health != expected:
                 raise ValueError("Selected RIDDLE fit health disagrees with its acceptance receipt")
+            if health.get("normalization", {}).get("status") != "passed":
+                raise ValueError("Selected RIDDLE fit failed its normalization/closure gate")
             members.append(dict(directory=member["directory"], **health["normalization"]))
         audit = dict(schema=1, status="passed", features=features, members=members,
                      source="per-attempt checks before acceptance; verified artifact hashes")
@@ -595,35 +734,80 @@ def validate_normalization(output, features, device):
     return audit
 
 
-def ensemble_predict(output, z, device, *, return_members=False, return_accepted_members=False):
+def ensemble_predict(output, z, device, *, return_members=False, return_accepted_members=False,
+                     return_raw=False, stein_mode=None, scoring_settings=None):
     root = Path(output)
     selection = json.loads((root / "ensemble_selection.json").read_text())
     require_complete_ensemble(selection)
     selected = selection["members"]
     accepted = selection.get("accepted_members", selected)
     selected_directories = {member["directory"] for member in selected}
+    first_inputs = json.loads((root / selected[0]["directory"] / "residual_training_inputs.json").read_text())
+    core = first_inputs.get("core", first_inputs.get("settings", {}).get("core", "residual"))
+    explicit_stein_mode = stein_mode
+    if core == "stein_witness":
+        if scoring_settings is None:
+            ensemble_inputs = json.loads((root / "ensemble_inputs.json").read_text())
+            scoring_settings = ensemble_inputs.get("settings", first_inputs["settings"])
+        scoring_settings = validate_residual(scoring_settings)
+        if stein_mode is None:
+            stein_mode = scoring_settings["stein"]["scoring"]["mode"]
+        elif stein_mode != scoring_settings["stein"]["scoring"]["mode"]:
+            scoring_settings = deepcopy(scoring_settings)
+            scoring_settings["stein"] = deepcopy(scoring_settings["stein"])
+            scoring_settings["stein"]["scoring"] = deepcopy(scoring_settings["stein"]["scoring"])
+            scoring_settings["stein"]["scoring"]["mode"] = stein_mode
+            scoring_settings = validate_residual(scoring_settings)
     combined = None
     selected_predictions = []
     accepted_predictions = []
     for member in accepted:
         from .production import NumericalFitError
         try:
-            ratio = residual_scores(root / member["directory"], member["epochs"], z, device)
+            ratio = residual_scores(
+                root / member["directory"], member["epochs"], z, device,
+                stein_mode=stein_mode if core == "stein_witness" else None,
+                stein_scoring_root=root if core == "stein_witness" else None,
+                stein_scoring_settings=scoring_settings if core == "stein_witness" else None,
+            )
         except (FloatingPointError, NumericalFitError) as error:
             raise MemberScoreError(member, error) from error
         if return_accepted_members:
             accepted_predictions.append(ratio)
         if member["directory"] in selected_directories:
-            combined = ratio if combined is None else np.logaddexp(combined, ratio)
+            if combined is None:
+                combined = ratio.copy()
+            elif core == "stein_witness":
+                combined = combined + ratio
+            else:
+                combined = np.logaddexp(combined, ratio)
             if return_members:
                 selected_predictions.append(ratio)
     if combined is None or not selected:
         raise ValueError("RIDDLE ensemble has no selected members")
-    scores = combined - np.log(len(selected))
-    if return_members and return_accepted_members:
-        return scores, np.stack(selected_predictions), np.stack(accepted_predictions)
+    ensemble_raw = (combined / len(selected) if core == "stein_witness" else combined - np.log(len(selected)))
+    raw = ensemble_raw
+    scores = ensemble_raw
+    if core == "stein_witness":
+        from .stein_scoring import final_transform, write_root_provenance
+
+        scores, raw, final_metadata = final_transform(
+            root, selected, ensemble_raw, np.asarray(z)[:, -1], device, scoring_settings
+        )
+        identity = json.loads((root / "ensemble_inputs.json").read_text())
+        mapping_identity = identity.get("mapping_identity", {
+            "training_latents_sha256": identity["training_sha256"],
+            "validation_latents_sha256": identity["selection_sha256"],
+        })
+        if explicit_stein_mode is None:
+            write_root_provenance(root, selected, accepted, scoring_settings, mapping_identity, final_metadata)
+    values = [scores]
+    if return_raw:
+        values.append(raw)
     if return_members:
-        return scores, np.stack(selected_predictions)
+        values.append(np.stack(selected_predictions))
     if return_accepted_members:
-        return scores, np.stack(accepted_predictions)
+        values.append(np.stack(accepted_predictions))
+    if len(values) > 1:
+        return tuple(values)
     return scores

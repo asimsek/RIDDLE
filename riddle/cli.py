@@ -76,7 +76,7 @@ def parser():
             "--workers",
             type=positive,
             default=1,
-            help="Concurrent RIDDLE/R-ANODE fits or independent LaCathode runs; fixed-background LaCathode and method/seed jobs stay sequential",
+            help="Concurrent RIDDLE/R-ANODE fits or independent LaCathode runs; fixed-background LaCathode stays sequential",
         )
         run.add_argument("--io-workers", type=positive, default=2,
                          help="Filesystem/host I/O concurrency; independent of PyTorch compute threads")
@@ -86,20 +86,20 @@ def parser():
         run.add_argument("--runs", type=positive,
                          help="Complete independent runs per seed (default: 1); retrain background and signal models")
         run.add_argument("--fits", type=positive,
-                         help="Signal ensemble fits per RIDDLE/R-ANODE run (default: method YAML); does not change LaCathode")
+                         help="Ensemble fits per RIDDLE/R-ANODE run (default: method settings); does not change LaCathode")
         run.add_argument("--lacathode-background", choices=("independent", "fixed"), default="independent",
                          help="Retrain each LaCathode background flow (default), or share one flow across classifier fits")
         run.add_argument(
             "--epochs", type=positive, help="Override RIDDLE/R-ANODE signal-fit and LaCathode classifier epochs; background stages are unchanged"
         )
-        run.add_argument("--fractions", nargs="+", help="Override YAML mixture-fraction configurations")
+        run.add_argument("--fractions", nargs="+", help="Override YAML mixture-fraction configurations (residual only)")
         from .roles import POLICIES
         run.add_argument("--data-policy", choices=tuple(POLICIES), help="Source-role policy; default production_v2 uses HC study mapping + production residual roles")
         run.add_argument("--ensemble-completion", choices=("strict", "partial"), help="Require every requested fit, or explicitly retain a partial ensemble")
         run.add_argument("--mass-conditioning", action=argparse.BooleanOptionalAction, default=None,
-                         help="Condition the RIDDLE residual density on mjj inside the signal region")
+                         help="Condition the RIDDLE latent background/model on mjj inside the signal region")
         run.add_argument("--background-correction", choices=("none", "bgcorr_40_reguide"), default=None,
-                         help="Optional latent denominator correction; bgcorr_40_reguide trains one shared 40-epoch q_phi(z|m) and retrains each guide against it")
+                         help="Optional latent background correction; bgcorr_40_reguide trains one shared 40-epoch q_phi(z|m) used by either RIDDLE core")
         from .options import add_feature_arguments
         add_feature_arguments(run)
         add_resume_options(run)
@@ -215,8 +215,6 @@ def run_campaign(args):
             if method == "lacathode":
                 options.update(run_overrides)
             elif method == "riddle":
-
-
                 options["runs"] = args.fits
             env = os.environ.copy()
             if args.device == "cpu":

@@ -39,8 +39,11 @@ def feature_options(settings):
 def effective_features(settings):
     options = feature_options(settings)
     result = {name: options[name] for name in FEATURES}
-
-    result["hard_bg"] = result["hard_bg"] and result["guided_fit"]
+    if settings.get("core", "residual") == "stein_witness":
+        for name in ("guided_fit", "hard_bg", "contrastive_fit", "score_flow", "coherent_mixture"):
+            result[name] = False
+    else:
+        result["hard_bg"] = result["hard_bg"] and result["guided_fit"]
     return result
 
 

@@ -48,9 +48,38 @@ def validation_improvement(log_mixture_ratios, *, sigma):
                 interpretation="label-free validation metric; may rank ensemble fits; not evidence of a physical signal")
 
 
+
+
+def validation_witness_improvement(data_scores, reference_scores, *, sigma):
+    data = np.asarray(data_scores, dtype=np.float64)
+    reference = np.asarray(reference_scores, dtype=np.float64)
+    if data.ndim != 1 or reference.ndim != 1 or len(data) < 2 or len(reference) < 2:
+        raise ValueError("Stein validation requires data and reference score samples")
+    if not np.isfinite(data).all() or not np.isfinite(reference).all():
+        raise NumericalFitError("Nonfinite reserved-validation Stein witness scores")
+    if not np.isfinite(sigma) or sigma < 0:
+        raise ValueError("Invalid validation improvement threshold")
+    gain = float(data.mean() - reference.mean())
+    error = float(np.sqrt(data.var(ddof=1) / len(data) + reference.var(ddof=1) / len(reference)))
+    margin = gain - sigma * error
+    if not np.isfinite([gain, error, margin]).all():
+        raise NumericalFitError("Nonfinite Stein validation statistics")
+    tolerance = 10 * np.finfo(np.float32).eps
+    evidence = ("improved" if margin > tolerance else
+                "deteriorated" if gain + sigma * error < -tolerance else "inconclusive")
+    return dict(
+        status="passed" if margin > tolerance else "insufficient_validation_improvement",
+        evidence_status=evidence, upper_margin=gain + sigma * error,
+        events=len(data), reference_events=len(reference), mean_witness_gain=gain,
+        standard_error=error, sigma=float(sigma), lower_margin=margin,
+        numerical_tolerance=float(tolerance), baseline="fixed latent background q_B(z|m)",
+        truth_labels_used=False,
+        interpretation="label-free held-out Stein witness discrepancy; may rank ensemble fits; not evidence of a physical signal",
+    )
+
 def select_ensemble_members(members, *, mode, fit_count):
-    if mode not in ("validation-best", "all"):
-        raise ValueError("ensemble fit selection must be validation-best or all")
+    if mode not in ("validation-best", "all", "all-valid"):
+        raise ValueError("ensemble fit selection must be validation-best, all-valid, or all")
     if type(fit_count) is not int or fit_count < 1:
         raise ValueError("ensemble fit count must be a positive integer")
     if not isinstance(members, list):
@@ -58,20 +87,26 @@ def select_ensemble_members(members, *, mode, fit_count):
     ranking = []
     for member in members:
         quality = member.get("quality", {}) or {}
-        gain = quality.get("mean_log_likelihood_gain")
+        metric = "mean_witness_gain" if "mean_witness_gain" in quality else "mean_log_likelihood_gain"
+        gain = quality.get(metric)
         if type(member.get("fit_index")) is not int or type(gain) not in (int, float) or not np.isfinite(gain):
-            raise ValueError("ensemble fit selection requires finite label-free validation likelihood for every fit")
+            raise ValueError("ensemble fit selection requires a finite label-free validation metric for every fit")
         error = quality.get("standard_error")
         if type(error) not in (int, float) or not np.isfinite(error):
             raise ValueError("ensemble fit selection requires finite validation uncertainty for every fit")
         ranking.append(dict(
             fit_index=member["fit_index"],
-            mean_log_likelihood_gain=float(gain),
+            selection_metric=metric,
+            selection_gain=float(gain),
             standard_error=float(error),
             directory=member.get("directory"),
         ))
-    ordered = sorted(ranking, key=lambda row: (-row["mean_log_likelihood_gain"], row["fit_index"]))
-    if mode == "all":
+    metrics = {row["selection_metric"] for row in ranking}
+    if len(metrics) != 1:
+        raise ValueError("Cannot rank ensemble fits with mixed validation metrics")
+    metric = next(iter(metrics))
+    ordered = sorted(ranking, key=lambda row: (-row["selection_gain"], row["fit_index"]))
+    if mode in ("all", "all-valid"):
         chosen = {row["fit_index"] for row in ranking}
     else:
         chosen = {row["fit_index"] for row in ordered[:min(fit_count, len(ordered))]}
@@ -82,7 +117,7 @@ def select_ensemble_members(members, *, mode, fit_count):
         fit_count=int(fit_count),
         candidate_fits=len(members),
         selected_fits=len(selected),
-        ranking_metric="reserved_validation_mean_log_likelihood_gain",
+        ranking_metric="reserved_validation_" + metric,
         ranking_direction="descending",
         truth_labels_used=False,
         selected_fit_indices=[member["fit_index"] for member in selected],
@@ -105,8 +140,9 @@ def fit_acceptance(health):
     quality = health.get("quality", {}) or {}
     evidence = "unavailable"
     try:
+        metric = "mean_witness_gain" if "mean_witness_gain" in quality else "mean_log_likelihood_gain"
         gain, error, sigma, tolerance = (float(quality[k]) for k in
-            ("mean_log_likelihood_gain", "standard_error", "sigma", "numerical_tolerance"))
+            (metric, "standard_error", "sigma", "numerical_tolerance"))
         if np.isfinite([gain, error, sigma, tolerance]).all() and min(error, sigma, tolerance) >= 0:
             evidence = ("improved" if gain - sigma * error > tolerance else
                         "deteriorated" if gain + sigma * error < -tolerance else "inconclusive")
@@ -212,9 +248,11 @@ def validate_score_record(record, *, method, stage):
     if not np.isnan(scores[~mask]).all():
         raise ValueError(f"{stage}: rejected-event scores must be NaN")
     summary = score_diagnostics(scores[mask], stage=stage, probability=method == "lacathode")
-    if "score_kind" in record and str(np.asarray(record["score_kind"]).item()) not in (
-            "log_density_ratio", "background_percentile_logit"):
-        raise ValueError(f"{stage}: unrecognized RIDDLE score coordinate")
+    if "score_kind" in record:
+        score_kind = str(np.asarray(record["score_kind"]).item())
+        if score_kind not in ("log_density_ratio", "background_percentile_logit", "stein_witness") \
+                and not score_kind.startswith("stein_"):
+            raise ValueError(f"{stage}: unrecognized RIDDLE score coordinate")
     if "raw_scores" in record:
         raw = np.asarray(record["raw_scores"])
         if raw.shape != (n,) or not np.isnan(raw[~mask]).all():

@@ -91,8 +91,13 @@ def main():
                 args.mps = "off"
                 emit_message("GPU identity unavailable; using ordinary concurrent fits", kind="WARNING")
         status = configure_mps(args.mps, args.device, workers)
+        args.runtime_mps = status.to_dict()
         if status.requested and not status.active:
             emit_message("MPS unavailable; ordinary concurrent fits remain enabled", kind="WARNING")
+    else:
+        args.runtime_mps = {"requested": False, "active": False, "started": False,
+                            "pipe_directory": None, "log_directory": None,
+                            "reason": "disabled_or_single_worker"}
     import torch
 
     torch.set_num_threads(args.torch_threads)

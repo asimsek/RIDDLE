@@ -119,8 +119,6 @@ def export_roles(roles, output, spec, source, *, smoke=False, variant="default",
             "manifests": {s: file_digest(output / s / "inputs.json") for s in scenarios},
         },
     )
-
-
 def read_sources(args, root, variant):
     catalog = load_dataset_catalog(args.catalog)
     definition = catalog.select("lhco")

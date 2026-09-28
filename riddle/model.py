@@ -25,7 +25,7 @@ PROTOCOL = {
     "selected_checkpoints": 10,
     "inputs": "saved real-data SR latents with mjj as conditional context; no truth labels",
     "background": "conditional latent background q_B(z|m); no mass PDF factor in the anomaly score",
-    "ensemble": "arithmetic mean of ten signal densities; validation mixture NLL selection",
+    "ensemble": "residual uses validation-selected signal-density checkpoints; stein_witness uses uniform arithmetic witness checkpoints",
     "score": "log(mean p_signal(z|m)) - log q_B(z|m); learned f(m) is excluded from the final score",
     "scan_score": "sigmoid(log density ratio); monotone display coordinate, not signal probability",
 }

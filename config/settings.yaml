@@ -5,6 +5,7 @@ inputs:
   mass_column: mjj
   label_column: label
 riddle:
+  core: stein_witness
   mass_conditioning: true
   background_correction: bgcorr_40_reguide
   ensemble_completion: strict
@@ -13,6 +14,29 @@ riddle:
   fits: 10
   epochs: 100
   fractions: [learned]
+  stein:
+    hidden_features: 128
+    hidden_layers: 3
+    activation: silu
+    witness_regularization: 1.0
+    potential_center_strength: 0.0
+    data_tail_fraction: 0.1
+    closure_samples: 4096
+    closure_sigma: 5.0
+    closure_mass_bins: 8
+    ensemble_fit_selection: all-valid
+    scoring:
+      mode: hybrid_gated
+      reference_samples: 65536
+      reference_split: 0.5
+      mass_bins: 8
+      beta: 0.5
+      local_gate_z: 1.28
+      local_temperature: 1.0
+      final_transform: background_cdf_power
+      final_power: 10.0
+      qscore_batch_size: 32768
+      inference_batch_size: 16384
   mass_fraction:
     enabled: true
     control_points: 5
@@ -41,7 +65,7 @@ riddle:
     contrastive_negative_weighted: false
     score_flow_epochs: 60
     rosenblatt_bins: 12
-    rosenblatt_hidden: 96
+    rosenblatt_hidden: 64
     rosenblatt_bound: 8.0
     guide_folds: 2
     guide_mass_conditioning: false
@@ -50,7 +74,7 @@ riddle:
     guide_ratio_calibration: false
     responsibility_temperature: 1.0
     qphi_mass_bins: 1
-    qphi_hidden_features: 96
+    qphi_hidden_features: 64
     pseudo_sr_parallel_probes: 3
     tail_rank: true
     tail_candidate_multiplier: 8
@@ -64,7 +88,7 @@ riddle:
     validation_sigma: 2.0
   flow:
     layers: 6
-    hidden_features: 96
+    hidden_features: 64
     num_blocks: 2
     use_residual_blocks: false
     use_batch_norm: true
@@ -104,6 +128,8 @@ background:
   epochs: 100
   batch_size: 256
   reference_samples: 267000
+  mapping_validation_batch_size: 65536
+  mapping_inference_batch_size: 65536
 injection_scan:
   signal_events: [1000, 667, 500, 333, 250, 167, 83]
   replicas: 10

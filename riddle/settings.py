@@ -42,6 +42,42 @@ def number(value, label, minimum=0, maximum=math.inf, *, strict=True):
 
 def validate_residual(value):
     value = deepcopy(value)
+    value.setdefault("core", "residual")
+    if value["core"] not in ("residual", "stein_witness"):
+        raise ValueError("riddle.core must be residual or stein_witness")
+    stein_defaults = {
+        "hidden_features": 128,
+        "hidden_layers": 3,
+        "activation": "silu",
+        "witness_regularization": 1.0,
+        "potential_center_strength": 0.0,
+        "data_tail_fraction": 0.1,
+        "closure_samples": 4096,
+        "closure_sigma": 5.0,
+        "closure_mass_bins": 8,
+        "ensemble_fit_selection": "all-valid",
+        "scoring": {
+            "mode": "hybrid_gated",
+            "reference_samples": 65536,
+            "reference_split": 0.5,
+            "mass_bins": 8,
+            "beta": 0.5,
+            "local_gate_z": 1.2815515655446004,
+            "local_temperature": 1.0,
+            "final_transform": "background_cdf_power",
+            "final_power": 10.0,
+            "qscore_batch_size": 32768,
+            "inference_batch_size": 16384,
+        },
+    }
+    supplied_stein = value.get("stein", {})
+    if not isinstance(supplied_stein, dict) or set(supplied_stein) - stein_defaults.keys():
+        raise ValueError("Invalid Stein residual settings")
+    supplied_scoring = supplied_stein.get("scoring", {})
+    if not isinstance(supplied_scoring, dict) or set(supplied_scoring) - stein_defaults["scoring"].keys():
+        raise ValueError("Invalid Stein scoring settings")
+    value["stein"] = {**stein_defaults, **supplied_stein,
+                      "scoring": {**stein_defaults["scoring"], **supplied_scoring}}
     from .options import DEFAULT_ENHANCEMENTS, FEATURES, feature_options
     supplied = value.get("enhancements", {})
     if not isinstance(supplied, dict) or set(supplied) - DEFAULT_ENHANCEMENTS.keys():
@@ -105,7 +141,7 @@ def validate_residual(value):
     })
 
     extra = "".join(" " + k for k in ("mass_conditioning", "input_space", "optimization", "data_policy", "ensemble_completion", "ensemble_fit_selection", "ensemble_fit_count", "background_correction") if k in value)
-    keys(value, "runs epochs fractions initialization flow training fit_recovery enhancements mass_fraction" + extra, "RIDDLE")
+    keys(value, "core runs epochs fractions initialization flow training fit_recovery enhancements stein mass_fraction" + extra, "RIDDLE")
     if "data_policy" in value:
         from .roles import policy_parts, DIAGNOSTIC_POLICIES
         policy_parts(value["data_policy"])
@@ -118,6 +154,49 @@ def validate_residual(value):
     integer(value["ensemble_fit_count"], "ensemble_fit_count")
     if "mass_conditioning" in value and type(value["mass_conditioning"]) is not bool:
         raise ValueError("mass_conditioning must be boolean")
+    if value["core"] == "stein_witness" and not value.get("mass_conditioning", False):
+        raise ValueError("stein_witness requires mass_conditioning=true")
+    stein = value["stein"]
+    keys(stein, "hidden_features hidden_layers activation witness_regularization potential_center_strength data_tail_fraction closure_samples closure_sigma closure_mass_bins ensemble_fit_selection scoring", "Stein residual")
+    integer(stein["hidden_features"], "stein.hidden_features", 4)
+    integer(stein["hidden_layers"], "stein.hidden_layers", 1)
+    if stein["activation"] != "silu":
+        raise ValueError("stein.activation must be silu")
+    number(stein["witness_regularization"], "stein.witness_regularization")
+    number(stein["potential_center_strength"], "stein.potential_center_strength", strict=False)
+    if value["core"] == "stein_witness" and stein["potential_center_strength"] != 0:
+        raise ValueError("stein_witness v6.0 requires potential_center_strength=0")
+    number(stein["data_tail_fraction"], "stein.data_tail_fraction", maximum=1.00000001)
+    if stein["data_tail_fraction"] > 1:
+        raise ValueError("stein.data_tail_fraction must be at most 1")
+    integer(stein["closure_samples"], "stein.closure_samples", 256)
+    number(stein["closure_sigma"], "stein.closure_sigma")
+    integer(stein["closure_mass_bins"], "stein.closure_mass_bins", 1)
+    if stein["ensemble_fit_selection"] not in ("validation-best", "all-valid"):
+        raise ValueError("stein.ensemble_fit_selection must be validation-best or all-valid")
+    scoring = stein["scoring"]
+    scoring_defaults = stein_defaults["scoring"]
+    if not isinstance(scoring, dict) or set(scoring) != set(scoring_defaults):
+        raise ValueError("Invalid Stein scoring settings")
+    if scoring["mode"] not in ("potential_raw", "potential_qnorm", "local_qnorm", "hybrid", "hybrid_gated"):
+        raise ValueError("Invalid stein.scoring.mode")
+    integer(scoring["reference_samples"], "stein.scoring.reference_samples", 1024)
+    number(scoring["reference_split"], "stein.scoring.reference_split", maximum=1)
+    if not 0 < scoring["reference_split"] < 1:
+        raise ValueError("stein.scoring.reference_split must lie strictly between zero and one")
+    integer(scoring["mass_bins"], "stein.scoring.mass_bins", 1)
+    number(scoring["beta"], "stein.scoring.beta", strict=False)
+    number(scoring["local_temperature"], "stein.scoring.local_temperature")
+    if type(scoring["local_gate_z"]) not in (int, float) or not math.isfinite(scoring["local_gate_z"]):
+        raise ValueError("Invalid stein.scoring.local_gate_z")
+    if scoring["final_transform"] not in ("identity", "background_cdf", "background_cdf_power"):
+        raise ValueError("Invalid stein.scoring.final_transform")
+    number(scoring["final_power"], "stein.scoring.final_power")
+    integer(scoring["qscore_batch_size"], "stein.scoring.qscore_batch_size", 1)
+    integer(scoring["inference_batch_size"], "stein.scoring.inference_batch_size", 1)
+    if value["core"] == "stein_witness" and value.get("input_space") == "physical":
+        raise ValueError("stein_witness is defined for mapped latent-space RIDDLE")
+
     mf = value["mass_fraction"]
     mf.setdefault("update_mode", "mean_damped")
     keys(mf, "enabled control_points smoothness variation damping min_fraction max_fraction max_iterations update_mode", "mass fraction")
@@ -125,6 +204,8 @@ def validate_residual(value):
         raise ValueError("mass_fraction.update_mode must be mean_matched or mean_damped")
     if type(mf["enabled"]) is not bool:
         raise ValueError("mass_fraction.enabled must be boolean")
+    if value["core"] == "stein_witness":
+        mf["enabled"] = False
     integer(mf["control_points"], "mass_fraction.control_points", 3)
     if mf["control_points"] % 2 == 0:
         raise ValueError("mass_fraction.control_points must be odd so one control point is at the SR center")
@@ -152,8 +233,8 @@ def validate_residual(value):
     if correction == "bgcorr_40_reguide":
         if not value.get("mass_conditioning"):
             raise ValueError("bgcorr_40_reguide requires mass_conditioning=true")
-        if not e["guided_fit"] or not e["contrastive_fit"]:
-            raise ValueError("bgcorr_40_reguide requires guided_fit and contrastive_fit")
+        if value["core"] == "residual" and (not e["guided_fit"] or not e["contrastive_fit"]):
+            raise ValueError("bgcorr_40_reguide requires guided_fit and contrastive_fit for residual")
         if e["score_flow"]:
             raise ValueError("bgcorr_40_reguide uses the q_phi density ratio directly; disable score_flow")
         if value.get("input_space") == "physical":
@@ -184,6 +265,10 @@ def validate_residual(value):
             normalized.append(fraction)
     if len(set(normalized)) != len(normalized):
         raise ValueError("Duplicate mixture fractions")
+    if value["core"] == "stein_witness" and normalized != ["learned"]:
+        raise ValueError("stein_witness uses no mixture fraction; keep fractions: [learned]")
+    if value["core"] == "stein_witness" and e["checkpoint_weighting"] != "uniform":
+        raise ValueError("stein_witness v6.0 requires checkpoint_weighting=uniform")
     value["fractions"] = normalized
     f, t = value["flow"], value["training"]
     from .roles import validate_replay_batch
@@ -200,7 +285,8 @@ def validate_residual(value):
     )
     for k in ("layers", "hidden_features", "num_blocks", "num_bins"):
         integer(f[k], k)
-    if value.get("background_correction") == "bgcorr_40_reguide" and e["qphi_hidden_features"] > f["hidden_features"]:
+    if (value["core"] == "residual" and value.get("background_correction") == "bgcorr_40_reguide"
+            and e["qphi_hidden_features"] > f["hidden_features"]):
         raise ValueError("qphi_hidden_features cannot exceed residual flow hidden_features")
     for k in ("use_residual_blocks", "use_batch_norm", "random_mask"):
         if type(f[k]) is not bool:
@@ -221,7 +307,8 @@ def validate_residual(value):
     number(t["weight_decay"], "weight_decay", strict=False)
     if value["epochs"] < t["selected_checkpoints"]:
         raise ValueError("Epochs must cover the number of selected checkpoints")
-    if e["guided_fit"] and e["guide_warmup_epochs"] + t["selected_checkpoints"] > value["epochs"]:
+    if (value["core"] == "residual" and e["guided_fit"]
+            and e["guide_warmup_epochs"] + t["selected_checkpoints"] > value["epochs"]):
         raise ValueError("Require enough post-guidance epochs for checkpoint selection")
     if value.get("input_space") == "physical" and any(e[k] for k in FEATURES):
         raise ValueError("Physical-input pilot requires all six RIDDLE enhancements disabled")
@@ -251,9 +338,11 @@ def validate_residual(value):
         number(o["min_delta"], "min_delta", strict=False)
         if o["lr_factor"] < 1 and o["min_lr"] > t["learning_rate"]:
             raise ValueError("min_lr exceeds the starting learning rate")
-        if o["fraction_warmup_epochs"] + t["selected_checkpoints"] > value["epochs"]:
+        if (value["core"] == "residual"
+                and o["fraction_warmup_epochs"] + t["selected_checkpoints"] > value["epochs"]):
             raise ValueError("Require enough post-warm-up epochs for checkpoint selection")
-        effective_warmup = e["guide_warmup_epochs"] if e["guided_fit"] else o["fraction_warmup_epochs"]
+        effective_warmup = (0 if value["core"] == "stein_witness" else
+                            e["guide_warmup_epochs"] if e["guided_fit"] else o["fraction_warmup_epochs"])
         if o["early_stopping_patience"] and not (
             effective_warmup + t["selected_checkpoints"] <= o["minimum_epochs"] <= value["epochs"]
         ):
@@ -279,10 +368,15 @@ def load_settings(path=DEFAULT_PATH):
         raise ValueError("Keep mjj and label separate from the input features")
     value["riddle"] = validate_residual(value["riddle"])
     b = value["background"]
-    keys(b, "configuration epochs batch_size reference_samples", "background")
+    background_defaults = {"mapping_validation_batch_size": 65536, "mapping_inference_batch_size": 65536}
+    for name, default in background_defaults.items():
+        b.setdefault(name, default)
+    keys(b, "configuration epochs batch_size reference_samples mapping_validation_batch_size mapping_inference_batch_size", "background")
     integer(b["epochs"], "background epochs", 11)
     integer(b["batch_size"], "background batch_size", 2)
     integer(b["reference_samples"], "reference_samples", 2)
+    integer(b["mapping_validation_batch_size"], "mapping_validation_batch_size", 1)
+    integer(b["mapping_inference_batch_size"], "mapping_inference_batch_size", 1)
     if not isinstance(b["configuration"], dict):
         raise ValueError("Background configuration must be a nested YAML mapping")
     keys(

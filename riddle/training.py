@@ -473,6 +473,14 @@ def train_residual(
     settings = deepcopy(DEFAULTS["riddle"] if settings is None else settings)
     settings.update(epochs=epochs, initialization=initialization)
     settings = validate_residual(settings)
+    if settings.get("core", "residual") == "stein_witness":
+        from .stein import train_stein_witness
+        return train_stein_witness(
+            train, validation, output, epochs=epochs, seed=seed, device=device, checkpoint=checkpoint,
+            after_epoch=after_epoch, fraction=fraction, initialization=initialization,
+            progress_label=progress_label.replace("residual mixture", "Stein witness"),
+            on_training_start=on_training_start, settings=settings, background_correction=background_correction,
+        )
     options = settings["training"]
     additions = feature_options(settings)
     active = effective_features(settings)
@@ -836,12 +844,20 @@ def train_residual(
     return order, history
 
 
-def residual_scores(output, order, z, device, *, normalization_checks=None, normalization_tests=1):
+def residual_scores(output, order, z, device, *, normalization_checks=None, normalization_tests=1,
+                    stein_mode=None, stein_scoring_root=None, stein_scoring_settings=None):
     if not len(order):
         raise ValueError("Residual scoring requires at least one checkpoint")
     inputs = json.loads((output / "residual_training_inputs.json").read_text())
     if inputs.get("scientific_version") != SCIENTIFIC_VERSION:
         raise ValueError("Legacy residual inputs; use saved legacy scores or retrain")
+    if inputs.get("core", inputs.get("settings", {}).get("core", "residual")) == "stein_witness":
+        from .stein import stein_scores
+        return stein_scores(
+            output, order, z, device, normalization_checks=normalization_checks,
+            normalization_tests=normalization_tests,
+            mode=stein_mode, scoring_root=stein_scoring_root, scoring_settings=stein_scoring_settings,
+        )
     if inputs["features"] != z.shape[1]:
         raise ValueError("Scoring feature count differs from training")
     model = build_signal_flow(device, features=z.shape[1], settings=inputs["settings"]).eval()
@@ -951,6 +967,8 @@ def residual_fraction_probabilities(output, order, z, *, return_checkpoints=Fals
         raise ValueError("Mass-fraction evaluation requires finite residual inputs")
     inputs = json.loads((output / "residual_training_inputs.json").read_text())
     settings = inputs["settings"]
+    if inputs.get("core", settings.get("core", "residual")) == "stein_witness":
+        raise ValueError("stein_witness has no mixture-fraction probabilities")
     selection_path = output / "residual_selection.json"
     checkpoint_weights = np.full(len(order), 1.0 / len(order), dtype=np.float64)
     if selection_path.exists():

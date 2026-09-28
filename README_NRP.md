@@ -1,6 +1,6 @@
 # RIDDLE on NRP
 
-RIDDLE: Residual Identification of Distributional Deviations in Latent-space through density Estimation
+**RIDDLE: Revealing Irregularities through Distributional Discrepancies in Latent-space via Stein-Witness Estimation**
 
 ## NRP Access and Storage (on your local terminal)
 

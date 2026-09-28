@@ -30,6 +30,12 @@ GPU_TYPES = {
     "h200": ("nvidia.com/h200", None),
 }
 
+A100_MIN_MEMORY_MB = "50000"
+A100_PCIE_80GB_PRODUCTS = (
+    "NVIDIA-A100-80GB-PCIe",
+    "NVIDIA-A100-PCIE-80GB",
+)
+A100_SXM4_80GB_PRODUCTS = ("NVIDIA-A100-SXM4-80GB",)
 
 def setup_runtime():
     spec = yaml.safe_load((ROOT / "config/nrp/jupyter.yaml").read_text())["spec"]
@@ -175,10 +181,55 @@ def job(args):
             },
         },
     }
+    pod_spec = result["spec"]["template"]["spec"]
     if region:
-        result["spec"]["template"]["spec"]["nodeSelector"]["topology.kubernetes.io/region"] = region
-    if gpu_product is not None:
-        result["spec"]["template"]["spec"]["nodeSelector"]["nvidia.com/gpu.product"] = gpu_product
+        pod_spec["nodeSelector"]["topology.kubernetes.io/region"] = region
+    if gpu == "a100":
+        pod_spec["affinity"] = {
+            "nodeAffinity": {
+                "requiredDuringSchedulingIgnoredDuringExecution": {
+                    "nodeSelectorTerms": [
+                        {
+                            "matchExpressions": [
+                                {
+                                    "key": "nvidia.com/gpu.memory",
+                                    "operator": "Gt",
+                                    "values": [A100_MIN_MEMORY_MB],
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "preferredDuringSchedulingIgnoredDuringExecution": [
+                    {
+                        "weight": 100,
+                        "preference": {
+                            "matchExpressions": [
+                                {
+                                    "key": "nvidia.com/gpu.product",
+                                    "operator": "In",
+                                    "values": list(A100_PCIE_80GB_PRODUCTS),
+                                }
+                            ]
+                        },
+                    },
+                    {
+                        "weight": 50,
+                        "preference": {
+                            "matchExpressions": [
+                                {
+                                    "key": "nvidia.com/gpu.product",
+                                    "operator": "In",
+                                    "values": list(A100_SXM4_80GB_PRODUCTS),
+                                }
+                            ]
+                        },
+                    },
+                ],
+            }
+        }
+    elif gpu_product is not None:
+        pod_spec["nodeSelector"]["nvidia.com/gpu.product"] = gpu_product
     secrets = [dict(item) for item in default_secrets]
     for name in getattr(args, "image_pull_secret", None) or []:
         if not re.fullmatch(r"[a-z0-9]([-a-z0-9.]*[a-z0-9])?", name) or len(name) > 253:
@@ -240,7 +291,7 @@ def main(argv=None):
     p.add_argument("--data", help="Prepared dataset path; defaults to data/lhco or data/injection_scan for scans")
     p.add_argument("--results", help="Result directory; defaults to results or results/injection_scan for scans")
     p.add_argument("--runs", type=positive, help="Complete independent runs per seed (default: 1)")
-    p.add_argument("--fits", type=positive, help="Signal ensemble fits per RIDDLE/R-ANODE run; does not change LaCathode")
+    p.add_argument("--fits", type=positive, help="Ensemble fits per RIDDLE/R-ANODE run; does not change LaCathode")
     from riddle.options import add_feature_arguments
     add_feature_arguments(p)
     p.add_argument("--mass-conditioning", action=argparse.BooleanOptionalAction, default=None,

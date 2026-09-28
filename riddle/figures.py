@@ -35,6 +35,7 @@ POPULATIONS = {
     "residual": {0: ("#D55E00", "-"), 1: ("#009E73", "--")},
 }
 VIEWS = {"comparison": tuple(METHODS), "LaCathode": ("raw",), "RIDDLE": ("residual",)}
+DISPLAY_TRANSFORMS = {"residual": "sigmoid"}
 BUDGETS = (("loose", 0.1), ("medium", 0.05), ("tight", 0.01), ("extra_tight", 0.004))
 SCORE_CUTS = tuple(value / 100 for value in range(30, 100))
 MASS_TARGETS = (0.20, 0.15, 0.10, 0.075, 0.05, 0.025, 0.01, 0.005, 0.004)
@@ -478,7 +479,8 @@ def sample_sr(sample, key):
 
 
 def display(key, values):
-    return expit(values) if key == "residual" else np.asarray(values)
+    values = np.asarray(values)
+    return expit(values) if DISPLAY_TRANSFORMS.get(key, "identity") == "sigmoid" else values
 
 
 def slug(value):
@@ -1409,8 +1411,8 @@ def strict_cut_histograms(values, edges, scores, mask, thresholds):
 def mass_scan_histograms(sample, keys, cuts=SCORE_CUTS):
     """Histogram strict cuts in each method's displayed 0--1 score coordinate.
 
-    RIDDLE stores log density ratios, so invert the display sigmoid before
-    selecting events. Neither scores nor thresholds are fitted on test labels.
+    RIDDLE stores an unbounded raw anomaly score, so invert the display sigmoid
+    before selecting events. Neither scores nor thresholds are fitted on test labels.
     Retentions use all physical test events, including rejected mapping rows.
     """
     from scipy.special import logit

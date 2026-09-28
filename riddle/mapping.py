@@ -7,13 +7,66 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from .enhancements import Rosenblatt, chunks, save_torch, load_torch, clip_gradients
+from .enhancements import Rosenblatt, save_torch, load_torch, clip_gradients
 from .integrity import require_finite, train_flow_epoch
 from .preprocessing import load_dataset
 from .storage import digest, write_json, save_array, seed_start, rng_state, restore_rng, atomic_write, save_npz, persist_boundary
 from .worker_progress import emit_message
 
 PREPROCESS_KEYS = ("min", "max", "mean2", "std2", "std2_logit_fix")
+
+
+def _inference_chunks(function, *arrays, device, size):
+    if not arrays or not len(arrays[0]) or any(len(a) != len(arrays[0]) for a in arrays):
+        raise ValueError("Inference requires aligned, nonempty arrays")
+    target = torch.device(device)
+    requested = int(size)
+    if requested <= 0:
+        raise ValueError("Mapping inference batch size must be positive")
+    current = min(requested, 8192) if target.type == "cpu" else requested
+    pieces = []
+    offset = 0
+    while offset < len(arrays[0]):
+        stop = min(offset + current, len(arrays[0]))
+        try:
+            with torch.inference_mode():
+                value = function(*(a[offset:stop].to(target) for a in arrays)).detach().cpu()
+            pieces.append(value)
+            offset = stop
+        except torch.cuda.OutOfMemoryError:
+            if target.type != "cuda" or current <= 256:
+                raise
+            torch.cuda.empty_cache()
+            current = max(256, current // 2)
+    result = torch.cat(pieces)
+    require_finite(result, "RIDDLE mapping inference")
+    return result, current
+
+
+def _map_roles_by_source(mapper, sources, roles):
+    mapped = {}
+    used = []
+    for source in sorted({role["source"] for role in roles.values()}):
+        role_names = [name for name, role in roles.items() if role["source"] == source]
+        union_indices = np.unique(np.concatenate([np.asarray(roles[name]["indices"], dtype=np.int64)
+                                                   for name in role_names]))
+        union_rows = sources[source][union_indices]
+        union_z, union_mask = mapper.map(union_rows)
+        if mapper.last_inference_batch_size is not None:
+            used.append(int(mapper.last_inference_batch_size))
+        latent_index = np.full(len(union_indices), -1, dtype=np.int64)
+        latent_index[union_mask] = np.arange(int(union_mask.sum()), dtype=np.int64)
+        for name in role_names:
+            indices = np.asarray(roles[name]["indices"], dtype=np.int64)
+            positions = np.searchsorted(union_indices, indices)
+            if (np.any(positions >= len(union_indices))
+                    or not np.array_equal(union_indices[positions], indices)):
+                raise ValueError("Role index reconstruction failed")
+            mask = union_mask[positions]
+            rows = sources[source][indices]
+            mapped[name] = dict(z=union_z[latent_index[positions[mask]]], mass=rows[mask, 0],
+                                mask=mask, rows=rows)
+    return mapped, (min(used) if used else None)
 
 
 def split_roles(data, seed, *, calibration):
@@ -59,11 +112,15 @@ class Mapper:
         self.selection = json.loads((self.output / "flow_selection.json").read_text())
         metadata = json.loads((self.output / "mapping_settings.json").read_text())
         self.options = metadata["options"]
+        runtime_background = (json.loads((self.output / "background_settings.json").read_text())
+                              if (self.output / "background_settings.json").exists() else metadata["background"])
+        self.inference_batch_size = int(runtime_background.get("mapping_inference_batch_size", 65536))
         self.reference = load_torch(self.output / "preprocessing.pt")
         self.mass_mean, self.mass_std = metadata["mass_parameters"]
         self.model = build_mapping(metadata["configuration"], self.options, metadata["features"], metadata["seed"], device)
         self.model.load_state_dict(torch.load(self.output / "model.pt", map_location=device, weights_only=True))
         self.model.eval().requires_grad_(False)
+        self.last_inference_batch_size = None
 
     def map(self, rows):
         # Remove truth labels before preprocessing.
@@ -71,9 +128,16 @@ class Mapper:
         prepared = load_dataset(clean, external_datadict=self.reference)
         x, m = prepared["tensor2"], prepared["labels"]
         if self.options["rosenblatt"]:
-            z = chunks(self.model, x, (m-self.mass_mean)/self.mass_std, device=self.device)
+            z, used = _inference_chunks(
+                self.model, x, (m-self.mass_mean)/self.mass_std,
+                device=self.device, size=self.inference_batch_size,
+            )
         else:
-            z = chunks(lambda x, m: self.model(x, m)[0], x, m, device=self.device)
+            z, used = _inference_chunks(
+                lambda x, m: self.model(x, m)[0], x, m,
+                device=self.device, size=self.inference_batch_size,
+            )
+        self.last_inference_batch_size = int(used)
         return z.numpy().astype(np.float32), prepared["mask"].numpy()
 
 
@@ -103,9 +167,11 @@ def prepare(data, output, seed, device, *, background, options, data_policy=None
         mass_parameters = experiment["mass_parameters"]
     if mass_parameters[1] <= 0:
         raise ValueError("Mapping requires a nonzero sideband mass span")
+    background_contract = {k: v for k, v in background.items()
+                           if k not in ("mapping_validation_batch_size", "mapping_inference_batch_size")}
     contract = dict(schema=1, implementation="production_conditional_mapping_v2_tail_safe_preprocessing",
                     preprocessing="nonrejecting_minmax_logit_clip_eps_1e-6_v1", configuration=config,
-                    options=options, background=background, seed=seed, features=features, device=str(device),
+                    options=options, background=background_contract, seed=seed, features=features, device=str(device),
                     hashes={k: digest(a[:, :-1]) for k, a in clean.items()}, mass_parameters=mass_parameters)
     if data_policy != "production_v1":
         contract.update(data_policy=data_policy, residual_batch_size=residual_batch_size)
@@ -143,6 +209,9 @@ def prepare(data, output, seed, device, *, background, options, data_policy=None
         history, start, best, best_model, best_epoch = (state[k] for k in ("history", "next_epoch", "best", "best_model", "best_epoch"))
         restore_rng(state["rng"])
     mm, ms = mass_parameters
+    validation_batch_used = (min(int(background["mapping_validation_batch_size"]), 8192)
+                             if torch.device(device).type == "cpu"
+                             else int(background["mapping_validation_batch_size"]))
     for epoch in range(start, background["epochs"]):
         model.train()
         if options["rosenblatt"]:
@@ -159,7 +228,12 @@ def prepare(data, output, seed, device, *, background, options, data_policy=None
             train_nll = train_flow_epoch(model, optimizer, loader, device, batch_norm_class=BatchNormFlow, verbose=False)[0]
         model.eval()
         context = (val["labels"]-mm)/ms if options["rosenblatt"] else val["labels"]
-        loss = -float(chunks(model.log_probs, val["tensor2"], context, device=device).double().mean())
+        log_prob, used = _inference_chunks(
+            model.log_probs, val["tensor2"], context, device=device,
+            size=background["mapping_validation_batch_size"],
+        )
+        validation_batch_used = min(validation_batch_used, int(used))
+        loss = -float(log_prob.double().mean())
         history.append(dict(epoch=epoch, train_nll=train_nll, validation_nll=loss))
         if loss < best:
             best, best_model, best_epoch = loss, deepcopy(model.state_dict()), epoch
@@ -183,10 +257,17 @@ def prepare(data, output, seed, device, *, background, options, data_policy=None
                      truth_labels_used=False)
     write_json(output / "flow_selection.json", selection)
     mapper = Mapper(output, device)
-    mapped = {}
-    for name, rows in arrays.items():
-        z, mask = mapper.map(rows)
-        mapped[name] = dict(z=z, mass=rows[mask, 0], mask=mask, rows=rows)
+    mapped, inference_batch_used = _map_roles_by_source(mapper, sources, roles)
+    if inference_batch_used is None:
+        raise ValueError("Mapping produced no source-union inference batches")
+    write_json(output / "mapping_runtime.json", {
+        "device": str(device),
+        "mapping_validation_batch_size_requested": int(background["mapping_validation_batch_size"]),
+        "mapping_validation_batch_size_used": int(validation_batch_used),
+        "mapping_inference_batch_size_requested": int(background["mapping_inference_batch_size"]),
+        "mapping_inference_batch_size_used": int(inference_batch_used),
+        "source_union_mapping": True,
+    })
     attach_source_ids(data, roles, mapped)
     mapped = finalize_mapped(mapped, seed, data_policy, residual_batch_size)
     identity_arrays = {}

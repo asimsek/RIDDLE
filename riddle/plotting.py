@@ -122,11 +122,18 @@ def is_riddle_report(report):
 
 
 def riddle_plot_spec(report):
-    # Treat NaNs outside the trained SR as intentionally unscored.
-
     base = BUILTINS["riddle"]
-    return PlotMethod(base.label, base.color, base.linestyle, base.signal_color,
-                      base.score_transform, riddle_score_scope(report))
+    protocol = report.get("protocol", {})
+    scoring = protocol.get("stein_scoring") if isinstance(protocol, dict) else None
+    if isinstance(scoring, dict):
+        mode = scoring.get("mode", "stein")
+        label = f"RIDDLE ({mode}, Stein scoring v3)"
+        transform = "identity"
+    else:
+        label = base.label
+        transform = base.score_transform
+    return PlotMethod(label, base.color, base.linestyle, base.signal_color,
+                      transform, riddle_score_scope(report))
 
 
 def register_method(report):
@@ -337,9 +344,13 @@ class PlotProgress:
 
 @contextmanager
 def methods(keys, *, view=None):
-    previous = f.METHODS, f.VIEWS, f.POPULATIONS
+    previous = f.METHODS, f.VIEWS, f.POPULATIONS, f.DISPLAY_TRANSFORMS
     f.METHODS = {k: STYLES[k] for k in keys}
-
+    reverse_keys = {plot_key: method for method, plot_key in KEYS.items()}
+    f.DISPLAY_TRANSFORMS = {
+        key: METHOD_SPECS[reverse_keys[key]].score_transform
+        for key in keys if key in reverse_keys and reverse_keys[key] in METHOD_SPECS
+    }
 
     missing = [k for k in keys if k not in POPULATION_STYLES]
     if missing:
@@ -355,7 +366,7 @@ def methods(keys, *, view=None):
     try:
         yield
     finally:
-        f.METHODS, f.VIEWS, f.POPULATIONS = previous
+        f.METHODS, f.VIEWS, f.POPULATIONS, f.DISPLAY_TRANSFORMS = previous
 
 
 def discover(root, requested=None, *, scan=False):
@@ -374,8 +385,8 @@ def discover(root, requested=None, *, scan=False):
             continue
         if method == "riddle" and "protocol.json" in report.get("artifacts_sha256", {}):
             protocol = read_metadata(path.parent, report, "protocol.json")
-
-            report = {**report, "score_scope": riddle_score_scope({**report, "protocol": protocol})}
+            report = {**report, "protocol": protocol,
+                      "score_scope": riddle_score_scope({**report, "protocol": protocol})}
         spec = register_method(report)
         METHOD_SPECS[method] = spec
         KEYS.setdefault(method, "method_" + method)
@@ -649,18 +660,28 @@ def resolve_plot_device(requested):
 def riddle_plot_predictions(root, report, member, groups, *, device="cpu"):
     """Read saved checkpoints without modifying production artifacts."""
     import torch
-    from .model import build_signal_flow, background_log_prob, signal_log_prob
 
     relative = Path("density") / member["directory"]
     inputs = read_metadata(root, report, str(relative / "residual_training_inputs.json"))
     version = report["contract"]["scientific_version"]
-    if version not in (2, 3, 4, 5) or inputs.get("scientific_version") != version:
+    if version not in (2, 3, 4, 5, 6) or inputs.get("scientific_version") != version:
         raise ValueError("Unsupported or inconsistent RIDDLE checkpoint protocol")
     paths = [verify_plot_input(root, report, str(relative / f"residual_epoch_{e}.pt"))
              for e in member["epochs"]]
     for z in groups.values():
         if z.ndim != 2 or z.shape[1] != inputs["features"] or not len(z) or not np.isfinite(z).all():
             raise ValueError("Invalid RIDDLE inference latents")
+    core = inputs.get("core", inputs.get("settings", {}).get("core", "residual"))
+    if core == "stein_witness":
+        from .stein import stein_scores
+        verify_plot_input(root, report, str(relative / "residual_selection.json"))
+        predictions = {
+            key: stein_scores(root / relative, member["epochs"], z, device, mode="potential_raw")
+            for key, z in groups.items()
+        }
+        return predictions, predictions.get("reserved_validation")
+
+    from .model import build_signal_flow, background_log_prob, signal_log_prob
     model = build_signal_flow(device, features=inputs["features"], settings=inputs["settings"]).eval()
     correction = inputs.get("background_correction")
     corrected_background = None
@@ -686,8 +707,6 @@ def riddle_plot_predictions(root, report, member, groups, *, device="cpu"):
     completed = 0
     with torch.no_grad(), ProgressStage("plot_riddle_inference", "Evaluate saved RIDDLE fit", total, "prediction") as progress:
         for path, epoch, weight in zip(paths, member["epochs"], member["signal_fractions"]):
-            # Stage checkpoints on CPU and move one inference batch at a time to GPU.
-
             checkpoint = torch.load(path, map_location="cpu", weights_only=True)
             if checkpoint.get("scientific_version") != version or checkpoint.get("epoch") != epoch:
                 raise ValueError("RIDDLE checkpoint identity differs from saved selection")
@@ -753,14 +772,26 @@ def riddle_plot_ensemble(root, report, *, io_workers=2, device="cpu"):
         return base, audit
     inputs = read_metadata(root, report, "density/ensemble_inputs.json")
     path = verify_plot_input(root, report, "background/validation_latents.npy")
-    validation = real_sr_latents(np.load(path, allow_pickle=False))
+    settings = inputs.get("settings", {})
+    core = settings.get("core", "residual")
+    mass_conditioning = bool(settings.get("mass_conditioning", False))
+    physical_inputs = settings.get("input_space") == "physical"
+    validation = real_sr_latents(
+        np.load(path, allow_pickle=False), mass_conditioning=mass_conditioning, physical_inputs=physical_inputs
+    )
     if digest(validation) != inputs.get("selection_sha256"):
         raise ValueError("Reserved RIDDLE validation events differ from the training selection")
-    reference = np.random.default_rng(3407).standard_normal((8192, validation.shape[1])).astype(np.float32)
-
     policy = inputs.get("settings", {}).get("fit_recovery", {})
     sigma = policy.get("validation_sigma", 2.0)
     members = [dict(m, fit_index=m.get("fit_index", i)) for i, m in enumerate(selection["members"])]
+    if mass_conditioning and members and not physical_inputs:
+        from .training import residual_background_sample
+        contexts = np.random.default_rng(3407).choice(validation[:, -1], 8192, replace=True).astype(np.float32)
+        reference = residual_background_sample(
+            root / "density" / members[0]["directory"], contexts, len(contexts), 3408, device
+        )
+    else:
+        reference = np.random.default_rng(3407).standard_normal((8192, validation.shape[1])).astype(np.float32)
     tests = sum(len(m["epochs"]) + 1 for m in members)
     for member in members:
         member["normalization_tests"] = tests
@@ -769,7 +800,9 @@ def riddle_plot_ensemble(root, report, *, io_workers=2, device="cpu"):
                  requested_fits=selection["requested_runs"], used_fits=0, used_members=[], excluded_members=excluded,
                  status="no_valid_fits", selection="Numerical validity only; reserved-validation evidence is diagnostic; historical production exclusions retained",
                  validation_sigma=sigma, reference_seed=3407, reference_samples=len(reference),
-                 ensemble="log(mean(exp(per-fit log ratio))) with equal weights over used fits",
+                 ensemble=("arithmetic mean of per-fit Stein witnesses with equal weights over used fits"
+                           if core == "stein_witness" else
+                           "log(mean(exp(per-fit log ratio))) with equal weights over used fits"),
                  partitions=["validation", "test", "signal_region"], independent_runs=1,
                  source_artifacts_modified=False, safeguard_filtering=True, checkpoint_inference=True,
                  inference_device=device)
@@ -788,13 +821,38 @@ def riddle_plot_ensemble(root, report, *, io_workers=2, device="cpu"):
                 try:
                     scores, mixture = riddle_plot_predictions(root, report, member,
                         {"reserved_validation": validation, "reference": reference}, device=device)
-                    validate_density_ratio(scores["reference"], stage=f"{member['directory']} ensemble", tests=tests)
-                    quality = validation_improvement(mixture, sigma=sigma)
+                    if core == "stein_witness":
+                        from .production import validation_witness_improvement
+                        from .stein import stein_identity_diagnostics
+                        from .training import residual_background_sample
+                        quality = validation_witness_improvement(
+                            scores["reserved_validation"], scores["reference"], sigma=sigma
+                        )
+                        closure_count = int(settings["stein"]["closure_samples"])
+                        closure_contexts = np.random.default_rng(3410).choice(
+                            validation[:, -1], closure_count, replace=True
+                        ).astype(np.float32)
+                        closure_reference = residual_background_sample(
+                            root / "density" / member["directory"], closure_contexts,
+                            closure_count, 3411, device
+                        )
+                        closure = stein_identity_diagnostics(
+                            root / "density" / member["directory"], member["epochs"], closure_reference, device
+                        )
+                        health = dict(normalization=dict(status=closure["status"], stein_identity_closure=closure),
+                                      quality=quality)
+                    else:
+                        validate_density_ratio(scores["reference"], stage=f"{member['directory']} ensemble", tests=tests)
+                        quality = validation_improvement(mixture, sigma=sigma)
+                        health = dict(normalization_status="passed", quality=quality)
                 except (NumericalFitError, FloatingPointError) as error:
                     excluded.append(dict(member, check="numerical_validity", reason=str(error)))
                     continue
-                accepted.append(dict(member, quality=quality, **fit_acceptance(
-                    dict(normalization_status="passed", quality=quality))))
+                assessment = fit_acceptance(health)
+                if not assessment["fit_valid"]:
+                    excluded.append(dict(member, check="normalization_or_closure", reason=assessment["fit_status"]))
+                    continue
+                accepted.append(dict(member, quality=quality, **assessment))
             if accepted:
                 base = {p: load_scores(root, report, p, for_rebuild=True) for p in audit["partitions"]}
 
@@ -812,13 +870,19 @@ def riddle_plot_ensemble(root, report, *, io_workers=2, device="cpu"):
                             excluded.append(dict(member, check="score_validity", reason=str(error)))
                             continue
                         for p, values in predictions.items():
-                            combined[p] = values if p not in combined else np.logaddexp(combined[p], values)
+                            if core == "stein_witness":
+                                combined[p] = values if p not in combined else combined[p] + values
+                            else:
+                                combined[p] = values if p not in combined else np.logaddexp(combined[p], values)
                         surviving.append(member)
                     accepted = surviving
                     for p, record in base.items():
                         if accepted:
                             record["scores"] = np.full(len(record["mask"]), np.nan)
-                            record["scores"][record["mask"]] = combined[p] - np.log(len(accepted))
+                            record["scores"][record["mask"]] = (
+                                combined[p] / len(accepted) if core == "stein_witness"
+                                else combined[p] - np.log(len(accepted))
+                            )
                 if accepted:
                     audit["status"] = "rebuilt_from_valid_fits" if excluded or not valid_saved_scores else "saved_ensemble"
     finally:
@@ -869,7 +933,9 @@ def _riddle_saved_fit_scores(root, report, partition):
             indices = archive["fit_indices"] if "fit_indices" in archive else np.arange(len(fits))
         else:
             raise ValueError(f"RIDDLE {root}: per-fit scores are unavailable for ensemble fit selection")
-        score_kind = str(np.asarray(archive["score_kind"]).item()) if "score_kind" in archive else "log_density_ratio"
+        score_kind = (str(np.asarray(archive["fit_score_kind"]).item()) if "fit_score_kind" in archive
+                      else str(np.asarray(archive["score_kind"]).item()) if "score_kind" in archive
+                      else "log_density_ratio")
         mask = archive["mask"]
     if (fits.ndim != 2 or fits.shape[1:] != mask.shape or indices.shape != (len(fits),)
             or len(set(int(i) for i in indices)) != len(indices)
@@ -902,11 +968,18 @@ def apply_riddle_ensemble_fit_selection(root, report, records, audit, *, enabled
     rebuild = set(selected_indices) != set(producer_indices) or len(selected_indices) != len(producer_indices)
 
     if rebuild:
+        scoring = report.get("protocol", {}).get("stein_scoring", {})
+        if (isinstance(scoring, dict) and scoring
+                and scoring.get("final_transform") in ("background_cdf", "background_cdf_power")):
+            raise ValueError(
+                "CDF-calibrated Stein ensemble fit selection is reference-B specific; "
+                "use the saved production ensemble or rescore the requested fit selection"
+            )
         for partition, record in records.items():
             fits, indices, score_kind = _riddle_saved_fit_scores(root, report, partition)
-            if score_kind != "log_density_ratio":
+            if score_kind != "log_density_ratio" and not score_kind.startswith("stein_"):
                 raise ValueError(
-                    "RIDDLE ensemble fit reselection is only supported for saved log-density-ratio scores; "
+                    "RIDDLE ensemble fit reselection requires saved raw member scores; "
                     "disable ensemble fit reselection for calibrated score-flow results"
                 )
             row_for_fit = {int(index): i for i, index in enumerate(indices)}
@@ -916,7 +989,10 @@ def apply_riddle_ensemble_fit_selection(root, report, records, audit, *, enabled
             rows = np.asarray([fits[row_for_fit[index]] for index in selected_indices])
             mask = record["mask"]
             scores = np.full(len(mask), np.nan, dtype=np.float64)
-            scores[mask] = np.logaddexp.reduce(rows[:, mask].astype(np.float64), axis=0) - np.log(len(rows))
+            selected_rows = rows[:, mask].astype(np.float64)
+            scores[mask] = (selected_rows.mean(axis=0) if score_kind.startswith("stein_") else
+                            np.logaddexp.reduce(selected_rows, axis=0) - np.log(len(selected_rows)))
+            record["score_kind"] = np.array(score_kind)
             record["scores"] = scores
             if "raw_scores" in record:
                 record["raw_scores"] = scores.copy()
@@ -937,7 +1013,10 @@ def apply_riddle_ensemble_fit_selection(root, report, records, audit, *, enabled
         "applied_mode": mode,
         "separate_from_safeguard_filtering": True,
     }
-    updated["ensemble"] = "log(mean(exp(per-fit log ratio))) with equal weights over ensemble-selected fits"
+    score_kinds = {str(np.asarray(record.get("score_kind", "log_density_ratio")).item()) for record in records.values()}
+    updated["ensemble"] = ("arithmetic mean of per-fit Stein scores over ensemble-selected fits"
+                           if score_kinds and all(kind.startswith("stein_") for kind in score_kinds) else
+                           "log(mean(exp(per-fit log ratio))) with equal weights over ensemble-selected fits")
     updated["ensemble_rebuilt_for_plot"] = bool(rebuild)
     if rebuild and "health" in updated:
         updated["producer_health"] = updated.pop("health")
@@ -1721,7 +1800,10 @@ def event_size_rows(groups, score_loader, *, data_root=None):
                     count = roles.get(role, {}).get("events")
                     if count is not None:
                         validation_parts.append(f"{int(count):,} {label}")
-                rows.append({**base, "component": "Residual signal density", "model_type": "residual density estimator",
+                core = report.get("contract", {}).get("settings", {}).get("riddle", {}).get("core", "residual")
+                rows.append({**base,
+                             "component": ("Stein witness" if core == "stein_witness" else "Residual signal density"),
+                             "model_type": ("neural Stein discrepancy witness" if core == "stein_witness" else "residual density estimator"),
                              "train_events": train_events, "train_sample": "signal-region data (unlabelled)",
                              "validation_events": validation_events,
                              "validation_sample": "; ".join(validation_parts) or "signal-region validation",
@@ -1998,10 +2080,9 @@ def _lacathode_sr_classifier_history(source):
 def _sr_model_training_history(method, source, score_loader=None):
     """Return the native second-stage training objective for each method.
 
-    RIDDLE and R-ANODE optimize signal-region density-model NLLs. LaCATHODE's
-    second stage is instead a classifier, so its native objective is BCE. The
-    cross-method plot therefore compares relative objective convergence, not
-    absolute losses or like-for-like likelihood values.
+    RIDDLE uses its configured core objective, R-ANODE optimizes a signal-region
+    density-model NLL, and LaCATHODE uses classifier BCE. The cross-method plot
+    compares relative objective convergence, not absolute loss values.
     """
     if method == "riddle":
         return _riddle_sr_model_nll_history(source, score_loader)
@@ -2021,14 +2102,14 @@ def _relative_nll(values):
 
 
 def _render_relative_history_comparison(
-    histories, destination, stem, *, ylabel=r"Relative NLL change from epoch 1 [\%]", method_labels=None
+    histories, destination, stem, *, ylabel=r"Relative objective change from epoch 1 [\%]", method_labels=None
 ):
     """Save one paper-ready standalone cross-method objective figure per split.
 
     Curves are normalized to their own epoch-1 objective, so the figure shows
     convergence trends only. This permits the SR-stage panel to include
-    LaCATHODE's classifier BCE alongside RIDDLE/R-ANODE density NLLs without
-    implying that their absolute objective values are numerically comparable.
+    different core objectives without implying that their absolute values are
+    numerically comparable.
     """
     if not histories:
         return
@@ -2113,7 +2194,7 @@ def comparison_training_figures(group, output, score_loader=None):
 
     _render_relative_history_comparison(
         sr_model, destination, "sr_model_nll",
-        ylabel=r"Relative NLL change from epoch 1 [\%]",
+        ylabel=r"Relative objective change from epoch 1 [\%]",
     )
 
 
@@ -2161,17 +2242,20 @@ def training_figures(group, output, score_loader=None):
                     raise ValueError("Inconsistent accepted RIDDLE training histories")
                 history = [dict(epoch=e, **{key: float(np.mean([h[e][key] for h in histories]))
                     for key in ("train_nll", "validation_nll", "signal_fraction")}) for e in range(len(histories[0]))]
+            core = report.get("contract", {}).get("settings", {}).get("riddle", {}).get("core", "residual")
             _plot_nll_history(
                 history, destination,
-                title="RIDDLE | SR residual-mixture density",
+                title=("RIDDLE | SR Stein witness" if core == "stein_witness" else "RIDDLE | SR residual-mixture density"),
                 filename="sr_model_nll",
+                ylabel=("Stein witness objective" if core == "stein_witness" else "Negative log likelihood"),
             )
 
-            fig, ax, _ = f.canvas("Fitted mixture fraction", "Epoch")
-            x = [r["epoch"] + 1 for r in history]
-            plot_history_series(ax, x, [r["signal_fraction"] for r in history], "RIDDLE")
-            f.legend(fig, title="RIDDLE | Residual-mixture fraction")
-            f.save(fig, destination / "mixture_fraction")
+            if core != "stein_witness":
+                fig, ax, _ = f.canvas("Fitted mixture fraction", "Epoch")
+                x = [r["epoch"] + 1 for r in history]
+                plot_history_series(ax, x, [r["signal_fraction"] for r in history], "RIDDLE")
+                f.legend(fig, title="RIDDLE | Residual-mixture fraction")
+                f.save(fig, destination / "mixture_fraction")
 
 
 
@@ -2201,7 +2285,9 @@ def training_figures(group, output, score_loader=None):
                 ax.set(yticks=positions, ylim=(min(positions) - .7, max(positions) + .7))
                 f.legend(fig)
                 f.save(fig, destination / "selected_epochs_by_fit")
-                fig, ax, _ = f.canvas("Validation mixture NLL", "Fit")
+                fig, ax, _ = f.canvas(
+                    "Validation Stein objective" if core == "stein_witness" else "Validation mixture NLL", "Fit"
+                )
                 for i, member, member_history in zip(positions, members, histories):
                     ax.plot(
                         [i],
