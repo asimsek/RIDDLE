@@ -124,7 +124,9 @@ def run(args, contract):
         calibration_raw = {}
         try:
             for partition, (rows, region, z, mask, preprocessing_mask, score_domain_mask) in mapped.items():
-                scores, fit_scores = ensemble_predict(output / "density", z, args.device, return_members=True)
+                scores, fit_scores, accepted_fit_scores = ensemble_predict(
+                    output / "density", z, args.device, return_members=True, return_accepted_members=True
+                )
                 require_finite(scores, "RIDDLE ensemble scores")
                 acceptance[partition] = {
                     **region_acceptance(rows[:, -1], mask, region),
@@ -136,6 +138,8 @@ def run(args, contract):
                 aligned[mask] = scores
                 aligned_fits = np.full((len(fit_scores), len(rows)), np.nan, dtype=fit_scores.dtype)
                 aligned_fits[:, mask] = fit_scores
+                aligned_accepted_fits = np.full((len(accepted_fit_scores), len(rows)), np.nan, dtype=accepted_fit_scores.dtype)
+                aligned_accepted_fits[:, mask] = accepted_fit_scores
                 arrays = dict(
                     mass=rows[:, 0],
                     is_signal_region=region,
@@ -152,6 +156,11 @@ def run(args, contract):
                     fit_indices=np.array([m["fit_index"] for m in result["members"]], dtype=np.int64),
                     fit_seeds=np.array([m["seed"] for m in result["members"]], dtype=np.uint32),
                     fit_directories=np.array([m["directory"] for m in result["members"]]),
+                    accepted_fit_scores=aligned_accepted_fits,
+                    accepted_fit_indices=np.array([m["fit_index"] for m in result["accepted_members"]], dtype=np.int64),
+                    accepted_fit_seeds=np.array([m["seed"] for m in result["accepted_members"]], dtype=np.uint32),
+                    accepted_fit_directories=np.array([m["directory"] for m in result["accepted_members"]]),
+                    accepted_fit_score_kind=np.array("log_density_ratio"),
                 )
                 if partition in evaluation_ids: arrays["event_ids"] = evaluation_ids[partition]
                 exports[partition] = arrays
@@ -219,9 +228,11 @@ def run(args, contract):
             **settings["riddle"]["training"],
             "gradient_clip": f"flow parameters only; norm {settings['riddle']['training']['gradient_clip_norm']}",
             "ensemble": (
-                f"equal-weight mean over accepted fits; {settings['riddle']['training']['selected_checkpoints']} validation-selected epochs per fit with "
+                f"equal-weight mean over {result['valid_runs']} selected fits from {result['accepted_runs']} safeguard-valid fits; "
+                f"{settings['riddle']['training']['selected_checkpoints']} validation-selected epochs per fit with "
                 + ("validation-likelihood checkpoint weights" if feature_options(settings["riddle"]).get("checkpoint_weighting") == "validation_likelihood" else "equal checkpoint weights")
             ),
+            "ensemble_fit_selection": result["ensemble_fit_selection"],
             "settings": settings,
             "implementation": ("riddle_v5_3_smooth_fm_bgcorr_40_reguide" if background_correction is not None
                                else "riddle_v5_3_smooth_fm_gaussian_fallback" if background_correction_decision is not None
@@ -266,8 +277,10 @@ def run(args, contract):
             "reference_samples": settings["background"]["reference_samples"],
             "epochs": args.epochs,
             "fits": args.runs,
-            "accepted_fits": result["valid_runs"],
-            "excluded_fits": args.runs - result["valid_runs"],
+            "accepted_fits": result["accepted_runs"],
+            "ensemble_fits": result["valid_runs"],
+            "unselected_fits": result["accepted_runs"] - result["valid_runs"],
+            "excluded_fits": args.runs - result["accepted_runs"],
             "fit_recovery": settings["riddle"]["fit_recovery"],
             "initialization": settings["riddle"]["initialization"],
             "fractions": args.fractions,

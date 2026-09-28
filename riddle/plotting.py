@@ -858,14 +858,105 @@ def unfiltered_plot_ensemble(root, report):
     return records, audit
 
 
+def _riddle_saved_fit_scores(root, report, partition):
+    path = verify_plot_input(root, report, f"{partition}_scores.npz")
+    with np.load(path, allow_pickle=False) as archive:
+        if "accepted_fit_scores" in archive:
+            fits = archive["accepted_fit_scores"]
+            indices = archive["accepted_fit_indices"] if "accepted_fit_indices" in archive else np.arange(len(fits))
+        elif "fit_scores" in archive:
+            fits = archive["fit_scores"]
+            indices = archive["fit_indices"] if "fit_indices" in archive else np.arange(len(fits))
+        else:
+            raise ValueError(f"RIDDLE {root}: per-fit scores are unavailable for ensemble fit selection")
+        score_kind = str(np.asarray(archive["score_kind"]).item()) if "score_kind" in archive else "log_density_ratio"
+        mask = archive["mask"]
+    if (fits.ndim != 2 or fits.shape[1:] != mask.shape or indices.shape != (len(fits),)
+            or len(set(int(i) for i in indices)) != len(indices)
+            or not np.isfinite(fits[:, mask]).all() or not np.isnan(fits[:, ~mask]).all()):
+        raise ValueError(f"RIDDLE {root}: invalid saved per-fit scores for ensemble fit selection")
+    return fits, np.asarray(indices, dtype=np.int64), score_kind
+
+
+def apply_riddle_ensemble_fit_selection(root, report, records, audit, *, enabled=True):
+    from .production import select_ensemble_members
+
+    selection = read_metadata(root, report, "density/ensemble_selection.json")
+    config = next(c for c in selection["configurations"] if c["name"] == selection["selected_configuration"])
+    accepted = [dict(m, fit_index=m.get("fit_index", i)) for i, m in enumerate(
+        selection.get("accepted_members", config.get("accepted_members", selection["members"])))
+    ]
+    safeguard_excluded = {m.get("fit_index") for m in audit.get("excluded_members", []) if type(m.get("fit_index")) is int}
+    candidates = [m for m in accepted if m["fit_index"] not in safeguard_excluded]
+    if not candidates:
+        raise NoValidFits(f"RIDDLE {root}: no safeguard-valid fits remain for ensemble fit selection")
+
+    saved_policy = selection.get("ensemble_fit_selection", {})
+    settings = report.get("contract", {}).get("settings", {}).get("riddle", {})
+    configured_mode = saved_policy.get("mode", settings.get("ensemble_fit_selection", "validation-best"))
+    configured_count = saved_policy.get("fit_count", settings.get("ensemble_fit_count", 10))
+    mode = configured_mode if enabled else "all"
+    selected, unselected, metadata = select_ensemble_members(candidates, mode=mode, fit_count=int(configured_count))
+    selected_indices = [m["fit_index"] for m in selected]
+    producer_indices = [m.get("fit_index") for m in selection.get("members", [])]
+    rebuild = set(selected_indices) != set(producer_indices) or len(selected_indices) != len(producer_indices)
+
+    if rebuild:
+        for partition, record in records.items():
+            fits, indices, score_kind = _riddle_saved_fit_scores(root, report, partition)
+            if score_kind != "log_density_ratio":
+                raise ValueError(
+                    "RIDDLE ensemble fit reselection is only supported for saved log-density-ratio scores; "
+                    "disable ensemble fit reselection for calibrated score-flow results"
+                )
+            row_for_fit = {int(index): i for i, index in enumerate(indices)}
+            missing = [index for index in selected_indices if index not in row_for_fit]
+            if missing:
+                raise ValueError(f"RIDDLE {root}: missing saved scores for selected fits {missing}")
+            rows = np.asarray([fits[row_for_fit[index]] for index in selected_indices])
+            mask = record["mask"]
+            scores = np.full(len(mask), np.nan, dtype=np.float64)
+            scores[mask] = np.logaddexp.reduce(rows[:, mask].astype(np.float64), axis=0) - np.log(len(rows))
+            record["scores"] = scores
+            if "raw_scores" in record:
+                record["raw_scores"] = scores.copy()
+            record["plot_saved_ensemble"] = False
+            validate_score_record(record, method="riddle", stage=f"RIDDLE plot ensemble fit selection {root}/{partition}")
+
+    updated = dict(audit)
+    updated["safeguard_used_fits"] = len(candidates)
+    updated["safeguard_used_members"] = candidates
+    updated["used_fits"] = len(selected)
+    updated["used_members"] = selected
+    updated["unselected_members"] = unselected
+    updated["ensemble_fit_selection"] = {
+        **metadata,
+        "enabled": bool(enabled),
+        "configured_mode": configured_mode,
+        "configured_fit_count": int(configured_count),
+        "applied_mode": mode,
+        "separate_from_safeguard_filtering": True,
+    }
+    updated["ensemble"] = "log(mean(exp(per-fit log ratio))) with equal weights over ensemble-selected fits"
+    updated["ensemble_rebuilt_for_plot"] = bool(rebuild)
+    if rebuild and "health" in updated:
+        updated["producer_health"] = updated.pop("health")
+        updated["producer_health_applies_to_plot_ensemble"] = False
+    updated["source_artifacts_modified"] = False
+    for record in records.values():
+        record["plot_ensemble"] = updated
+    return records, updated
+
+
 class ScoreLoader:
     """Load saved method predictions once; ensemble members are not repeat runs."""
 
-    def __init__(self, *, safeguard_filtering=True, io_workers=2, device="cpu"):
+    def __init__(self, *, safeguard_filtering=True, ensemble_fit_selection=True, io_workers=2, device="cpu"):
         self.cache = {}
         self.validated = set()
         self.fit_audit = {}
         self.safeguard_filtering = safeguard_filtering
+        self.ensemble_fit_selection = ensemble_fit_selection
         self.io_workers = io_workers
         self.device = plot_device_argument(device)
 
@@ -913,6 +1004,22 @@ class ScoreLoader:
                 audit = read_metadata(root, report, "density/normalization_check.json")
                 if audit.get("status") != "passed":
                     raise ValueError(f"{root}: failed density normalization check")
+            if method == "riddle" and not legacy_riddle:
+                records = {}
+                for name in ("validation", "test", "signal_region"):
+                    key = (identity, name)
+                    records[name] = self.cache.get(key) if key in self.cache else load_scores(root, report, name)
+                records, audit = apply_riddle_ensemble_fit_selection(
+                    root, report, records, self.fit_audit[identity], enabled=self.ensemble_fit_selection
+                )
+                self.cache.update({(identity, name): record for name, record in records.items()})
+                self.fit_audit[identity] = audit
+                policy = audit["ensemble_fit_selection"]
+                colored_status(
+                    f"RIDDLE {report['scenario']}/seed_{report['seed']:03d}: ensemble fit selection "
+                    f"{policy['applied_mode']} uses {audit['used_fits']}/{audit['safeguard_used_fits']} safeguard-valid fits",
+                    kind="INFO", level=0
+                )
             self.validated.add(identity)
         key = (str(root.resolve()), partition)
         if key not in self.cache:
@@ -1619,8 +1726,8 @@ def event_size_rows(groups, score_loader, *, data_root=None):
                              "validation_events": validation_events,
                              "validation_sample": "; ".join(validation_parts) or "signal-region validation",
                              "generated_reference_samples": "",
-                             "notes": f"{selection.get('valid_runs', '')}/{selection.get('requested_runs', '')} accepted fits; "
-                                      f"{selection.get('selected_checkpoints', '')} selected checkpoints"})
+                             "notes": f"{selection.get('accepted_runs', selection.get('valid_runs', ''))}/{selection.get('requested_runs', '')} safeguard-valid fits; "
+                                      f"{selection.get('valid_runs', '')} ensemble fits; {selection.get('selected_checkpoints', '')} selected checkpoints"})
             elif method == "lacathode":
                 metadata = read_metadata(root, report, "protocol.json")
                 rows.append({**base, "component": "Background flow", "model_type": "density estimator",
@@ -1717,11 +1824,14 @@ def settings_rows(group, score_loader=None):
                 for k in (
                     "selected_configuration",
                     "requested_runs",
+                    "accepted_runs",
                     "valid_runs",
+                    "ensemble_fit_selection",
                     "selected_checkpoints",
                     "failures",
                     "members",
-                )
+                    "unselected_members",
+                ) if k in result
             }
         for key, value in flatten(payload):
             rows.append(
@@ -2996,28 +3106,33 @@ def _ensemble_member_scores(method, source, score_loader, *, scope="signal_regio
 
     path = verify_plot_input(root, report, f"{partition}_scores.npz")
     with np.load(path, allow_pickle=False) as archive:
-        scores = np.asarray(
-            archive["fit_scores"] if "fit_scores" in archive else archive["scores"][None, :],
-            dtype=np.float64,
-        )
+        if method == "riddle" and "accepted_fit_scores" in archive:
+            scores = np.asarray(archive["accepted_fit_scores"], dtype=np.float64)
+            indices = np.asarray(archive["accepted_fit_indices"], dtype=int)
+            score_kind = str(archive["accepted_fit_score_kind"]) if "accepted_fit_score_kind" in archive else "log_density_ratio"
+        else:
+            scores = np.asarray(
+                archive["fit_scores"] if "fit_scores" in archive else archive["scores"][None, :],
+                dtype=np.float64,
+            )
+            indices = np.asarray(archive["fit_indices"], dtype=int) if method == "riddle" and "fit_indices" in archive else None
+            score_kind = (
+                str(archive["fit_score_kind"])
+                if "fit_score_kind" in archive
+                else str(archive["score_kind"])
+                if "score_kind" in archive
+                else ""
+            )
         if scores.ndim != 2 or scores.shape[1] != len(record["labels"]):
             raise ValueError(f"{METHOD_SPECS[method].label} ensemble-convergence score shape is invalid")
-        if method == "riddle" and "fit_indices" in archive:
+        if method == "riddle" and indices is not None:
             audit = score_loader.fit_audit.get(identity, {})
             used = [m.get("fit_index") for m in audit.get("used_members", []) if m.get("fit_index") is not None]
             if used:
-                indices = np.asarray(archive["fit_indices"], dtype=int)
                 lookup = {int(value): i for i, value in enumerate(indices)}
                 if any(int(value) not in lookup for value in used):
                     raise ValueError("RIDDLE ensemble-convergence fit identities disagree with accepted ensemble")
                 scores = scores[[lookup[int(value)] for value in used]]
-        score_kind = (
-            str(archive["fit_score_kind"])
-            if "fit_score_kind" in archive
-            else str(archive["score_kind"])
-            if "score_kind" in archive
-            else ""
-        )
 
     if not np.isfinite(scores[:, record["mask"]]).all() or not np.isnan(scores[:, ~record["mask"]]).all():
         raise ValueError(f"{METHOD_SPECS[method].label} ensemble-convergence member scores are invalid")
@@ -3677,6 +3792,8 @@ def main(argv=None):
                         help="RIDDLE safeguard/checkpoint inference device: cpu (default), cuda:<index>, or auto")
     parser.add_argument("--no-safeguard-filtering", action="store_true",
                         help="Disable plot-time RIDDLE/R-ANODE fit filtering and use saved ensemble scores")
+    parser.add_argument("--no-ensemble-fit-selection", action="store_true",
+                        help="Disable only RIDDLE label-free validation fit selection and ensemble all safeguard-valid fits; safeguards are unchanged")
     parser.add_argument("--plot-workers", type=int, default=min(8, max(1, (os.cpu_count() or 1) // 2)),
                         help="Parallel PDF/PNG export processes (default: half the CPUs, capped at 8)")
     parser.add_argument("--plot-cache-mb", type=int, default=1024,
@@ -3715,12 +3832,16 @@ def main(argv=None):
             if any(path.is_symlink() for path in args.output.rglob("*")):
                 raise ValueError("Cannot overwrite a plot directory containing symbolic links")
         score_loader = ScoreLoader(safeguard_filtering=not args.no_safeguard_filtering,
+                                   ensemble_fit_selection=not args.no_ensemble_fit_selection,
                                    io_workers=args.io_workers, device=args.device)
         requested_groups = {key: dict(group) for key, group in groups.items()}
         requested_scan_groups = {key: dict(group) for key, group in scan_groups.items()}
         colored_status("Validate plot inputs | RIDDLE/R-ANODE safeguard filtering "
                        + ("disabled: use saved ensembles" if args.no_safeguard_filtering
                           else "active: check fits before plotting"), kind="INFO", level=1)
+        colored_status("Validate plot inputs | RIDDLE ensemble fit selection "
+                       + ("disabled: use all safeguard-valid fits" if args.no_ensemble_fit_selection
+                          else "active: use saved validation-best/all policy"), kind="INFO", level=1)
         with threadpool_limits(limits=args.io_workers):
             preflight_scores([*groups.values(), *scan_groups.values()], score_loader, allow_smoke=args.allow_smoke)
         groups = {key: group for key, group in groups.items() if group}
@@ -3861,6 +3982,7 @@ def main(argv=None):
                         if any(a.get("checkpoint_inference") for a in score_loader.fit_audit.values())
                         else "Saved predictions only; no checkpoint inference or modification of results"),
                     "safeguard_filtering": not args.no_safeguard_filtering,
+                    "ensemble_fit_selection": not args.no_ensemble_fit_selection,
                     "requested_inference_device": args.device,
                     "checkpoint_inference_devices": sorted({a["inference_device"] for a in score_loader.fit_audit.values() if a.get("checkpoint_inference")}),
                     "score_ensembles": list(score_loader.fit_audit.values()),

@@ -20,7 +20,48 @@ from .model import (
 from .integrity import SCIENTIFIC_VERSION, ordered_epochs
 from .options import feature_options, effective_features
 
-ENHANCED_TRAINING_PROTOCOL = "riddle_v5_5_configurable_contrastive_weighting_v4"
+ENHANCED_TRAINING_PROTOCOL = "riddle_v5_5_configurable_contrastive_weighting_v5_qphi_width_safe_masks"
+
+
+def _set_mask_from_degrees(linear, input_degrees, *, output=False):
+    if not hasattr(linear, "mask") or not hasattr(linear, "degrees"):
+        raise ValueError("q_phi width transfer requires nflows masked linear layers")
+    input_degrees = input_degrees.to(device=linear.degrees.device, dtype=linear.degrees.dtype)
+    if linear.mask.shape != (len(linear.degrees), len(input_degrees)):
+        raise ValueError("Autoregressive mask shape is inconsistent with stored degrees")
+    expected = ((linear.degrees[:, None] > input_degrees[None, :]) if output
+                else (linear.degrees[:, None] >= input_degrees[None, :]))
+    expected = expected.to(device=linear.mask.device, dtype=linear.mask.dtype)
+    with torch.no_grad():
+        linear.mask.copy_(expected)
+    if not torch.equal(linear.mask, expected):
+        raise ValueError("Failed to synchronize autoregressive mask with stored degrees")
+    return linear.degrees
+
+
+def _synchronize_autoregressive_masks(model):
+    count = 0
+    for transform in model._transform._transforms:
+        network = getattr(transform, "autoregressive_net", None)
+        if network is None:
+            continue
+        initial = network.initial_layer
+        input_degrees = torch.arange(
+            1, initial.in_features + 1, device=initial.degrees.device, dtype=initial.degrees.dtype
+        )
+        degrees = _set_mask_from_degrees(initial, input_degrees)
+        for block in network.blocks:
+            if hasattr(block, "linear"):
+                degrees = _set_mask_from_degrees(block.linear, degrees)
+            elif hasattr(block, "linear_layers"):
+                for linear in block.linear_layers:
+                    degrees = _set_mask_from_degrees(linear, degrees)
+            else:
+                raise ValueError("Unsupported nflows MADE block in q_phi width transfer")
+        _set_mask_from_degrees(network.final_layer, degrees, output=True)
+        count += 1
+    if count == 0:
+        raise ValueError("No autoregressive transforms found while synchronizing q_phi width transfer")
 
 
 def _initialize_from_corrected_background(model, background, validation_inputs):
@@ -67,6 +108,7 @@ def _initialize_from_corrected_background(model, background, validation_inputs):
                 )
             widened[key] = value
         model.load_state_dict(widened)
+        _synchronize_autoregressive_masks(model)
     probe = torch.as_tensor(validation_inputs[:min(512, len(validation_inputs))], dtype=torch.float32, device=next(model.parameters()).device)
     model.eval()
     background.eval()
@@ -481,12 +523,19 @@ def train_residual(
     )
     corrected_background = None
     corrected_background_digest = None
+    width_transfer = None
     if background_correction is not None:
         from .background_correction import load as load_background_correction
         corrected_background = load_background_correction(
             background_correction, settings, ztrain.shape[1]-1, device
         )
-        _initialize_from_corrected_background(model, corrected_background, zval)
+        source_hidden, target_hidden = _initialize_from_corrected_background(model, corrected_background, zval)
+        width_transfer = {
+            "qphi_hidden_features": source_hidden,
+            "residual_hidden_features": target_hidden,
+            "autoregressive_masks_synchronized": True,
+            "function_preserving_initialization": True,
+        }
     if corrected_background is None:
         if initialization in ("background", "identity"):
             from .model import match_background
@@ -592,6 +641,7 @@ def train_residual(
                 "local_sha256": corrected_background_digest,
                 "selected_epoch": background_correction["selected_epoch"],
                 "epochs": background_correction["epochs"],
+                "width_transfer": width_transfer,
             }),
         },
     )

@@ -88,6 +88,8 @@ def validate_residual(value):
     # Require every requested residual member unless partial diagnostics are explicit.
 
     value.setdefault("ensemble_completion", "strict")
+    value.setdefault("ensemble_fit_selection", "validation-best")
+    value.setdefault("ensemble_fit_count", 10)
     # Learn a smooth f(m) from latent residual responsibilities.
 
 
@@ -102,7 +104,7 @@ def validate_residual(value):
         "max_iterations": 100,
     })
 
-    extra = "".join(" " + k for k in ("mass_conditioning", "input_space", "optimization", "data_policy", "ensemble_completion", "background_correction") if k in value)
+    extra = "".join(" " + k for k in ("mass_conditioning", "input_space", "optimization", "data_policy", "ensemble_completion", "ensemble_fit_selection", "ensemble_fit_count", "background_correction") if k in value)
     keys(value, "runs epochs fractions initialization flow training fit_recovery enhancements mass_fraction" + extra, "RIDDLE")
     if "data_policy" in value:
         from .roles import policy_parts, DIAGNOSTIC_POLICIES
@@ -111,6 +113,9 @@ def validate_residual(value):
             raise ValueError("Diagnostic role replay requires one fit and all six features")
     if value["ensemble_completion"] not in ("strict", "partial"):
         raise ValueError("ensemble_completion must be strict or partial")
+    if value["ensemble_fit_selection"] not in ("validation-best", "all"):
+        raise ValueError("ensemble_fit_selection must be validation-best or all")
+    integer(value["ensemble_fit_count"], "ensemble_fit_count")
     if "mass_conditioning" in value and type(value["mass_conditioning"]) is not bool:
         raise ValueError("mass_conditioning must be boolean")
     mf = value["mass_fraction"]

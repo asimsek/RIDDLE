@@ -131,7 +131,7 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --name riddle-seed42 --methods riddle --scenarios signal_injection \
   --seeds 42 --config config/settings.yaml --workers 5 --io-workers 2 --torch-threads 2 --mps on \
-  --runs 10 --fits 10 --epochs 100 --data data/lhco --results results \
+  --runs 10 --fits 20 --epochs 100 --data data/lhco --results results \
   | kubectl apply -n cua-asimsek -f -
 ```
 
@@ -140,7 +140,7 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --name riddle-bg-seed42 --methods riddle --scenarios background_only \
   --seeds 42 --config config/settings.yaml --workers 5 --io-workers 2 --torch-threads 2 --mps on \
-  --runs 10 --fits 10 --epochs 100 --data data/lhco --results results \
+  --runs 10 --fits 20 --epochs 100 --data data/lhco --results results \
   | kubectl apply -n cua-asimsek -f -
 ```
 
@@ -186,7 +186,7 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   | kubectl apply -n cua-asimsek -f -
 ```
 
-For RIDDLE/R-ANODE, `--fits 10` trains one ensemble with ten signal fits.<br>
+For RIDDLE/R-ANODE, `--fits 20` trains one ensemble with twenty signal fits.<br>
 Add `--runs 10` to retrain the complete method ten times, including separate background models; method uncertainty bands use these independent runs.<br>
 
 For one combined job instead, request `--methods lacathode riddle ranode` with a different job name.<br>

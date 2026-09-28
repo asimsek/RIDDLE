@@ -122,7 +122,7 @@ def job(args):
     if gpu not in GPU_TYPES:
         raise ValueError(f"Unknown GPU {gpu!r}; choose from {', '.join(GPU_TYPES)}")
     gpu_resource, gpu_product = GPU_TYPES[gpu]
-    resource = {"cpu": "32", "memory": "128Gi", gpu_resource: 1}
+    resource = {"cpu": "16", "memory": "64Gi", gpu_resource: 1}
     result = {
         "apiVersion": "batch/v1",
         "kind": "Job",

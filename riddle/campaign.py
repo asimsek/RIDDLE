@@ -12,7 +12,7 @@ from .model import PROTOCOL as SINGLE_PROTOCOL, background_log_prob, real_sr_lat
 from .training import (train_residual, residual_scores, residual_background_log_prob, residual_background_sample,
                        residual_fraction_probabilities)
 from .integrity import SCIENTIFIC_VERSION
-from .production import (PRODUCTION_POLICY, EVIDENCE_GATED_POLICY, fit_acceptance,
+from .production import (PRODUCTION_POLICY, EVIDENCE_GATED_POLICY, fit_acceptance, select_ensemble_members,
                          require_complete_members, require_complete_ensemble)
 from .options import effective_features
 
@@ -20,7 +20,7 @@ PROTOCOL = {
     **SINGLE_PROTOCOL,
     "name": "RIDDLE",
     "campaign_version": SCIENTIFIC_VERSION,
-    "ensemble": "equal-weight mean signal density over accepted fits and ten validation-selected epochs per fit",
+    "ensemble": "equal-weight mean signal density over label-free validation-selected accepted fits and validation-selected epochs per fit",
     "splits": "80/20 resamples of development training rows; reserved validation reserved for configuration/cuts",
     "failures": "bounded fresh retries for numerical failures only; retain inconclusive evidence without retries",
 }
@@ -406,17 +406,26 @@ def train_campaign(
     configs, failures = [], []
     for tag in tags:
         receipts = [json.loads((output / tag / f"run_{i:03d}" / "fit.json").read_text()) for i in range(runs)]
-        members = [m for m in receipts if m["status"] == "completed"]
+        accepted_members = [m for m in receipts if m["status"] == "completed"]
         excluded = [m for m in receipts if m["status"] == "excluded"]
         failures.extend(dict(configuration=tag, fit_index=m["fit_index"], **attempt)
                         for m in receipts for attempt in m["attempts"] if attempt["status"] != "completed")
+        members, unselected, fit_selection = select_ensemble_members(
+            accepted_members, mode=settings["ensemble_fit_selection"], fit_count=settings["ensemble_fit_count"]
+        ) if accepted_members else ([], [], dict(
+            mode=settings["ensemble_fit_selection"], fit_count=settings["ensemble_fit_count"], candidate_fits=0,
+            selected_fits=0, ranking_metric="reserved_validation_mean_log_likelihood_gain",
+            ranking_direction="descending", truth_labels_used=False, selected_fit_indices=[],
+            selected_fit_indices_by_rank=[], unselected_fit_indices=[], ranking=[]))
         config = dict(name=tag, fraction=fraction_values[tags.index(tag)], members=members,
-                      excluded_fits=excluded, valid_runs=len(members))
-        if members:
-            require_complete_members(members, runs, checkpoints, configuration=tag, allow_excluded=True)
+                      accepted_members=accepted_members, unselected_members=unselected, excluded_fits=excluded,
+                      accepted_runs=len(accepted_members), valid_runs=len(members),
+                      ensemble_fit_selection=fit_selection)
+        if accepted_members:
+            require_complete_members(accepted_members, runs, checkpoints, configuration=tag, allow_excluded=True)
             if background_correction is not None:
                 recorded = []
-                for member in members:
+                for member in accepted_members:
                     inputs = json.loads((output / member["directory"] / "residual_training_inputs.json").read_text())
                     info = inputs.get("background_correction")
                     if info is None:
@@ -503,8 +512,8 @@ def train_campaign(
                       "epochs": background_correction["epochs"], "selected_epoch": background_correction["selected_epoch"],
                       "model_sha256": background_correction["model_sha256"]}),
                   failures=failures, fit_recovery=settings["fit_recovery"],
-                  selection=("internal selection likelihood; reserved evidence never selects configurations"
-                             if zselection is not None else "reserved-validation mixture likelihood; no truth or test-score selection"))
+                  selection=("label-free reserved-validation likelihood ranks fits when requested; internal selection likelihood chooses configurations; no truth or test-score selection"
+                             if zselection is not None else "label-free reserved-validation mixture likelihood ranks fits/configurations; no truth or test-score selection"))
     result['ensemble_completion'] = settings.get('ensemble_completion', 'partial')
     write_json(output / "numerical_failures.json", {"failures": failures})
     if not usable:
@@ -512,22 +521,29 @@ def train_campaign(
         from .production import IncompleteEnsembleError
         raise IncompleteEnsembleError("RIDDLE: no fits passed after bounded retries; no physics result was produced. "
                                       "Inspect density/ensemble_selection.json and the fit attempt records.")
-    if settings.get("ensemble_completion", "partial") == "strict" and any(len(c["members"]) != runs for c in configs):
+    if settings.get("ensemble_completion", "partial") == "strict" and any(len(c.get("accepted_members", c["members"])) != runs for c in configs):
         from .production import IncompleteEnsembleError
         result["status"] = "incomplete_strict_ensemble"
         write_json(output / "ensemble_selection.json", result)
         raise IncompleteEnsembleError("Strict ensemble incomplete after bounded retries; artifacts preserved")
     chosen = min(usable, key=lambda c: c["selection_nll"])
     result.update(selected_configuration=chosen["name"], members=chosen["members"],
+                  accepted_members=chosen["accepted_members"], unselected_members=chosen["unselected_members"],
+                  ensemble_fit_selection=chosen["ensemble_fit_selection"],
                   health=chosen["health"], production_ready=False,
-                  valid_runs=len(chosen["members"]), selected_checkpoints=len(chosen["members"]) * checkpoints)
+                  accepted_runs=len(chosen["accepted_members"]), valid_runs=len(chosen["members"]),
+                  accepted_checkpoints=len(chosen["accepted_members"]) * checkpoints,
+                  selected_checkpoints=len(chosen["members"]) * checkpoints)
     if coherent:
         result["coherent_mixture"] = chosen["coherent_mixture"]
         write_json(output / "coherent_mixture.json", chosen["coherent_mixture"])
     require_complete_ensemble(result)
     write_json(output / "ensemble_selection.json", result)
-    write_json(output / "residual_losses.json", dict(history=chosen["history"], aggregation="mean over accepted fits"))
-    emit_message(f"RIDDLE: {result['valid_runs']}/{runs} fits accepted; saved ensemble excludes exhausted fits", level=0)
+    write_json(output / "residual_losses.json", dict(history=chosen["history"], aggregation="mean over selected ensemble fits"))
+    emit_message(
+        f"RIDDLE: {result['accepted_runs']}/{runs} fits passed safeguards; "
+        f"ensemble uses {result['valid_runs']} fits ({result['ensemble_fit_selection']['mode']})", level=0
+    )
     return result
 
 
@@ -579,20 +595,35 @@ def validate_normalization(output, features, device):
     return audit
 
 
-def ensemble_predict(output, z, device, *, return_members=False):
+def ensemble_predict(output, z, device, *, return_members=False, return_accepted_members=False):
     root = Path(output)
     selection = json.loads((root / "ensemble_selection.json").read_text())
     require_complete_ensemble(selection)
+    selected = selection["members"]
+    accepted = selection.get("accepted_members", selected)
+    selected_directories = {member["directory"] for member in selected}
     combined = None
-    predictions = []
-    for member in selection["members"]:
+    selected_predictions = []
+    accepted_predictions = []
+    for member in accepted:
         from .production import NumericalFitError
         try:
             ratio = residual_scores(root / member["directory"], member["epochs"], z, device)
         except (FloatingPointError, NumericalFitError) as error:
             raise MemberScoreError(member, error) from error
-        combined = ratio if combined is None else np.logaddexp(combined, ratio)
-        if return_members:
-            predictions.append(ratio)
-    scores = combined - np.log(len(selection["members"]))
-    return (scores, np.stack(predictions)) if return_members else scores
+        if return_accepted_members:
+            accepted_predictions.append(ratio)
+        if member["directory"] in selected_directories:
+            combined = ratio if combined is None else np.logaddexp(combined, ratio)
+            if return_members:
+                selected_predictions.append(ratio)
+    if combined is None or not selected:
+        raise ValueError("RIDDLE ensemble has no selected members")
+    scores = combined - np.log(len(selected))
+    if return_members and return_accepted_members:
+        return scores, np.stack(selected_predictions), np.stack(accepted_predictions)
+    if return_members:
+        return scores, np.stack(selected_predictions)
+    if return_accepted_members:
+        return scores, np.stack(accepted_predictions)
+    return scores

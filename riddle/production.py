@@ -23,7 +23,7 @@ class NumericalFitError(ValueError):
 def validation_improvement(log_mixture_ratios, *, sigma):
     """Paired validation gain against the fixed background, without truth labels.
 
-    This is a diagnostic, not a fit-retry criterion or calibrated discovery test.
+    This is a label-free model-selection diagnostic, not a fit-retry criterion or calibrated discovery test.
     """
     values = np.asarray(log_mixture_ratios, dtype=np.float64)
     if values.ndim != 1 or len(values) < 2:
@@ -45,7 +45,52 @@ def validation_improvement(log_mixture_ratios, *, sigma):
                 events=len(values), mean_log_likelihood_gain=gain,
                 standard_error=error, sigma=float(sigma), lower_margin=margin, numerical_tolerance=float(tolerance),
                 baseline="standard-normal background", truth_labels_used=False,
-                interpretation="validation diagnostic only; not evidence of a physical signal")
+                interpretation="label-free validation metric; may rank ensemble fits; not evidence of a physical signal")
+
+
+def select_ensemble_members(members, *, mode, fit_count):
+    if mode not in ("validation-best", "all"):
+        raise ValueError("ensemble fit selection must be validation-best or all")
+    if type(fit_count) is not int or fit_count < 1:
+        raise ValueError("ensemble fit count must be a positive integer")
+    if not isinstance(members, list):
+        raise ValueError("ensemble members must be a list")
+    ranking = []
+    for member in members:
+        quality = member.get("quality", {}) or {}
+        gain = quality.get("mean_log_likelihood_gain")
+        if type(member.get("fit_index")) is not int or type(gain) not in (int, float) or not np.isfinite(gain):
+            raise ValueError("ensemble fit selection requires finite label-free validation likelihood for every fit")
+        error = quality.get("standard_error")
+        if type(error) not in (int, float) or not np.isfinite(error):
+            raise ValueError("ensemble fit selection requires finite validation uncertainty for every fit")
+        ranking.append(dict(
+            fit_index=member["fit_index"],
+            mean_log_likelihood_gain=float(gain),
+            standard_error=float(error),
+            directory=member.get("directory"),
+        ))
+    ordered = sorted(ranking, key=lambda row: (-row["mean_log_likelihood_gain"], row["fit_index"]))
+    if mode == "all":
+        chosen = {row["fit_index"] for row in ranking}
+    else:
+        chosen = {row["fit_index"] for row in ordered[:min(fit_count, len(ordered))]}
+    selected = [member for member in members if member["fit_index"] in chosen]
+    unselected = [member for member in members if member["fit_index"] not in chosen]
+    metadata = dict(
+        mode=mode,
+        fit_count=int(fit_count),
+        candidate_fits=len(members),
+        selected_fits=len(selected),
+        ranking_metric="reserved_validation_mean_log_likelihood_gain",
+        ranking_direction="descending",
+        truth_labels_used=False,
+        selected_fit_indices=[member["fit_index"] for member in selected],
+        selected_fit_indices_by_rank=[row["fit_index"] for row in ordered if row["fit_index"] in chosen],
+        unselected_fit_indices=[member["fit_index"] for member in unselected],
+        ranking=ordered,
+    )
+    return selected, unselected, metadata
 
 
 def fit_acceptance(health):
@@ -190,6 +235,15 @@ def validate_score_record(record, *, method, stage):
         summary["members"] = [score_diagnostics(fit[mask], stage=f"{stage} member {i}",
                                                probability=method == "lacathode")
                               for i, fit in enumerate(fits)]
+    if "accepted_fit_scores" in record:
+        accepted = record["accepted_fit_scores"]
+        if (accepted.ndim != 2 or accepted.shape[1:] != (n,) or not len(accepted)
+                or not np.isfinite(accepted[:, mask]).all() or not np.isnan(accepted[:, ~mask]).all()):
+            raise ValueError(f"{stage}: invalid saved safeguard-valid fit scores")
+        for key in ("accepted_fit_indices", "accepted_fit_seeds", "accepted_fit_directories"):
+            if key in record and np.asarray(record[key]).shape != (len(accepted),):
+                raise ValueError(f"{stage}: invalid {key}")
+        summary["accepted_members"] = len(accepted)
     return summary
 
 
@@ -296,9 +350,9 @@ def require_complete_members(members, requested, checkpoints, *, configuration, 
 
 
 def require_complete_ensemble(selection):
-    completion = selection.get('ensemble_completion', 'partial')
-    if completion not in ('strict', 'partial'):
-        raise IncompleteEnsembleError('Unrecognized ensemble completion policy')
+    completion = selection.get("ensemble_completion", "partial")
+    if completion not in ("strict", "partial"):
+        raise IncompleteEnsembleError("Unrecognized ensemble completion policy")
     policy = selection.get("production_policy")
     legacy = policy == {**PRODUCTION_POLICY, "ensemble": "all_requested_runs"}
     evidence_gated = policy == EVIDENCE_GATED_POLICY
@@ -309,28 +363,87 @@ def require_complete_ensemble(selection):
     configs = selection.get("configurations", [])
     if not configs or (legacy and selection.get("failures")):
         raise IncompleteEnsembleError("RIDDLE ensemble has failed or missing configurations")
+
+    fit_selection_enabled = isinstance(selection.get("ensemble_fit_selection"), dict) or any(
+        "accepted_members" in config for config in configs
+    )
+    if not fit_selection_enabled:
+        for config in configs:
+            members = config.get("members", [])
+            if completion == "strict" and len(members) != requested:
+                raise IncompleteEnsembleError("Strict ensemble has missing requested fits")
+            if members or legacy:
+                require_complete_members(members, requested, checkpoints,
+                                         configuration=config.get("name"), allow_excluded=not legacy)
+            if config.get("valid_runs") != len(members):
+                raise IncompleteEnsembleError("RIDDLE configuration has an inconsistent accepted-fit count")
+            if not legacy:
+                excluded = config.get("excluded_fits", [])
+                indices = [m.get("fit_index") for m in [*members, *excluded]]
+                if (type(requested) is not int or any(type(i) is not int for i in indices)
+                        or sorted(indices) != list(range(requested))
+                        or any(m.get("status") != "excluded" for m in excluded)
+                        or (evidence_gated and any(m.get("quality", {}).get("status") != "passed" for m in members))
+                        or (not evidence_gated and any(not fit_acceptance(m)["fit_valid"] for m in members))
+                        or any(m.get("normalization", {}).get("status") != "passed" for m in members)):
+                    raise IncompleteEnsembleError("RIDDLE fit acceptance/exclusion inventory is inconsistent")
+        chosen = [c for c in configs if c.get("name") == selection.get("selected_configuration")]
+        members = selection.get("members", [])
+        if (len(chosen) != 1 or not members or members != chosen[0]["members"]
+                or selection.get("valid_runs") != len(members)
+                or selection.get("selected_checkpoints") != len(members) * checkpoints):
+            raise IncompleteEnsembleError("RIDDLE ensemble selection is incomplete or inconsistent")
+        return
+
+    if type(requested) is not int or requested < 1 or type(checkpoints) is not int or checkpoints < 1:
+        raise IncompleteEnsembleError("RIDDLE ensemble size/checkpoint requirements are invalid")
     for config in configs:
-        members = config.get("members", [])
-        if completion == 'strict' and len(members) != requested:
-            raise IncompleteEnsembleError('Strict ensemble has missing requested fits')
-        if members or legacy:
-            require_complete_members(members, requested, checkpoints,
+        selected = config.get("members", [])
+        accepted = config.get("accepted_members", selected)
+        unselected = config.get("unselected_members", [])
+        excluded = config.get("excluded_fits", [])
+        policy_info = config.get("ensemble_fit_selection")
+        if not isinstance(policy_info, dict):
+            raise IncompleteEnsembleError("RIDDLE ensemble fit selection metadata is missing")
+        if completion == "strict" and len(accepted) != requested:
+            raise IncompleteEnsembleError("Strict ensemble has missing requested fits")
+        if accepted:
+            require_complete_members(accepted, requested, checkpoints,
                                      configuration=config.get("name"), allow_excluded=not legacy)
-        if config.get("valid_runs") != len(members):
-            raise IncompleteEnsembleError("RIDDLE configuration has an inconsistent accepted-fit count")
-        if not legacy:
-            excluded = config.get("excluded_fits", [])
-            indices = [m.get("fit_index") for m in [*members, *excluded]]
-            if (type(requested) is not int or any(type(i) is not int for i in indices)
-                    or sorted(indices) != list(range(requested))
-                    or any(m.get("status") != "excluded" for m in excluded)
-                    or (evidence_gated and any(m.get("quality", {}).get("status") != "passed" for m in members))
-                    or (not evidence_gated and any(not fit_acceptance(m)["fit_valid"] for m in members))
-                    or any(m.get("normalization", {}).get("status") != "passed" for m in members)):
-                raise IncompleteEnsembleError("RIDDLE fit acceptance/exclusion inventory is inconsistent")
+        accepted_indices = [m.get("fit_index") for m in accepted]
+        selected_indices = [m.get("fit_index") for m in selected]
+        unselected_indices = [m.get("fit_index") for m in unselected]
+        excluded_indices = [m.get("fit_index") for m in excluded]
+        if (any(type(i) is not int for i in [*accepted_indices, *excluded_indices])
+                or sorted([*accepted_indices, *excluded_indices]) != list(range(requested))
+                or any(m.get("status") != "excluded" for m in excluded)
+                or config.get("accepted_runs") != len(accepted)
+                or config.get("valid_runs") != len(selected)
+                or sorted([*selected_indices, *unselected_indices]) != sorted(accepted_indices)
+                or len(set(selected_indices).intersection(unselected_indices)) != 0
+                or any(not fit_acceptance(m)["fit_valid"] for m in accepted)
+                or any(m.get("normalization", {}).get("status") != "passed" for m in accepted)):
+            raise IncompleteEnsembleError("RIDDLE fit acceptance/selection inventory is inconsistent")
+        expected_selected, expected_unselected, expected_info = select_ensemble_members(
+            accepted, mode=policy_info.get("mode"), fit_count=policy_info.get("fit_count")
+        )
+        if ([m["fit_index"] for m in selected] != [m["fit_index"] for m in expected_selected]
+                or [m["fit_index"] for m in unselected] != [m["fit_index"] for m in expected_unselected]
+                or policy_info.get("selected_fit_indices") != expected_info["selected_fit_indices"]
+                or policy_info.get("unselected_fit_indices") != expected_info["unselected_fit_indices"]
+                or policy_info.get("ranking_metric") != expected_info["ranking_metric"]
+                or policy_info.get("truth_labels_used") is not False):
+            raise IncompleteEnsembleError("RIDDLE label-free ensemble fit selection is inconsistent")
+
     chosen = [c for c in configs if c.get("name") == selection.get("selected_configuration")]
     members = selection.get("members", [])
+    accepted = selection.get("accepted_members", [])
+    unselected = selection.get("unselected_members", [])
     if (len(chosen) != 1 or not members or members != chosen[0]["members"]
+            or accepted != chosen[0]["accepted_members"] or unselected != chosen[0]["unselected_members"]
+            or selection.get("ensemble_fit_selection") != chosen[0]["ensemble_fit_selection"]
+            or selection.get("accepted_runs") != len(accepted)
             or selection.get("valid_runs") != len(members)
+            or selection.get("accepted_checkpoints") != len(accepted) * checkpoints
             or selection.get("selected_checkpoints") != len(members) * checkpoints):
-        raise IncompleteEnsembleError("RIDDLE ensemble selection is incomplete or inconsistent")
+        raise IncompleteEnsembleError("RIDDLE ensemble fit selection is incomplete or inconsistent")

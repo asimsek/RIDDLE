@@ -8,6 +8,8 @@ riddle:
   mass_conditioning: true
   background_correction: bgcorr_40_reguide
   ensemble_completion: strict
+  ensemble_fit_selection: validation-best
+  ensemble_fit_count: 10
   fits: 10
   epochs: 100
   fractions: [learned]
@@ -39,7 +41,7 @@ riddle:
     contrastive_negative_weighted: false
     score_flow_epochs: 60
     rosenblatt_bins: 12
-    rosenblatt_hidden: 64
+    rosenblatt_hidden: 96
     rosenblatt_bound: 8.0
     guide_folds: 2
     guide_mass_conditioning: false
@@ -48,7 +50,7 @@ riddle:
     guide_ratio_calibration: false
     responsibility_temperature: 1.0
     qphi_mass_bins: 1
-    qphi_hidden_features: 64
+    qphi_hidden_features: 96
     pseudo_sr_parallel_probes: 3
     tail_rank: true
     tail_candidate_multiplier: 8
