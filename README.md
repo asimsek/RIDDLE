@@ -56,7 +56,7 @@ python run.py prepare --variant deltaR --output data/lhco_deltaR --io-workers 8
 
 ```bash
 python run.py run --methods riddle --data data/lhco --output results \
-  --scenarios signal_injection --seeds 42 --device cuda:0 --fits 10 --epochs 100 \
+  --scenarios signal_injection --seeds 42 --device cuda:0 --fits 20 --epochs 100 \
   --runs 10 --workers 2 --io-workers 8 --mps auto --resume
 ```
 
@@ -73,7 +73,7 @@ python run.py run --methods lacathode --data data/lhco --output results \
 ```bash
 python run.py run --methods ranode --data data/lhco --output results \
   --scenarios signal_injection background_only --seeds 42 --device cuda:0 \
-  --runs 10 --fits 10 --epochs 100 \
+  --runs 10 --fits 20 --epochs 300 \
   --io-workers 8 --resume
 ```
 
@@ -82,7 +82,7 @@ Run all three methods and both scenarios (`signal_injection`, `background_only`)
 ```bash
 python run.py run --methods lacathode riddle ranode --data data/lhco --output results \
   --scenarios signal_injection background_only --seeds 42 \
-  --runs 10 --fits 10 --epochs 100 \
+  --runs 10 --fits 20 --epochs 100 \
   --device cuda:0 --workers 2 --io-workers 8 --mps auto --resume
 ```
 
@@ -131,7 +131,7 @@ python run.py prepare-scan --config config/settings.yaml --output data/injection
 ```bash
 python run.py scan --methods lacathode riddle ranode --config config/settings.yaml \
   --data data/injection_scan --output results_injection_scan \
-  --runs 10 --fits 10 --epochs 100 \
+  --runs 1 --fits 20 --epochs 100 \
   --device cuda:0 --workers 2 --io-workers 8 --mps auto --resume
 ```
 

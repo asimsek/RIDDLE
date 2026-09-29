@@ -257,7 +257,7 @@ def validate_score_record(record, *, method, stage):
         raw = np.asarray(record["raw_scores"])
         if raw.shape != (n,) or not np.isnan(raw[~mask]).all():
             raise ValueError(f"{stage}: invalid raw density-score alignment")
-        score_diagnostics(raw[mask], stage=stage+" raw density ratio")
+        score_diagnostics(raw[mask], stage=stage+" raw score")
     summary["rejected_events"] = int((~mask).sum())
     if "preprocessing_mask" in record:
         pre = np.asarray(record["preprocessing_mask"])

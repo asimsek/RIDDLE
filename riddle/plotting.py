@@ -73,6 +73,10 @@ def method_family(method):
     return "riddle" if method in RIDDLE_METHOD_IDS else method
 
 
+def _is_stein_core(core):
+    return core in {"stein_witness", "stein_residual"}
+
+
 def result_variant(report):
     return report.get("variant", report.get("contract", {}).get("inputs", {}).get("variant", "default"))
 
@@ -125,12 +129,10 @@ def riddle_plot_spec(report):
     base = BUILTINS["riddle"]
     protocol = report.get("protocol", {})
     scoring = protocol.get("stein_scoring") if isinstance(protocol, dict) else None
+    label = base.label
     if isinstance(scoring, dict):
-        mode = scoring.get("mode", "stein")
-        label = f"RIDDLE ({mode}, Stein scoring v3)"
         transform = "identity"
     else:
-        label = base.label
         transform = base.score_transform
     return PlotMethod(label, base.color, base.linestyle, base.signal_color,
                       transform, riddle_score_scope(report))
@@ -672,7 +674,7 @@ def riddle_plot_predictions(root, report, member, groups, *, device="cpu"):
         if z.ndim != 2 or z.shape[1] != inputs["features"] or not len(z) or not np.isfinite(z).all():
             raise ValueError("Invalid RIDDLE inference latents")
     core = inputs.get("core", inputs.get("settings", {}).get("core", "residual"))
-    if core == "stein_witness":
+    if _is_stein_core(core):
         from .stein import stein_scores
         verify_plot_input(root, report, str(relative / "residual_selection.json"))
         predictions = {
@@ -801,7 +803,7 @@ def riddle_plot_ensemble(root, report, *, io_workers=2, device="cpu"):
                  status="no_valid_fits", selection="Numerical validity only; reserved-validation evidence is diagnostic; historical production exclusions retained",
                  validation_sigma=sigma, reference_seed=3407, reference_samples=len(reference),
                  ensemble=("arithmetic mean of per-fit Stein witnesses with equal weights over used fits"
-                           if core == "stein_witness" else
+                           if _is_stein_core(core) else
                            "log(mean(exp(per-fit log ratio))) with equal weights over used fits"),
                  partitions=["validation", "test", "signal_region"], independent_runs=1,
                  source_artifacts_modified=False, safeguard_filtering=True, checkpoint_inference=True,
@@ -821,7 +823,7 @@ def riddle_plot_ensemble(root, report, *, io_workers=2, device="cpu"):
                 try:
                     scores, mixture = riddle_plot_predictions(root, report, member,
                         {"reserved_validation": validation, "reference": reference}, device=device)
-                    if core == "stein_witness":
+                    if _is_stein_core(core):
                         from .production import validation_witness_improvement
                         from .stein import stein_identity_diagnostics
                         from .training import residual_background_sample
@@ -870,7 +872,7 @@ def riddle_plot_ensemble(root, report, *, io_workers=2, device="cpu"):
                             excluded.append(dict(member, check="score_validity", reason=str(error)))
                             continue
                         for p, values in predictions.items():
-                            if core == "stein_witness":
+                            if _is_stein_core(core):
                                 combined[p] = values if p not in combined else combined[p] + values
                             else:
                                 combined[p] = values if p not in combined else np.logaddexp(combined[p], values)
@@ -880,7 +882,7 @@ def riddle_plot_ensemble(root, report, *, io_workers=2, device="cpu"):
                         if accepted:
                             record["scores"] = np.full(len(record["mask"]), np.nan)
                             record["scores"][record["mask"]] = (
-                                combined[p] / len(accepted) if core == "stein_witness"
+                                combined[p] / len(accepted) if _is_stein_core(core)
                                 else combined[p] - np.log(len(accepted))
                             )
                 if accepted:
@@ -1206,6 +1208,11 @@ def make_bundle(group, confidence, score_loader=None):
                 )
         sample = {k: base[k] for k in ("mass", "labels", "mask")}
         sample["sr_masks"] = sr_masks
+        sample["display_transforms"] = {
+            KEYS[method]: (riddle_plot_spec(method_report).score_transform
+                           if method_family(method) == "riddle" else BUILTINS[method_family(method)].score_transform)
+            for method, (_, method_report) in group.items()
+        }
         sample.update({k + "_scores": r["scores"] for k, r in records.items()})
         sample.update({k + "_fit_scores": f.fit_scores(r) for k, r in records.items() if "fit_scores" in r})
         if partition == "signal_region":
@@ -1802,8 +1809,8 @@ def event_size_rows(groups, score_loader, *, data_root=None):
                         validation_parts.append(f"{int(count):,} {label}")
                 core = report.get("contract", {}).get("settings", {}).get("riddle", {}).get("core", "residual")
                 rows.append({**base,
-                             "component": ("Stein witness" if core == "stein_witness" else "Residual signal density"),
-                             "model_type": ("neural Stein discrepancy witness" if core == "stein_witness" else "residual density estimator"),
+                             "component": ("Stein witness" if _is_stein_core(core) else "Residual signal density"),
+                             "model_type": ("neural Stein discrepancy witness" if _is_stein_core(core) else "residual density estimator"),
                              "train_events": train_events, "train_sample": "signal-region data (unlabelled)",
                              "validation_events": validation_events,
                              "validation_sample": "; ".join(validation_parts) or "signal-region validation",
@@ -2078,12 +2085,7 @@ def _lacathode_sr_classifier_history(source):
 
 
 def _sr_model_training_history(method, source, score_loader=None):
-    """Return the native second-stage training objective for each method.
-
-    RIDDLE uses its configured core objective, R-ANODE optimizes a signal-region
-    density-model NLL, and LaCATHODE uses classifier BCE. The cross-method plot
-    compares relative objective convergence, not absolute loss values.
-    """
+    """Return the native second-stage training objective for each method."""
     if method == "riddle":
         return _riddle_sr_model_nll_history(source, score_loader)
     if method == "ranode":
@@ -2093,70 +2095,61 @@ def _sr_model_training_history(method, source, score_loader=None):
     return None
 
 
-def _relative_nll(values):
+def _objective_gap_to_best(values):
     values = np.asarray(values, dtype=float)
     if values.ndim != 1 or not len(values) or not np.isfinite(values).all():
         return None
-    scale = max(abs(float(values[0])), np.finfo(float).eps)
-    return 100.0 * (values - values[0]) / scale
+    best = float(values.min())
+    gap = float(values[0]) - best
+    tolerance = np.finfo(float).eps * max(1.0, abs(float(values[0])), abs(best)) * 32.0
+    if gap <= tolerance:
+        if np.all(np.abs(values - best) <= tolerance):
+            return np.zeros_like(values)
+        return None
+    return 100.0 * (values - best) / gap
 
 
-def _render_relative_history_comparison(
-    histories, destination, stem, *, ylabel=r"Relative objective change from epoch 1 [\%]", method_labels=None
-):
-    """Save one paper-ready standalone cross-method objective figure per split.
-
-    Curves are normalized to their own epoch-1 objective, so the figure shows
-    convergence trends only. This permits the SR-stage panel to include
-    different core objectives without implying that their absolute values are
-    numerically comparable.
-    """
+def _render_convergence_history_comparison(histories, destination, stem, *, method_labels=None):
     if not histories:
         return
     method_labels = {} if method_labels is None else method_labels
     destination.mkdir(parents=True, exist_ok=True)
+    ylabel = r"Objective gap to best [\% of epoch-1 gap]"
     for field, noun in (("train", "training"), ("validation", "validation")):
         fig, ax, _ = f.canvas(ylabel, "Training epoch")
         drawn_methods = []
         all_values = []
         max_epoch = 1
         for method, values in histories.items():
-            relative = _relative_nll(values[field])
-            if relative is None:
+            convergence = _objective_gap_to_best(values[field])
+            if convergence is None:
                 continue
             default_label, color, _, _ = PHYSICAL_STYLES[method]
             label = method_labels.get(method, default_label)
-            epochs = np.arange(1, len(relative) + 1)
+            epochs = np.arange(1, len(convergence) + 1)
             max_epoch = max(max_epoch, int(epochs[-1]))
-            all_values.append(relative)
-
-
-
-            if len(relative) >= 5:
-                smooth = np.convolve(relative, np.ones(5) / 5, mode="valid")
+            all_values.append(convergence)
+            if len(convergence) >= 5:
+                smooth = np.convolve(convergence, np.ones(5) / 5, mode="valid")
                 ax.plot(epochs[4:], smooth, color=color, ls="-", lw=2.0, zorder=2)
             else:
-                ax.plot(epochs, relative, color=color, ls="-", lw=1.8, zorder=2)
-            ax.plot(epochs, relative, color=color, ls=":", lw=1.15, alpha=.72, zorder=3)
+                ax.plot(epochs, convergence, color=color, ls="-", lw=1.8, zorder=2)
+            ax.plot(epochs, convergence, color=color, ls=":", lw=1.15, alpha=.72, zorder=3)
             drawn_methods.append((label, color))
 
         if not drawn_methods:
             f.plt.close(fig)
             continue
 
-        ax.axhline(0.0, color=".55", ls="--", lw=1.0, gid="publication-guide")
+        ax.axhline(0.0, color=".45", ls="--", lw=1.0, gid="publication-guide")
+        ax.axhline(100.0, color=".72", ls=":", lw=1.0, gid="publication-guide")
         ax.set_xlim(1, max_epoch)
-
-
         finite = np.concatenate([v[np.isfinite(v)] for v in all_values if np.isfinite(v).any()])
         if finite.size:
-            low = min(float(finite.min()), 0.0)
-            high = max(float(finite.max()), 0.0)
-            span = high - low
-            pad = 0.10 * span if span > 0 else max(0.1, 0.10 * max(abs(low), abs(high), 1.0))
-            ax.set_ylim(low - pad, high + pad)
+            high = max(float(finite.max()), 100.0)
+            pad = 0.06 * max(high, 100.0)
+            ax.set_ylim(-pad, high + pad)
             ax._publication_fixed_ylim = True
-
 
         method_handles = [
             f.Line2D([], [], color=color, lw=2.0, ls="-", label=label)
@@ -2167,15 +2160,11 @@ def _render_relative_history_comparison(
             f.Line2D([], [], color=".20", lw=1.3, ls=":", label="Per epoch"),
         ]
         handles = [*method_handles, *style_handles]
-        labels = [h.get_label() for h in handles]
-        f.legend(fig, handles=handles, labels=labels, ncols=1)
-
-
+        f.legend(fig, handles=handles, labels=[h.get_label() for h in handles], title="Lower is better")
         f.save(fig, destination / f"{stem}_{noun}")
 
 
 def comparison_training_figures(group, output, score_loader=None):
-    """Compare normalized training convergence while preserving objective semantics."""
     destination = output / "02_training"
     background = {}
     sr_model = {}
@@ -2186,19 +2175,11 @@ def comparison_training_figures(group, output, score_loader=None):
         values = _sr_model_training_history(method, source, score_loader)
         if values is not None:
             sr_model[method] = values
-    _render_relative_history_comparison(
-        background, destination, "background_nll",
-        ylabel=r"Relative NLL change from epoch 1 [\%]",
-    )
+    _render_convergence_history_comparison(background, destination, "background_nll_convergence")
+    _render_convergence_history_comparison(sr_model, destination, "sr_model_convergence")
 
 
-    _render_relative_history_comparison(
-        sr_model, destination, "sr_model_nll",
-        ylabel=r"Relative objective change from epoch 1 [\%]",
-    )
-
-
-def _plot_nll_history(history, destination, *, title, filename, ylabel="Negative log likelihood"):
+def _plot_objective_history(history, destination, *, title, filename, ylabel="Negative log likelihood"):
     fig, ax, _ = f.canvas(ylabel, "Epoch")
     x = np.asarray([row.get("epoch", i) + 1 for i, row in enumerate(history)])
     plot_history_series(ax, x, [row["train_nll"] for row in history], "Train")
@@ -2222,7 +2203,7 @@ def training_figures(group, output, score_loader=None):
 
             background_history = _history_rows(root, report, "background/history.json")
             if background_history is not None:
-                _plot_nll_history(
+                _plot_objective_history(
                     background_history, destination,
                     title="RIDDLE | Background flow",
                     filename="background_nll",
@@ -2243,14 +2224,14 @@ def training_figures(group, output, score_loader=None):
                 history = [dict(epoch=e, **{key: float(np.mean([h[e][key] for h in histories]))
                     for key in ("train_nll", "validation_nll", "signal_fraction")}) for e in range(len(histories[0]))]
             core = report.get("contract", {}).get("settings", {}).get("riddle", {}).get("core", "residual")
-            _plot_nll_history(
+            _plot_objective_history(
                 history, destination,
-                title=("RIDDLE | SR Stein witness" if core == "stein_witness" else "RIDDLE | SR residual-mixture density"),
-                filename="sr_model_nll",
-                ylabel=("Stein witness objective" if core == "stein_witness" else "Negative log likelihood"),
+                title=("RIDDLE | SR Stein witness" if _is_stein_core(core) else "RIDDLE | SR residual density"),
+                filename=("sr_stein_objective" if _is_stein_core(core) else "sr_residual_nll"),
+                ylabel=("Stein witness objective" if _is_stein_core(core) else "Negative log likelihood"),
             )
 
-            if core != "stein_witness":
+            if not _is_stein_core(core):
                 fig, ax, _ = f.canvas("Fitted mixture fraction", "Epoch")
                 x = [r["epoch"] + 1 for r in history]
                 plot_history_series(ax, x, [r["signal_fraction"] for r in history], "RIDDLE")
@@ -2264,7 +2245,7 @@ def training_figures(group, output, score_loader=None):
             if correction_name in report.get("artifacts_sha256", {}):
                 correction_history = _history_rows(root, report, correction_name)
                 if correction_history is not None:
-                    _plot_nll_history(
+                    _plot_objective_history(
                         correction_history, destination,
                         title=r"RIDDLE | Background correction $q_\phi$",
                         filename="background_correction_nll",
@@ -2286,7 +2267,7 @@ def training_figures(group, output, score_loader=None):
                 f.legend(fig)
                 f.save(fig, destination / "selected_epochs_by_fit")
                 fig, ax, _ = f.canvas(
-                    "Validation Stein objective" if core == "stein_witness" else "Validation mixture NLL", "Fit"
+                    "Validation Stein objective" if _is_stein_core(core) else "Validation mixture NLL", "Fit"
                 )
                 for i, member, member_history in zip(positions, members, histories):
                     ax.plot(
@@ -2322,7 +2303,7 @@ def training_figures(group, output, score_loader=None):
             if not all((directory / name).is_file() for name in names):
                 continue
             fig, ax, _ = f.canvas(
-                "Negative log likelihood" if stage == "background" else "Classification loss", "Epoch"
+                "Negative log likelihood" if stage == "background" else "Binary cross-entropy", "Epoch"
             )
             for name, label in zip(names, ("Train", "Validation")):
                 verify_plot_input(root, report, str((directory / name).relative_to(root)))
@@ -2339,7 +2320,7 @@ def training_figures(group, output, score_loader=None):
                 fig,
                 title="LaCathode | " + ("Background flow" if stage == "background" else "Classifier"),
             )
-            f.save(fig, destination / ("background_nll" if stage == "background" else "classifier_loss"))
+            f.save(fig, destination / ("background_nll" if stage == "background" else "classifier_bce"))
 
 def verify_plot_input(root, report, name):
     path = (root / name).resolve()
@@ -3163,7 +3144,7 @@ def render_ranode_training(source, output, *, signal_attempts=None):
         f.save(
             fig,
             output / "R-ANODE" / "02_training" / (
-                "background_nll" if stage == "background" else "sr_model_nll"
+                "background_nll" if stage == "background" else "sr_density_nll"
             ),
         )
 
@@ -3223,10 +3204,14 @@ def _ensemble_member_scores(method, source, score_loader, *, scope="signal_regio
     if not np.isfinite(scores[:, record["mask"]]).all() or not np.isnan(scores[:, ~record["mask"]]).all():
         raise ValueError(f"{METHOD_SPECS[method].label} ensemble-convergence member scores are invalid")
     if method == "riddle":
+        settings = report.get("contract", {}).get("settings", {}).get("riddle", {})
+        scoring = settings.get("stein", {}).get("scoring", {}) if isinstance(settings, dict) else {}
+        if score_kind.startswith("stein_") and scoring.get("final_transform") in ("background_cdf", "background_cdf_power"):
+            return record, None, "subset-specific reference-B recalibration is required for exact CDF-calibrated Stein ensemble convergence"
         aggregation = (
             "equal-weight log-mean-exp of residual likelihood-ratio fits"
             if "ratio" in score_kind or not score_kind
-            else "arithmetic mean in saved member-score coordinate (diagnostic)"
+            else "arithmetic mean in saved member-score coordinate"
         )
     else:
         # Use median member performance because pinned LaCATHODE does not average fits.
@@ -3354,7 +3339,8 @@ def _set_convergence_ylim(ax, curves, *, floor=None):
 def ensemble_size_convergence(group, output, score_loader, *, repetitions=32):
     """Fit-count convergence at the four exact publication background working points.
 
-    RIDDLE/R-ANODE use their native equal-weight likelihood-ratio ensemble rule.
+    R-ANODE uses its native equal-weight likelihood-ratio ensemble rule.
+    CDF-calibrated Stein RIDDLE is excluded without subset-specific reference-B recalibration.
     LaCATHODE has no cross-fit production ensemble, so its curve is the median
     exact-WP performance of the included classifier fits.  Random fit orderings
     provide a 16--84% subset band without using labels to choose members.
@@ -3364,13 +3350,18 @@ def ensemble_size_convergence(group, output, score_loader, *, repetitions=32):
     """
     budgets = np.asarray((0.004, 0.01, 0.05, 0.10), dtype=float)
     results = {}
+    excluded = {}
     scenario = next(iter(group.values()))[1].get("scenario") if group else None
     if scenario == "background_only":
         return {"status": "not_applicable_without_signal"}
 
     for method, source in group.items():
         record, members, aggregation = _ensemble_member_scores(method, source, score_loader, scope="signal_region")
-        if members is None or len(members) < 1 or int(np.sum(record["labels"] == 1)) < 1:
+        if members is None:
+            if aggregation:
+                excluded[method] = aggregation
+            continue
+        if len(members) < 1 or int(np.sum(record["labels"] == 1)) < 1:
             continue
         count = len(members)
         orderings = _fit_orderings(count, repetitions=repetitions)
@@ -3409,7 +3400,7 @@ def ensemble_size_convergence(group, output, score_loader, *, repetitions=32):
         )
 
     if not results:
-        return {"status": "unavailable"}
+        return {"status": "unavailable", "excluded_methods": excluded}
 
     destination = output / "07_ensemble_size_convergence"
     individual_destination = destination / "individual"
@@ -3445,12 +3436,13 @@ def ensemble_size_convergence(group, output, score_loader, *, repetitions=32):
         "exact_background_efficiency": True,
         "repetitions": repetitions,
         "methods": results,
+        "excluded_methods": excluded,
         "individual_files": [
             f"individual/ensemble_size_convergence_{f.format_budget_percent(b).replace('.', 'p').replace('%', 'pct')}"
             for b in budgets
         ],
     }))
-    return {"status": "available", "scope": "signal_region", "methods": results}
+    return {"status": "available", "scope": "signal_region", "methods": results, "excluded_methods": excluded}
 
 
 def ensemble_size_convergence_overall(group, output, score_loader, *, scope="signal_region", repetitions=32, min_background=10):
@@ -3471,9 +3463,14 @@ def ensemble_size_convergence_overall(group, output, score_loader, *, scope="sig
         return {"status": "not_applicable_without_signal", "scope": scope}
 
     results = {}
+    excluded = {}
     for method, source in scoped.items():
         record, members, aggregation = _ensemble_member_scores(method, source, score_loader, scope=scope)
-        if members is None or len(members) < 1 or int(np.sum(record["labels"] == 1)) < 1:
+        if members is None:
+            if aggregation:
+                excluded[method] = aggregation
+            continue
+        if len(members) < 1 or int(np.sum(record["labels"] == 1)) < 1:
             continue
         count = len(members)
         orderings = _fit_orderings(count, repetitions=repetitions)
@@ -3514,7 +3511,7 @@ def ensemble_size_convergence_overall(group, output, score_loader, *, scope="sig
         )
 
     if not results:
-        return {"status": "unavailable", "scope": scope}
+        return {"status": "unavailable", "scope": scope, "excluded_methods": excluded}
 
     destination = output / "07_ensemble_size_convergence"
     individual_destination = destination / "individual"
@@ -3554,6 +3551,7 @@ def ensemble_size_convergence_overall(group, output, score_loader, *, scope="sig
         "minimum_background_count": min_background,
         "repetitions": repetitions,
         "methods": results,
+        "excluded_methods": excluded,
         "individual_files": [
             f"individual/ensemble_size_convergence_overall_{slug}_{'signal_region' if scope == 'signal_region' else 'full_range'}"
             for _, _, _, slug in metric_specs
@@ -3564,6 +3562,7 @@ def ensemble_size_convergence_overall(group, output, score_loader, *, scope="sig
         "scope": scope,
         "minimum_background_count": min_background,
         "methods": results,
+        "excluded_methods": excluded,
     }
 
 
@@ -4072,7 +4071,7 @@ def main(argv=None):
                     "requested_inference_device": args.device,
                     "checkpoint_inference_devices": sorted({a["inference_device"] for a in score_loader.fit_audit.values() if a.get("checkpoint_inference")}),
                     "score_ensembles": list(score_loader.fit_audit.values()),
-                    "ensemble_size_convergence": "SR-only diagnostic at exact B=0.4%, 1.0%, 5.0%, 10.0%; RIDDLE/R-ANODE use native likelihood-ratio aggregation, LaCATHODE uses median per-fit performance because its pinned production protocol does not cross-fit-average scores.",
+                    "ensemble_size_convergence": "SR-only diagnostic at exact B=0.4%, 1.0%, 5.0%, 10.0%; CDF-calibrated Stein RIDDLE is omitted unless subset-specific reference-B recalibration is available; R-ANODE uses native likelihood-ratio aggregation and LaCATHODE uses median per-fit performance.",
                     "ensemble_size_convergence_overall": "Overall fit-count convergence for conditional AUC and full-pipeline maximum SIC. Produced in SR-Only for all methods with signal, and in Full-Range for methods with saved full-range scores.",
                     "summary_axes": f.SUMMARY_AXES, "publication_y_ranges": f.PUBLICATION_Y_RANGES,
                 }))

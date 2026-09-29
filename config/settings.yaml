@@ -9,7 +9,7 @@ riddle:
   mass_conditioning: true
   background_correction: bgcorr_40_reguide
   ensemble_completion: strict
-  ensemble_fit_selection: validation-best
+  ensemble_fit_selection: all
   ensemble_fit_count: 10
   fits: 10
   epochs: 100
@@ -26,10 +26,14 @@ riddle:
     closure_mass_bins: 8
     ensemble_fit_selection: all-valid
     scoring:
-      mode: hybrid_gated
-      reference_samples: 65536
+      mode: sic_preserving
+      reference_samples: 524288
       reference_split: 0.5
       mass_bins: 8
+      energy_weight: 2.0
+      operator_weight: 0.4
+      operator_gate_z: 1.96
+      operator_temperature: 0.35
       beta: 0.5
       local_gate_z: 1.28
       local_temperature: 1.0

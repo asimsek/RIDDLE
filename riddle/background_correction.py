@@ -108,27 +108,57 @@ def log_prob(model, latent, context):
     return model.log_prob(latent, context=context.reshape(-1, 1))
 
 
-def sample(model, context, dimensions, seed, device):
+def sample(model, context, dimensions, seed, device, batch_size=None):
     """Sample q_phi(z|m) at matched mass contexts without perturbing caller RNG."""
-    context = torch.as_tensor(context, dtype=torch.float32, device=device).reshape(-1, 1)
+    context = torch.as_tensor(context, dtype=torch.float32).reshape(-1, 1)
     target = torch.device(device)
     if target.type not in ("cpu", "cuda"):
         raise ValueError("Corrected-background sampling supports CPU and CUDA devices")
+    if batch_size is None:
+        index = (torch.cuda.current_device() if target.index is None else target.index) if target.type == "cuda" else None
+        devices = [] if index is None else [index]
+        with torch.random.fork_rng(devices=devices), torch.no_grad():
+            torch.random.default_generator.manual_seed(int(seed))
+            if index is not None:
+                torch.cuda.default_generators[index].manual_seed(int(seed))
+            values = model.sample(1, context=context.to(target))
+        if values.ndim == 3 and values.shape[1] == 1:
+            values = values[:, 0, :]
+        elif values.ndim == 3 and values.shape[0] == 1:
+            values = values[0]
+        if tuple(values.shape) != (len(context), dimensions):
+            raise ValueError(f"Unexpected conditional background sample shape {tuple(values.shape)}")
+        require_finite(values, "Corrected-background samples")
+        return values
+    if type(batch_size) is not int or batch_size < 1:
+        raise ValueError("Corrected-background sampling batch size must be a positive integer")
     index = (torch.cuda.current_device() if target.index is None else target.index) if target.type == "cuda" else None
     devices = [] if index is None else [index]
+    parts = []
+    size = min(int(batch_size), max(1, len(context)))
+    offset = 0
     with torch.random.fork_rng(devices=devices), torch.no_grad():
         torch.random.default_generator.manual_seed(int(seed))
         if index is not None:
             torch.cuda.default_generators[index].manual_seed(int(seed))
-        values = model.sample(1, context=context)
-    if values.ndim == 3 and values.shape[1] == 1:
-        values = values[:, 0, :]
-    elif values.ndim == 3 and values.shape[0] == 1:
-        values = values[0]
-    if tuple(values.shape) != (len(context), dimensions):
-        raise ValueError(f"Unexpected conditional background sample shape {tuple(values.shape)}")
-    require_finite(values, "Corrected-background samples")
-    return values
+        noise = torch.randn((len(context), dimensions), dtype=torch.float32, device=target)
+        while offset < len(context):
+            stop = min(offset + size, len(context))
+            try:
+                c = context[offset:stop].to(target)
+                embedded = model._embedding_net(c)
+                values, _ = model._transform.inverse(noise[offset:stop], context=embedded)
+                if tuple(values.shape) != (stop - offset, dimensions):
+                    raise ValueError(f"Unexpected conditional background sample shape {tuple(values.shape)}")
+                require_finite(values, "Corrected-background samples")
+                parts.append(values.detach().cpu())
+                offset = stop
+            except torch.cuda.OutOfMemoryError:
+                if target.type != "cuda" or size <= 256:
+                    raise
+                torch.cuda.empty_cache()
+                size = max(256, size // 2)
+    return torch.cat(parts, dim=0)
 
 
 def _gaussian_log_prob(latent):

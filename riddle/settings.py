@@ -57,10 +57,14 @@ def validate_residual(value):
         "closure_mass_bins": 8,
         "ensemble_fit_selection": "all-valid",
         "scoring": {
-            "mode": "hybrid_gated",
-            "reference_samples": 65536,
+            "mode": "sic_preserving",
+            "reference_samples": 524288,
             "reference_split": 0.5,
             "mass_bins": 8,
+            "energy_weight": 2.0,
+            "operator_weight": 0.4,
+            "operator_gate_z": 1.96,
+            "operator_temperature": 0.35,
             "beta": 0.5,
             "local_gate_z": 1.2815515655446004,
             "local_temperature": 1.0,
@@ -178,13 +182,18 @@ def validate_residual(value):
     scoring_defaults = stein_defaults["scoring"]
     if not isinstance(scoring, dict) or set(scoring) != set(scoring_defaults):
         raise ValueError("Invalid Stein scoring settings")
-    if scoring["mode"] not in ("potential_raw", "potential_qnorm", "local_qnorm", "hybrid", "hybrid_gated"):
+    if scoring["mode"] not in ("potential_raw", "potential_qnorm", "local_qnorm", "hybrid", "hybrid_gated", "sic_preserving"):
         raise ValueError("Invalid stein.scoring.mode")
     integer(scoring["reference_samples"], "stein.scoring.reference_samples", 1024)
     number(scoring["reference_split"], "stein.scoring.reference_split", maximum=1)
     if not 0 < scoring["reference_split"] < 1:
         raise ValueError("stein.scoring.reference_split must lie strictly between zero and one")
     integer(scoring["mass_bins"], "stein.scoring.mass_bins", 1)
+    number(scoring["energy_weight"], "stein.scoring.energy_weight", strict=False)
+    number(scoring["operator_weight"], "stein.scoring.operator_weight", strict=False)
+    if type(scoring["operator_gate_z"]) not in (int, float) or not math.isfinite(scoring["operator_gate_z"]):
+        raise ValueError("Invalid stein.scoring.operator_gate_z")
+    number(scoring["operator_temperature"], "stein.scoring.operator_temperature")
     number(scoring["beta"], "stein.scoring.beta", strict=False)
     number(scoring["local_temperature"], "stein.scoring.local_temperature")
     if type(scoring["local_gate_z"]) not in (int, float) or not math.isfinite(scoring["local_gate_z"]):

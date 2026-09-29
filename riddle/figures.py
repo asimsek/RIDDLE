@@ -478,9 +478,12 @@ def sample_sr(sample, key):
     return sr(sample["mass"])
 
 
-def display(key, values):
+def display(key, values, sample=None):
     values = np.asarray(values)
-    return expit(values) if DISPLAY_TRANSFORMS.get(key, "identity") == "sigmoid" else values
+    transform = DISPLAY_TRANSFORMS.get(key, "identity")
+    if sample is not None:
+        transform = sample.get("display_transforms", {}).get(key, transform)
+    return expit(values) if transform == "sigmoid" else values
 
 
 def slug(value):
@@ -586,7 +589,7 @@ def selection_stats(sample, key, cut, edges, confidence, *, budget=None, selecti
             rows.append(selection_stats({**sample, **kwargs}, key, cuts[i] if budget is None else None,
                                         edges, confidence, budget=budget, selection_scope=selection_scope))
         out = {"cut": None if budget is not None else np.asarray(cuts).tolist(),
-               "display_cut": None if budget is not None else display(key, np.asarray(cuts)).tolist(),
+               "display_cut": None if budget is not None else display(key, np.asarray(cuts), sample).tolist(),
                "status": "available", "fit_count": len(rows), "fits": rows,
                "aggregation": "mean per-fit counts/efficiencies; median per-fit shape diagnostics"}
         for name in ("signal", "background"):
@@ -607,7 +610,7 @@ def selection_stats(sample, key, cut, edges, confidence, *, budget=None, selecti
         out = {"cut": None, "display_cut": None, "status": "available", "selection_budget": float(budget)}
     else:
         weights = selected(sample, key, cut).astype(float)
-        out = {"cut": cut, "display_cut": float(display(key, cut)), "status": "available"}
+        out = {"cut": cut, "display_cut": float(display(key, cut, sample)), "status": "available"}
     for name, label in (("signal", 1), ("background", 0)):
         population = region & (sample["labels"] == label)
         n = int(population.sum())
@@ -1067,7 +1070,7 @@ def render_scores(bundle, output):
             mask = sample_sr(sample, key) if region == "sr" else np.ones(len(sample["mass"]), bool)
             for truth in (0, 1):
                 population = mask & sample["mask"] & (sample["labels"] == truth)
-                counts = fit_histogram(display(key, sample_fit_scores(sample, key)), edges, population)
+                counts = fit_histogram(display(key, sample_fit_scores(sample, key), sample), edges, population)
                 histograms[key, truth] = (
                     counts / (population.sum() * np.diff(edges)) if population.any() else np.zeros(40)
                 )
@@ -1411,9 +1414,9 @@ def strict_cut_histograms(values, edges, scores, mask, thresholds):
 def mass_scan_histograms(sample, keys, cuts=SCORE_CUTS):
     """Histogram strict cuts in each method's displayed 0--1 score coordinate.
 
-    RIDDLE stores an unbounded raw anomaly score, so invert the display sigmoid
-    before selecting events. Neither scores nor thresholds are fitted on test labels.
-    Retentions use all physical test events, including rejected mapping rows.
+    Invert any configured display transform before selecting events. Neither scores nor
+    thresholds are fitted on test labels. Retentions use all physical test events,
+    including rejected mapping rows.
     """
     from scipy.special import logit
 
@@ -1428,7 +1431,8 @@ def mass_scan_histograms(sample, keys, cuts=SCORE_CUTS):
     for key in keys:
         # Match stored score precision so events at a cut are classified identically.
 
-        thresholds = np.asarray([logit(cut) if key == "residual" else cut for cut in cuts],
+        transform = sample.get("display_transforms", {}).get(key, DISPLAY_TRANSFORMS.get(key, "identity"))
+        thresholds = np.asarray([logit(cut) if transform == "sigmoid" else cut for cut in cuts],
                                 dtype=sample[key + "_scores"].dtype)
         fits = sample_fit_scores(sample, key)
         if len(fits) == 1:
@@ -1942,7 +1946,7 @@ def feature_records(bundle):
                         if region == "SR"
                         else np.ones(len(m), bool)
                     )
-                    x = physical[i] if i < len(physical) else display(key, sample_fit_scores(sample, key))
+                    x = physical[i] if i < len(physical) else display(key, sample_fit_scores(sample, key), sample)
                     classes = []
                     for label in (0, 1):
                         pop = scope & (sample["labels"] == label) & np.isfinite(x)

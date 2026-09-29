@@ -12,6 +12,7 @@ from .integrity import SCIENTIFIC_VERSION, ordered_epochs, require_finite
 from .model import real_sr_latents
 from .options import feature_options
 from .settings import validate_residual
+from .stein_scoring import SCORING_PROTOCOL
 from .storage import atomic_torch_save, digest, persist_boundary, restore_rng, rng_state, write_json
 from .worker_progress import ProgressStage
 
@@ -554,7 +555,7 @@ def train_stein_witness(train, validation, output, *, epochs, seed, device, chec
         "scientific_version": SCIENTIFIC_VERSION,
         "core": "stein_witness",
         "stein_protocol": PROTOCOL,
-        "stein_scoring_protocol": "stein_scoring_v3_qanchored_local_hybrid",
+        "stein_scoring_protocol": SCORING_PROTOCOL,
         "train_events": len(ztrain),
         "validation_events": len(zval),
         "train_latents_sha256": digest(ztrain),
@@ -677,7 +678,7 @@ def train_stein_witness(train, validation, output, *, epochs, seed, device, chec
         "stein_protocol": PROTOCOL,
         "epochs": order,
         "criterion": f"{options['selected_checkpoints']} lowest validation Stein objectives",
-        "witness_ensemble": "uniform arithmetic mean of negative Stein potentials",
+        "witness_ensemble": "uniform arithmetic mean of selected Stein witness checkpoint scores",
         "checkpoint_weighting": weighting,
         "checkpoint_weights": [float(value) for value in checkpoint_weights],
         "validation_objective": [float(value) for value in selected],

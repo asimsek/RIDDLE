@@ -314,7 +314,7 @@ for r in {0..9}; do
     python /shared/work/RIDDLE/nrp.py \
     --workflow scan --name "riddle-injection-scan-r${r}" --methods riddle --replicas "$r" \
     --config config/settings.yaml --data data/injection_scan --results results_injection_scan \
-    --runs 1 --fits 10 --epochs 100 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
+    --runs 1 --fits 20 --epochs 100 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
     | kubectl apply -n cua-asimsek -f -
 done
 ```

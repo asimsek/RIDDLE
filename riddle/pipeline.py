@@ -278,7 +278,7 @@ def run(args, contract):
             ),
             "ensemble_fit_selection": result["ensemble_fit_selection"],
             "settings": settings,
-            "implementation": ("riddle_stein_witness_v6_0_qanchored_scoring" if core == "stein_witness" else
+            "implementation": ("riddle_stein_witness_v6_2_sic_preserving_scoring" if core == "stein_witness" else
                                "riddle_v5_3_smooth_fm_bgcorr_40_reguide" if background_correction is not None
                                else "riddle_v5_3_smooth_fm_gaussian_fallback" if background_correction_decision is not None
                                else "riddle_v5_3_smooth_fm"),
@@ -295,9 +295,7 @@ def run(args, contract):
                       if core == "stein_witness" else
                       "log p_signal(z|mjj) ensemble - log q_phi(z|mjj)" if background_correction is not None else
                       "logit conditional background percentile" if active["score_flow"] else "log mean residual/background density ratio"),
-            "raw_score": ((f"Stein {settings['riddle']['stein']['scoring']['mode']} ensemble score"
-                           if settings['riddle']['stein']['scoring']['final_transform'] == "identity"
-                           else "conditional background CDF of the configured Stein ensemble score")
+            "raw_score": ((f"Stein {settings['riddle']['stein']['scoring']['mode']} ensemble score before final calibration")
                           if core == "stein_witness" else
                           "log p_signal(z|mjj) ensemble - log q_phi(z|mjj)" if background_correction is not None else
                           "log mean residual/background density ratio"),

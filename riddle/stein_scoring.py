@@ -9,7 +9,7 @@ from scipy.special import ndtri
 from .integrity import SCIENTIFIC_VERSION, require_finite
 from .storage import atomic_write, digest, file_digest, save_array, save_npz, write_json
 
-SCORING_PROTOCOL = "stein_scoring_v3_qanchored_local_hybrid"
+SCORING_PROTOCOL = "stein_scoring_v4_qanchored_pew_sic_preserving"
 REFERENCE_SEEDS = {"mass_context": 93001, "background_sample": 93002, "split": 93003}
 
 
@@ -27,6 +27,52 @@ def _scoring(settings):
     from .settings import validate_residual
 
     return validate_residual(settings)["stein"]["scoring"]
+
+
+def _mode_identity(cfg):
+    value = {
+        "mode": cfg["mode"],
+        "reference_samples": int(cfg["reference_samples"]),
+        "reference_split": float(cfg["reference_split"]),
+        "mass_bins": int(cfg["mass_bins"]),
+    }
+    if cfg["mode"] == "sic_preserving":
+        value.update(
+            energy_weight=float(cfg["energy_weight"]),
+            operator_weight=float(cfg["operator_weight"]),
+            operator_gate_z=float(cfg["operator_gate_z"]),
+            operator_temperature=float(cfg["operator_temperature"]),
+        )
+    elif cfg["mode"] == "hybrid":
+        value["beta"] = float(cfg["beta"])
+    elif cfg["mode"] == "hybrid_gated":
+        value.update(
+            beta=float(cfg["beta"]),
+            local_gate_z=float(cfg["local_gate_z"]),
+            local_temperature=float(cfg["local_temperature"]),
+        )
+    return value
+
+
+def _ensemble_identity(root, selected, cfg, reference_meta):
+    root = Path(root)
+    return {
+        "scoring_protocol": SCORING_PROTOCOL,
+        "scoring": _mode_identity(cfg),
+        "reference_A_sha256": reference_meta["reference_A_sha256"],
+        "reference_B_sha256": reference_meta["reference_B_sha256"],
+        "background_model_hash": reference_meta["background_model_hash"],
+        "mapping_hash": reference_meta["mapping_hash"],
+        "selected_fits": [{
+            "fit_index": int(m["fit_index"]),
+            "directory": m["directory"],
+            "epochs": [int(e) for e in m["epochs"]],
+            "checkpoint_sha256": {
+                str(int(e)): file_digest(root / m["directory"] / f"residual_epoch_{int(e)}.pt")
+                for e in m["epochs"]
+            },
+        } for m in selected],
+    }
 
 
 def _mass_cdf(reference_scores, reference_mass, values, mass, bins):
@@ -100,6 +146,13 @@ def conditional_percentile(reference_scores, reference_mass, values, mass, bins)
     return _mass_cdf(reference_scores, reference_mass, values, mass, bins)
 
 
+def _sic_preserving_score(zp, ze, zw, cfg):
+    boost = np.logaddexp(
+        0.0, (zw - float(cfg["operator_gate_z"])) / float(cfg["operator_temperature"])
+    )
+    return zp + float(cfg["energy_weight"]) * ze + float(cfg["operator_weight"]) * boost
+
+
 def prepare_reference(root, members, validation, device, settings, mapping_identity):
     root = Path(root)
     if not members:
@@ -142,9 +195,19 @@ def prepare_reference(root, members, validation, device, settings, mapping_ident
         saved = json.loads(meta_path.read_text())
         if saved.get("sampling_contract") != sampling_contract:
             raise ValueError("Stein scoring reference provenance changed; use a new output")
+        if saved.get("reference_file_sha256") != file_digest(npz_path):
+            raise ValueError("Persisted Stein scoring reference file changed")
         with np.load(npz_path, allow_pickle=False) as archive:
+            if set(archive.files) != {"reference_A", "reference_B"}:
+                raise ValueError("Invalid persisted Stein scoring reference arrays")
             a, b = archive["reference_A"], archive["reference_B"]
-        if saved.get("reference_A_sha256") != digest(a) or saved.get("reference_B_sha256") != digest(b):
+        expected_split = int(round(int(cfg["reference_samples"]) * float(cfg["reference_split"])))
+        if (a.shape != (expected_split, validation.shape[1])
+                or b.shape != (int(cfg["reference_samples"]) - expected_split, validation.shape[1])
+                or a.dtype != np.float32 or b.dtype != np.float32
+                or not np.isfinite(a).all() or not np.isfinite(b).all()
+                or saved.get("reference_A_events") != len(a) or saved.get("reference_B_events") != len(b)
+                or saved.get("reference_A_sha256") != digest(a) or saved.get("reference_B_sha256") != digest(b)):
             raise ValueError("Persisted Stein scoring reference changed")
         return saved
 
@@ -156,7 +219,8 @@ def prepare_reference(root, members, validation, device, settings, mapping_ident
 
     first = root / members[0]["directory"]
     reference = residual_background_sample(
-        first, contexts, count, REFERENCE_SEEDS["background_sample"], device
+        first, contexts, count, REFERENCE_SEEDS["background_sample"], device,
+        batch_size=int(cfg["inference_batch_size"]),
     )
     permutation = np.random.default_rng(REFERENCE_SEEDS["split"]).permutation(count)
     split = int(round(count * float(cfg["reference_split"])))
@@ -244,26 +308,30 @@ def _load_checkpoint(output, model, epoch, device):
     model.load_state_dict(checkpoint["model"])
 
 
-def _checkpoint_values(model, inputs, qscore, regularization, device, batch_size, need_local):
+def _checkpoint_values(model, inputs, qscore, regularization, device, batch_size, need_derivatives):
     from .stein import _split_inputs, _stein_operator_values
 
     inputs = np.asarray(inputs, dtype=np.float32)
     qscore = None if qscore is None else np.asarray(qscore, dtype=np.float32)
     if qscore is not None and qscore.shape != (len(inputs), inputs.shape[1] - 1):
         raise ValueError("Stein q-score is misaligned")
-    potential_parts, local_parts = [], []
+    if need_derivatives and qscore is None:
+        raise ValueError("Stein derivative scoring requires the background q-score")
+    potential_parts, local_parts, operator_parts, energy_parts = [], [], [], []
     size = int(batch_size)
     offset = 0
     while offset < len(inputs):
         stop = min(offset + size, len(inputs))
         try:
             x = torch.as_tensor(inputs[offset:stop], dtype=torch.float32, device=device)
-            if need_local:
+            if need_derivatives:
                 qs = torch.as_tensor(qscore[offset:stop], dtype=torch.float32, device=device)
                 with torch.enable_grad():
                     operator, energy, potential = _stein_operator_values(model, x, qs, training=False)
                 local = operator - 0.5 * float(regularization) * energy
                 local_parts.append(local.detach().cpu().numpy())
+                operator_parts.append(operator.detach().cpu().numpy())
+                energy_parts.append(energy.detach().cpu().numpy())
                 potential_parts.append((-potential).detach().cpu().numpy())
             else:
                 with torch.inference_mode():
@@ -278,12 +346,31 @@ def _checkpoint_values(model, inputs, qscore, regularization, device, batch_size
     potential = np.concatenate(potential_parts).astype(np.float64)
     if not np.isfinite(potential).all():
         raise FloatingPointError("Nonfinite Stein potential score")
-    if not need_local:
-        return potential, None, size
+    if not need_derivatives:
+        return potential, None, None, None, size
     local = np.concatenate(local_parts).astype(np.float64)
-    if not np.isfinite(local).all():
-        raise FloatingPointError("Nonfinite local Stein score")
-    return potential, local, size
+    operator = np.concatenate(operator_parts).astype(np.float64)
+    energy = np.concatenate(energy_parts).astype(np.float64)
+    if not np.isfinite(local).all() or not np.isfinite(operator).all() or not np.isfinite(energy).all():
+        raise FloatingPointError("Nonfinite Stein derivative score")
+    return potential, local, operator, energy, size
+
+
+def _validate_calibration_archive(path, saved, order, reference):
+    if saved.get("calibration_file_sha256") != file_digest(path):
+        raise ValueError("Persisted Stein member scoring calibration changed")
+    expected = {"mass"}
+    for epoch in order:
+        expected.update({f"p_{int(epoch)}", f"h_{int(epoch)}", f"w_{int(epoch)}", f"e_{int(epoch)}"})
+    with np.load(path, allow_pickle=False) as archive:
+        if set(archive.files) != expected:
+            raise ValueError("Incomplete Stein member scoring calibration arrays")
+        for name in expected:
+            value = archive[name]
+            if value.shape != (len(reference),) or value.dtype != np.float32 or not np.isfinite(value).all():
+                raise ValueError("Invalid Stein member scoring calibration arrays")
+        if not np.array_equal(archive["mass"], reference[:, -1].astype(np.float32)):
+            raise ValueError("Stein member calibration mass is misaligned with reference A")
 
 
 def _calibration(output, order, device, cfg, scoring_root):
@@ -293,8 +380,12 @@ def _calibration(output, order, device, cfg, scoring_root):
     scoring_root = Path(scoring_root)
     inputs = json.loads((output / "residual_training_inputs.json").read_text())
     reference_meta = json.loads((scoring_root / "stein_scoring_reference.json").read_text())
+    if reference_meta.get("scoring_protocol") != SCORING_PROTOCOL:
+        raise ValueError("Stein calibration reference uses a different scoring protocol")
     with np.load(scoring_root / "stein_scoring_reference.npz", allow_pickle=False) as archive:
         reference = np.ascontiguousarray(archive["reference_A"], dtype=np.float32)
+    if reference_meta.get("reference_A_sha256") != digest(reference):
+        raise ValueError("Stein calibration reference A changed")
     background_hash = _background_identity(inputs)
     if background_hash != reference_meta["background_model_hash"]:
         raise ValueError("Stein calibration background differs from shared q reference")
@@ -305,6 +396,7 @@ def _calibration(output, order, device, cfg, scoring_root):
         "training_protocol": inputs.get("stein_protocol"),
         "reference_A_sha256": reference_meta["reference_A_sha256"],
         "background_model_hash": background_hash,
+        "mapping_hash": reference_meta["mapping_hash"],
         "features": int(inputs["features"]),
         "epochs": [int(e) for e in order],
         "checkpoint_sha256": {str(int(e)): file_digest(output / f"residual_epoch_{int(e)}.pt") for e in order},
@@ -316,10 +408,10 @@ def _calibration(output, order, device, cfg, scoring_root):
         saved = json.loads(metadata_path.read_text())
         if saved.get("contract") != contract:
             raise ValueError("Stein member scoring calibration provenance changed")
+        _validate_calibration_archive(arrays_path, saved, order, reference)
         return saved, arrays_path
 
     background = _load_background(output, inputs, device)
-    need_local = True
     qscore = _qscore(
         reference, background, device, cfg, scoring_root / ".resume/stein_qscore_cache", background_hash
     )
@@ -329,12 +421,14 @@ def _calibration(output, order, device, cfg, scoring_root):
     effective = int(cfg["inference_batch_size"])
     for epoch in order:
         _load_checkpoint(output, model, int(epoch), device)
-        p, h, used = _checkpoint_values(
+        p, h, w, e, used = _checkpoint_values(
             model, reference, qscore, contract["witness_regularization"], device,
-            int(cfg["inference_batch_size"]), need_local,
+            int(cfg["inference_batch_size"]), True,
         )
         payload[f"p_{int(epoch)}"] = p.astype(np.float32)
         payload[f"h_{int(epoch)}"] = h.astype(np.float32)
+        payload[f"w_{int(epoch)}"] = w.astype(np.float32)
+        payload[f"e_{int(epoch)}"] = e.astype(np.float32)
         effective = min(effective, used)
     atomic_write(arrays_path, lambda p: save_npz(p, **payload))
     metadata = {
@@ -345,6 +439,7 @@ def _calibration(output, order, device, cfg, scoring_root):
         "truth_labels_used": False,
     }
     write_json(metadata_path, metadata)
+    _validate_calibration_archive(arrays_path, metadata, order, reference)
     return metadata, arrays_path
 
 
@@ -359,12 +454,15 @@ def member_scores(output, order, z, device, *, mode=None, scoring_root=None, nor
         raise ValueError("Invalid Stein scoring inputs")
     cfg = _scoring(inputs["settings"] if scoring_settings is None else scoring_settings)
     mode = cfg["mode"] if mode is None else mode
-    if mode not in ("potential_raw", "potential_qnorm", "local_qnorm", "hybrid", "hybrid_gated"):
+    if mode not in ("potential_raw", "potential_qnorm", "local_qnorm", "hybrid", "hybrid_gated", "sic_preserving"):
         raise ValueError("Unknown Stein scoring mode")
+    if mode != cfg["mode"]:
+        cfg = dict(cfg)
+        cfg["mode"] = mode
     model = build_potential(device, z.shape[1], inputs["settings"], initialization="random").eval()
     model.requires_grad_(False)
     weights = _checkpoint_weights(output, order)
-    need_local = mode in ("local_qnorm", "hybrid", "hybrid_gated")
+    need_derivatives = mode in ("local_qnorm", "hybrid", "hybrid_gated", "sic_preserving")
     background_hash = _background_identity(inputs)
     qscore = None
     calibration = None
@@ -373,7 +471,7 @@ def member_scores(output, order, z, device, *, mode=None, scoring_root=None, nor
             raise ValueError("q-normalized Stein scoring requires the shared scoring reference")
         _, calibration_path = _calibration(output, order, device, cfg, scoring_root)
         calibration = np.load(calibration_path, allow_pickle=False)
-        if need_local:
+        if need_derivatives:
             background = _load_background(output, inputs, device)
             qscore = _qscore(
                 z, background, device, cfg, Path(scoring_root) / ".resume/stein_qscore_cache", background_hash
@@ -383,8 +481,8 @@ def member_scores(output, order, z, device, *, mode=None, scoring_root=None, nor
     regularization = float(inputs["settings"]["stein"]["witness_regularization"])
     for epoch, weight in zip(order, weights):
         _load_checkpoint(output, model, int(epoch), device)
-        p, h, _ = _checkpoint_values(
-            model, z, qscore, regularization, device, int(cfg["inference_batch_size"]), need_local
+        p, h, w, e, _ = _checkpoint_values(
+            model, z, qscore, regularization, device, int(cfg["inference_batch_size"]), need_derivatives
         )
         if mode == "potential_raw":
             values = p
@@ -393,6 +491,10 @@ def member_scores(output, order, z, device, *, mode=None, scoring_root=None, nor
             zp, _ = conditional_gaussianize(calibration[f"p_{int(epoch)}"], ref_mass, p, mass, cfg["mass_bins"])
             if mode == "potential_qnorm":
                 values = zp
+            elif mode == "sic_preserving":
+                ze, _ = conditional_gaussianize(calibration[f"e_{int(epoch)}"], ref_mass, e, mass, cfg["mass_bins"])
+                zw, _ = conditional_gaussianize(calibration[f"w_{int(epoch)}"], ref_mass, w, mass, cfg["mass_bins"])
+                values = _sic_preserving_score(zp, ze, zw, cfg)
             else:
                 zh, _ = conditional_gaussianize(calibration[f"h_{int(epoch)}"], ref_mass, h, mass, cfg["mass_bins"])
                 if mode == "local_qnorm":
@@ -416,29 +518,16 @@ def member_scores(output, order, z, device, *, mode=None, scoring_root=None, nor
     return combined
 
 
-def _ensemble_reference(root, selected, device, cfg):
+def _ensemble_reference(root, selected, device, cfg, settings):
     root = Path(root)
     reference_meta = json.loads((root / "stein_scoring_reference.json").read_text())
+    if reference_meta.get("scoring_protocol") != SCORING_PROTOCOL:
+        raise ValueError("Stein ensemble reference uses a different scoring protocol")
     with np.load(root / "stein_scoring_reference.npz", allow_pickle=False) as archive:
         reference = np.ascontiguousarray(archive["reference_B"], dtype=np.float32)
-    identity = {
-        "scoring_protocol": SCORING_PROTOCOL,
-        "reference_B_sha256": reference_meta["reference_B_sha256"],
-        "mode": cfg["mode"],
-        "beta": float(cfg["beta"]),
-        "local_gate_z": float(cfg["local_gate_z"]),
-        "local_temperature": float(cfg["local_temperature"]),
-        "mass_bins": int(cfg["mass_bins"]),
-        "selected_fits": [{
-            "fit_index": int(m["fit_index"]),
-            "directory": m["directory"],
-            "epochs": [int(e) for e in m["epochs"]],
-            "checkpoint_sha256": {
-                str(int(e)): file_digest(root / m["directory"] / f"residual_epoch_{int(e)}.pt")
-                for e in m["epochs"]
-            },
-        } for m in selected],
-    }
+    if reference_meta.get("reference_B_sha256") != digest(reference):
+        raise ValueError("Stein ensemble reference B changed")
+    identity = _ensemble_identity(root, selected, cfg, reference_meta)
     cache = root / ".resume/stein_scoring"
     cache.mkdir(parents=True, exist_ok=True)
     key = _json_digest(identity)[:24]
@@ -450,12 +539,24 @@ def _ensemble_reference(root, selected, device, cfg):
         saved = json.loads(meta_path.read_text())
         if saved.get("identity") != identity:
             raise ValueError("Stein ensemble scoring calibration cache identity changed")
+        if saved.get("reference_file_sha256") != file_digest(npz_path):
+            raise ValueError("Persisted Stein ensemble scoring calibration changed")
         with np.load(npz_path, allow_pickle=False) as archive:
-            return archive["raw"].astype(np.float64), archive["mass"].astype(np.float64), saved
-    settings = json.loads((root / "ensemble_inputs.json").read_text()).get("settings")
+            if set(archive.files) != {"raw", "mass"}:
+                raise ValueError("Invalid Stein ensemble scoring calibration arrays")
+            raw = archive["raw"]
+            mass = archive["mass"]
+            if (raw.shape != (len(reference),) or mass.shape != (len(reference),)
+                    or raw.dtype != np.float32 or mass.dtype != np.float32
+                    or not np.isfinite(raw).all() or not np.isfinite(mass).all()
+                    or not np.array_equal(mass, reference[:, -1].astype(np.float32))):
+                raise ValueError("Invalid Stein ensemble scoring calibration arrays")
+            return raw.astype(np.float64), mass.astype(np.float64), saved
     rows = [member_scores(root / m["directory"], m["epochs"], reference, device,
                           mode=cfg["mode"], scoring_root=root, scoring_settings=settings) for m in selected]
     raw = np.mean(np.stack(rows), axis=0)
+    if not np.isfinite(raw).all():
+        raise FloatingPointError("Nonfinite Stein reference-B ensemble score")
     atomic_write(npz_path, lambda p: save_npz(p, raw=raw.astype(np.float32), mass=reference[:, -1].astype(np.float32)))
     metadata = {
         "schema": 1,
@@ -474,7 +575,7 @@ def final_transform(root, selected, raw, mass, device, settings):
     transform = cfg["final_transform"]
     if transform == "identity":
         return raw.copy(), raw.copy(), {"final_transform": "identity"}
-    reference_raw, reference_mass, reference_meta = _ensemble_reference(root, selected, device, cfg)
+    reference_raw, reference_mass, reference_meta = _ensemble_reference(root, selected, device, cfg, settings)
     uniform, cdf_meta = conditional_percentile(reference_raw, reference_mass, raw, mass, cfg["mass_bins"])
     if transform == "background_cdf":
         final = uniform
@@ -485,7 +586,7 @@ def final_transform(root, selected, raw, mass, device, settings):
     if (np.any(uniform <= 0) or np.any(uniform >= 1) or not np.isfinite(uniform).all()
             or np.any(final < 0) or np.any(final > 1) or not np.isfinite(final).all()):
         raise FloatingPointError("Invalid CDF-based Stein final score")
-    return final, uniform, {
+    return final, raw.copy(), {
         "final_transform": transform,
         "final_power": float(cfg["final_power"]),
         "cdf": cdf_meta,
@@ -497,20 +598,31 @@ def write_root_provenance(root, selected, accepted, settings, mapping_identity, 
     root = Path(root)
     cfg = _scoring(settings)
     reference = json.loads((root / "stein_scoring_reference.json").read_text())
+    if reference.get("scoring_protocol") != SCORING_PROTOCOL:
+        raise ValueError("Stein root provenance reference uses a different scoring protocol")
+    mapping_hash = _json_digest(mapping_identity)
+    if reference.get("mapping_hash") != mapping_hash:
+        raise ValueError("Stein root provenance mapping identity changed")
     value = {
         "schema": 1,
         "scoring_protocol": SCORING_PROTOCOL,
         "mode": cfg["mode"],
+        "reference_samples": int(cfg["reference_samples"]),
+        "reference_split": float(cfg["reference_split"]),
+        "mass_bins": int(cfg["mass_bins"]),
+        "energy_weight": float(cfg["energy_weight"]),
+        "operator_weight": float(cfg["operator_weight"]),
+        "operator_gate_z": float(cfg["operator_gate_z"]),
+        "operator_temperature": float(cfg["operator_temperature"]),
         "beta": float(cfg["beta"]),
         "local_gate_z": float(cfg["local_gate_z"]),
         "local_temperature": float(cfg["local_temperature"]),
         "gamma": float(cfg["final_power"]),
         "final_transform": cfg["final_transform"],
-        "mass_bins": int(cfg["mass_bins"]),
         "q_reference_hashes": {"A": reference["reference_A_sha256"], "B": reference["reference_B_sha256"]},
         "q_reference_seeds": REFERENCE_SEEDS,
         "background_model_hash": reference["background_model_hash"],
-        "mapping_hash": _json_digest(mapping_identity),
+        "mapping_hash": mapping_hash,
         "selected_fits": [int(m["fit_index"]) for m in selected],
         "accepted_fits": [int(m["fit_index"]) for m in accepted],
         "selected_checkpoints": {str(m["fit_index"]): [int(e) for e in m["epochs"]] for m in selected},
@@ -522,8 +634,7 @@ def write_root_provenance(root, selected, accepted, settings, mapping_identity, 
         },
         "conditional_calibration": "equal-occupancy mass bins with interpolated empirical midrank CDF",
         "precalibration_ensemble_score": cfg["mode"],
-        "discriminating_raw_score": (cfg["mode"] if cfg["final_transform"] == "identity"
-                                     else "conditional_background_cdf"),
+        "discriminating_raw_score": cfg["mode"],
         "final_monotonic_score": cfg["final_transform"],
         "truth_labels_used": False,
         "settings": cfg,
