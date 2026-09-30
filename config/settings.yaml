@@ -10,8 +10,8 @@ riddle:
   background_correction: bgcorr_40_reguide
   ensemble_completion: strict
   ensemble_fit_selection: all
-  ensemble_fit_count: 10
-  fits: 10
+  ensemble_fit_count: 20
+  fits: 20
   epochs: 100
   fractions: [learned]
   stein:
@@ -26,21 +26,29 @@ riddle:
     closure_mass_bins: 8
     ensemble_fit_selection: all-valid
     scoring:
-      mode: sic_preserving
+      mode: tail_focus
       reference_samples: 524288
       reference_split: 0.5
       mass_bins: 8
-      energy_weight: 2.0
-      operator_weight: 0.4
+      energy_weight: 1.5
+      operator_weight: 0.6
       operator_gate_z: 1.96
-      operator_temperature: 0.35
+      operator_temperature: 0.25
       beta: 0.5
       local_gate_z: 1.28
       local_temperature: 1.0
+      final_mass_bins: 2
       final_transform: background_cdf_power
       final_power: 10.0
       qscore_batch_size: 32768
       inference_batch_size: 16384
+      support_guard:
+        enabled: true
+        statistic: radius
+        mass_bins: 8
+        gate_quantile: 0.999
+        weight: 2.0
+        temperature: 0.25
   mass_fraction:
     enabled: true
     control_points: 5

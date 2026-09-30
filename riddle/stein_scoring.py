@@ -9,7 +9,7 @@ from scipy.special import ndtri
 from .integrity import SCIENTIFIC_VERSION, require_finite
 from .storage import atomic_write, digest, file_digest, save_array, save_npz, write_json
 
-SCORING_PROTOCOL = "stein_scoring_v4_qanchored_pew_sic_preserving"
+SCORING_PROTOCOL = "stein_scoring_v5_qanchored_pew_tail_focus_support_guard"
 REFERENCE_SEEDS = {"mass_context": 93001, "background_sample": 93002, "split": 93003}
 
 
@@ -36,7 +36,7 @@ def _mode_identity(cfg):
         "reference_split": float(cfg["reference_split"]),
         "mass_bins": int(cfg["mass_bins"]),
     }
-    if cfg["mode"] == "sic_preserving":
+    if cfg["mode"] in ("sic_preserving", "tail_focus"):
         value.update(
             energy_weight=float(cfg["energy_weight"]),
             operator_weight=float(cfg["operator_weight"]),
@@ -54,11 +54,35 @@ def _mode_identity(cfg):
     return value
 
 
+def _support_identity(cfg):
+    guard = cfg["support_guard"]
+    return {
+        "enabled": bool(guard["enabled"]),
+        "statistic": guard["statistic"],
+        "mass_bins": int(guard["mass_bins"]),
+        "gate_quantile": float(guard["gate_quantile"]),
+        "gate_z": float(ndtri(float(guard["gate_quantile"]))),
+        "weight": float(guard["weight"]),
+        "temperature": float(guard["temperature"]),
+        "radius_excludes_mass": True,
+    }
+
+
+def _scoring_identity(cfg):
+    return {
+        "mode": _mode_identity(cfg),
+        "support_guard": _support_identity(cfg),
+        "final_mass_bins": int(cfg["final_mass_bins"]),
+        "final_transform": cfg["final_transform"],
+        "final_power": float(cfg["final_power"]),
+    }
+
+
 def _ensemble_identity(root, selected, cfg, reference_meta):
     root = Path(root)
     return {
         "scoring_protocol": SCORING_PROTOCOL,
-        "scoring": _mode_identity(cfg),
+        "precalibration_scoring": _mode_identity(cfg),
         "reference_A_sha256": reference_meta["reference_A_sha256"],
         "reference_B_sha256": reference_meta["reference_B_sha256"],
         "background_model_hash": reference_meta["background_model_hash"],
@@ -146,11 +170,71 @@ def conditional_percentile(reference_scores, reference_mass, values, mass, bins)
     return _mass_cdf(reference_scores, reference_mass, values, mass, bins)
 
 
-def _sic_preserving_score(zp, ze, zw, cfg):
+def _pew_score(zp, ze, zw, cfg):
     boost = np.logaddexp(
         0.0, (zw - float(cfg["operator_gate_z"])) / float(cfg["operator_temperature"])
     )
     return zp + float(cfg["energy_weight"]) * ze + float(cfg["operator_weight"]) * boost
+
+
+def _latent_radius(z):
+    z = np.asarray(z)
+    if z.ndim != 2 or z.shape[1] < 2 or not np.isfinite(z).all():
+        raise ValueError("Invalid mapped latents for Stein support radius")
+    radius = np.linalg.norm(np.asarray(z[:, :-1], dtype=np.float64), axis=1)
+    if radius.shape != (len(z),) or not np.isfinite(radius).all():
+        raise FloatingPointError("Nonfinite Stein support radius")
+    return radius
+
+
+def _support_penalties(reference, z, cfg, *, include_reference):
+    reference = np.asarray(reference)
+    z = np.asarray(z)
+    if reference.ndim != 2 or z.ndim != 2 or reference.shape[1] != z.shape[1] or len(reference) < 2:
+        raise ValueError("Stein support calibration latents are misaligned")
+    if not np.isfinite(reference).all() or not np.isfinite(z).all():
+        raise ValueError("Nonfinite Stein support calibration latents")
+    guard = cfg["support_guard"]
+    reference_radius = _latent_radius(reference)
+    radius = _latent_radius(z)
+    reference_mass = np.asarray(reference[:, -1], dtype=np.float64)
+    mass = np.asarray(z[:, -1], dtype=np.float64)
+    query_radius = np.concatenate((radius, reference_radius)) if include_reference else radius
+    query_mass = np.concatenate((mass, reference_mass)) if include_reference else mass
+    zr, metadata = conditional_gaussianize(
+        reference_radius, reference_mass, query_radius, query_mass, int(guard["mass_bins"])
+    )
+    gate_z = float(ndtri(float(guard["gate_quantile"])))
+    penalties = float(guard["weight"]) * np.logaddexp(
+        0.0, (zr - gate_z) / float(guard["temperature"])
+    )
+    penalty = penalties[:len(z)]
+    reference_penalty = penalties[len(z):] if include_reference else None
+    if penalty.shape != (len(z),) or not np.isfinite(penalty).all():
+        raise FloatingPointError("Nonfinite Stein support penalty")
+    if include_reference and (reference_penalty.shape != (len(reference),)
+                              or not np.isfinite(reference_penalty).all()):
+        raise FloatingPointError("Nonfinite Stein reference support penalty")
+    return penalty, reference_penalty, metadata
+
+
+def _support_penalty(reference, z, cfg):
+    penalty, _, metadata = _support_penalties(reference, z, cfg, include_reference=False)
+    return penalty, metadata
+
+
+def _load_reference_b(root):
+    root = Path(root)
+    reference_meta = json.loads((root / "stein_scoring_reference.json").read_text())
+    if reference_meta.get("scoring_protocol") != SCORING_PROTOCOL:
+        raise ValueError("Stein reference B uses a different scoring protocol")
+    with np.load(root / "stein_scoring_reference.npz", allow_pickle=False) as archive:
+        reference = np.ascontiguousarray(archive["reference_B"], dtype=np.float32)
+    if reference.ndim != 2 or len(reference) < 2 or not np.isfinite(reference).all():
+        raise ValueError("Invalid Stein reference B array")
+    if reference_meta.get("reference_B_sha256") != digest(reference):
+        raise ValueError("Stein reference B changed")
+    return reference, reference_meta
 
 
 def prepare_reference(root, members, validation, device, settings, mapping_identity):
@@ -240,7 +324,7 @@ def prepare_reference(root, members, validation, device, settings, mapping_ident
         "reference_file_sha256": file_digest(npz_path),
         "background_model_hash": background_hash,
         "mapping_hash": mapping_hash,
-        "settings_hash": _json_digest(cfg),
+        "reference_settings_hash": _json_digest(reference_settings),
         "truth_labels_used": False,
     }
     write_json(meta_path, metadata)
@@ -268,10 +352,14 @@ def _qscore(inputs, background_model, device, cfg, cache_root, background_hash):
     array = np.asarray(inputs, dtype=np.float32)
     cache_root = Path(cache_root)
     cache_root.mkdir(parents=True, exist_ok=True)
-    key = _json_digest({"input": digest(array), "background": background_hash})
+    key = _json_digest({"protocol": SCORING_PROTOCOL, "input": digest(array), "background": background_hash})
     path = cache_root / f"qscore_{key}.npy"
     metadata_path = cache_root / f"qscore_{key}.json"
-    identity = {"input_sha256": digest(array), "background_model_hash": background_hash}
+    identity = {
+        "scoring_protocol": SCORING_PROTOCOL,
+        "input_sha256": digest(array),
+        "background_model_hash": background_hash,
+    }
     if path.exists() or metadata_path.exists():
         if not (path.exists() and metadata_path.exists()):
             raise ValueError("Incomplete cached Stein background score")
@@ -454,7 +542,7 @@ def member_scores(output, order, z, device, *, mode=None, scoring_root=None, nor
         raise ValueError("Invalid Stein scoring inputs")
     cfg = _scoring(inputs["settings"] if scoring_settings is None else scoring_settings)
     mode = cfg["mode"] if mode is None else mode
-    if mode not in ("potential_raw", "potential_qnorm", "local_qnorm", "hybrid", "hybrid_gated", "sic_preserving"):
+    if mode not in ("potential_raw", "potential_qnorm", "local_qnorm", "hybrid", "hybrid_gated", "sic_preserving", "tail_focus"):
         raise ValueError("Unknown Stein scoring mode")
     if mode != cfg["mode"]:
         cfg = dict(cfg)
@@ -462,7 +550,7 @@ def member_scores(output, order, z, device, *, mode=None, scoring_root=None, nor
     model = build_potential(device, z.shape[1], inputs["settings"], initialization="random").eval()
     model.requires_grad_(False)
     weights = _checkpoint_weights(output, order)
-    need_derivatives = mode in ("local_qnorm", "hybrid", "hybrid_gated", "sic_preserving")
+    need_derivatives = mode in ("local_qnorm", "hybrid", "hybrid_gated", "sic_preserving", "tail_focus")
     background_hash = _background_identity(inputs)
     qscore = None
     calibration = None
@@ -491,10 +579,10 @@ def member_scores(output, order, z, device, *, mode=None, scoring_root=None, nor
             zp, _ = conditional_gaussianize(calibration[f"p_{int(epoch)}"], ref_mass, p, mass, cfg["mass_bins"])
             if mode == "potential_qnorm":
                 values = zp
-            elif mode == "sic_preserving":
+            elif mode in ("sic_preserving", "tail_focus"):
                 ze, _ = conditional_gaussianize(calibration[f"e_{int(epoch)}"], ref_mass, e, mass, cfg["mass_bins"])
                 zw, _ = conditional_gaussianize(calibration[f"w_{int(epoch)}"], ref_mass, w, mass, cfg["mass_bins"])
-                values = _sic_preserving_score(zp, ze, zw, cfg)
+                values = _pew_score(zp, ze, zw, cfg)
             else:
                 zh, _ = conditional_gaussianize(calibration[f"h_{int(epoch)}"], ref_mass, h, mass, cfg["mass_bins"])
                 if mode == "local_qnorm":
@@ -518,15 +606,16 @@ def member_scores(output, order, z, device, *, mode=None, scoring_root=None, nor
     return combined
 
 
-def _ensemble_reference(root, selected, device, cfg, settings):
+def _ensemble_reference(root, selected, device, cfg, settings, reference=None, reference_meta=None):
     root = Path(root)
-    reference_meta = json.loads((root / "stein_scoring_reference.json").read_text())
-    if reference_meta.get("scoring_protocol") != SCORING_PROTOCOL:
-        raise ValueError("Stein ensemble reference uses a different scoring protocol")
-    with np.load(root / "stein_scoring_reference.npz", allow_pickle=False) as archive:
-        reference = np.ascontiguousarray(archive["reference_B"], dtype=np.float32)
-    if reference_meta.get("reference_B_sha256") != digest(reference):
-        raise ValueError("Stein ensemble reference B changed")
+    if reference is None or reference_meta is None:
+        reference, reference_meta = _load_reference_b(root)
+    else:
+        reference = np.asarray(reference, dtype=np.float32)
+        if (reference.ndim != 2 or len(reference) < 2 or not np.isfinite(reference).all()
+                or reference_meta.get("scoring_protocol") != SCORING_PROTOCOL
+                or reference_meta.get("reference_B_sha256") != digest(reference)):
+            raise ValueError("Invalid preloaded Stein ensemble reference B")
     identity = _ensemble_identity(root, selected, cfg, reference_meta)
     cache = root / ".resume/stein_scoring"
     cache.mkdir(parents=True, exist_ok=True)
@@ -551,7 +640,7 @@ def _ensemble_reference(root, selected, device, cfg, settings):
                     or not np.isfinite(raw).all() or not np.isfinite(mass).all()
                     or not np.array_equal(mass, reference[:, -1].astype(np.float32))):
                 raise ValueError("Invalid Stein ensemble scoring calibration arrays")
-            return raw.astype(np.float64), mass.astype(np.float64), saved
+            return raw.astype(np.float64), reference, saved
     rows = [member_scores(root / m["directory"], m["epochs"], reference, device,
                           mode=cfg["mode"], scoring_root=root, scoring_settings=settings) for m in selected]
     raw = np.mean(np.stack(rows), axis=0)
@@ -565,18 +654,56 @@ def _ensemble_reference(root, selected, device, cfg, settings):
         "truth_labels_used": False,
     }
     write_json(meta_path, metadata)
-    return raw, reference[:, -1].astype(np.float64), metadata
+    return raw, reference, metadata
 
 
-def final_transform(root, selected, raw, mass, device, settings):
+def final_transform(root, selected, raw, z, device, settings):
     cfg = _scoring(settings)
     raw = np.asarray(raw, dtype=np.float64)
-    mass = np.asarray(mass, dtype=np.float64)
+    z = np.asarray(z)
+    if z.ndim != 2 or len(z) != len(raw) or z.shape[1] < 2 or not np.isfinite(z).all():
+        raise ValueError("Invalid mapped latents for Stein final transform")
+    if raw.shape != (len(z),) or not np.isfinite(raw).all():
+        raise ValueError("Invalid Stein ensemble raw score")
+    mass = np.asarray(z[:, -1], dtype=np.float64)
+    support_metadata = _support_identity(cfg)
+    guarded_raw = raw.copy()
+    reference = None
+    reference_meta = None
+    reference_penalty = None
     transform = cfg["final_transform"]
+    if cfg["support_guard"]["enabled"]:
+        reference, reference_meta = _load_reference_b(root)
+        penalty, reference_penalty, radius_metadata = _support_penalties(
+            reference, z, cfg, include_reference=transform != "identity"
+        )
+        guarded_raw = raw - penalty
+        if not np.isfinite(guarded_raw).all():
+            raise FloatingPointError("Nonfinite support-guarded Stein raw score")
+        support_metadata = {**support_metadata, "radius_calibration": radius_metadata}
     if transform == "identity":
-        return raw.copy(), raw.copy(), {"final_transform": "identity"}
-    reference_raw, reference_mass, reference_meta = _ensemble_reference(root, selected, device, cfg, settings)
-    uniform, cdf_meta = conditional_percentile(reference_raw, reference_mass, raw, mass, cfg["mass_bins"])
+        return guarded_raw.copy(), guarded_raw.copy(), {
+            "final_transform": "identity",
+            "final_mass_bins": int(cfg["final_mass_bins"]),
+            "support_guard": support_metadata,
+        }
+    reference_raw, reference_latents, reference_score_meta = _ensemble_reference(
+        root, selected, device, cfg, settings, reference=reference, reference_meta=reference_meta
+    )
+    if reference is None:
+        reference = reference_latents
+    elif not np.array_equal(reference, reference_latents):
+        raise ValueError("Stein support and ensemble reference B arrays disagree")
+    reference_guarded = reference_raw.copy()
+    if cfg["support_guard"]["enabled"]:
+        reference_guarded = reference_raw - reference_penalty
+        if not np.isfinite(reference_guarded).all():
+            raise FloatingPointError("Nonfinite support-guarded Stein reference-B raw score")
+        support_metadata = {**support_metadata, "reference_radius_calibration": support_metadata["radius_calibration"]}
+    reference_mass = np.asarray(reference[:, -1], dtype=np.float64)
+    uniform, cdf_meta = conditional_percentile(
+        reference_guarded, reference_mass, guarded_raw, mass, int(cfg["final_mass_bins"])
+    )
     if transform == "background_cdf":
         final = uniform
     elif transform == "background_cdf_power":
@@ -586,11 +713,13 @@ def final_transform(root, selected, raw, mass, device, settings):
     if (np.any(uniform <= 0) or np.any(uniform >= 1) or not np.isfinite(uniform).all()
             or np.any(final < 0) or np.any(final > 1) or not np.isfinite(final).all()):
         raise FloatingPointError("Invalid CDF-based Stein final score")
-    return final, raw.copy(), {
+    return final, guarded_raw.copy(), {
         "final_transform": transform,
+        "final_mass_bins": int(cfg["final_mass_bins"]),
         "final_power": float(cfg["final_power"]),
         "cdf": cdf_meta,
-        "ensemble_reference": reference_meta["identity"],
+        "support_guard": support_metadata,
+        "ensemble_reference": reference_score_meta["identity"],
     }
 
 
@@ -603,9 +732,37 @@ def write_root_provenance(root, selected, accepted, settings, mapping_identity, 
     mapping_hash = _json_digest(mapping_identity)
     if reference.get("mapping_hash") != mapping_hash:
         raise ValueError("Stein root provenance mapping identity changed")
+    checkpoint_hashes = {
+        str(m["fit_index"]): {
+            str(int(e)): file_digest(root / m["directory"] / f"residual_epoch_{int(e)}.pt")
+            for e in m["epochs"]
+        } for m in selected
+    }
+    selected_checkpoints = {str(m["fit_index"]): [int(e) for e in m["epochs"]] for m in selected}
+    scoring_identity = {
+        "scoring_protocol": SCORING_PROTOCOL,
+        "scoring": _scoring_identity(cfg),
+        "reference_A_sha256": reference["reference_A_sha256"],
+        "reference_B_sha256": reference["reference_B_sha256"],
+        "background_model_hash": reference["background_model_hash"],
+        "mapping_hash": mapping_hash,
+        "selected_fits": [int(m["fit_index"]) for m in selected],
+        "selected_checkpoints": selected_checkpoints,
+        "selected_checkpoint_sha256": checkpoint_hashes,
+    }
+    support = _support_identity(cfg)
+    score_kind = (
+        f"stein_{cfg['mode']}_support_guard_{cfg['final_transform']}"
+        if support["enabled"] else f"stein_{cfg['mode']}_{cfg['final_transform']}"
+    )
+    path = root / "stein_scoring_calibration.json"
+    existing = json.loads(path.read_text()) if path.exists() else None
+    if existing is not None and existing.get("scoring_identity") != scoring_identity:
+        raise ValueError("Stein scoring calibration provenance changed; use a new output")
     value = {
         "schema": 1,
         "scoring_protocol": SCORING_PROTOCOL,
+        "scoring_identity": scoring_identity,
         "mode": cfg["mode"],
         "reference_samples": int(cfg["reference_samples"]),
         "reference_split": float(cfg["reference_split"]),
@@ -617,29 +774,31 @@ def write_root_provenance(root, selected, accepted, settings, mapping_identity, 
         "beta": float(cfg["beta"]),
         "local_gate_z": float(cfg["local_gate_z"]),
         "local_temperature": float(cfg["local_temperature"]),
-        "gamma": float(cfg["final_power"]),
+        "support_guard": support,
+        "final_mass_bins": int(cfg["final_mass_bins"]),
         "final_transform": cfg["final_transform"],
+        "final_power": float(cfg["final_power"]),
+        "gamma": float(cfg["final_power"]),
         "q_reference_hashes": {"A": reference["reference_A_sha256"], "B": reference["reference_B_sha256"]},
         "q_reference_seeds": REFERENCE_SEEDS,
         "background_model_hash": reference["background_model_hash"],
         "mapping_hash": mapping_hash,
         "selected_fits": [int(m["fit_index"]) for m in selected],
         "accepted_fits": [int(m["fit_index"]) for m in accepted],
-        "selected_checkpoints": {str(m["fit_index"]): [int(e) for e in m["epochs"]] for m in selected},
-        "selected_checkpoint_sha256": {
-            str(m["fit_index"]): {
-                str(int(e)): file_digest(root / m["directory"] / f"residual_epoch_{int(e)}.pt")
-                for e in m["epochs"]
-            } for m in selected
-        },
+        "selected_checkpoints": selected_checkpoints,
+        "selected_checkpoint_sha256": checkpoint_hashes,
         "conditional_calibration": "equal-occupancy mass bins with interpolated empirical midrank CDF",
-        "precalibration_ensemble_score": cfg["mode"],
-        "discriminating_raw_score": cfg["mode"],
-        "final_monotonic_score": cfg["final_transform"],
+        "precalibration_ensemble_score": f"stein_{cfg['mode']}",
+        "discriminating_raw_score": (f"stein_{cfg['mode']}_support_guard" if support["enabled"]
+                                     else f"stein_{cfg['mode']}"),
+        "final_monotonic_score": score_kind,
+        "support_reference": "q-reference B latent Euclidean radius excluding mass coordinate",
         "truth_labels_used": False,
         "settings": cfg,
     }
     if final_metadata is not None:
         value["final_calibration"] = final_metadata
-    write_json(root / "stein_scoring_calibration.json", value)
+    elif existing is not None and "final_calibration" in existing:
+        value["final_calibration"] = existing["final_calibration"]
+    write_json(path, value)
     return value

@@ -188,11 +188,13 @@ def run(args, contract):
                     ),
                 )
                 if core == "stein_witness":
+                    scoring_cfg = settings["riddle"]["stein"]["scoring"]
+                    support_suffix = "_support_guard" if scoring_cfg["support_guard"]["enabled"] else ""
                     arrays["score_kind"] = np.array(
-                        "stein_" + settings["riddle"]["stein"]["scoring"]["final_transform"]
+                        f"stein_{scoring_cfg['mode']}{support_suffix}_{scoring_cfg['final_transform']}"
                     )
                     arrays["fit_score_kind"] = np.array(
-                        f"stein_{settings['riddle']['stein']['scoring']['mode']}"
+                        f"stein_{scoring_cfg['mode']}"
                     )
                 if partition in evaluation_ids: arrays["event_ids"] = evaluation_ids[partition]
                 exports[partition] = arrays
@@ -248,6 +250,9 @@ def run(args, contract):
     write_json(output / "mapping_acceptance.json", acceptance)
     stein_scoring = (json.loads((output / "density/stein_scoring_calibration.json").read_text())
                      if core == "stein_witness" else None)
+    scoring_cfg = settings["riddle"]["stein"]["scoring"] if core == "stein_witness" else None
+    support_enabled = bool(scoring_cfg["support_guard"]["enabled"]) if scoring_cfg is not None else False
+    support_text = " with q-reference-B latent-radius support guard" if support_enabled else ""
     write_json(
         output / "protocol.json",
         {
@@ -278,7 +283,8 @@ def run(args, contract):
             ),
             "ensemble_fit_selection": result["ensemble_fit_selection"],
             "settings": settings,
-            "implementation": ("riddle_stein_witness_v6_2_sic_preserving_scoring" if core == "stein_witness" else
+            "implementation": ((f"riddle_stein_witness_v6_5_{scoring_cfg['mode']}"
+                                f"{'_support_guard' if support_enabled else ''}_scoring") if core == "stein_witness" else
                                "riddle_v5_3_smooth_fm_bgcorr_40_reguide" if background_correction is not None
                                else "riddle_v5_3_smooth_fm_gaussian_fallback" if background_correction_decision is not None
                                else "riddle_v5_3_smooth_fm"),
@@ -290,15 +296,21 @@ def run(args, contract):
                 if settings['riddle'].get('data_policy') == 'study_replay_v1' else
                 "Disjoint mapping, residual development, common mixture-selection, reserved evidence, calibration training/validation, and sideband closure roles; final test untouched")} if enhanced else {}),
             "feature_dependencies": {"hard_bg": "inactive when guided_fit is disabled"},
-            "score": (f"Stein {settings['riddle']['stein']['scoring']['mode']} with "
-                      f"{settings['riddle']['stein']['scoring']['final_transform']} final transform"
+            "score": (f"Stein {scoring_cfg['mode']}{support_text} with "
+                      f"{scoring_cfg['final_transform']} final transform"
                       if core == "stein_witness" else
                       "log p_signal(z|mjj) ensemble - log q_phi(z|mjj)" if background_correction is not None else
                       "logit conditional background percentile" if active["score_flow"] else "log mean residual/background density ratio"),
-            "raw_score": ((f"Stein {settings['riddle']['stein']['scoring']['mode']} ensemble score before final calibration")
+            "raw_score": ((f"Stein {scoring_cfg['mode']} ensemble score"
+                           f"{' after q-reference-B latent-radius support correction' if support_enabled else ''} before final calibration")
                           if core == "stein_witness" else
                           "log p_signal(z|mjj) ensemble - log q_phi(z|mjj)" if background_correction is not None else
                           "log mean residual/background density ratio"),
+            **({
+                "unguarded_ensemble_score": f"arithmetic mean of selected per-fit {scoring_cfg['mode']} Stein scores before support correction",
+                "support_guard": ("q-reference-B latent Euclidean radius excluding mass; label-free and truth-blind"
+                                  if support_enabled else "disabled"),
+            } if core == "stein_witness" else {}),
             "background_correction": (None if background_correction is None else {
                 "mode": background_correction["mode"], "protocol": background_correction["protocol"],
                 "epochs": background_correction["epochs"], "selected_epoch": background_correction["selected_epoch"],
@@ -315,7 +327,8 @@ def run(args, contract):
             }),
             "background_correction_decision": (None if background_correction_decision is None else
                                                 background_correction_decision["selection"]),
-            "fit_score_note": ("per-fit Stein scores after per-checkpoint q-normalization and checkpoint averaging"
+            "fit_score_note": ((f"per-fit {scoring_cfg['mode']} Stein scores after per-checkpoint q-normalization and checkpoint averaging; "
+                                "support correction is ensemble-level and not included in fit_scores")
                                if core == "stein_witness" else
                                "Individual density scores through the frozen ensemble calibrator; not independently calibrated member models" if active["score_flow"] else "individual density ratios"),
             "coherent_mixture": result.get("coherent_mixture"),
@@ -350,11 +363,13 @@ def run(args, contract):
                          "RIDDLE bgcorr Gaussian fallback" if background_correction_decision is not None else
                          "RIDDLE + mass-conditioned residual"),
                 "mass_conditioning": True,
-                "inputs": ("SR latents only for the Stein witness; mjj context is used only by q_phi(z|mjj); no truth labels"
+                "inputs": (("SR mapped latents with mjj context for conditional q-normalization"
+                            + (", q-reference-B latent-radius support calibration" if support_enabled else "")
+                            + ", and final conditional calibration; no truth labels")
                            if core == "stein_witness" else
                            "SR latents plus mass context (mjj - 3.5 TeV) / 0.2 TeV; no truth labels"),
-                "score": (f"{settings['riddle']['stein']['scoring']['mode']} Stein score with "
-                          f"{settings['riddle']['stein']['scoring']['final_transform']} final calibration"
+                "score": (f"{scoring_cfg['mode']} Stein score{support_text} with "
+                          f"{scoring_cfg['final_transform']} final calibration"
                           if core == "stein_witness" else
                           "log(mean signal density p(z|mjj)) - log q_phi(z|mjj)" if background_correction is not None else
                           "log(mean signal density p(z|mjj)) - log standard-normal latent density"),

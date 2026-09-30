@@ -57,21 +57,30 @@ def validate_residual(value):
         "closure_mass_bins": 8,
         "ensemble_fit_selection": "all-valid",
         "scoring": {
-            "mode": "sic_preserving",
+            "mode": "tail_focus",
             "reference_samples": 524288,
             "reference_split": 0.5,
             "mass_bins": 8,
-            "energy_weight": 2.0,
-            "operator_weight": 0.4,
+            "energy_weight": 1.5,
+            "operator_weight": 0.6,
             "operator_gate_z": 1.96,
-            "operator_temperature": 0.35,
+            "operator_temperature": 0.25,
             "beta": 0.5,
-            "local_gate_z": 1.2815515655446004,
+            "local_gate_z": 1.28,
             "local_temperature": 1.0,
+            "final_mass_bins": 2,
             "final_transform": "background_cdf_power",
             "final_power": 10.0,
             "qscore_batch_size": 32768,
             "inference_batch_size": 16384,
+            "support_guard": {
+                "enabled": True,
+                "statistic": "radius",
+                "mass_bins": 8,
+                "gate_quantile": 0.999,
+                "weight": 2.0,
+                "temperature": 0.25,
+            },
         },
     }
     supplied_stein = value.get("stein", {})
@@ -80,8 +89,16 @@ def validate_residual(value):
     supplied_scoring = supplied_stein.get("scoring", {})
     if not isinstance(supplied_scoring, dict) or set(supplied_scoring) - stein_defaults["scoring"].keys():
         raise ValueError("Invalid Stein scoring settings")
+    supplied_support_guard = supplied_scoring.get("support_guard", {})
+    if (not isinstance(supplied_support_guard, dict)
+            or set(supplied_support_guard) - stein_defaults["scoring"]["support_guard"].keys()):
+        raise ValueError("Invalid Stein support guard settings")
+    merged_scoring = {**stein_defaults["scoring"], **supplied_scoring}
+    merged_scoring["support_guard"] = {
+        **stein_defaults["scoring"]["support_guard"], **supplied_support_guard
+    }
     value["stein"] = {**stein_defaults, **supplied_stein,
-                      "scoring": {**stein_defaults["scoring"], **supplied_scoring}}
+                      "scoring": merged_scoring}
     from .options import DEFAULT_ENHANCEMENTS, FEATURES, feature_options
     supplied = value.get("enhancements", {})
     if not isinstance(supplied, dict) or set(supplied) - DEFAULT_ENHANCEMENTS.keys():
@@ -128,8 +145,8 @@ def validate_residual(value):
     # Require every requested residual member unless partial diagnostics are explicit.
 
     value.setdefault("ensemble_completion", "strict")
-    value.setdefault("ensemble_fit_selection", "validation-best")
-    value.setdefault("ensemble_fit_count", 10)
+    value.setdefault("ensemble_fit_selection", "all")
+    value.setdefault("ensemble_fit_count", 20)
     # Learn a smooth f(m) from latent residual responsibilities.
 
 
@@ -169,7 +186,7 @@ def validate_residual(value):
     number(stein["witness_regularization"], "stein.witness_regularization")
     number(stein["potential_center_strength"], "stein.potential_center_strength", strict=False)
     if value["core"] == "stein_witness" and stein["potential_center_strength"] != 0:
-        raise ValueError("stein_witness v6.0 requires potential_center_strength=0")
+        raise ValueError("stein_witness requires potential_center_strength=0")
     number(stein["data_tail_fraction"], "stein.data_tail_fraction", maximum=1.00000001)
     if stein["data_tail_fraction"] > 1:
         raise ValueError("stein.data_tail_fraction must be at most 1")
@@ -182,7 +199,7 @@ def validate_residual(value):
     scoring_defaults = stein_defaults["scoring"]
     if not isinstance(scoring, dict) or set(scoring) != set(scoring_defaults):
         raise ValueError("Invalid Stein scoring settings")
-    if scoring["mode"] not in ("potential_raw", "potential_qnorm", "local_qnorm", "hybrid", "hybrid_gated", "sic_preserving"):
+    if scoring["mode"] not in ("potential_raw", "potential_qnorm", "local_qnorm", "hybrid", "hybrid_gated", "sic_preserving", "tail_focus"):
         raise ValueError("Invalid stein.scoring.mode")
     integer(scoring["reference_samples"], "stein.scoring.reference_samples", 1024)
     number(scoring["reference_split"], "stein.scoring.reference_split", maximum=1)
@@ -198,11 +215,26 @@ def validate_residual(value):
     number(scoring["local_temperature"], "stein.scoring.local_temperature")
     if type(scoring["local_gate_z"]) not in (int, float) or not math.isfinite(scoring["local_gate_z"]):
         raise ValueError("Invalid stein.scoring.local_gate_z")
+    integer(scoring["final_mass_bins"], "stein.scoring.final_mass_bins", 1)
     if scoring["final_transform"] not in ("identity", "background_cdf", "background_cdf_power"):
         raise ValueError("Invalid stein.scoring.final_transform")
     number(scoring["final_power"], "stein.scoring.final_power")
     integer(scoring["qscore_batch_size"], "stein.scoring.qscore_batch_size", 1)
     integer(scoring["inference_batch_size"], "stein.scoring.inference_batch_size", 1)
+    support_guard = scoring["support_guard"]
+    support_defaults = scoring_defaults["support_guard"]
+    if not isinstance(support_guard, dict) or set(support_guard) != set(support_defaults):
+        raise ValueError("Invalid Stein support guard settings")
+    if type(support_guard["enabled"]) is not bool:
+        raise ValueError("stein.scoring.support_guard.enabled must be boolean")
+    if support_guard["statistic"] != "radius":
+        raise ValueError("stein.scoring.support_guard.statistic must be radius")
+    integer(support_guard["mass_bins"], "stein.scoring.support_guard.mass_bins", 1)
+    number(support_guard["gate_quantile"], "stein.scoring.support_guard.gate_quantile", maximum=1)
+    number(support_guard["weight"], "stein.scoring.support_guard.weight", strict=False)
+    number(support_guard["temperature"], "stein.scoring.support_guard.temperature")
+    if support_guard["enabled"] and scoring["mode"] != "tail_focus":
+        raise ValueError("stein.scoring.support_guard.enabled requires mode=tail_focus")
     if value["core"] == "stein_witness" and value.get("input_space") == "physical":
         raise ValueError("stein_witness is defined for mapped latent-space RIDDLE")
 
@@ -277,7 +309,7 @@ def validate_residual(value):
     if value["core"] == "stein_witness" and normalized != ["learned"]:
         raise ValueError("stein_witness uses no mixture fraction; keep fractions: [learned]")
     if value["core"] == "stein_witness" and e["checkpoint_weighting"] != "uniform":
-        raise ValueError("stein_witness v6.0 requires checkpoint_weighting=uniform")
+        raise ValueError("stein_witness requires checkpoint_weighting=uniform")
     value["fractions"] = normalized
     f, t = value["flow"], value["training"]
     from .roles import validate_replay_batch

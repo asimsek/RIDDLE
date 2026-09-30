@@ -792,7 +792,7 @@ def ensemble_predict(output, z, device, *, return_members=False, return_accepted
         from .stein_scoring import final_transform, write_root_provenance
 
         scores, raw, final_metadata = final_transform(
-            root, selected, ensemble_raw, np.asarray(z)[:, -1], device, scoring_settings
+            root, selected, ensemble_raw, z, device, scoring_settings
         )
         identity = json.loads((root / "ensemble_inputs.json").read_text())
         mapping_identity = identity.get("mapping_identity", {

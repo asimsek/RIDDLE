@@ -971,10 +971,12 @@ def apply_riddle_ensemble_fit_selection(root, report, records, audit, *, enabled
 
     if rebuild:
         scoring = report.get("protocol", {}).get("stein_scoring", {})
+        support_guard = scoring.get("support_guard", {}) if isinstance(scoring, dict) else {}
         if (isinstance(scoring, dict) and scoring
-                and scoring.get("final_transform") in ("background_cdf", "background_cdf_power")):
+                and (scoring.get("final_transform") in ("background_cdf", "background_cdf_power")
+                     or bool(support_guard.get("enabled", False)))):
             raise ValueError(
-                "CDF-calibrated Stein ensemble fit selection is reference-B specific; "
+                "Support-guarded or CDF-calibrated Stein ensemble fit selection is reference-B specific; "
                 "use the saved production ensemble or rescore the requested fit selection"
             )
         for partition, record in records.items():
@@ -3206,8 +3208,11 @@ def _ensemble_member_scores(method, source, score_loader, *, scope="signal_regio
     if method == "riddle":
         settings = report.get("contract", {}).get("settings", {}).get("riddle", {})
         scoring = settings.get("stein", {}).get("scoring", {}) if isinstance(settings, dict) else {}
-        if score_kind.startswith("stein_") and scoring.get("final_transform") in ("background_cdf", "background_cdf_power"):
-            return record, None, "subset-specific reference-B recalibration is required for exact CDF-calibrated Stein ensemble convergence"
+        support_guard = scoring.get("support_guard", {}) if isinstance(scoring, dict) else {}
+        if (score_kind.startswith("stein_")
+                and (scoring.get("final_transform") in ("background_cdf", "background_cdf_power")
+                     or bool(support_guard.get("enabled", False)))):
+            return record, None, "subset-specific ensemble support correction and reference-B recalibration are required for exact Stein ensemble convergence"
         aggregation = (
             "equal-weight log-mean-exp of residual likelihood-ratio fits"
             if "ratio" in score_kind or not score_kind
