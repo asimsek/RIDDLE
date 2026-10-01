@@ -83,8 +83,10 @@ def main():
 
         settings = run_settings(getattr(args, "runs", None), getattr(args, "epochs", None),
                                 getattr(args, "lacathode_background", "independent"))
-        workers = min(workers, settings["pipeline_runs"])
-        concurrent = getattr(args, "lacathode_background", "independent") == "independent" and workers > 1
+        background_mode = getattr(args, "lacathode_background", "independent")
+        limit = settings["classifier_runs"] if background_mode == "fixed" else settings["pipeline_runs"]
+        workers = min(workers, limit)
+        concurrent = workers > 1
     if concurrent:
         from .mps import configure_mps
 

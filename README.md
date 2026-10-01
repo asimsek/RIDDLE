@@ -65,7 +65,7 @@ python run.py run --methods riddle --data data/lhco --output results \
 ```bash
 python run.py run --methods lacathode --data data/lhco --output results \
   --scenarios signal_injection --seeds 42 --device cuda:0 --runs 10 --epochs 100 \
-  --lacathode-background fixed --workers 1 --io-workers 8 --mps auto --resume
+  --lacathode-background fixed --workers 5 --io-workers 8 --torch-threads 2 --mps auto --resume
 ```
 
 **R-ANODE:**
@@ -103,7 +103,7 @@ python run.py run --methods lacathode riddle ranode --data data/lhco --output re
 ```
 
 `--device cpu` for CPU execution.<br>
-`--workers` controls concurrent RIDDLE/R-ANODE/IAD/Supervised fits or complete independent LaCathode runs; fixed-background LaCathode stays sequential.<br>
+`--workers` controls concurrent RIDDLE/R-ANODE/IAD/Supervised fits, complete independent LaCathode runs, or fixed-background LaCathode classifier fits after the shared flow is ready.<br>
 `--io-workers` controls CPU threads per process.<br>
 MPS is optional on Linux NVIDIA GPUs; `auto` falls back to ordinary concurrency, while `on` requires MPS.
 

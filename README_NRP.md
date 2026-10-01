@@ -164,7 +164,7 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   | kubectl apply -n cua-asimsek -f -
 ```
 
-Add `--lacathode-background fixed` to a LaCathode submission to share one background flow across `--runs` classifiers; the default is `independent`.
+Add `--lacathode-background fixed` to share one background flow across `--runs` classifiers; after the flow is ready, up to `--workers` classifier fits run concurrently. In the default `independent` mode, up to `--workers` complete runs train concurrently, each with its own background flow.
 
 **R-ANODE:**
 
@@ -355,6 +355,8 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   --lacathode-background independent \
   | kubectl apply -n cua-asimsek -f -
 ```
+
+LaCathode scan points use the same concurrency: independent mode parallelizes complete `--runs` and only reuses a compatible background from the same run/seed, while fixed mode parallelizes classifier fits after the shared or reused background flow is ready.
 
 **R-ANODE:**
 

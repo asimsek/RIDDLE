@@ -1,15 +1,18 @@
 import ast
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 import inspect
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import pickle
+import queue
 import signal
 import shutil
 import subprocess
 import sys
 import time
+import traceback
 import uuid
 
 FLOW_PREFIX = "lacathode_model"
@@ -217,6 +220,313 @@ def launch_runs(args, requests):
         write_json(audit, execution)
 
 
+
+def fixed_classifier_seeds(seed, count):
+    import numpy as np
+
+    if type(seed) is not int or not 0 <= seed < 2**32:
+        raise ValueError("Invalid LaCathode classifier seed")
+    values = [int(np.random.SeedSequence([seed, 0x4C4346, i]).generate_state(1)[0]) for i in range(count)]
+    if len(set(values)) != count:
+        raise ValueError("LaCathode classifier fit seeds collided; choose another campaign seed")
+    return values
+
+
+def _fixed_classifier_fit(job, options):
+    import numpy as np
+    import torch
+
+    from .acceleration import execution_report, install_tensor_batches
+    from .epoch_hook import install_epoch_recovery
+    from .recovery import EpochRecovery
+    from .source import verify
+    from .storage import seed_start
+
+    root = Path(options["root"])
+    sources = Path(options["sources"])
+    verify(sources)
+    sys.path.insert(0, str(sources))
+    os.chdir(sources)
+    import classifier_training_utils
+
+    recovery = EpochRecovery(
+        root,
+        options["contract"],
+        True,
+        allow_code_change=options["allow_code_change"],
+        allow_device_change=options["allow_device_change"],
+    )
+    classifier_training_utils.train_model = recovery.classifier_fits(
+        install_epoch_recovery(classifier_training_utils, "train_model", "classifier", recovery)
+    )
+    acceleration = install_tensor_batches(options["device"])
+    seed_start(job["seed"])
+    X_train = np.load(root / "X_train.npy")
+    X_test = np.load(root / "X_test.npy")
+    y_train = np.load(root / "y_train.npy")
+    y_test = np.load(root / "y_test.npy")
+    X_extrasig = None if options["no_extra_signal"] or options["supervised"] else np.load(root / "X_extrasig.npy")
+    X_val = np.load(root / "X_validation.npy") if options["supervised"] or options["separate_val_set"] else None
+    losses = classifier_training_utils.train_model(
+        options["config_file"],
+        options["epochs"],
+        X_train,
+        y_train,
+        X_test,
+        y_test,
+        X_extrasig=X_extrasig,
+        X_val=X_val,
+        use_mjj=options["use_mjj"],
+        batch_size=options["batch_size"],
+        supervised=options["supervised"],
+        use_class_weights=options["use_class_weights"],
+        CWoLa=options["CWoLa"],
+        SR_center=options["SR_center"],
+        save_model=str(root / f"model_run{job['index']}"),
+        verbose=options["verbose"],
+    )
+    return {
+        "fit": job["index"],
+        "seed": job["seed"],
+        "train_loss": np.asarray(losses[0]),
+        "validation_loss": np.asarray(losses[1]),
+        "acceleration": execution_report(acceleration),
+    }
+
+
+def _fixed_classifier_worker(events, job, options):
+    import torch
+    from riddle.worker_progress import BufferedLog, durable_progress_event
+    from .worker_progress import _LOCAL_SINK
+
+    index = job["index"]
+    root = Path(options["root"])
+    log_root = root / ".resume"
+    log_root.mkdir(parents=True, exist_ok=True)
+    previous_handler = signal.getsignal(signal.SIGTERM)
+
+    def terminate(signum, frame):
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, terminate)
+    with (log_root / f"classifier_worker_{index:03d}.log").open("a") as raw_log:
+        log = BufferedLog(raw_log)
+        with redirect_stdout(log), redirect_stderr(log):
+            def publish(event):
+                log.write(json.dumps(event) + "\n")
+                if durable_progress_event(event):
+                    log.force_flush()
+                events.put((index, "progress", event))
+
+            token = _LOCAL_SINK.set(publish)
+            try:
+                torch.set_num_threads(options["torch_threads"])
+                torch.set_num_interop_threads(1)
+                torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False
+                events.put((index, "result", _fixed_classifier_fit(job, options)))
+            except BaseException as error:
+                traceback.print_exc()
+                log.force_flush()
+                events.put((index, "error", f"{type(error).__name__}: {error}"))
+            finally:
+                log.force_flush()
+                _LOCAL_SINK.reset(token)
+                signal.signal(signal.SIGTERM, previous_handler)
+
+
+def _stop_classifier_workers(active):
+    for state in active.values():
+        process = state["process"]
+        if process.is_alive():
+            process.terminate()
+    for state in active.values():
+        process = state["process"]
+        process.join(timeout=5)
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=5)
+
+
+def _finalize_parallel_classifiers(root, training, results):
+    import numpy as np
+    import classifier_training_utils
+    from evaluation_utils import minimum_val_loss_model_evaluation
+    from .storage import save_array
+
+    ordered = [results[index] for index in range(training.n_runs)]
+    loss_matrix = np.stack([item["train_loss"] for item in ordered])
+    val_loss_matrix = np.stack([item["validation_loss"] for item in ordered])
+    save_array(root / "loss_matris.npy", loss_matrix)
+    save_array(root / "val_loss_matris.npy", val_loss_matrix)
+    minimum_val_loss_model_evaluation(
+        str(root),
+        str(root),
+        n_epochs=10,
+        use_mjj=training.use_mjj,
+        extra_signal=not training.no_extra_signal,
+    )
+    for index in range(training.n_runs):
+        classifier_training_utils.plot_classifier_losses(
+            loss_matrix[index],
+            val_loss_matrix[index],
+            savefig=str(root / f"model_run{index}_loss_plot"),
+            suppress_show=True,
+        )
+    return ordered
+
+
+def train_fixed_classifiers(args, contract, root, training):
+    from .progress import _duration, _short_value
+    from .worker_progress import ProgressStage, emit_message
+
+    count = int(training.n_runs)
+    workers = min(max(1, int(getattr(args, "workers", 1))), count)
+    if workers == 1 or count == 1:
+        import run_all
+
+        run_all.train_classifier(training)
+        return {
+            "mode": "sequential",
+            "workers": 1,
+            "fits": count,
+            "fit_seeds": None,
+            "mps": getattr(args, "runtime_mps", None),
+        }
+    seeds = fixed_classifier_seeds(args.seed, count)
+    training_options = {
+        "config_file": training.config_file,
+        "epochs": training.epochs,
+        "batch_size": training.batch_size,
+        "no_extra_signal": training.no_extra_signal,
+        "use_mjj": training.use_mjj,
+        "supervised": training.supervised,
+        "use_class_weights": training.use_class_weights,
+        "CWoLa": training.CWoLa,
+        "SR_center": training.SR_center,
+        "separate_val_set": training.separate_val_set,
+        "verbose": training.verbose,
+    }
+    options = {
+        **training_options,
+        "root": str(root),
+        "sources": str(args.sources),
+        "contract": contract,
+        "device": str(args.device),
+        "torch_threads": int(args.torch_threads),
+        "allow_code_change": bool(getattr(args, "resume_across_code_change", False)),
+        "allow_device_change": bool(getattr(args, "resume_across_device_change", False)),
+    }
+    import gc
+    import torch
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    context = multiprocessing.get_context("spawn")
+    events = context.Queue()
+    waiting = [{"index": index, "seed": seeds[index]} for index in range(count)]
+    active = {}
+    results = {}
+    previous_handler = signal.getsignal(signal.SIGTERM)
+
+    def terminate(signum, frame):
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, terminate)
+    emit_message(f"LaCathode fixed-background classifiers: up to {workers} concurrent fits on {args.device}")
+    try:
+        with ProgressStage("fixed_classifier_runs", "Fixed-background classifier fits", count, "fit") as progress:
+            while waiting or active:
+                while waiting and len(active) < workers:
+                    job = waiting.pop(0)
+                    process = context.Process(target=_fixed_classifier_worker, args=(events, job, options))
+                    process.start()
+                    active[job["index"]] = {
+                        "process": process,
+                        "started": time.monotonic(),
+                        "epoch": 0,
+                        "printed": -1,
+                        "metrics": {},
+                    }
+                    emit_message(
+                        f"Classifier fit {job['index'] + 1}/{count}: started; active fits={len(active)}/{workers}",
+                        kind="WORK",
+                    )
+                try:
+                    index, kind, event = events.get(timeout=1)
+                except queue.Empty:
+                    now = time.monotonic()
+                    for index, state in active.items():
+                        code = state["process"].exitcode
+                        if code is None:
+                            state.pop("exit_seen", None)
+                            continue
+                        if code != 0:
+                            raise RuntimeError(
+                                f"LaCathode classifier fit {index + 1}/{count}: worker exited with code {code}; resume to retry"
+                            )
+                        state.setdefault("exit_seen", now)
+                        if now - state["exit_seen"] > 5:
+                            raise RuntimeError(
+                                f"LaCathode classifier fit {index + 1}/{count}: worker exited without a result; resume to retry"
+                            )
+                    index, kind, event = None, None, None
+                if kind == "error":
+                    raise RuntimeError(f"LaCathode classifier fit {index + 1}/{count} failed: {event}")
+                if kind == "result":
+                    state = active.pop(index)
+                    state["process"].join(timeout=10)
+                    if state["process"].is_alive():
+                        state["process"].terminate()
+                        state["process"].join(timeout=5)
+                    if state["process"].exitcode not in (0, None):
+                        raise RuntimeError(
+                            f"LaCathode classifier fit {index + 1}/{count}: worker exited with code {state['process'].exitcode}; resume to retry"
+                        )
+                    results[index] = event
+                    progress.update(len(results), force=True)
+                    emit_message(
+                        f"Classifier fit {index + 1}/{count}: completed; completed fits={len(results)}/{count}; active fits={len(active)}/{workers}",
+                        kind="PASS",
+                    )
+                elif kind == "progress" and index in active:
+                    state = active[index]
+                    if event.get("unit") == "epoch" and event.get("completed") is not None:
+                        state["epoch"] = int(event["completed"])
+                        state["metrics"] = event.get("metrics", {})
+                now = time.monotonic()
+                for index, state in active.items():
+                    if state["epoch"] <= state["printed"]:
+                        continue
+                    epoch = state["epoch"]
+                    elapsed = now - state["started"]
+                    eta = _duration(elapsed * max(0, training.epochs - epoch) / max(1, epoch))
+                    metrics = "; ".join(
+                        f"{name}={_short_value(value)}"
+                        for name, value in state["metrics"].items()
+                        if name in {"train_loss", "validation_loss"}
+                    )
+                    emit_message(
+                        f"Classifier fit {index + 1}/{count}: {epoch}/{training.epochs} epoch; fit_elapsed={_duration(elapsed)}; fit_ETA={eta}; active fits={len(active)}/{workers}"
+                        + (f"; {metrics}" if metrics else ""),
+                        kind="PROGRESS",
+                    )
+                    state["printed"] = epoch
+    finally:
+        signal.signal(signal.SIGTERM, previous_handler)
+        _stop_classifier_workers(active)
+        events.close()
+        events.cancel_join_thread()
+    ordered = _finalize_parallel_classifiers(root, training, results)
+    return {
+        "mode": "parallel",
+        "workers": workers,
+        "fits": count,
+        "fit_seeds": seeds,
+        "mps": getattr(args, "runtime_mps", None),
+        "worker_acceleration": [item["acceleration"] for item in ordered],
+    }
+
 def collect_runs(args, members):
     import numpy as np
     from .storage import atomic_write, save_npz, save_array, write_json, verify_artifacts
@@ -295,12 +605,10 @@ def run(args, contract):
     from .storage import write_json
     from .worker_progress import emit_message
 
-    if getattr(args, "lacathode_background", "independent") == "fixed":
-        if getattr(args, "workers", 1) > 1:
-            emit_message("LaCathode fixed-background mode remains sequential; --workers does not parallelize its classifiers")
-        return run_single(args, contract)
     if type(getattr(args, "workers", 1)) is not int or getattr(args, "workers", 1) < 1:
         raise ValueError("LaCathode workers must be a positive integer")
+    if getattr(args, "lacathode_background", "independent") == "fixed":
+        return run_single(args, contract)
     count = run_settings(getattr(args, "runs", None), getattr(args, "epochs", None))["pipeline_runs"]
     members = [dict(run=i, seed=seed, directory=f"runs/run_{i:03d}")
                for i, seed in enumerate(run_seeds(args.seed, count))]
@@ -382,7 +690,13 @@ def _select_background_reuse(args, contract, flow_epochs, config_file):
     if getattr(args, "lacathode_scan_background_reuse_policy", None) != "shared_fixed_background_v1":
         return None
     expected = _background_reuse_signature(contract, flow_epochs, config_file)
+    independent = getattr(args, "lacathode_background", "independent") == "independent"
+    current_run = getattr(args, "run_index", None)
     for item in getattr(args, "lacathode_background_reuse_candidates", None) or ():
+        if independent and current_run is not None and (
+            item.get("run_index") != current_run or item.get("seed") != args.seed
+        ):
+            continue
         source = Path(item["result"]).resolve()
         data = Path(item["data"]).resolve()
         report_path = source / "result.json"
@@ -645,10 +959,25 @@ def run_single(args, contract):
 
     recovery.stage("creation", create)
 
+    training = run_all.create_namespace_classifier_training(parsed)
+
     def classify():
-        run_all.train_classifier(run_all.create_namespace_classifier_training(parsed))
+        execution = train_fixed_classifiers(args, contract, root, training)
+        write_json(root / "classifier_execution.json", execution)
 
     recovery.stage("classifier", classify)
+    classifier_execution_path = root / "classifier_execution.json"
+    classifier_execution = (
+        json.loads(classifier_execution_path.read_text())
+        if classifier_execution_path.is_file()
+        else {
+            "mode": "sequential",
+            "workers": 1,
+            "fits": parsed.cf_n_runs,
+            "fit_seeds": None,
+            "mps": getattr(args, "runtime_mps", None),
+        }
+    )
     for name in ("loss_matris.npy", "val_loss_matris.npy"):
         losses = np.load(root / name, allow_pickle=False)
         if not losses.size:
@@ -689,6 +1018,7 @@ def run_single(args, contract):
             "primary_classifier_fit": 0,
             "fit_scores": "All classifier fits, in upstream run order, when classifier_runs > 1",
             "acceleration": execution_report(acceleration),
+            "classifier_execution": classifier_execution,
             "configuration": {
                 name: (args.sources / name).read_text() for name in (config_file, "classifier.yml")
             },

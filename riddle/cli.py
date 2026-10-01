@@ -81,7 +81,7 @@ def parser():
             "--workers",
             type=positive,
             default=1,
-            help="Concurrent RIDDLE/R-ANODE/IAD/Supervised fits or independent LaCathode runs; fixed-background LaCathode stays sequential",
+            help="Concurrent RIDDLE/R-ANODE/IAD/Supervised fits, independent LaCathode runs, or fixed-background LaCathode classifier fits",
         )
         run.add_argument("--io-workers", type=positive, default=2,
                          help="Filesystem/host I/O concurrency; independent of PyTorch compute threads")

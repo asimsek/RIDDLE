@@ -187,9 +187,18 @@ def _lacathode_background_candidates(output_root, data_root, variant, current_po
             if not losses.is_file() or len(checkpoints) < 10 or data is None:
                 continue
             seen.add(source)
-            candidates.append((_source_priority(report), str(source), data))
+            candidates.append((
+                _source_priority(report),
+                str(source),
+                data,
+                report.get("run_index"),
+                report.get("seed"),
+            ))
     candidates.sort(key=lambda item: (item[0], item[1]))
-    return [{"result": source, "data": data} for _, source, data in candidates]
+    return [
+        {"result": source, "data": data, "run_index": run_index, "seed": seed}
+        for _, source, data, run_index, seed in candidates
+    ]
 
 
 def _ranode_background_candidates(output_root, variant, current_point):
