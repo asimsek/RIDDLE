@@ -247,12 +247,20 @@ def validate_score_record(record, *, method, stage):
         raise ValueError(f"{stage}: misaligned accepted background density")
     if not np.isnan(scores[~mask]).all():
         raise ValueError(f"{stage}: rejected-event scores must be NaN")
-    summary = score_diagnostics(scores[mask], stage=stage, probability=method == "lacathode")
-    if "score_kind" in record:
-        score_kind = str(np.asarray(record["score_kind"]).item())
-        if score_kind not in ("log_density_ratio", "background_percentile_logit", "stein_witness") \
+    score_kind = str(np.asarray(record["score_kind"]).item()) if "score_kind" in record else None
+    if method in ("iad", "supervised"):
+        if score_kind != "classifier_probability":
+            raise ValueError(f"{stage}: AD baseline requires classifier_probability scores")
+        if str(np.asarray(record.get("fit_score_kind", "")).item()) != "classifier_probability":
+            raise ValueError(f"{stage}: AD baseline requires classifier_probability fit scores")
+    elif score_kind == "classifier_probability":
+        raise ValueError(f"{stage}: classifier_probability is reserved for AD baselines")
+    probability = method in ("lacathode", "iad", "supervised")
+    summary = score_diagnostics(scores[mask], stage=stage, probability=probability)
+    if score_kind is not None:
+        if score_kind not in ("log_density_ratio", "background_percentile_logit", "stein_witness", "classifier_probability") \
                 and not score_kind.startswith("stein_"):
-            raise ValueError(f"{stage}: unrecognized RIDDLE score coordinate")
+            raise ValueError(f"{stage}: unrecognized score coordinate")
     if "raw_scores" in record:
         raw = np.asarray(record["raw_scores"])
         if raw.shape != (n,) or not np.isnan(raw[~mask]).all():
@@ -271,8 +279,15 @@ def validate_score_record(record, *, method, stage):
         if fits.ndim != 2 or fits.shape[1:] != (n,) or not len(fits) or not np.isnan(fits[:, ~mask]).all():
             raise ValueError(f"{stage}: invalid saved member scores")
         summary["members"] = [score_diagnostics(fit[mask], stage=f"{stage} member {i}",
-                                               probability=method == "lacathode")
+                                               probability=probability)
                               for i, fit in enumerate(fits)]
+        if method in ("iad", "supervised"):
+            for key in ("accepted_fit_indices", "accepted_fit_seeds"):
+                if key not in record or np.asarray(record[key]).shape != (len(fits),):
+                    raise ValueError(f"{stage}: invalid {key}")
+            expected = np.mean(fits[:, mask], axis=0, dtype=np.float64)
+            if not np.allclose(scores[mask], expected, rtol=1e-6, atol=1e-7):
+                raise ValueError(f"{stage}: ensemble score disagrees with mean fit probability")
     if "accepted_fit_scores" in record:
         accepted = record["accepted_fit_scores"]
         if (accepted.ndim != 2 or accepted.shape[1:] != (n,) or not len(accepted)
@@ -485,3 +500,226 @@ def require_complete_ensemble(selection):
             or selection.get("accepted_checkpoints") != len(accepted) * checkpoints
             or selection.get("selected_checkpoints") != len(members) * checkpoints):
         raise IncompleteEnsembleError("RIDDLE ensemble fit selection is incomplete or inconsistent")
+
+CLASSIFIER_SCORE_PARTITIONS = {
+    "validation": ("innerdata_val.npy", "outerdata_val.npy"),
+    "test": ("innerdata_test.npy", "outerdata_test.npy"),
+    "signal_region": ("innerdata_test.npy", "innerdata_extrabkg_test.npy", "innerdata_extrasig.npy"),
+}
+
+
+def load_classifier_preprocessing(training_root):
+    from pathlib import Path
+
+    with np.load(Path(training_root) / "preprocessing.npz", allow_pickle=False) as archive:
+        mean = archive["mean"]
+        std = archive["std"]
+        order = archive["feature_order"].astype(str).tolist()
+        include_mass = bool(archive["include_mass"].item())
+        input_dimension = int(archive["input_dimension"].item())
+    if len(order) != input_dimension or len(mean) != input_dimension or len(std) != input_dimension:
+        raise ValueError("Invalid AD baseline preprocessing artifact")
+    return mean, std, order, include_mass
+
+
+def classifier_evaluation_population(data_root, names, event_ids):
+    from pathlib import Path
+
+    arrays = [np.load(Path(data_root) / name, mmap_mode="r", allow_pickle=False) for name in names]
+    event_rows, region = evaluation_rows(arrays, names)
+    identities = np.concatenate([event_ids[name] for name in names])
+    return event_rows, region, identities
+
+
+def classifier_standardized_features(event_rows, mean, std, include_mass):
+    from .data import baseline_feature_matrix
+
+    values = baseline_feature_matrix(event_rows, include_mass)
+    values = (values - mean) / std
+    if not np.isfinite(values).all():
+        raise ValueError("AD baseline evaluation preprocessing produced nonfinite features")
+    return np.asarray(values, dtype=np.float32)
+
+
+def predict_classifier_checkpoint(model, features, batch_size, device):
+    import torch
+
+    outputs = []
+    model.eval()
+    with torch.no_grad():
+        for start in range(0, len(features), batch_size):
+            batch = torch.from_numpy(features[start:start + batch_size]).to(device)
+            outputs.append(torch.sigmoid(model(batch).reshape(-1)).cpu().numpy())
+    result = np.concatenate(outputs) if outputs else np.empty(0, dtype=np.float32)
+    if not np.isfinite(result).all() or (result < 0).any() or (result > 1).any():
+        raise ValueError("AD baseline classifier produced invalid probabilities")
+    return result
+
+
+def classifier_fit_predictions(training_root, receipt, features, classifier, device):
+    from pathlib import Path
+    import torch
+    from .storage import file_digest
+    from .training import build_binary_classifier
+
+    fit_root = Path(training_root) / f"fit_{receipt['fit_index']:03d}" / receipt["attempt_directory"]
+    predictions = np.zeros(len(features), dtype=np.float64)
+    selected = receipt["selected_checkpoints"]
+    for candidate in selected:
+        checkpoint = fit_root / candidate["filename"]
+        if file_digest(checkpoint) != candidate["sha256"]:
+            raise ValueError("AD baseline selected checkpoint changed before scoring")
+        payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        if int(payload["epoch"]) != int(candidate["epoch"]) or float(payload["validation_bce"]) != float(candidate["validation_bce"]):
+            raise ValueError("AD baseline checkpoint metadata changed")
+        model = build_binary_classifier(features.shape[1], classifier).to(device)
+        model.load_state_dict(payload["model"])
+        predictions += predict_classifier_checkpoint(model, features, classifier["inference_batch_size"], device)
+        del model
+    predictions /= len(selected)
+    return predictions.astype(np.float32)
+
+
+def classifier_checkpoint_signature(receipt):
+    return [
+        {
+            "epoch": int(candidate["epoch"]),
+            "validation_bce": float(candidate["validation_bce"]),
+            "filename": candidate["filename"],
+            "sha256": candidate["sha256"],
+        }
+        for candidate in receipt["selected_checkpoints"]
+    ]
+
+
+def classifier_member_signature(receipt):
+    return {
+        "fit_index": int(receipt["fit_index"]),
+        "fit_seed": int(receipt["fit_seed"]),
+        "attempt": int(receipt["attempt"]),
+        "attempt_directory": receipt["attempt_directory"],
+        "selected_checkpoints": classifier_checkpoint_signature(receipt),
+    }
+
+
+def load_or_predict_classifier_member(scoring_root, training_root, receipt, features, classifier, device, resume):
+    import json
+    from pathlib import Path
+    from .storage import file_digest, save_array, write_json
+
+    signature = classifier_member_signature(receipt)
+    path = Path(scoring_root) / f"fit_{int(receipt['fit_index']):03d}.npy"
+    receipt_path = path.with_suffix(".json")
+    if resume and path.is_file() and receipt_path.is_file():
+        saved = json.loads(receipt_path.read_text())
+        if saved.get("member") == signature and saved.get("prediction_sha256") == file_digest(path):
+            predictions = np.load(path, allow_pickle=False)
+            if predictions.shape == (len(features),) and np.isfinite(predictions).all() and (predictions >= 0).all() and (predictions <= 1).all():
+                return np.asarray(predictions, dtype=np.float32)
+    predictions = classifier_fit_predictions(training_root, receipt, features, classifier, device)
+    save_array(path, predictions)
+    write_json(receipt_path, {
+        "schema": 1,
+        "member": signature,
+        "prediction_sha256": file_digest(path),
+        "events": int(len(predictions)),
+    })
+    return predictions
+
+
+def score_classifier_partitions(method, data_root, output, training_root, classifier, accepted_receipts, device, resume=False):
+    import json
+    from pathlib import Path
+    import torch
+    from .storage import atomic_write, digest, file_digest, save_npz, write_json
+
+    data_root = Path(data_root)
+    output = Path(output)
+    with np.load(data_root / "event_ids.npz", allow_pickle=False) as archive:
+        event_ids = {name: archive[name] for name in archive.files}
+    mean, std, feature_order, include_mass = load_classifier_preprocessing(training_root)
+    prepared = {}
+    lengths = []
+    population_signatures = {}
+    for name, files in CLASSIFIER_SCORE_PARTITIONS.items():
+        event_rows, region, identities = classifier_evaluation_population(data_root, files, event_ids)
+        features = classifier_standardized_features(event_rows, mean, std, include_mass)
+        prepared[name] = (event_rows, region, identities, features)
+        lengths.append(len(features))
+        population_signatures[name] = {
+            "files": list(files),
+            "events": int(len(event_rows)),
+            "event_ids_sha256": digest(identities),
+            "physical_population_sha256": digest(event_rows),
+        }
+    combined = np.concatenate([prepared[name][3] for name in CLASSIFIER_SCORE_PARTITIONS], axis=0)
+    scoring_root = output / ".resume" / "baseline_scoring"
+    scoring_root.mkdir(parents=True, exist_ok=True)
+    scoring_contract = {
+        "schema": 1,
+        "method": method,
+        "classifier": classifier,
+        "preprocessing_sha256": file_digest(Path(training_root) / "preprocessing.npz"),
+        "members": [classifier_member_signature(receipt) for receipt in accepted_receipts],
+        "populations": population_signatures,
+    }
+    contract_path = scoring_root / "contract.json"
+    if contract_path.is_file() and resume:
+        saved_contract = json.loads(contract_path.read_text())
+        if saved_contract != scoring_contract:
+            raise ValueError("AD baseline scoring recovery contract changed")
+    write_json(contract_path, scoring_contract)
+    member_predictions = [
+        load_or_predict_classifier_member(scoring_root, training_root, receipt, combined, classifier, torch.device(device), resume)
+        for receipt in accepted_receipts
+    ]
+    members = np.asarray(member_predictions, dtype=np.float32)
+    if members.ndim != 2 or members.shape[1] != len(combined):
+        raise ValueError("Invalid AD baseline fit prediction shape")
+    ensemble = members.mean(axis=0, dtype=np.float64).astype(np.float32)
+    offsets = np.cumsum([0, *lengths])
+    acceptance = {}
+    evaluation_hashes = {}
+    for index, name in enumerate(CLASSIFIER_SCORE_PARTITIONS):
+        event_rows, region, identities, features = prepared[name]
+        fit_scores = members[:, offsets[index]:offsets[index + 1]].copy()
+        scores = ensemble[offsets[index]:offsets[index + 1]].copy()
+        preprocessing_mask = np.ones(len(event_rows), dtype=bool)
+        preprocessing_mask, score_domain_mask, mask = scoring_masks(preprocessing_mask, region, classifier["score_scope"])
+        scores[~mask] = np.nan
+        fit_scores[:, ~mask] = np.nan
+        arrays = {
+            "mass": event_rows[:, 0].astype(np.float32),
+            "labels": event_rows[:, -1].astype(np.int64),
+            "mask": mask,
+            "scores": scores,
+            "physical": event_rows[:, 1:-1].astype(np.float32),
+            "event_ids": identities,
+            "is_signal_region": region,
+            "preprocessing_mask": preprocessing_mask,
+            "score_domain_mask": score_domain_mask,
+            "fit_scores": fit_scores,
+            "accepted_fit_indices": np.asarray([receipt["fit_index"] for receipt in accepted_receipts], dtype=np.int64),
+            "accepted_fit_seeds": np.asarray([receipt["fit_seed"] for receipt in accepted_receipts], dtype=np.uint64),
+            "score_scope": np.asarray(classifier["score_scope"]),
+            "score_kind": np.asarray("classifier_probability"),
+            "fit_score_kind": np.asarray("classifier_probability"),
+        }
+        atomic_write(output / f"{name}_scores.npz", lambda path, values=arrays: save_npz(path, **values))
+        acceptance[name] = {
+            "events": int(len(event_rows)),
+            "scored_events": int(mask.sum()),
+            "outside_score_domain_events": int((~score_domain_mask).sum()),
+        }
+        evaluation_hashes[name] = {
+            "event_ids_sha256": digest(identities),
+            "physical_population_sha256": digest(event_rows),
+            "score_artifact_sha256": file_digest(output / f"{name}_scores.npz"),
+        }
+    write_json(output / "mapping_acceptance.json", acceptance)
+    return {
+        "feature_order": feature_order,
+        "evaluation_population_hashes": evaluation_hashes,
+        "accepted_fit_indices": [int(receipt["fit_index"]) for receipt in accepted_receipts],
+        "accepted_fit_seeds": [int(receipt["fit_seed"]) for receipt in accepted_receipts],
+    }

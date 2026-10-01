@@ -29,7 +29,7 @@ from riddle.storage import file_digest
 
 METHOD_ORDER = ("riddle", "iad", "supervised", "lacathode", "ranode")
 METHOD_ALIASES = {"riddle": "riddle", "riddlev2": "riddle", "riddlev3": "riddle", "iad": "iad", "idealized": "iad", "idealized_ad": "iad", "supervised": "supervised", "supervised_ad": "supervised", "lacathode": "lacathode", "ranode": "ranode"}
-METHOD_LABELS = {"riddle": "RIDDLE", "iad": "IAD", "supervised": "Supervised", "lacathode": "LaCATHODE", "ranode": "R-ANODE"}
+METHOD_LABELS = {"riddle": "RIDDLE", "iad": "Idealized AD", "supervised": "Supervised AD", "lacathode": "LaCATHODE", "ranode": "R-ANODE"}
 METHOD_COLORS = {"riddle": "#D55E00", "iad": "#56B4E9", "supervised": "#009E73", "lacathode": "#0072B2", "ranode": "#8B1A1A"}
 METHOD_DARK = {"riddle": "#9E4500", "iad": "#0072B2", "supervised": "#00543e", "lacathode": "#004C78", "ranode": "#5F1111"}
 METHOD_LIGHT = {"riddle": "#F0A06A", "iad": "#78cdf5", "supervised": "#46eba2", "lacathode": "#6AB1D6", "ranode": "#C47777"}
@@ -1336,6 +1336,11 @@ def plot_training(groups, output, formats, overwrite):
                         train = np.asarray([item[0][:min_len] for item in histories])
                         validation = np.asarray([item[1][:min_len] for item in histories])
                         plot_history_band(train, validation, "Stein objective", destination / "stein_witness_objective", formats, overwrite)
+            elif method in ("iad", "supervised"):
+                paths = [verify_requested_artifact(root, report, "training/" + name) for name in ("train_bce.npy", "validation_bce.npy")]
+                if all(path is not None for path in paths):
+                    values = [np.atleast_2d(np.load(path, allow_pickle=False)) for path in paths]
+                    plot_history_band(values[0], values[1], "Binary cross-entropy", destination / "classifier_bce", formats, overwrite, method=method, labels=("Train BCE", "Validation BCE"))
             elif method == "lacathode":
                 for stem, names, ylabel in (("background_nll", ("lacathode_model_train_losses.npy", "lacathode_model_val_losses.npy"), "Negative log likelihood"), ("classifier_bce", ("loss_matris.npy", "val_loss_matris.npy"), "Binary cross-entropy")):
                     paths = [verify_requested_artifact(root, report, "training/" + name) for name in names]
@@ -1354,13 +1359,13 @@ def plot_history(arrays, ylabel, stem, formats, overwrite):
     save_figure(fig, ax, stem, formats, overwrite, legend)
 
 
-def plot_history_band(train, validation, ylabel, stem, formats, overwrite):
+def plot_history_band(train, validation, ylabel, stem, formats, overwrite, method="riddle", labels=("Train", "Validation")):
     train = np.atleast_2d(train)
     validation = np.atleast_2d(validation)
     length = min(train.shape[1], validation.shape[1])
     x = np.arange(1, length + 1)
     fig, ax = new_figure("Epoch", ylabel)
-    for values, label, color, style in ((train[:, :length], "Train", METHOD_LIGHT["riddle"], "-"), (validation[:, :length], "Validation", METHOD_DARK["riddle"], "--")):
+    for values, label, color, style in ((train[:, :length], labels[0], METHOD_LIGHT[method], "-"), (validation[:, :length], labels[1], METHOD_DARK[method], "--")):
         median = np.median(values, axis=0)
         ax.plot(x, median, label=label, color=color, ls=style)
         if len(values) >= 2:
@@ -1651,6 +1656,13 @@ def export_tables(groups, cache, loader, output, file_formats, data_root, verbos
         variant = str(row.get("variant", row.get("Dataset", "default")))
         training = event_count_text(row.get("train_events", row.get("Training events")), row.get("train_sample", row.get("Training sample", "")))
         validation = event_count_text(row.get("validation_events", row.get("Validation events")), row.get("validation_sample", row.get("Validation sample", "")), True)
+        canonical = canonical_method(str(row.get("method_id", method)))
+        if canonical == "iad":
+            training = f"{int(row.get('train_class1_events', 0)):,} actual SR data + {int(row.get('train_class0_events', 0)):,} pure BG simulation"
+            validation = f"{int(row.get('validation_class1_events', 0)):,} actual SR validation data + {int(row.get('validation_class0_events', 0)):,} pure BG simulation"
+        elif canonical == "supervised":
+            training = f"{int(row.get('train_class1_events', 0)):,} pure simulated signal + {int(row.get('train_class0_events', 0)):,} pure simulated background"
+            validation = f"{int(row.get('validation_class1_events', 0)):,} pure simulated signal + {int(row.get('validation_class0_events', 0)):,} pure simulated background"
         reference_count = row.get("generated_reference_samples", row.get("Generated reference events"))
         reference = event_count_text(reference_count, "reference samples") if reference_count not in (None, "") else ""
         background = row.get("evaluation_background", row.get("Evaluation background"))

@@ -117,10 +117,10 @@ python run.py prepare --dataset lhco --catalog config/datasets.yaml --output dat
 ```
 
 
-## Local terminal: RIDDLE, LaCathode, and R-ANODE batch job submission
+## Local terminal: batch job submission
 
-Each block submits one seed-42 job requesting **one A100, 16 CPUs and 64 GiB RAM**.<br>
-Together they use two separate GPU allocations, not a two-GPU request. They may run concurrently and write to separate method directories.
+Each block submits one seed-42 job requesting **exactly one GPU, 16 CPUs and 64 GiB RAM**.<br>
+A100 remains the default accelerator. Separate jobs use separate one-GPU allocations and may run concurrently.
 
 **These examples use `signal_injection` inputs; replace the scenario with `background_only`, or list both scenarios for sequential runs within each job.**
 
@@ -186,11 +186,33 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   | kubectl apply -n cua-asimsek -f -
 ```
 
-For RIDDLE/R-ANODE, `--fits 20` trains one ensemble with twenty signal fits.<br>
-Add `--runs 10` to retrain the complete method ten times, including separate background models; method uncertainty bands use these independent runs.<br>
+**Idealized AD:**
 
-For one combined job instead, request `--methods lacathode riddle ranode` with a different job name.<br>
-Do not submit that alongside these three jobs for the same result identities.
+```bash
+kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
+  python /shared/work/RIDDLE/nrp.py \
+  --name iad-seed42 --methods iad --scenarios signal_injection \
+  --seeds 42 --config config/settings.yaml --workers 5 --io-workers 2 --torch-threads 2 --mps on \
+  --runs 1 --fits 20 --epochs 100 --data data/lhco --results results \
+  | kubectl apply -n cua-asimsek -f -
+```
+
+**Supervised AD:**
+
+```bash
+kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
+  python /shared/work/RIDDLE/nrp.py \
+  --name supervised-seed42 --methods supervised --scenarios signal_injection \
+  --seeds 42 --config config/settings.yaml --workers 5 --io-workers 2 --torch-threads 2 --mps on \
+  --runs 1 --fits 20 --epochs 100 --data data/lhco --results results \
+  | kubectl apply -n cua-asimsek -f -
+```
+
+For RIDDLE/R-ANODE/IAD/Supervised, `--fits 20` trains one ensemble with twenty fits.<br>
+Add `--runs 10` to retrain the complete method ten times; method uncertainty bands use these independent runs.<br>
+
+For one combined RIDDLE benchmark job, request `--methods riddle iad supervised` with a different job name.<br>
+Do not submit that alongside the corresponding standalone jobs for the same result identities.
 
 Optional controls use the preparation commands in `README.md`.<br>
 To submit one later, add `--data data/lhco_shifted --results results_shifted` or `--data data/lhco_deltaR --results results_deltaR` to the generator command and choose a new job name.<br>
@@ -200,7 +222,7 @@ To continue compatible checkpoints after an implementation update, add `--resume
 To continue unfinished training on a different CUDA GPU, add `--resume-across-device-change`.<br>
 Both require `--resume` (already enabled by `nrp.py`) and can be combined.
 
-Add `--gpu l40` or `--gpu l40s` to any `nrp.py` submission, including injection scans and either method. Omitting `--gpu` keeps the existing A100 request.<br>
+Add `--gpu l40` or `--gpu l40s` to any `nrp.py` submission, including injection scans and any method. Omitting `--gpu` keeps the existing A100 request.<br>
 Supported values (case-insensitive): `a100`, `l40`, `l40s`, `l4`, `a40`, `rtxa6000`, `rtx8000`, `rtx3090`, `rtx4090`, `h100`, `h200`.
 
 
@@ -287,17 +309,16 @@ kubectl exec -n cua-asimsek \
 ```bash
 cd /shared/work/RIDDLE
 python scripts/nrp_runtime.py
-
 python plot.py --results results --output plots --verbose 1 --io-workers 16 --overwrite
 
 python paper_plot.py --data data/lhco --results results \
-  --config config/settings.yaml --output paper_plots --scenarios signal_injection background_only \
-  --methods riddle lacathode ranode --variants default deltaR shifted \
+  --config config/settings.yaml --output paper_plots \
+  --methods riddle lacathode ranode iad supervised --variants default deltaR shifted \
   --plot-formats png --file-formats csv --overwrite --verbose 1
 ```
 
 All completed methods are discovered automatically.<br>
-Request either method alone with `--methods lacathode`, `--methods riddle`, or `--methods ranode`.<br>
+Request a method directly with `--methods lacathode`, `--methods riddle`, `--methods ranode`, `--methods iad`, or `--methods supervised`.<br>
 Add `--overwrite` to regenerate matching plots and tables.
 
 
@@ -346,6 +367,28 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   | kubectl apply -n cua-asimsek -f -
 ```
 
+**Idealized AD:**
+
+```bash
+kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
+  python /shared/work/RIDDLE/nrp.py \
+  --workflow scan --name "iad-injection-scan" --methods iad --replicas 0-9 \
+  --config config/settings.yaml --data data/injection_scan --results results_injection_scan \
+  --runs 1 --fits 20 --epochs 100 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
+  | kubectl apply -n cua-asimsek -f -
+```
+
+**Supervised AD:**
+
+```bash
+kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
+  python /shared/work/RIDDLE/nrp.py \
+  --workflow scan --name "supervised-injection-scan" --methods supervised --replicas 0-9 \
+  --config config/settings.yaml --data data/injection_scan --results results_injection_scan \
+  --runs 1 --fits 20 --epochs 100 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
+  | kubectl apply -n cua-asimsek -f -
+```
+
 In Jupyter, plot completed scan results:
 
 ```bash
@@ -353,7 +396,7 @@ python plot.py --results results_injection_scan --output plots_injection_scan --
 
 python paper_plot.py --scan-data data/injection_scan --scan-results results/injection_scan \
   --config config/settings.yaml --output paper_plots \
-  --methods riddle lacathode ranode --variants default deltaR shifted \
+  --methods riddle lacathode ranode iad supervised --variants default deltaR shifted \
   --plot-formats png --file-formats csv --overwrite --verbose 1
 ```
 

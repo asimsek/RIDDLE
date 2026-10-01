@@ -77,7 +77,23 @@ python run.py run --methods ranode --data data/lhco --output results \
   --io-workers 8 --resume
 ```
 
-Run all three methods and both scenarios (`signal_injection`, `background_only`):
+**Idealized AD:** trains a signal-region data-vs-pure-background classifier without using RIDDLE's learned representation.
+
+```bash
+python run.py run --methods iad --data data/lhco --output results \
+  --scenarios signal_injection --seeds 42 --device cuda:0 --runs 1 --fits 20 --epochs 100 \
+  --workers 5 --io-workers 2 --torch-threads 2 --mps on --resume
+```
+
+**Supervised AD:** trains the same classifier architecture on independent pure simulated signal and background samples.
+
+```bash
+python run.py run --methods supervised --data data/lhco --output results \
+  --scenarios signal_injection --seeds 42 --device cuda:0 --runs 1 --fits 20 --epochs 100 \
+  --workers 5 --io-workers 2 --torch-threads 2 --mps on --resume
+```
+
+Run the three original methods and both scenarios (`signal_injection`, `background_only`):
 
 ```bash
 python run.py run --methods lacathode riddle ranode --data data/lhco --output results \
@@ -87,16 +103,16 @@ python run.py run --methods lacathode riddle ranode --data data/lhco --output re
 ```
 
 `--device cpu` for CPU execution.<br>
-`--workers` controls concurrent RIDDLE/R-ANODE signal fits or complete independent LaCathode runs; fixed-background LaCathode stays sequential.<br>
+`--workers` controls concurrent RIDDLE/R-ANODE/IAD/Supervised fits or complete independent LaCathode runs; fixed-background LaCathode stays sequential.<br>
 `--io-workers` controls CPU threads per process.<br>
 MPS is optional on Linux NVIDIA GPUs; `auto` falls back to ordinary concurrency, while `on` requires MPS.
 
-`--fits` controls the signal fits inside each RIDDLE/R-ANODE ensemble.<br>
+`--fits` controls the ensemble fits inside RIDDLE/R-ANODE/IAD/Supervised.<br>
 `--runs` controls complete independent method runs per base seed; default = 1.<br>
 `--epochs` controls signal/classifier epochs.<br>
 `--lacathode-background fixed` shares same LaCathode background flow across `--runs` classifiers; default = `independent`.
 
-For all three methods, to continue compatible checkpoints after an implementation update, add `--resume-across-code-change`.<br>
+For all methods, to continue compatible checkpoints after an implementation update, add `--resume-across-code-change`.<br>
 To continue unfinished training on a different CUDA GPU, add `--resume-across-device-change`.<br>
 Both require `--resume` and can be combined.
 
@@ -118,7 +134,7 @@ python plot.py --results results --output plots --device auto --io-workers 8 --v
 ```
 
 All completed methods are discovered automatically.<br>
-Request either method alone with `--methods lacathode`, `--methods riddle`, or `--methods ranode`.<br>
+Request a method directly with `--methods lacathode`, `--methods riddle`, `--methods ranode`, `--methods iad`, or `--methods supervised`.<br>
 `--plot-workers` controls parallel PDF/PNG export; `--io-workers` controls numerical CPU threads.<br>
 Add `--overwrite` to regenerate matching plots and tables.
 

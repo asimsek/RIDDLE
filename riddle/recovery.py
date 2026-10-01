@@ -226,3 +226,95 @@ class EpochRecovery:
 
     def next_epoch(self, phase):
         return self.next_epochs.get(phase, 0)
+
+def _optimizer_to_device(optimizer, device):
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if isinstance(value, torch.Tensor):
+                state[key] = value.to(device)
+
+
+class ClassifierFitRecovery:
+    def __init__(self, root, identity, resume):
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.resume_root = self.root / ".resume"
+        self.resume_root.mkdir(parents=True, exist_ok=True)
+        self.identity_path = self.resume_root / "identity.json"
+        self.latest_path = self.resume_root / "latest.pt"
+        self.identity = identity
+        if self.identity_path.exists():
+            if not resume:
+                raise FileExistsError("AD baseline fit recovery exists; use --resume")
+            previous = json.loads(self.identity_path.read_text())
+            if previous != identity:
+                raise ValueError("AD baseline fit recovery identity changed")
+        else:
+            write_json(self.identity_path, identity)
+
+    def load(self, model, optimizer, train_loader, val_loader):
+        if not self.latest_path.exists():
+            return 0, [], [], []
+        state = torch.load(self.latest_path, map_location="cpu", weights_only=False)
+        if state.get("identity") != self.identity:
+            raise ValueError("AD baseline recovery state identity changed")
+        model.load_state_dict(state["model"])
+        optimizer.load_state_dict(state["optimizer"])
+        _optimizer_to_device(optimizer, next(model.parameters()).device)
+        if train_loader.generator is not None:
+            train_loader.generator.set_state(state["train_generator"])
+        if val_loader.generator is not None and state.get("val_generator") is not None:
+            val_loader.generator.set_state(state["val_generator"])
+        restore_rng(state["rng"])
+        candidates = list(state.get("candidates", []))
+        for candidate in candidates:
+            path = self.root / candidate["filename"]
+            if not path.is_file() or file_digest(path) != candidate["sha256"]:
+                raise ValueError("AD baseline selected checkpoint recovery artifact changed")
+        return int(state["next_epoch"]), list(state["train_bce"]), list(state["validation_bce"]), candidates
+
+    def offer_candidate(self, epoch, validation_bce, model, candidates, selected):
+        key = (float(validation_bce), int(epoch))
+        ordered = sorted(candidates, key=lambda item: (item["validation_bce"], item["epoch"]))
+        if len(ordered) >= selected and key >= (ordered[-1]["validation_bce"], ordered[-1]["epoch"]):
+            return ordered
+        filename = f"checkpoints/epoch_{epoch:03d}.pt"
+        payload = {
+            "epoch": int(epoch),
+            "validation_bce": float(validation_bce),
+            "model": _cpu_state_dict(model),
+        }
+        checksum = atomic_torch_save(self.root / filename, payload)
+        ordered.append({"epoch": int(epoch), "validation_bce": float(validation_bce), "filename": filename, "sha256": checksum})
+        ordered.sort(key=lambda item: (item["validation_bce"], item["epoch"]))
+        while len(ordered) > selected:
+            removed = ordered.pop()
+            (self.root / removed["filename"]).unlink(missing_ok=True)
+        return ordered
+
+    def save_epoch(self, next_epoch, model, optimizer, train_loader, val_loader, train_bce, validation_bce, candidates):
+        state = {
+            "identity": self.identity,
+            "next_epoch": int(next_epoch),
+            "model": _cpu_state_dict(model),
+            "optimizer": optimizer.state_dict(),
+            "train_generator": train_loader.generator.get_state() if train_loader.generator is not None else None,
+            "val_generator": val_loader.generator.get_state() if val_loader.generator is not None else None,
+            "rng": rng_state(),
+            "train_bce": list(train_bce),
+            "validation_bce": list(validation_bce),
+            "candidates": list(candidates),
+        }
+        atomic_torch_save(self.latest_path, state)
+
+    def complete(self, train_bce, validation_bce, candidates, receipt):
+        save_array(self.root / "train_bce.npy", np.asarray(train_bce, dtype=np.float64))
+        save_array(self.root / "validation_bce.npy", np.asarray(validation_bce, dtype=np.float64))
+        receipt = {
+            **receipt,
+            "train_bce_sha256": file_digest(self.root / "train_bce.npy"),
+            "validation_bce_sha256": file_digest(self.root / "validation_bce.npy"),
+            "selected_checkpoints": list(candidates),
+        }
+        write_json(self.root / "fit.json", receipt)
+        return receipt

@@ -139,8 +139,12 @@ def build_dataset_roles(
         )
     if not len(background):
         raise RuntimeError("Dataset does not contain any background events")
-    if enforce_expected_counts and len(signal) < spec.injected_signal_rows:
-        raise RuntimeError("Dataset has too few signal rows for the configured injection")
+    if enforce_expected_counts and len(signal) < spec.injection_reservoir_rows:
+        raise RuntimeError("Dataset has too few signal rows for the configured injection reservoir")
+    if spec.injected_signal_rows > spec.injection_reservoir_rows:
+        raise RuntimeError("Injected signal count exceeds the fixed injection reservoir")
+    if not 0.0 < spec.signal_training_fraction < 1.0:
+        raise RuntimeError("Signal training fraction must lie strictly between zero and one")
     background_partition = partition_labels(len(background))
     signal_region = np.asarray(arrays["is_signal_region"], dtype=bool)
     final_background = background[background_partition == "final_test"]
@@ -175,6 +179,20 @@ def build_dataset_roles(
         extra_order = extra_order[extra_signal_region[extra_order]]
         if len(extra_order) <= spec.sic_background_validation_stop:
             raise RuntimeError("The dedicated SIC background source is too small after the signal-region cut")
+        reserved_background = extra_order[: spec.sic_background_validation_stop]
+        background_train_stop = len(reserved_background) // 2
+        if background_train_stop == 0 or background_train_stop == len(reserved_background):
+            raise RuntimeError("The dedicated background reservation cannot be split for classifier training")
+        roles["baseline_background_train"] = _take(
+            sic_background_arrays,
+            reserved_background[:background_train_stop],
+            np.full(background_train_stop, "baseline_training", dtype="U24"),
+        )
+        roles["baseline_background_val"] = _take(
+            sic_background_arrays,
+            reserved_background[background_train_stop:],
+            np.full(len(reserved_background) - background_train_stop, "baseline_validation", dtype="U24"),
+        )
         extra_test = extra_order[spec.sic_background_validation_stop :]
         primary_test_sr = final_background[signal_region[final_background]]
         primary_role = _take(
@@ -186,30 +204,43 @@ def build_dataset_roles(
         roles["sic_evaluation_background"] = {
             name: np.concatenate((primary_role[name], extra_role[name])) for name in EVENT_COLUMNS
         }
-    evaluation_signal_background_only = signal[signal_region[signal]]
-    if len(evaluation_signal_background_only):
-        roles["sic_evaluation_signal_background_only"] = _take(
-            arrays,
-            evaluation_signal_background_only,
-            np.full(len(evaluation_signal_background_only), "sic_evaluation", dtype="U16"),
+    reservoir = signal[: spec.injection_reservoir_rows]
+    roles["injection_reservoir"] = _take(
+        arrays, reservoir, np.full(len(reservoir), "injection_reservoir", dtype="U24")
+    )
+    remaining_signal = signal[spec.injection_reservoir_rows :]
+    remaining_signal_sr = remaining_signal[signal_region[remaining_signal]]
+    if len(remaining_signal_sr) <= spec.signal_simulation_rows:
+        raise RuntimeError(
+            "Insufficient signal-region simulation after injection-reservoir removal for the configured classifier pool and final evaluation"
         )
+    simulation_signal = remaining_signal_sr[: spec.signal_simulation_rows]
+    signal_train_stop = int(round(len(simulation_signal) * spec.signal_training_fraction))
+    if signal_train_stop <= 0 or signal_train_stop >= len(simulation_signal):
+        raise RuntimeError("The configured signal simulation split leaves an empty training or validation pool")
+    roles["baseline_signal_train"] = _take(
+        arrays,
+        simulation_signal[:signal_train_stop],
+        np.full(signal_train_stop, "baseline_training", dtype="U24"),
+    )
+    roles["baseline_signal_val"] = _take(
+        arrays,
+        simulation_signal[signal_train_stop:],
+        np.full(len(simulation_signal) - signal_train_stop, "baseline_validation", dtype="U24"),
+    )
+    evaluation_signal = remaining_signal_sr[spec.signal_simulation_rows :]
+    roles["sic_evaluation_signal_background_only"] = _take(
+        arrays, evaluation_signal, np.full(len(evaluation_signal), "sic_evaluation", dtype="U16")
+    )
     if len(signal) >= spec.injected_signal_rows and spec.injected_signal_rows > 0:
-        injected = signal[: spec.injected_signal_rows]
+        injected = reservoir[: spec.injected_signal_rows]
         injected_partition = partition_labels(len(injected))
         injection_indices = np.concatenate((background, injected))
         injection_partition = np.concatenate((background_partition, injected_partition))
         roles["signal_injection"] = _take(arrays, injection_indices, injection_partition)
-        injected_final_start = 2 * spec.injected_signal_rows // 3
-        evaluation_signal_injection = np.concatenate(
-            (injected[injected_final_start:], signal[spec.injected_signal_rows :])
+        roles["sic_evaluation_signal_signal_injection"] = _take(
+            arrays, evaluation_signal, np.full(len(evaluation_signal), "sic_evaluation", dtype="U16")
         )
-        evaluation_signal_injection = evaluation_signal_injection[signal_region[evaluation_signal_injection]]
-        if len(evaluation_signal_injection):
-            roles["sic_evaluation_signal_signal_injection"] = _take(
-                arrays,
-                evaluation_signal_injection,
-                np.full(len(evaluation_signal_injection), "sic_evaluation", dtype="U16"),
-            )
     return roles
 
 

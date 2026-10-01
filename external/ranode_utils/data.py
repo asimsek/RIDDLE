@@ -72,12 +72,15 @@ def validate(root):
         raise ValueError(
             "R-ANODE dedicated evaluation sources have inconsistent truth labels"
         )
-    if meta.get("schema") == 2:
+    if meta.get("schema") in (2, 3):
         identity_path = root / "event_ids.npz"
         if digest(identity_path) != meta.get("event_ids_sha256"):
             raise ValueError("R-ANODE event identity hash mismatch")
         with np.load(identity_path, allow_pickle=False) as archive:
-            if set(archive.files) != set(FILES):
+            identity_names = set(archive.files)
+            if (meta.get("schema") == 2 and identity_names != set(FILES)) or (
+                meta.get("schema") == 3 and not set(FILES) <= identity_names
+            ):
                 raise ValueError("Incomplete R-ANODE event identity archive")
             identities = []
             for name in FILES:

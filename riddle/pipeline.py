@@ -415,3 +415,229 @@ def run(args, contract):
                 "bookkeeping": "Cached background log density is never passed to the signal network"} if physical_inputs else {}),
         },
     )
+
+def classifier_population_signature(populations):
+    return {name: {key: value[key] for key in ("events", "data_sha256", "event_ids_sha256")} for name, value in populations.items()}
+
+
+def reusable_classifier_candidate(candidate, method, classifier, populations, preprocessing, scientific_seed, run_index):
+    from pathlib import Path
+    from baselines import SCIENTIFIC_VERSION
+    from .storage import verify_artifacts
+
+    candidate = Path(candidate)
+    result_path = candidate / "result.json"
+    protocol_path = candidate / "protocol.json"
+    populations_path = candidate / "training" / "populations.json"
+    prep_path = candidate / "training" / "preprocessing.json"
+    if not all(path.is_file() for path in (result_path, protocol_path, populations_path, prep_path)):
+        return False
+    result = json.loads(result_path.read_text())
+    protocol = json.loads(protocol_path.read_text())
+    saved_populations = json.loads(populations_path.read_text())
+    saved_prep = json.loads(prep_path.read_text())
+    if result.get("completed") is not True or result.get("method") != method:
+        return False
+    if int(result.get("seed", -1)) != int(scientific_seed) or int(result.get("run_index", -1)) != int(run_index):
+        return False
+    try:
+        verify_artifacts(candidate, result["artifacts_sha256"], label="Verify reusable supervised result")
+    except (KeyError, OSError, ValueError):
+        return False
+    if protocol.get("scientific_version") != SCIENTIFIC_VERSION or protocol.get("classifier") != classifier:
+        return False
+    expected = {
+        "train_class1": saved_populations["training"]["class1"],
+        "train_class0": saved_populations["training"]["class0"],
+        "val_class1": saved_populations["validation"]["class1"],
+        "val_class0": saved_populations["validation"]["class0"],
+    }
+    if classifier_population_signature(expected) != classifier_population_signature(populations):
+        return False
+    for key in ("rule", "feature_order", "input_dimension", "include_mass", "mean_sha256", "std_sha256"):
+        if saved_prep.get(key) != preprocessing.get(key):
+            return False
+    return True
+
+
+def reuse_supervised_classifier(candidates, training_root, classifier, populations, preprocessing, scientific_seed, run_index):
+    from pathlib import Path
+    import shutil
+
+    for candidate in candidates or ():
+        candidate = Path(candidate)
+        if not reusable_classifier_candidate(candidate, "supervised", classifier, populations, preprocessing, scientific_seed, run_index):
+            continue
+        source = candidate / "training"
+        for path in sorted(source.glob("fit_*")):
+            destination = training_root / path.name
+            if not destination.exists():
+                shutil.copytree(path, destination)
+        return {
+            "source_result": str(candidate),
+            "source_result_sha256": file_digest(candidate / "result.json"),
+            "population_signature": classifier_population_signature(populations),
+        }
+    return None
+
+
+def accepted_classifier_fits(receipts):
+    accepted = [receipt for receipt in receipts if receipt["status"] == "completed"]
+    if not accepted:
+        raise RuntimeError("AD baseline has no valid classifier fits after bounded retries")
+    return accepted
+
+
+def classifier_fit_provenance(receipt):
+    result = {
+        "fit_index": int(receipt["fit_index"]),
+        "status": receipt["status"],
+        "failures": list(receipt.get("failures", [])),
+    }
+    if receipt["status"] == "completed":
+        result.update(
+            fit_seed=int(receipt["fit_seed"]),
+            attempt=int(receipt["attempt"]),
+            selected_checkpoints=[
+                {
+                    "epoch": int(item["epoch"]),
+                    "validation_bce": float(item["validation_bce"]),
+                    "filename": item["filename"],
+                    "sha256": item["sha256"],
+                }
+                for item in receipt["selected_checkpoints"]
+            ],
+        )
+    else:
+        result["reason"] = receipt.get("reason")
+    return result
+
+
+def aggregate_classifier_histories(training_root, accepted):
+    from pathlib import Path
+    from .storage import save_array
+
+    train = []
+    validation = []
+    for receipt in accepted:
+        attempt = Path(training_root) / f"fit_{receipt['fit_index']:03d}" / receipt["attempt_directory"]
+        train.append(np.load(attempt / "train_bce.npy", allow_pickle=False))
+        validation.append(np.load(attempt / "validation_bce.npy", allow_pickle=False))
+    train = np.asarray(train, dtype=np.float64)
+    validation = np.asarray(validation, dtype=np.float64)
+    save_array(Path(training_root) / "train_bce.npy", train)
+    save_array(Path(training_root) / "validation_bce.npy", validation)
+    return train, validation
+
+
+def run_classifier_baseline(args, contract, method):
+    from pathlib import Path
+    from baselines import LABELS, SCIENTIFIC_VERSION
+    from .data import prepare_baseline_training_cache
+    from .parallel import run_classifier_fits
+    from .production import score_classifier_partitions
+
+    if method not in LABELS:
+        raise ValueError("Unknown AD baseline method")
+    classifier = dict(args.settings["ad_baselines"]["classifier"])
+    output = Path(args.output)
+    training_root = output / "training"
+    resume_root = training_root / ".resume"
+    resume_root.mkdir(parents=True, exist_ok=True)
+    write_json(resume_root / "contract.json", contract)
+    manifest = contract["inputs"]
+    cache, preprocessing, populations = prepare_baseline_training_cache(method, args.data, training_root, classifier, manifest)
+    reuse = None
+    if method == "supervised":
+        reuse = reuse_supervised_classifier(
+            getattr(args, "supervised_reuse_candidates", None),
+            training_root,
+            classifier,
+            populations,
+            preprocessing,
+            args.seed,
+            getattr(args, "run_index", 0),
+        )
+    receipts = run_classifier_fits(
+        method,
+        cache,
+        training_root,
+        classifier,
+        args.seed,
+        getattr(args, "run_index", 0),
+        args.device,
+        getattr(args, "effective_workers", args.workers),
+        args.torch_threads,
+        args.resume or reuse is not None,
+    )
+    accepted = accepted_classifier_fits(receipts)
+    fit_members = [classifier_fit_provenance(receipt) for receipt in receipts]
+    train_bce, validation_bce = aggregate_classifier_histories(training_root, accepted)
+    write_json(training_root / "ensemble.json", {
+        "schema": 1,
+        "method": method,
+        "requested_fits": int(classifier["fits"]),
+        "accepted_fits": len(accepted),
+        "accepted_fit_indices": [int(receipt["fit_index"]) for receipt in accepted],
+        "accepted_fit_seeds": [int(receipt["fit_seed"]) for receipt in accepted],
+        "excluded_fit_indices": [int(receipt["fit_index"]) for receipt in receipts if receipt["status"] != "completed"],
+        "ensemble_fit_selection": classifier["ensemble_fit_selection"],
+        "checkpoint_selection": classifier["checkpoint_selection"],
+        "selected_checkpoints": int(classifier["selected_checkpoints"]),
+        "ensemble": classifier["ensemble"],
+        "fit_members": fit_members,
+        "reuse": reuse,
+    })
+    scoring = score_classifier_partitions(method, args.data, output, training_root, classifier, accepted, args.device, args.resume or reuse is not None)
+    protocol = {
+        "schema": 1,
+        "method": method,
+        "public_label": LABELS[method],
+        "scientific_version": SCIENTIFIC_VERSION,
+        "dataset_variant": manifest.get("variant", "default"),
+        "scenario": args.scenario,
+        "score_scope": classifier["score_scope"],
+        "score_kind": "classifier_probability",
+        "fit_score_kind": "classifier_probability",
+        "classifier": classifier,
+        "checkpoint_selection": classifier["checkpoint_selection"],
+        "selected_checkpoints_per_fit": int(classifier["selected_checkpoints"]),
+        "ensemble_rule": classifier["ensemble"],
+        "ensemble_fit_selection": classifier["ensemble_fit_selection"],
+        "preprocessing_rule": classifier["preprocessing"],
+        "class_balance": classifier["class_balance"],
+        "architecture": {"hidden_layers": classifier["hidden_layers"], "activation": classifier["activation"], "output": "single_logit"},
+        "optimizer": {"name": classifier["optimizer"], "learning_rate": classifier["learning_rate"]},
+        "loss": "BCEWithLogitsLoss",
+        "saved_prediction": "sigmoid_probability",
+        "preprocessing": preprocessing,
+        "training_populations": classifier_population_signature(populations),
+        "truth_blind_training": method == "iad",
+        "truth_supervised_training": method == "supervised",
+        "data_class_definition": "actual signal-region mock data regardless of hidden truth" if method == "iad" else None,
+        "simulation_background_class_definition": "dedicated pure-background signal-region simulation" if method == "iad" else None,
+        "signal_simulation_source": populations["train_class1"] if method == "supervised" else None,
+        "background_simulation_source": populations["train_class0"] if method == "supervised" else None,
+        "accepted_fit_indices": scoring["accepted_fit_indices"],
+        "accepted_fit_seeds": scoring["accepted_fit_seeds"],
+        "fit_members": fit_members,
+        "feature_order": scoring["feature_order"],
+        "include_mass": bool(classifier["include_mass"]),
+        "evaluation_population_hashes": scoring["evaluation_population_hashes"],
+        "training_history_sha256": {
+            "train_bce": file_digest(training_root / "train_bce.npy"),
+            "validation_bce": file_digest(training_root / "validation_bce.npy"),
+        },
+        "reuse": reuse,
+    }
+    write_json(output / "protocol.json", protocol)
+    write_json(output / "method_health.json", {
+        "schema": 1,
+        "status": "passed",
+        "requested_fits": int(classifier["fits"]),
+        "accepted_fits": len(accepted),
+        "excluded_fits": int(classifier["fits"] - len(accepted)),
+        "training_bce_final_mean": float(train_bce[:, -1].mean()),
+        "validation_bce_final_mean": float(validation_bce[:, -1].mean()),
+    })
+    return protocol

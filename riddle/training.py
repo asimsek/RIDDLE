@@ -2,12 +2,13 @@ import json
 import math
 from pathlib import Path
 import random
+import time
 import numpy as np
 import torch
 from copy import deepcopy
 from .settings import DEFAULTS, validate_residual
 from riddle.worker_progress import ProgressStage
-from riddle.storage import atomic_torch_save, write_json, digest, file_digest, rng_state, restore_rng, persist_boundary
+from riddle.storage import atomic_torch_save, write_json, digest, file_digest, rng_state, restore_rng, persist_boundary, seed_start
 from .model import (
     build_signal_flow,
     initial_fraction_logit,
@@ -1050,3 +1051,226 @@ def residual_background_sample(output, contexts, count, seed, device, batch_size
     rng = np.random.default_rng(seed)
     latent = rng.standard_normal((count, features-1)).astype(np.float32)
     return np.column_stack((latent, contexts)).astype(np.float32)
+
+class BinaryClassifier(torch.nn.Module):
+    def __init__(self, input_dim, hidden_layers):
+        super().__init__()
+        layers = []
+        width = int(input_dim)
+        for hidden in hidden_layers:
+            layers.extend((torch.nn.Linear(width, int(hidden)), torch.nn.ReLU()))
+            width = int(hidden)
+        layers.append(torch.nn.Linear(width, 1))
+        self.network = torch.nn.Sequential(*layers)
+
+    def forward(self, inputs):
+        return self.network(inputs).squeeze(-1)
+
+
+def build_binary_classifier(input_dim, settings):
+    if settings["activation"] != "relu":
+        raise ValueError("Only relu is supported for the AD baseline classifier")
+    return BinaryClassifier(input_dim, settings["hidden_layers"])
+
+
+def baseline_method_code(method):
+    return {"iad": 1729, "supervised": 3253}[method]
+
+
+def baseline_fit_seed(scientific_seed, run_index, fit_index, method, attempt=0):
+    return int(np.random.SeedSequence([int(scientific_seed), int(run_index), int(fit_index), baseline_method_code(method), int(attempt)]).generate_state(1)[0])
+
+
+def classifier_fit_identity(method, scientific_seed, run_index, fit_index, attempt, seed, classifier, cache_contract_sha256):
+    return {
+        "schema": 1,
+        "method": method,
+        "scientific_seed": int(scientific_seed),
+        "run_index": int(run_index),
+        "fit_index": int(fit_index),
+        "attempt": int(attempt),
+        "fit_seed": int(seed),
+        "classifier": classifier,
+        "cache_contract_sha256": cache_contract_sha256,
+    }
+
+
+def classifier_loaders(cache, classifier, seed):
+    from .data import load_baseline_training_cache
+
+    arrays = load_baseline_training_cache(cache)
+    tensors = [torch.from_numpy(np.asarray(array).copy()) for array in arrays]
+    train_dataset = torch.utils.data.TensorDataset(tensors[0], tensors[1], tensors[2])
+    val_dataset = torch.utils.data.TensorDataset(tensors[3], tensors[4], tensors[5])
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int(seed))
+    validation_generator = torch.Generator(device="cpu")
+    validation_generator.manual_seed((int(seed) + 1) % 2**63)
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=classifier["batch_size"],
+        shuffle=True,
+        generator=generator,
+        num_workers=0,
+        pin_memory=False,
+    )
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset,
+        batch_size=classifier["batch_size"],
+        shuffle=False,
+        generator=validation_generator,
+        num_workers=0,
+        pin_memory=False,
+    )
+    return train_loader, val_loader, tensors[0].shape[1]
+
+
+def classifier_loss_epoch(model, loader, device, optimizer=None):
+    training = optimizer is not None
+    model.train(training)
+    loss_sum = 0.0
+    weight_sum = 0.0
+    criterion = torch.nn.BCEWithLogitsLoss(reduction="none")
+    context = torch.enable_grad() if training else torch.no_grad()
+    with context:
+        for features, targets, weights in loader:
+            if features.device != device:
+                features = features.to(device)
+                targets = targets.to(device)
+                weights = weights.to(device)
+            if training:
+                optimizer.zero_grad(set_to_none=True)
+            logits = model(features).reshape(-1)
+            per_event = criterion(logits, targets)
+            weighted = per_event * weights
+            loss = weighted.sum() / weights.sum()
+            if not torch.isfinite(loss):
+                raise FloatingPointError("Nonfinite AD baseline BCE")
+            if training:
+                loss.backward()
+                optimizer.step()
+            loss_sum += float(weighted.detach().sum().cpu())
+            weight_sum += float(weights.detach().sum().cpu())
+    value = loss_sum / weight_sum
+    if not math.isfinite(value):
+        raise FloatingPointError("Nonfinite AD baseline epoch BCE")
+    return value
+
+
+def verify_completed_classifier_fit(root, identity):
+    path = Path(root) / "fit.json"
+    if not path.is_file():
+        return None
+    saved = json.loads(path.read_text())
+    if saved.get("identity") != identity or saved.get("status") != "completed":
+        raise ValueError("AD baseline completed fit identity changed")
+    for candidate in saved.get("selected_checkpoints", []):
+        checkpoint = Path(root) / candidate["filename"]
+        if not checkpoint.is_file() or file_digest(checkpoint) != candidate["sha256"]:
+            raise ValueError("AD baseline completed checkpoint changed")
+    for name, key in (("train_bce.npy", "train_bce_sha256"), ("validation_bce.npy", "validation_bce_sha256")):
+        if file_digest(Path(root) / name) != saved[key]:
+            raise ValueError("AD baseline completed training history changed")
+    return saved
+
+
+def train_classifier_attempt(method, cache, root, classifier, scientific_seed, run_index, fit_index, attempt, device, resume):
+    from .acceleration import install_tensor_batches
+    from .recovery import ClassifierFitRecovery
+    from .worker_progress import emit_progress
+
+    device = torch.device(device)
+    seed = baseline_fit_seed(scientific_seed, run_index, fit_index, method, attempt)
+    cache_contract_sha256 = file_digest(Path(cache) / "contract.json")
+    identity = classifier_fit_identity(method, scientific_seed, run_index, fit_index, attempt, seed, classifier, cache_contract_sha256)
+    completed = verify_completed_classifier_fit(root, identity)
+    if completed is not None:
+        return completed
+    seed_start(seed)
+    train_loader, val_loader, inputs = classifier_loaders(cache, classifier, seed)
+    install_tensor_batches(device)
+    model = build_binary_classifier(inputs, classifier).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=classifier["learning_rate"])
+    recovery = ClassifierFitRecovery(root, identity, resume)
+    start_epoch, train_history, validation_history, candidates = recovery.load(model, optimizer, train_loader, val_loader)
+    started = time.monotonic()
+    for epoch in range(start_epoch, classifier["epochs"]):
+        train_bce = classifier_loss_epoch(model, train_loader, device, optimizer)
+        validation_bce = classifier_loss_epoch(model, val_loader, device)
+        train_history.append(train_bce)
+        validation_history.append(validation_bce)
+        candidates = recovery.offer_candidate(epoch, validation_bce, model, candidates, classifier["selected_checkpoints"])
+        recovery.save_epoch(epoch + 1, model, optimizer, train_loader, val_loader, train_history, validation_history, candidates)
+        emit_progress(
+            "ad_baseline_training",
+            f"{method} fit {fit_index + 1}",
+            total=classifier["epochs"],
+            completed=epoch + 1,
+            initial=start_epoch,
+            unit="epoch",
+            report_every=1,
+            train_bce=train_bce,
+            validation_bce=validation_bce,
+        )
+    if len(candidates) != classifier["selected_checkpoints"]:
+        raise ValueError("AD baseline checkpoint selection is incomplete")
+    return recovery.complete(
+        train_history,
+        validation_history,
+        candidates,
+        {
+            "schema": 1,
+            "status": "completed",
+            "identity": identity,
+            "fit_index": int(fit_index),
+            "fit_seed": int(seed),
+            "epochs": int(classifier["epochs"]),
+            "checkpoint_selection": classifier["checkpoint_selection"],
+            "elapsed_seconds": float(time.monotonic() - started),
+        },
+    )
+
+
+def train_classifier_fit(method, cache, fit_root, classifier, scientific_seed, run_index, fit_index, device, resume):
+    fit_root = Path(fit_root)
+    failures = []
+    for attempt in range(classifier["max_retries"] + 1):
+        root = fit_root / f"attempt_{attempt:03d}"
+        failure_path = root / "failure.json"
+        if resume and failure_path.is_file():
+            failures.append(json.loads(failure_path.read_text()))
+            continue
+        try:
+            receipt = train_classifier_attempt(method, cache, root, classifier, scientific_seed, run_index, fit_index, attempt, device, resume)
+            summary = {
+                "schema": 1,
+                "status": "completed",
+                "fit_index": int(fit_index),
+                "fit_seed": int(receipt["fit_seed"]),
+                "attempt": int(attempt),
+                "attempt_directory": f"attempt_{attempt:03d}",
+                "selected_checkpoints": receipt["selected_checkpoints"],
+                "failures": failures,
+            }
+            write_json(fit_root / "fit.json", summary)
+            return summary
+        except FloatingPointError as error:
+            failures.append({"attempt": int(attempt), "error_type": type(error).__name__, "error": str(error)})
+            write_json(root / "failure.json", failures[-1])
+        except Exception as error:
+            write_json(root / "error.json", {
+                "attempt": int(attempt),
+                "error_type": type(error).__name__,
+                "error": str(error),
+                "retryable": False,
+            })
+            raise
+    summary = {
+        "schema": 1,
+        "status": "excluded",
+        "fit_index": int(fit_index),
+        "reason": "numerical_retry_budget_exhausted",
+        "failures": failures,
+    }
+    write_json(fit_root / "fit.json", summary)
+    return summary

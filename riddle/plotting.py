@@ -60,6 +60,8 @@ BUILTINS = {
     "lacathode": PlotMethod("LaCathode", "#0072B2", "-", "#CC79A7"),
     "riddle": PlotMethod("RIDDLE", "#D55E00", "--", "#009E73", "sigmoid"),
     "ranode": PlotMethod("R-ANODE", "#8B1A1A", "-.", "#56B4E9", "sigmoid", "signal_region"),
+    "iad": PlotMethod("Idealized AD", "#56B4E9", "-", "#0072B2", "identity", "signal_region"),
+    "supervised": PlotMethod("Supervised AD", "#009E73", "-", "#00543E", "identity", "signal_region"),
 }
 # Canonicalize mass-conditioned RIDDLE IDs onto the shared plotting path.
 
@@ -176,9 +178,11 @@ def register_method(report):
     return spec
 
 
-KEYS = {"lacathode": "raw", "riddle": "residual", "ranode": "ranode"}
+KEYS = {"lacathode": "raw", "riddle": "residual", "ranode": "ranode", "iad": "iad", "supervised": "supervised"}
 STYLES = dict(f.METHODS)
 STYLES["ranode"] = ("R-ANODE", "#8B1A1A", "-.")
+STYLES["iad"] = ("Idealized AD", BUILTINS["iad"].color, "-")
+STYLES["supervised"] = ("Supervised AD", BUILTINS["supervised"].color, "-")
 
 
 
@@ -188,6 +192,11 @@ POPULATION_STYLES["ranode"] = {
     0: (BUILTINS["ranode"].color, "-"),
     1: (BUILTINS["ranode"].signal_color, "--"),
 }
+for _method in ("iad", "supervised"):
+    POPULATION_STYLES[_method] = {
+        0: (BUILTINS[_method].color, "-"),
+        1: (BUILTINS[_method].signal_color, "--"),
+    }
 
 
 PHYSICAL_STYLES = {method: spec.style for method, spec in METHOD_SPECS.items()}
@@ -447,7 +456,8 @@ def load_scores(root, report, name, *, attempt=None, for_rebuild=False):
             if "background_log_density" in archive:
                 data["background_log_density"] = archive["background_log_density"]
         for key in ("raw_scores", "score_kind", "fit_score_kind", "event_ids",
-                    "preprocessing_mask", "score_domain_mask", "score_scope"):
+                    "preprocessing_mask", "score_domain_mask", "score_scope",
+                    "accepted_fit_indices", "accepted_fit_seeds"):
             if key in archive:
                 data[key] = archive[key]
         if "fit_scores" in archive:
@@ -1744,6 +1754,7 @@ def event_size_rows(groups, score_loader, *, data_root=None):
             evaluation_background, evaluation_signal = _event_eval_counts(root, report, score_loader)
             base = dict(
                 method=METHOD_SPECS[method].label,
+                method_id=method,
                 scenario=scenario,
                 variant=variant,
                 scientific_protocol=protocol,
@@ -1819,6 +1830,28 @@ def event_size_rows(groups, score_loader, *, data_root=None):
                              "generated_reference_samples": "",
                              "notes": f"{selection.get('accepted_runs', selection.get('valid_runs', ''))}/{selection.get('requested_runs', '')} safeguard-valid fits; "
                                       f"{selection.get('valid_runs', '')} ensemble fits; {selection.get('selected_checkpoints', '')} selected checkpoints"})
+            elif method in ("iad", "supervised"):
+                populations = read_metadata(root, report, "training/populations.json")
+                ensemble = read_metadata(root, report, "training/ensemble.json")
+                train_class1 = populations.get("training", {}).get("class1", {})
+                train_class0 = populations.get("training", {}).get("class0", {})
+                val_class1 = populations.get("validation", {}).get("class1", {})
+                val_class0 = populations.get("validation", {}).get("class0", {})
+                train_events = int(train_class1.get("events", 0)) + int(train_class0.get("events", 0))
+                validation_events = int(val_class1.get("events", 0)) + int(val_class0.get("events", 0))
+                train_sample = ("actual SR data + pure BG simulation" if method == "iad"
+                                else "pure simulated signal + pure simulated background")
+                validation_sample = ("actual SR validation data + pure BG simulation" if method == "iad"
+                                     else "pure simulated signal + pure simulated background")
+                rows.append({**base, "component": "Classifier", "model_type": "classifier",
+                             "train_events": train_events, "train_sample": train_sample,
+                             "train_class1_events": int(train_class1.get("events", 0)),
+                             "train_class0_events": int(train_class0.get("events", 0)),
+                             "validation_events": validation_events, "validation_sample": validation_sample,
+                             "validation_class1_events": int(val_class1.get("events", 0)),
+                             "validation_class0_events": int(val_class0.get("events", 0)),
+                             "generated_reference_samples": "",
+                             "notes": f"{ensemble.get('accepted_fits', '')}/{ensemble.get('requested_fits', '')} accepted fits; {ensemble.get('selected_checkpoints', '')} selected checkpoints/fit"})
             elif method == "lacathode":
                 metadata = read_metadata(root, report, "protocol.json")
                 rows.append({**base, "component": "Background flow", "model_type": "density estimator",
@@ -2382,7 +2415,7 @@ def summary_figures(bundles, output, args, *, view="comparison"):
                 if key not in scores or len(np.unique(labels)) != 2:
                     continue
                 record = bundle["evaluation"]["signal_region"][key]
-                method = "lacathode" if key == "raw" else "riddle"
+                method = next((name for name, plot_key in KEYS.items() if plot_key == key), key)
                 for fit, score_group in enumerate(run_score_groups(method, record)):
                     per_fit = []
                     for score in score_group:
@@ -2435,7 +2468,7 @@ def summary_figures(bundles, output, args, *, view="comparison"):
                 if np.any(full == 0):
                     continue
                 record = bundle["evaluation"]["test"][key]
-                method = "lacathode" if key == "raw" else "riddle"
+                method = next((name for name, plot_key in KEYS.items() if plot_key == key), key)
                 for fit, score_group in enumerate(run_score_groups(method, record)):
                     per_fit = []
                     for scores in score_group:

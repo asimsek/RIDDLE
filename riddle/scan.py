@@ -73,10 +73,16 @@ def prepare_scan(args):
         if not pending:
             return
         primary, extra, by_source, provenance = read_sources(args, root, args.variant)
+        prepared_settings = load_settings(args.config)
+        baseline_data = prepared_settings["ad_baselines"]["data"]
+        reservoir_rows = max(prepared_settings["injection_scan"]["signal_events"])
         for point in pending:
             spec = replace(
                 DatasetSpec(),
                 injected_signal_rows=point["signal_events"],
+                injection_reservoir_rows=reservoir_rows,
+                signal_simulation_rows=baseline_data["signal_simulation_events"],
+                signal_training_fraction=baseline_data["signal_training_fraction"],
                 preparation_seed=point["preparation_seed"],
             )
             roles = build_dataset_roles(
@@ -245,6 +251,32 @@ def _riddle_background_candidates(output_root, point, variant, current_point):
     return [source for _, source in candidates]
 
 
+
+def _supervised_candidates(output_root, point, variant, current_point):
+    candidates = []
+    seen = set()
+    for root in _candidate_roots(output_root):
+        for report_path in root.rglob("result.json"):
+            source = report_path.parent.resolve()
+            if source in seen or source == current_point.resolve() or current_point.resolve() in source.parents:
+                continue
+            try:
+                report = json.loads(report_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            if report.get("method") != "supervised" or report.get("completed") is not True or report.get("scenario") != "signal_injection":
+                continue
+            source_variant = report.get("variant", report.get("contract", {}).get("inputs", {}).get("variant", "default"))
+            scan = report.get("contract", {}).get("inputs", {}).get("injection_scan")
+            if source_variant != variant or not isinstance(scan, dict) or scan.get("replica") != point["replica"]:
+                continue
+            if not (source / "training" / "ensemble.json").is_file():
+                continue
+            seen.add(source)
+            candidates.append((abs(int(scan.get("signal_events", 0)) - int(point["signal_events"])), str(source)))
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return [source for _, source in candidates]
+
 def run_scan(args):
     from .cli import run_campaign
 
@@ -255,6 +287,7 @@ def run_scan(args):
         manifest = validate(
             data_root / point_name(point) / "signal_injection",
             require_event_ids="riddle" in args.methods,
+            require_baseline=any(method in args.methods for method in ("iad", "supervised")),
         )
         if manifest.get("injection_scan") != point:
             raise ValueError(
@@ -266,7 +299,7 @@ def run_scan(args):
         options.output = output_root / point_name(point)
         options.scenarios = ["signal_injection"]
         options.seeds = [point["training_seed"]]
-        manifest = validate(options.data / "signal_injection", require_event_ids="riddle" in args.methods)
+        manifest = validate(options.data / "signal_injection", require_event_ids="riddle" in args.methods, require_baseline=any(method in args.methods for method in ("iad", "supervised")))
         variant = manifest.get("variant", "default")
         if "riddle" in args.methods:
             options.scan_background_reuse_policy = "shared_fixed_background_v1"
@@ -282,5 +315,9 @@ def run_scan(args):
             options.ranode_scan_background_reuse_policy = "shared_fixed_background_v1"
             options.ranode_background_reuse_candidates = _ranode_background_candidates(
                 output_root, variant, options.output
+            )
+        if "supervised" in args.methods:
+            options.supervised_reuse_candidates = _supervised_candidates(
+                output_root, point, variant, options.output
             )
         run_campaign(options)

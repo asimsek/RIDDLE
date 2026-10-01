@@ -8,7 +8,7 @@ import sys
 
 import yaml
 
-from riddle.cli import METHODS, DEFAULT_METHODS, SCENARIOS, seeds, positive
+from riddle.cli import METHODS, DEFAULT_METHODS, SCENARIOS, seeds, positive, method_name
 from riddle.storage import atomic_write
 from riddle.resume import add_resume_options
 
@@ -280,7 +280,7 @@ def main(argv=None):
     action = p.add_mutually_exclusive_group(required=True)
     action.add_argument("--name")
     action.add_argument("--pin-image", help="Save a built image digest in config/nrp/jupyter.yaml")
-    p.add_argument("--methods", nargs="+", choices=METHODS, default=list(DEFAULT_METHODS))
+    p.add_argument("--methods", nargs="+", type=method_name, choices=METHODS, default=list(DEFAULT_METHODS))
     p.add_argument("--workflow", choices=("run", "scan"), default="run")
     p.add_argument("--replicas", type=seeds, help="Scan replica indices, e.g. 0-9")
     p.add_argument("--signal-events", type=seeds, help="Scan total signal counts, e.g. 1000,667")
@@ -291,7 +291,7 @@ def main(argv=None):
     p.add_argument("--data", help="Prepared dataset path; defaults to data/lhco or data/injection_scan for scans")
     p.add_argument("--results", help="Result directory; defaults to results or results/injection_scan for scans")
     p.add_argument("--runs", type=positive, help="Complete independent runs per seed (default: 1)")
-    p.add_argument("--fits", type=positive, help="Ensemble fits per RIDDLE/R-ANODE run; does not change LaCathode")
+    p.add_argument("--fits", type=positive, help="Ensemble fits per RIDDLE/R-ANODE/IAD/Supervised run; does not change LaCathode")
     from riddle.options import add_feature_arguments
     add_feature_arguments(p)
     p.add_argument("--mass-conditioning", action=argparse.BooleanOptionalAction, default=None,
@@ -300,7 +300,7 @@ def main(argv=None):
                    help="Use the shared 40-epoch corrected latent background denominator and corrected guide")
     p.add_argument("--lacathode-background", choices=("independent", "fixed"), default="independent",
                    help="Retrain each LaCathode background flow (default), or share one flow across classifier fits")
-    p.add_argument("--epochs", type=positive, help="Override RIDDLE/R-ANODE signal-fit and LaCathode classifier epochs; background stages are unchanged")
+    p.add_argument("--epochs", type=positive, help="Override RIDDLE/R-ANODE/IAD/Supervised signal-fit and LaCathode classifier epochs; background stages are unchanged")
     p.add_argument("--workers", type=positive, default=2)
     p.add_argument("--io-workers", type=positive, default=4,
                    help="Filesystem/host I/O concurrency")

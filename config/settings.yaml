@@ -120,6 +120,28 @@ riddle:
     weight_decay: 0.01
     gradient_clip_norm: 1
     selected_checkpoints: 10
+ad_baselines:
+  classifier:
+    hidden_layers: [64, 64, 64]
+    activation: relu
+    optimizer: adam
+    learning_rate: 0.001
+    batch_size: 128
+    epochs: 100
+    fits: 20
+    selected_checkpoints: 10
+    ensemble_fit_selection: all-valid
+    checkpoint_selection: lowest-validation-bce
+    ensemble: mean_probability
+    preprocessing: background_standardization
+    class_balance: balanced_loss_weight
+    inference_batch_size: 65536
+    score_scope: signal_region
+    include_mass: false
+    max_retries: 2
+  data:
+    signal_simulation_events: 55000
+    signal_training_fraction: 0.5
 background:
   configuration:
     ModelType: MAF

@@ -10,10 +10,15 @@ from .resume import add_resume_options, resume_policy
 from .settings import default_config_path
 
 ROOT = Path(__file__).resolve().parents[1]
-METHODS = ("lacathode", "riddle", "ranode")
+METHODS = ("lacathode", "riddle", "ranode", "iad", "supervised")
 DEFAULT_METHODS = ("lacathode", "riddle")
+METHOD_ALIASES = {"idealized": "iad", "idealized_ad": "iad", "supervised_ad": "supervised"}
 SCENARIOS = ("signal_injection", "background_only")
 
+
+
+def method_name(value):
+    return METHOD_ALIASES.get(value, value)
 
 def seeds(value):
     result = []
@@ -40,7 +45,7 @@ def positive(value):
 
 
 def parser():
-    p = argparse.ArgumentParser(description="Independent LaCathode, RIDDLE and R-ANODE LHCO pipelines")
+    p = argparse.ArgumentParser(description="Independent LaCathode, RIDDLE, R-ANODE, Idealized AD and Supervised AD LHCO pipelines")
     subs = p.add_subparsers(dest="command", required=True)
     setup = subs.add_parser("setup", help="Verify manually cloned, pinned upstream checkouts")
     setup.add_argument("--sources", type=Path, default=ROOT / "external/lacathode")
@@ -50,6 +55,7 @@ def parser():
     prep.add_argument("--dataset", choices=["lhco"], default="lhco")
     prep.add_argument("--catalog", type=Path, default=default_config_path("datasets.yaml"))
     prep.add_argument("--output", type=Path, default=Path("data/lhco"))
+    prep.add_argument("--config", type=Path, default=default_config_path("settings.yaml"))
     prep.add_argument("--variant", choices=["default", "shifted", "deltaR"], default="default")
     prep.add_argument("--io-workers", type=positive, default=4)
     prep.add_argument("--resume", action="store_true")
@@ -57,13 +63,12 @@ def parser():
     prep_scan = subs.add_parser("prepare-scan", parents=[deepcopy(prep)], add_help=False,
                                 help="Prepare independently partitioned injection strengths")
     prep_scan.set_defaults(output=Path("data/injection_scan"))
-    prep_scan.add_argument("--config", type=Path, default=default_config_path("settings.yaml"))
     prep_scan.add_argument("--signal-events", type=seeds, help="Subset of configured total signal counts")
     prep_scan.add_argument("--replicas", type=seeds, help="Zero-based replica indices, e.g. 0-9")
     for command in ("run", "scan"):
         run = subs.add_parser(command, allow_abbrev=False,
                               help="Run independent methods" if command == "run" else "Run the optional injection scan")
-        run.add_argument("--methods", nargs="+", choices=METHODS, default=list(DEFAULT_METHODS))
+        run.add_argument("--methods", nargs="+", type=method_name, choices=METHODS, default=list(DEFAULT_METHODS))
         run.add_argument("--data", type=Path, default=Path("data/lhco"))
         run.add_argument("--output", type=Path, default=Path("results"))
         run.add_argument("--sources", type=Path, default=ROOT / "external/lacathode")
@@ -76,7 +81,7 @@ def parser():
             "--workers",
             type=positive,
             default=1,
-            help="Concurrent RIDDLE/R-ANODE fits or independent LaCathode runs; fixed-background LaCathode stays sequential",
+            help="Concurrent RIDDLE/R-ANODE/IAD/Supervised fits or independent LaCathode runs; fixed-background LaCathode stays sequential",
         )
         run.add_argument("--io-workers", type=positive, default=2,
                          help="Filesystem/host I/O concurrency; independent of PyTorch compute threads")
@@ -86,11 +91,11 @@ def parser():
         run.add_argument("--runs", type=positive,
                          help="Complete independent runs per seed (default: 1); retrain background and signal models")
         run.add_argument("--fits", type=positive,
-                         help="Ensemble fits per RIDDLE/R-ANODE run (default: method settings); does not change LaCathode")
+                         help="Ensemble fits per RIDDLE/R-ANODE/IAD/Supervised run (default: method settings); does not change LaCathode")
         run.add_argument("--lacathode-background", choices=("independent", "fixed"), default="independent",
                          help="Retrain each LaCathode background flow (default), or share one flow across classifier fits")
         run.add_argument(
-            "--epochs", type=positive, help="Override RIDDLE/R-ANODE signal-fit and LaCathode classifier epochs; background stages are unchanged"
+            "--epochs", type=positive, help="Override RIDDLE/R-ANODE/IAD/Supervised signal-fit and LaCathode classifier epochs; background stages are unchanged"
         )
         run.add_argument("--fractions", nargs="+", help="Override YAML mixture-fraction configurations (residual only)")
         from .roles import POLICIES
@@ -154,7 +159,7 @@ def run_campaign(args):
     from .storage import locked
     from .worker_progress import monitor_worker
 
-    if "riddle" in args.methods:
+    if any(method in args.methods for method in ("riddle", "iad", "supervised")):
         from .settings import resolve, input_features
 
         resolve(args)
@@ -173,7 +178,7 @@ def run_campaign(args):
             manifest, _ = validate_ranode(args.data / scenario)
         else:
             from .data import validate
-            manifest = validate(args.data / scenario, require_event_ids="riddle" in args.methods)
+            manifest = validate(args.data / scenario, require_event_ids="riddle" in args.methods, require_baseline=any(method in args.methods for method in ("iad", "supervised")))
         if "riddle" in args.methods:
             input_features(args.settings, manifest)
         if "ranode" in args.methods:
@@ -216,6 +221,8 @@ def run_campaign(args):
                 options.update(run_overrides)
             elif method == "riddle":
                 options["runs"] = args.fits
+            elif method in ("iad", "supervised"):
+                options["fits"] = args.fits
             env = os.environ.copy()
             if args.device == "cpu":
                 env["CUDA_VISIBLE_DEVICES"] = ""
