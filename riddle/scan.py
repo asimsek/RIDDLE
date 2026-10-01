@@ -2,6 +2,7 @@
 
 from copy import copy
 from dataclasses import replace
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -112,6 +113,49 @@ def prepare_scan(args):
         )
 
 
+
+def _riddle_background_candidates(output_root, point, variant, current_point):
+    roots = []
+    for root in (Path("results").resolve(), output_root.parent / "results", output_root):
+        root = root.resolve()
+        if root.exists() and root not in roots:
+            roots.append(root)
+    candidates = []
+    seen = set()
+    for root in roots:
+        for report_path in root.rglob("result.json"):
+            source = report_path.parent.resolve()
+            if source in seen or source == current_point.resolve() or current_point.resolve() in source.parents:
+                continue
+            try:
+                report = json.loads(report_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            method = str(report.get("method", ""))
+            if not method.startswith("riddle") or report.get("completed") is not True:
+                continue
+            if report.get("scenario") != "signal_injection" or report.get("seed") != point["training_seed"]:
+                continue
+            source_variant = report.get("variant", report.get("contract", {}).get("inputs", {}).get("variant", "default"))
+            if source_variant != variant:
+                continue
+            scan = report.get("contract", {}).get("inputs", {}).get("injection_scan")
+            if scan is not None and scan.get("replica") != point["replica"]:
+                continue
+            required = (
+                source / "background" / "model.pt",
+                source / "background" / "preprocessing.pt",
+                source / "background" / "flow_selection.json",
+                source / "background" / "mapping_settings.json",
+            )
+            if not all(path.is_file() for path in required):
+                continue
+            seen.add(source)
+            candidates.append((0 if scan is None else 1, str(source)))
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return [source for _, source in candidates]
+
+
 def run_scan(args):
     from .cli import run_campaign
 
@@ -133,4 +177,10 @@ def run_scan(args):
         options.output = output_root / point_name(point)
         options.scenarios = ["signal_injection"]
         options.seeds = [point["training_seed"]]
+        if "riddle" in args.methods:
+            manifest = validate(options.data / "signal_injection", require_event_ids=True)
+            options.scan_background_reuse_policy = "same_replica_fixed_background_v1"
+            options.riddle_background_reuse_candidates = _riddle_background_candidates(
+                output_root, point, manifest.get("variant", "default"), options.output
+            )
         run_campaign(options)

@@ -8,6 +8,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from copy import deepcopy
 from pathlib import Path
 import json
+import shutil
 import math
 import multiprocessing as mp
 
@@ -704,6 +705,93 @@ def train(directory, train_z, train_mass, val_z, val_mass, *, settings, seed, de
                  "Background correction failed safety gates; using Gaussian denominator", level=0)
     return dict(requested_mode=MODE, active=bool(active), descriptor=descriptor(directory) if active else None,
                 selection=decision)
+
+
+def _reuse_signature(settings, seed):
+    epochs, mass_bins = _qphi_options(settings)
+    return {
+        "schema": 7,
+        "scientific_version": SCIENTIFIC_VERSION,
+        "protocol": PROTOCOL,
+        "mode": MODE,
+        "epochs": epochs,
+        "mass_bins": mass_bins,
+        "seed": int(seed),
+        "flow": _qphi_flow(settings),
+        "learning_rate": settings["training"]["learning_rate"],
+    }
+
+
+def reuse(directory, source_result, *, settings, seed, device):
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    manifest_path = directory / "reuse.json"
+    expected_signature = _reuse_signature(settings, seed)
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text())
+        if manifest.get("policy") != "same_replica_fixed_background_v1" or manifest.get("target_signature") != expected_signature:
+            raise ValueError("Background-correction reuse settings changed; use a new output")
+        for name, expected in manifest.get("local_artifacts_sha256", {}).items():
+            path = directory / name
+            if not path.is_file() or file_digest(path) != expected:
+                raise ValueError("Reused background-correction artifact changed or is missing")
+        selection = json.loads((directory / "selection.json").read_text())
+        active = selection.get("status") == "activated" and bool(selection.get("active"))
+        return dict(requested_mode=MODE, active=active, descriptor=descriptor(directory) if active else None,
+                    selection=selection, reuse=manifest)
+    if (directory / "contract.json").exists() or (directory / ".resume/latest.pt").exists():
+        return None
+    source = Path(source_result).resolve()
+    report_path = source / "result.json"
+    if not report_path.is_file():
+        return None
+    try:
+        report = json.loads(report_path.read_text())
+    except json.JSONDecodeError:
+        return None
+    if report.get("completed") is not True or not str(report.get("method", "")).startswith("riddle"):
+        return None
+    base = source / "density" / "background_correction"
+    relative_names = ("contract.json", "model.pt", "selection.json")
+    source_paths = {}
+    for name in relative_names:
+        relative = f"density/background_correction/{name}"
+        path = base / name
+        expected = report.get("artifacts_sha256", {}).get(relative)
+        if expected is None or not path.is_file() or file_digest(path) != expected:
+            return None
+        source_paths[name] = path
+    source_contract = json.loads(source_paths["contract.json"].read_text())
+    for key, value in expected_signature.items():
+        if source_contract.get(key) != value:
+            return None
+    optional = base / "history.json"
+    optional_relative = "density/background_correction/history.json"
+    optional_expected = report.get("artifacts_sha256", {}).get(optional_relative)
+    if optional_expected is not None and optional.is_file() and file_digest(optional) == optional_expected:
+        source_paths["history.json"] = optional
+    copied = {}
+    for name, source_path in source_paths.items():
+        target = directory / name
+        shutil.copy2(source_path, target)
+        copied[name] = file_digest(target)
+    selection = json.loads((directory / "selection.json").read_text())
+    active = selection.get("status") == "activated" and bool(selection.get("active"))
+    manifest = {
+        "schema": 1,
+        "policy": "same_replica_fixed_background_v1",
+        "source_result": str(source),
+        "source_result_sha256": file_digest(report_path),
+        "source_model_sha256": file_digest(source_paths["model.pt"]),
+        "target_signature": expected_signature,
+        "local_artifacts_sha256": copied,
+        "training_reused": True,
+        "truth_labels_used": False,
+    }
+    write_json(manifest_path, manifest)
+    emit_message(f"Reuse frozen RIDDLE background correction from {source}", kind="PASS", level=0)
+    return dict(requested_mode=MODE, active=active, descriptor=descriptor(directory) if active else None,
+                selection=selection, reuse=manifest)
 
 
 def independent_closure_diagnostic(model, latent, mass, device, *, selected_denominator):

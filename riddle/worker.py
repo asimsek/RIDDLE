@@ -155,6 +155,9 @@ def main():
         contract["riddle_production_policy"] = PRODUCTION_POLICY
         contract["riddle_score_scope"] = ("signal_region" if args.settings["riddle"].get("mass_conditioning")
                                           else "full_region")
+        scan_reuse_policy = getattr(args, "scan_background_reuse_policy", None)
+        if scan_reuse_policy is not None:
+            contract["scan_background_reuse_policy"] = scan_reuse_policy
         if mapping_experiment is not None:
             contract["mapping_experiment"] = mapping_experiment
     if args.method == "lacathode":

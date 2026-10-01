@@ -30,15 +30,26 @@ def run(args, contract):
     mass_conditioning = settings["riddle"].get("mass_conditioning", False)
     physical_inputs = settings["riddle"].get("input_space") == "physical"
     score_scope = "signal_region" if mass_conditioning else "full_region"
+    mapping_reuse = None
     if enhanced:
         from .mapping import prepare as prepare_mapping
         if getattr(args, "mapping_experiment", None) is not None:
             from .mapping_experiment import prepare_frozen
-            prepare_mapping = lambda *a, **kw: prepare_frozen(*a, **kw, experiment=args.mapping_experiment)
-        selection, mapper, development = prepare_mapping(args.data, latent_root, args.seed, args.device,
-            background=settings["background"], options=feature_options(settings["riddle"]),
-            data_policy=settings["riddle"].get("data_policy", DEFAULT_POLICY),
-            residual_batch_size=settings["riddle"]["training"]["batch_size"])
+            selection, mapper, development = prepare_frozen(
+                args.data, latent_root, args.seed, args.device,
+                background=settings["background"], options=feature_options(settings["riddle"]),
+                data_policy=settings["riddle"].get("data_policy", DEFAULT_POLICY),
+                residual_batch_size=settings["riddle"]["training"]["batch_size"],
+                experiment=args.mapping_experiment,
+            )
+        else:
+            selection, mapper, development, mapping_reuse = prepare_mapping(
+                args.data, latent_root, args.seed, args.device,
+                background=settings["background"], options=feature_options(settings["riddle"]),
+                data_policy=settings["riddle"].get("data_policy", DEFAULT_POLICY),
+                residual_batch_size=settings["riddle"]["training"]["batch_size"],
+                reuse_candidates=getattr(args, "riddle_background_reuse_candidates", None),
+            )
     else:
         selection = prepare(args.data, latent_root, args.seed, args.device, recovery, settings=settings["background"])
     training, validation = ordered_map(
@@ -57,6 +68,8 @@ def run(args, contract):
         path = latent_root / name
         if path.is_file():
             mapping_identity[name] = file_digest(path)
+    if mapping_reuse is not None:
+        mapping_identity["background_reuse"] = mapping_reuse
     background_reference = None
     if physical_inputs:
         training, validation = mapper.physical_development(args.data, settings["background"]["reference_samples"])
@@ -70,13 +83,20 @@ def run(args, contract):
         for role in ("correction_train", "correction_val", "closure"):
             if role not in development:
                 raise ValueError(f"Missing reserved {role} role required by bgcorr_40_reguide")
-        from .background_correction import train as train_background_correction
-        background_correction_decision = train_background_correction(
-            output / "density" / "background_correction",
-            development["correction_train"]["z"], development["correction_train"]["mass"],
-            development["correction_val"]["z"], development["correction_val"]["mass"],
-            settings=settings["riddle"], seed=(int(args.seed)+91000) % 2**32, device=args.device,
-            closure_z=development["closure"]["z"], closure_mass=development["closure"]["mass"])
+        from .background_correction import train as train_background_correction, reuse as reuse_background_correction
+        background_correction_decision = None
+        if mapping_reuse is not None:
+            background_correction_decision = reuse_background_correction(
+                output / "density" / "background_correction", mapping_reuse["source_result"],
+                settings=settings["riddle"], seed=(int(args.seed)+91000) % 2**32, device=args.device,
+            )
+        if background_correction_decision is None:
+            background_correction_decision = train_background_correction(
+                output / "density" / "background_correction",
+                development["correction_train"]["z"], development["correction_train"]["mass"],
+                development["correction_val"]["z"], development["correction_val"]["mass"],
+                settings=settings["riddle"], seed=(int(args.seed)+91000) % 2**32, device=args.device,
+                closure_z=development["closure"]["z"], closure_mass=development["closure"]["mass"])
         background_correction = background_correction_decision["descriptor"]
     acceptance, mapped = {}, {}
     evaluation_ids = {}
@@ -324,9 +344,16 @@ def run(args, contract):
                 "guide": ("not used by stein_witness" if core == "stein_witness" else "retrained against q_phi(z|m) samples at matched masses"),
                 "residual_initialization": ("zero Stein witness" if core == "stein_witness" else "q_phi"),
                 "denominator": "q_phi(z|m)",
+                "reuse": background_correction_decision.get("reuse"),
             }),
             "background_correction_decision": (None if background_correction_decision is None else
                                                 background_correction_decision["selection"]),
+            "scan_background_reuse": (None if mapping_reuse is None else {
+                "policy": mapping_reuse["policy"],
+                "mapping": mapping_reuse,
+                "background_correction": background_correction_decision.get("reuse")
+                    if background_correction_decision is not None else None,
+            }),
             "fit_score_note": ((f"per-fit {scoring_cfg['mode']} Stein scores after per-checkpoint q-normalization and checkpoint averaging; "
                                 "support correction is ensemble-level and not included in fit_scores")
                                if core == "stein_witness" else

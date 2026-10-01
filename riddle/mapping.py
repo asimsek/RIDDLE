@@ -2,15 +2,16 @@
 from copy import deepcopy
 import json
 from pathlib import Path
+import shutil
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from .enhancements import Rosenblatt, save_torch, load_torch, clip_gradients
-from .integrity import require_finite, train_flow_epoch
+from .integrity import SCIENTIFIC_VERSION, require_finite, train_flow_epoch
 from .preprocessing import load_dataset
-from .storage import digest, write_json, save_array, seed_start, rng_state, restore_rng, atomic_write, save_npz, persist_boundary
+from .storage import digest, file_digest, write_json, save_array, seed_start, rng_state, restore_rng, atomic_write, save_npz, persist_boundary
 from .worker_progress import emit_message
 
 PREPROCESS_KEYS = ("min", "max", "mean2", "std2", "std2_logit_fix")
@@ -141,8 +142,115 @@ class Mapper:
         return z.numpy().astype(np.float32), prepared["mask"].numpy()
 
 
+def _reuse_signature(contract):
+    keys = ("schema", "implementation", "preprocessing", "configuration", "options", "background",
+            "features", "data_policy", "residual_batch_size")
+    return {key: contract.get(key) for key in keys if key in contract}
+
+
+def _verified_source_artifact(source, report, relative):
+    path = source / relative
+    expected = report.get("artifacts_sha256", {}).get(str(relative))
+    if expected is None or not path.is_file() or file_digest(path) != expected:
+        return None
+    return path
+
+
+def _mapping_reuse_candidate(candidate, current_contract, seed):
+    source = Path(candidate).resolve()
+    report_path = source / "result.json"
+    if not report_path.is_file():
+        return None
+    try:
+        report = json.loads(report_path.read_text())
+    except json.JSONDecodeError:
+        return None
+    if report.get("completed") is not True or not str(report.get("method", "")).startswith("riddle"):
+        return None
+    if report.get("contract", {}).get("scientific_version") != SCIENTIFIC_VERSION:
+        return None
+    if report.get("seed") != seed or report.get("scenario") != "signal_injection":
+        return None
+    relative_files = (
+        Path("background/model.pt"),
+        Path("background/preprocessing.pt"),
+        Path("background/flow_selection.json"),
+        Path("background/mapping_settings.json"),
+    )
+    verified = {}
+    for relative in relative_files:
+        path = _verified_source_artifact(source, report, relative)
+        if path is None:
+            return None
+        verified[str(relative)] = path
+    try:
+        metadata = json.loads(verified["background/mapping_settings.json"].read_text())
+        selection = json.loads(verified["background/flow_selection.json"].read_text())
+    except json.JSONDecodeError:
+        return None
+    if metadata.get("seed") != seed or _reuse_signature(metadata) != _reuse_signature(current_contract):
+        return None
+    if selection.get("implementation") != current_contract["implementation"]:
+        return None
+    optional = {}
+    for relative in (Path("background/history.json"),):
+        path = _verified_source_artifact(source, report, relative)
+        if path is not None:
+            optional[str(relative)] = path
+    return source, report, metadata, selection, verified, optional
+
+
+def _activate_mapping_reuse(output, candidates, current_contract, seed):
+    manifest_path = output / "mapping_reuse.json"
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text())
+        if manifest.get("policy") != "same_replica_fixed_background_v1":
+            raise ValueError("Unrecognized mapping reuse policy")
+        if manifest.get("target_seed") != seed or manifest.get("target_signature") != _reuse_signature(current_contract):
+            raise ValueError("Mapping reuse target settings changed; use a new output")
+        for name, expected in manifest.get("local_artifacts_sha256", {}).items():
+            path = output / name
+            if not path.is_file() or file_digest(path) != expected:
+                raise ValueError("Reused mapping artifact changed or is missing")
+        return manifest
+    if (output / "mapping_settings.json").exists() or (output / ".resume/latest.pt").exists():
+        return None
+    for candidate in candidates or ():
+        found = _mapping_reuse_candidate(candidate, current_contract, seed)
+        if found is None:
+            continue
+        source, report, metadata, selection, verified, optional = found
+        copied = {}
+        for relative, source_path in {**verified, **optional}.items():
+            target_name = Path(relative).name
+            target = output / target_name
+            shutil.copy2(source_path, target)
+            copied[target_name] = file_digest(target)
+        manifest = {
+            "schema": 1,
+            "policy": "same_replica_fixed_background_v1",
+            "source_result": str(source),
+            "source_result_sha256": file_digest(source / "result.json"),
+            "source_seed": report.get("seed"),
+            "source_scenario": report.get("scenario"),
+            "source_variant": report.get("variant", report.get("contract", {}).get("inputs", {}).get("variant", "default")),
+            "target_seed": seed,
+            "target_signature": _reuse_signature(current_contract),
+            "source_mapping_settings_sha256": file_digest(verified["background/mapping_settings.json"]),
+            "source_model_sha256": file_digest(verified["background/model.pt"]),
+            "source_preprocessing_sha256": file_digest(verified["background/preprocessing.pt"]),
+            "local_artifacts_sha256": copied,
+            "training_reused": True,
+            "truth_labels_used": False,
+        }
+        write_json(manifest_path, manifest)
+        emit_message(f"Reuse frozen RIDDLE background map from {source}", kind="PASS", level=0)
+        return manifest
+    return None
+
+
 def prepare(data, output, seed, device, *, background, options, data_policy=None, residual_batch_size=256,
-            experiment=None):
+            experiment=None, reuse_candidates=None):
     output = Path(output); output.mkdir(parents=True, exist_ok=True)
     sources, roles = split_roles(data, seed, calibration=options["score_flow"])
     from .roles import DEFAULT_POLICY, override_roles, attach_source_ids, finalize_mapped
@@ -155,7 +263,6 @@ def prepare(data, output, seed, device, *, background, options, data_policy=None
         from .mapping_experiment import mapping_inputs
         roles, experiment_reference = mapping_inputs(experiment, roles, sources, device)
     arrays = {k: sources[v["source"]][v["indices"]] for k, v in roles.items()}
-    # Only mass and observables enter fitting and reproducibility checks.
     clean = {}
     for name, rows in arrays.items():
         clean[name] = rows.copy(); clean[name][:, -1] = 0
@@ -177,85 +284,92 @@ def prepare(data, output, seed, device, *, background, options, data_policy=None
         contract.update(data_policy=data_policy, residual_batch_size=residual_batch_size)
     if experiment is not None:
         contract["mapping_experiment"] = experiment
+    mapping_reuse = None if experiment is not None else _activate_mapping_reuse(
+        output, reuse_candidates, contract, seed
+    )
     settings_path = output / "mapping_settings.json"
-    if settings_path.exists() and json.loads(settings_path.read_text()) != contract:
-        raise ValueError("Mapping data/settings changed; use a new output")
-    if not settings_path.exists() and (output / ".resume/latest.pt").exists():
-        raise ValueError("Mapping checkpoint has no provenance contract")
-    write_json(settings_path, contract)
     write_json(output / "background_settings.json", background)
     atomic_write(output / "source_partitions.npz", lambda p: save_npz(p, **{k: v["indices"] for k, v in roles.items()}))
     write_json(output / "data_roles.json", {k: dict(source=v["source"]+".npy", events=len(v["indices"]),
                indices_sha256=digest(v["indices"]), truth_labels_used=False) for k, v in roles.items()})
-    fit = (load_dataset(clean["map_train"]) if experiment is None else
-           load_dataset(clean["map_train"], external_datadict=experiment_reference))
-    val = load_dataset(clean["map_val"], external_datadict=fit)
-    seed_start(seed)
-    model = build_mapping(config, options, features, seed, device)
-    if options["rosenblatt"]:
-        optimizer = torch.optim.Adam(model.parameters(), lr=3e-4, weight_decay=1e-6)
-        seed_start((seed+1) % 2**32)
-    else:
-        cfg = config["optimizer"]
-        optimizer = torch.optim.Adam(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
-    loader = DataLoader(TensorDataset(fit["tensor2"], fit["labels"]), batch_size=background["batch_size"], shuffle=True)
-    latest = output / ".resume/latest.pt"
-    history, start, best, best_model, best_epoch = [], 0, float("inf"), None, None
-    if latest.exists():
-        state = load_torch(latest, device)
-        if state["contract"] != contract:
-            raise ValueError("Mapping recovery contract changed")
-        model.load_state_dict(state["model"]); optimizer.load_state_dict(state["optimizer"])
-        history, start, best, best_model, best_epoch = (state[k] for k in ("history", "next_epoch", "best", "best_model", "best_epoch"))
-        restore_rng(state["rng"])
-    mm, ms = mass_parameters
-    validation_batch_used = (min(int(background["mapping_validation_batch_size"]), 8192)
-                             if torch.device(device).type == "cpu"
-                             else int(background["mapping_validation_batch_size"]))
-    for epoch in range(start, background["epochs"]):
-        model.train()
+    validation_batch_used = None
+    if mapping_reuse is None:
+        if settings_path.exists() and json.loads(settings_path.read_text()) != contract:
+            raise ValueError("Mapping data/settings changed; use a new output")
+        if not settings_path.exists() and (output / ".resume/latest.pt").exists():
+            raise ValueError("Mapping checkpoint has no provenance contract")
+        write_json(settings_path, contract)
+        fit = (load_dataset(clean["map_train"]) if experiment is None else
+               load_dataset(clean["map_train"], external_datadict=experiment_reference))
+        val = load_dataset(clean["map_val"], external_datadict=fit)
+        seed_start(seed)
+        model = build_mapping(config, options, features, seed, device)
         if options["rosenblatt"]:
-            total = 0.
-            for x, m in loader:
-                optimizer.zero_grad(); loss = -model.log_probs(x.to(device), ((m-mm)/ms).to(device)).mean()
-                require_finite(loss, "Rosenblatt NLL"); loss.backward()
-                for head in model.heads:
-                    clip_gradients(head.parameters(), 1.)
-                optimizer.step(); total += float(loss.detach())*len(x)
-            train_nll = total/len(fit["tensor2"])
+            optimizer = torch.optim.Adam(model.parameters(), lr=3e-4, weight_decay=1e-6)
+            seed_start((seed+1) % 2**32)
         else:
-            from .flows import BatchNormFlow
-            train_nll = train_flow_epoch(model, optimizer, loader, device, batch_norm_class=BatchNormFlow, verbose=False)[0]
-        model.eval()
-        context = (val["labels"]-mm)/ms if options["rosenblatt"] else val["labels"]
-        log_prob, used = _inference_chunks(
-            model.log_probs, val["tensor2"], context, device=device,
-            size=background["mapping_validation_batch_size"],
-        )
-        validation_batch_used = min(validation_batch_used, int(used))
-        loss = -float(log_prob.double().mean())
-        history.append(dict(epoch=epoch, train_nll=train_nll, validation_nll=loss))
-        if loss < best:
-            best, best_model, best_epoch = loss, deepcopy(model.state_dict()), epoch
-        if experiment is not None:
-            from .mapping_experiment import observe_epoch
-            observe_epoch(experiment, output, model, epoch, clean, sources, fit, mass_parameters, device, loss)
-        if persist_boundary(epoch, background["epochs"]):
-            save_torch(latest, dict(contract=contract, next_epoch=epoch+1, model=model.state_dict(),
-                       optimizer=optimizer.state_dict(), rng=rng_state(), history=history,
-                       best=best, best_model=best_model, best_epoch=best_epoch))
-            write_json(output / "history.json", history)
-        emit_message(f"Background map {epoch+1}/{background['epochs']}: validation NLL={loss:.6g}")
-    save_torch(output / "model.pt", best_model)
-    save_torch(output / "preprocessing.pt", {k: fit[k].cpu() for k in PREPROCESS_KEYS})
-    selection = dict(training_mapping_epoch=best_epoch, inference_mapping_epoch=best_epoch,
-                     trained_epochs=background["epochs"], criterion="lowest independent map-validation NLL",
-                     implementation="production_conditional_mapping_v2_tail_safe_preprocessing",
-                     preprocessing="nonrejecting_minmax_logit_clip_eps_1e-6_v1",
-                     architecture="Rosenblatt" if options["rosenblatt"] else "MAF",
-                     affine_log_scale_bound=None if options["rosenblatt"] else config.get("affine_log_scale_bound"),
-                     truth_labels_used=False)
-    write_json(output / "flow_selection.json", selection)
+            cfg = config["optimizer"]
+            optimizer = torch.optim.Adam(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
+        loader = DataLoader(TensorDataset(fit["tensor2"], fit["labels"]), batch_size=background["batch_size"], shuffle=True)
+        latest = output / ".resume/latest.pt"
+        history, start, best, best_model, best_epoch = [], 0, float("inf"), None, None
+        if latest.exists():
+            state = load_torch(latest, device)
+            if state["contract"] != contract:
+                raise ValueError("Mapping recovery contract changed")
+            model.load_state_dict(state["model"]); optimizer.load_state_dict(state["optimizer"])
+            history, start, best, best_model, best_epoch = (state[k] for k in ("history", "next_epoch", "best", "best_model", "best_epoch"))
+            restore_rng(state["rng"])
+        mm, ms = mass_parameters
+        validation_batch_used = (min(int(background["mapping_validation_batch_size"]), 8192)
+                                 if torch.device(device).type == "cpu"
+                                 else int(background["mapping_validation_batch_size"]))
+        for epoch in range(start, background["epochs"]):
+            model.train()
+            if options["rosenblatt"]:
+                total = 0.
+                for x, m in loader:
+                    optimizer.zero_grad(); loss = -model.log_probs(x.to(device), ((m-mm)/ms).to(device)).mean()
+                    require_finite(loss, "Rosenblatt NLL"); loss.backward()
+                    for head in model.heads:
+                        clip_gradients(head.parameters(), 1.)
+                    optimizer.step(); total += float(loss.detach())*len(x)
+                train_nll = total/len(fit["tensor2"])
+            else:
+                from .flows import BatchNormFlow
+                train_nll = train_flow_epoch(model, optimizer, loader, device, batch_norm_class=BatchNormFlow, verbose=False)[0]
+            model.eval()
+            context = (val["labels"]-mm)/ms if options["rosenblatt"] else val["labels"]
+            log_prob, used = _inference_chunks(
+                model.log_probs, val["tensor2"], context, device=device,
+                size=background["mapping_validation_batch_size"],
+            )
+            validation_batch_used = min(validation_batch_used, int(used))
+            loss = -float(log_prob.double().mean())
+            history.append(dict(epoch=epoch, train_nll=train_nll, validation_nll=loss))
+            if loss < best:
+                best, best_model, best_epoch = loss, deepcopy(model.state_dict()), epoch
+            if experiment is not None:
+                from .mapping_experiment import observe_epoch
+                observe_epoch(experiment, output, model, epoch, clean, sources, fit, mass_parameters, device, loss)
+            if persist_boundary(epoch, background["epochs"]):
+                save_torch(latest, dict(contract=contract, next_epoch=epoch+1, model=model.state_dict(),
+                           optimizer=optimizer.state_dict(), rng=rng_state(), history=history,
+                           best=best, best_model=best_model, best_epoch=best_epoch))
+                write_json(output / "history.json", history)
+            emit_message(f"Background map {epoch+1}/{background['epochs']}: validation NLL={loss:.6g}")
+        save_torch(output / "model.pt", best_model)
+        save_torch(output / "preprocessing.pt", {k: fit[k].cpu() for k in PREPROCESS_KEYS})
+        selection = dict(training_mapping_epoch=best_epoch, inference_mapping_epoch=best_epoch,
+                         trained_epochs=background["epochs"], criterion="lowest independent map-validation NLL",
+                         implementation="production_conditional_mapping_v2_tail_safe_preprocessing",
+                         preprocessing="nonrejecting_minmax_logit_clip_eps_1e-6_v1",
+                         architecture="Rosenblatt" if options["rosenblatt"] else "MAF",
+                         affine_log_scale_bound=None if options["rosenblatt"] else config.get("affine_log_scale_bound"),
+                         truth_labels_used=False)
+        write_json(output / "flow_selection.json", selection)
+    else:
+        selection = json.loads((output / "flow_selection.json").read_text())
     mapper = Mapper(output, device)
     mapped, inference_batch_used = _map_roles_by_source(mapper, sources, roles)
     if inference_batch_used is None:
@@ -263,18 +377,21 @@ def prepare(data, output, seed, device, *, background, options, data_policy=None
     write_json(output / "mapping_runtime.json", {
         "device": str(device),
         "mapping_validation_batch_size_requested": int(background["mapping_validation_batch_size"]),
-        "mapping_validation_batch_size_used": int(validation_batch_used),
+        "mapping_validation_batch_size_used": validation_batch_used,
         "mapping_inference_batch_size_requested": int(background["mapping_inference_batch_size"]),
         "mapping_inference_batch_size_used": int(inference_batch_used),
         "source_union_mapping": True,
+        "training_reused": mapping_reuse is not None,
     })
     attach_source_ids(data, roles, mapped)
     mapped = finalize_mapped(mapped, seed, data_policy, residual_batch_size)
     identity_arrays = {}
     for role, item in mapped.items():
-        if role == "member_splits": continue
+        if role == "member_splits":
+            continue
         for key in ("ids", "source_ids", "source_indices", "mask"):
-            if key in item: identity_arrays[role+"__"+key] = item[key]
+            if key in item:
+                identity_arrays[role+"__"+key] = item[key]
     if identity_arrays:
         atomic_write(output / "event_roles.npz", lambda p: save_npz(p, **identity_arrays))
     write_json(output / "role_policy.json", dict(policy=data_policy, truth_labels_used=False))
@@ -283,4 +400,5 @@ def prepare(data, output, seed, device, *, background, options, data_policy=None
     for name, role in (("training_latents.npy", "residual_train"), ("validation_latents.npy", "evidence"),
                        ("mixture_validation_latents.npy", "mixture_validation")):
         atomic_write(output / name, lambda p, value=latent_rows(mapped[role]): save_array(p, value))
-    return selection, mapper, mapped
+    return selection, mapper, mapped, mapping_reuse
+

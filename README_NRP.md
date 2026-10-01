@@ -288,6 +288,11 @@ kubectl exec -n cua-asimsek \
 cd /shared/work/RIDDLE
 python scripts/nrp_runtime.py
 python plot.py --results results --output plots --verbose 1 --io-workers 16 --overwrite
+
+python paper_plot.py --data data/lhco --results results \
+  --config config/settings.yaml --output paper_plots \
+  --methods riddle lacathode ranode --variants default deltaR shifted \
+  --plot-formats png --file-formats csv --overwrite --verbose 1
 ```
 
 All completed methods are discovered automatically.<br>
@@ -301,7 +306,7 @@ In the Jupyter terminal, prepare the configured strengths and replicas once.
 
 ```bash
 cd /shared/work/RIDDLE
-python run.py prepare-scan --config config/settings.yaml --output data/injection_scan --io-workers 4 --resume
+python run.py prepare-scan --config config/settings.yaml --output data/injection_scan --io-workers 16 --resume
 ```
 
 After preparation is complete, submit the jobs below from your local terminal.
@@ -309,47 +314,46 @@ After preparation is complete, submit the jobs below from your local terminal.
 **RIDDLE:**
 
 ```bash
-for r in {0..9}; do
-  kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
-    python /shared/work/RIDDLE/nrp.py \
-    --workflow scan --name "riddle-injection-scan-r${r}" --methods riddle --replicas "$r" \
-    --config config/settings.yaml --data data/injection_scan --results results_injection_scan \
-    --runs 1 --fits 20 --epochs 100 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
-    | kubectl apply -n cua-asimsek -f -
-done
+kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
+  python /shared/work/RIDDLE/nrp.py \
+  --workflow scan --name "riddle-injection-scan" --methods riddle --replicas 0-4 \
+  --config config/settings.yaml --data data/injection_scan --results results_injection_scan \
+  --runs 1 --fits 20 --epochs 100 --workers 5 --io-workers 2 --torch-threads 2 --mps on --resume --resume-across-code-change \
+  | kubectl apply -n cua-asimsek -f -
 ```
 
 **LaCathode:**
 
 ```bash
-for r in {0..9}; do
-  kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
-    python /shared/work/RIDDLE/nrp.py \
-    --workflow scan --name "lacathode-injection-scan-r${r}" --methods lacathode --replicas "$r" \
-    --config config/settings.yaml --data data/injection_scan --results results_injection_scan \
-    --runs 1 --epochs 100 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
-    --lacathode-background independent \
-    | kubectl apply -n cua-asimsek -f -
-done
+kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
+  python /shared/work/RIDDLE/nrp.py \
+  --workflow scan --name "lacathode-injection-scan" --methods lacathode --replicas 0-4 \
+  --config config/settings.yaml --data data/injection_scan --results results_injection_scan \
+  --runs 1 --epochs 100 --workers 5 --io-workers 2 --torch-threads 2 --mps on --resume --resume-across-code-change \
+  --lacathode-background independent \
+  | kubectl apply -n cua-asimsek -f -
 ```
 
 **R-ANODE:**
 
 ```bash
-for r in {0..9}; do
-  kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
-    python /shared/work/RIDDLE/nrp.py \
-    --workflow scan --name "ranode-injection-scan-r${r}" --methods ranode --replicas "$r" \
-    --data data/injection_scan --results results_injection_scan \
-    --runs 1 --fits 20 --epochs 300 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
-    | kubectl apply -n cua-asimsek -f -
-done
+kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
+  python /shared/work/RIDDLE/nrp.py \
+  --workflow scan --name "ranode-injection-scan" --methods ranode --replicas 0-4 \
+  --data data/injection_scan --results results_injection_scan --resume --resume-across-code-change \
+  --runs 1 --fits 20 --epochs 300 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
+  | kubectl apply -n cua-asimsek -f -
 ```
 
 In Jupyter, plot completed scan results:
 
 ```bash
 python plot.py --results results_injection_scan --output plots_injection_scan --verbose 1  --io-workers 16 --overwrite
+
+python paper_plot.py --scan-data data/injection_scan --scan-results results/injection_scan \
+  --config config/settings.yaml --output paper_plots \
+  --methods riddle lacathode ranode --variants default deltaR shifted \
+  --plot-formats png --file-formats csv --overwrite --verbose 1
 ```
 
 
