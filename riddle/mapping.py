@@ -169,7 +169,7 @@ def _mapping_reuse_candidate(candidate, current_contract, seed):
         return None
     if report.get("contract", {}).get("scientific_version") != SCIENTIFIC_VERSION:
         return None
-    if report.get("seed") != seed or report.get("scenario") != "signal_injection":
+    if report.get("scenario") != "signal_injection":
         return None
     relative_files = (
         Path("background/model.pt"),
@@ -188,7 +188,7 @@ def _mapping_reuse_candidate(candidate, current_contract, seed):
         selection = json.loads(verified["background/flow_selection.json"].read_text())
     except json.JSONDecodeError:
         return None
-    if metadata.get("seed") != seed or _reuse_signature(metadata) != _reuse_signature(current_contract):
+    if _reuse_signature(metadata) != _reuse_signature(current_contract):
         return None
     if selection.get("implementation") != current_contract["implementation"]:
         return None
@@ -204,7 +204,7 @@ def _activate_mapping_reuse(output, candidates, current_contract, seed):
     manifest_path = output / "mapping_reuse.json"
     if manifest_path.exists():
         manifest = json.loads(manifest_path.read_text())
-        if manifest.get("policy") != "same_replica_fixed_background_v1":
+        if manifest.get("policy") not in ("same_replica_fixed_background_v1", "shared_fixed_background_v1"):
             raise ValueError("Unrecognized mapping reuse policy")
         if manifest.get("target_seed") != seed or manifest.get("target_signature") != _reuse_signature(current_contract):
             raise ValueError("Mapping reuse target settings changed; use a new output")
@@ -213,41 +213,51 @@ def _activate_mapping_reuse(output, candidates, current_contract, seed):
             if not path.is_file() or file_digest(path) != expected:
                 raise ValueError("Reused mapping artifact changed or is missing")
         return manifest
-    if (output / "mapping_settings.json").exists() or (output / ".resume/latest.pt").exists():
-        return None
+    found = None
     for candidate in candidates or ():
-        found = _mapping_reuse_candidate(candidate, current_contract, seed)
-        if found is None:
-            continue
-        source, report, metadata, selection, verified, optional = found
-        copied = {}
-        for relative, source_path in {**verified, **optional}.items():
-            target_name = Path(relative).name
-            target = output / target_name
-            shutil.copy2(source_path, target)
-            copied[target_name] = file_digest(target)
-        manifest = {
-            "schema": 1,
-            "policy": "same_replica_fixed_background_v1",
-            "source_result": str(source),
-            "source_result_sha256": file_digest(source / "result.json"),
-            "source_seed": report.get("seed"),
-            "source_scenario": report.get("scenario"),
-            "source_variant": report.get("variant", report.get("contract", {}).get("inputs", {}).get("variant", "default")),
-            "target_seed": seed,
-            "target_signature": _reuse_signature(current_contract),
-            "source_mapping_settings_sha256": file_digest(verified["background/mapping_settings.json"]),
-            "source_model_sha256": file_digest(verified["background/model.pt"]),
-            "source_preprocessing_sha256": file_digest(verified["background/preprocessing.pt"]),
-            "local_artifacts_sha256": copied,
-            "training_reused": True,
-            "truth_labels_used": False,
-        }
-        write_json(manifest_path, manifest)
-        emit_message(f"Reuse frozen RIDDLE background map from {source}", kind="PASS", level=0)
-        return manifest
-    return None
-
+        candidate_result = _mapping_reuse_candidate(candidate, current_contract, seed)
+        if candidate_result is not None:
+            found = candidate_result
+            break
+    if found is None:
+        return None
+    downstream = output.parent / "density"
+    local_training = (output / "mapping_settings.json").exists() or (output / ".resume/latest.pt").exists()
+    if local_training and downstream.exists() and any(path.is_file() for path in downstream.rglob("*")):
+        return None
+    if local_training:
+        for name in ("model.pt", "preprocessing.pt", "flow_selection.json", "mapping_settings.json", "history.json", "mapping_runtime.json"):
+            path = output / name
+            if path.exists():
+                path.unlink()
+        shutil.rmtree(output / ".resume", ignore_errors=True)
+    source, report, metadata, selection, verified, optional = found
+    copied = {}
+    for relative, source_path in {**verified, **optional}.items():
+        target_name = Path(relative).name
+        target = output / target_name
+        shutil.copy2(source_path, target)
+        copied[target_name] = file_digest(target)
+    manifest = {
+        "schema": 1,
+        "policy": "shared_fixed_background_v1",
+        "source_result": str(source),
+        "source_result_sha256": file_digest(source / "result.json"),
+        "source_seed": report.get("seed"),
+        "source_scenario": report.get("scenario"),
+        "source_variant": report.get("variant", report.get("contract", {}).get("inputs", {}).get("variant", "default")),
+        "target_seed": seed,
+        "target_signature": _reuse_signature(current_contract),
+        "source_mapping_settings_sha256": file_digest(verified["background/mapping_settings.json"]),
+        "source_model_sha256": file_digest(verified["background/model.pt"]),
+        "source_preprocessing_sha256": file_digest(verified["background/preprocessing.pt"]),
+        "local_artifacts_sha256": copied,
+        "training_reused": True,
+        "truth_labels_used": False,
+    }
+    write_json(manifest_path, manifest)
+    emit_message(f"Reuse frozen RIDDLE background map from {source}", kind="PASS", level=0)
+    return manifest
 
 def prepare(data, output, seed, device, *, background, options, data_policy=None, residual_batch_size=256,
             experiment=None, reuse_candidates=None):

@@ -707,7 +707,7 @@ def train(directory, train_z, train_mass, val_z, val_mass, *, settings, seed, de
                 selection=decision)
 
 
-def _reuse_signature(settings, seed):
+def _reuse_signature(settings):
     epochs, mass_bins = _qphi_options(settings)
     return {
         "schema": 7,
@@ -716,7 +716,6 @@ def _reuse_signature(settings, seed):
         "mode": MODE,
         "epochs": epochs,
         "mass_bins": mass_bins,
-        "seed": int(seed),
         "flow": _qphi_flow(settings),
         "learning_rate": settings["training"]["learning_rate"],
     }
@@ -726,10 +725,10 @@ def reuse(directory, source_result, *, settings, seed, device):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     manifest_path = directory / "reuse.json"
-    expected_signature = _reuse_signature(settings, seed)
+    expected_signature = _reuse_signature(settings)
     if manifest_path.exists():
         manifest = json.loads(manifest_path.read_text())
-        if manifest.get("policy") != "same_replica_fixed_background_v1" or manifest.get("target_signature") != expected_signature:
+        if manifest.get("policy") != "shared_fixed_background_v1" or manifest.get("target_signature") != expected_signature:
             raise ValueError("Background-correction reuse settings changed; use a new output")
         for name, expected in manifest.get("local_artifacts_sha256", {}).items():
             path = directory / name
@@ -779,7 +778,7 @@ def reuse(directory, source_result, *, settings, seed, device):
     active = selection.get("status") == "activated" and bool(selection.get("active"))
     manifest = {
         "schema": 1,
-        "policy": "same_replica_fixed_background_v1",
+        "policy": "shared_fixed_background_v1",
         "source_result": str(source),
         "source_result_sha256": file_digest(report_path),
         "source_model_sha256": file_digest(source_paths["model.pt"]),

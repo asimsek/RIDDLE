@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import pickle
 import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -364,6 +365,143 @@ def device_masks(module):
     module.load_dataset = namespace["load_dataset"]
 
 
+def _background_reuse_signature(contract, flow_epochs, config_file):
+    inputs = contract["inputs"]
+    return {
+        "scientific_version": contract["scientific_version"],
+        "source_commit": contract["source_commit"],
+        "source_sha256": contract["source_sha256"],
+        "variant": inputs.get("variant", "default"),
+        "source": inputs.get("source"),
+        "flow_epochs": int(flow_epochs),
+        "config_file": config_file,
+    }
+
+
+def _select_background_reuse(args, contract, flow_epochs, config_file):
+    if getattr(args, "lacathode_scan_background_reuse_policy", None) != "shared_fixed_background_v1":
+        return None
+    expected = _background_reuse_signature(contract, flow_epochs, config_file)
+    for item in getattr(args, "lacathode_background_reuse_candidates", None) or ():
+        source = Path(item["result"]).resolve()
+        data = Path(item["data"]).resolve()
+        report_path = source / "result.json"
+        protocol_path = source / "protocol.json"
+        if not report_path.is_file() or not protocol_path.is_file() or not data.is_dir():
+            continue
+        try:
+            report = json.loads(report_path.read_text())
+            protocol = json.loads(protocol_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        source_contract = report.get("contract", {})
+        signature = {
+            "scientific_version": source_contract.get("scientific_version"),
+            "source_commit": source_contract.get("source_commit"),
+            "source_sha256": source_contract.get("source_sha256"),
+            "variant": source_contract.get("inputs", {}).get("variant", "default"),
+            "source": source_contract.get("inputs", {}).get("source"),
+            "flow_epochs": protocol.get("flow_epochs"),
+            "config_file": "DE_MAF_model_deltaR.yml" if source_contract.get("inputs", {}).get("variant") == "deltaR" else "DE_MAF_model.yml",
+        }
+        if report.get("completed") is not True or report.get("method") != "lacathode" or report.get("scenario") != "signal_injection" or signature != expected:
+            continue
+        artifacts = report.get("artifacts_sha256", {})
+        relative = [name for name in artifacts if name.startswith("training/lacathode_model_epoch_") and name.endswith(".par")]
+        relative += ["training/lacathode_model_train_losses.npy", "training/lacathode_model_val_losses.npy"]
+        if len([name for name in relative if name.endswith(".par")]) < 10 or any(name not in artifacts for name in relative):
+            continue
+        if any(not (source / name).is_file() for name in relative):
+            continue
+        return {"source": source, "data": data, "report": report, "files": relative, "signature": expected}
+    return None
+
+
+def _flow_recovery_state(root):
+    path = Path(root) / ".resume/stages.pt"
+    if not path.is_file():
+        return None
+    import torch
+    return torch.load(path, map_location="cpu", weights_only=False)
+
+
+def _prepare_reuse_root(root, request):
+    root = Path(root)
+    if request is None or not root.exists() or (root / "background_reuse.json").is_file():
+        return request
+    state = _flow_recovery_state(root)
+    if state is None:
+        return None if any(root.iterdir()) else request
+    if "flow" in state.get("done", ()) or state.get("phase") not in (None, "flow"):
+        return None
+    shutil.rmtree(root)
+    return request
+
+
+def _activate_background_reuse(root, request, data_handler, device):
+    if request is None:
+        return None, None, None
+    import torch
+    from .storage import atomic_write, file_digest, write_json
+
+    root = Path(root)
+    manifest_path = root / "background_reuse.json"
+    stats_path = root / "background_preprocessing.pt"
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text())
+        if manifest.get("policy") != "shared_fixed_background_v1" or manifest.get("signature") != request["signature"]:
+            raise ValueError("LaCathode shared-background reuse contract changed; use a new output")
+        for name, expected in manifest.get("local_artifacts_sha256", {}).items():
+            path = root / name
+            if not path.is_file() or file_digest(path) != expected:
+                raise ValueError("Reused LaCathode background artifact changed or is missing")
+    else:
+        artifacts = request["report"]["artifacts_sha256"]
+        copied = {}
+        for relative in request["files"]:
+            source_path = request["source"] / relative
+            if file_digest(source_path) != artifacts[relative]:
+                raise ValueError("LaCathode background source artifact changed")
+            target = root / Path(relative).name
+            shutil.copy2(source_path, target)
+            copied[target.name] = file_digest(target)
+        rows = __import__("numpy").load(request["data"] / "outerdata_train.npy").astype("float32")
+        reference = data_handler.load_dataset(rows, shuffle_loader=False, device=torch.device("cpu"))
+        stats = {name: reference[name].detach().cpu() for name in ("max", "min", "mean2", "std2", "std2_logit_fix")}
+        atomic_write(stats_path, lambda path: torch.save(stats, path))
+        copied[stats_path.name] = file_digest(stats_path)
+        manifest = {
+            "schema": 1,
+            "policy": "shared_fixed_background_v1",
+            "signature": request["signature"],
+            "source_result": str(request["source"]),
+            "source_result_sha256": file_digest(request["source"] / "result.json"),
+            "source_data": str(request["data"]),
+            "local_artifacts_sha256": copied,
+            "training_reused": True,
+            "preprocessing_reused": True,
+        }
+        write_json(manifest_path, manifest)
+    stats = torch.load(stats_path, map_location="cpu", weights_only=True)
+    creation_reference = {name: value.to(device) for name, value in stats.items()}
+    evaluation_reference = {name: value.cpu() for name, value in stats.items()}
+    return manifest, creation_reference, evaluation_reference
+
+
+def _install_fixed_preprocessing(data_handler, reference):
+    if reference is None:
+        return None
+    original = data_handler.LHCORD_data_handler.preprocess_ANODE_data
+
+    def preprocess(self, *args, **kwargs):
+        if kwargs.get("external_param") is None:
+            kwargs["external_param"] = reference
+        return original(self, *args, **kwargs)
+
+    data_handler.LHCORD_data_handler.preprocess_ANODE_data = preprocess
+    return original
+
+
 def run_single(args, contract):
     import numpy as np
     import torch
@@ -406,7 +544,13 @@ def run_single(args, contract):
 
     torch.load = trusted_load
     root = args.output / "training"
+    background_request = _select_background_reuse(args, contract, background_epochs, config_file)
+    background_request = _prepare_reuse_root(root, background_request)
     recovery = EpochRecovery(root, contract, args.resume, **resume_policy(args))
+    background_reuse, creation_reference, evaluation_reference = _activate_background_reuse(
+        root, background_request, data_handler, torch.device(args.device)
+    )
+    original_preprocess = _install_fixed_preprocessing(data_handler, creation_reference)
     run_ANODE_training.train_ANODE = install_epoch_recovery(
         ANODE_training_utils, "train_ANODE", "flow", recovery
     )
@@ -449,7 +593,10 @@ def run_single(args, contract):
         emit_progress("flow", "Train background flow", total=background_epochs, unit="epoch", completed=0)
         run_all.train_DE(de)
 
-    recovery.stage("flow", flow)
+    if background_reuse is None:
+        recovery.stage("flow", flow)
+    else:
+        emit_progress("flow", "Reuse shared background flow", total=1, unit="step", completed=1)
     for name in (f"{FLOW_PREFIX}_train_losses.npy", f"{FLOW_PREFIX}_val_losses.npy"):
         losses = np.load(root / name, allow_pickle=False)
         if not losses.size:
@@ -497,7 +644,10 @@ def run_single(args, contract):
             sic_range=(0, 20),
             savefig=str(root / "internal_sic"),
         )
-    evaluate(args, root, data_handler, config_file=config_file, classifier_runs=parsed.cf_n_runs)
+    evaluate(args, root, data_handler, config_file=config_file, classifier_runs=parsed.cf_n_runs,
+             background_reference=evaluation_reference)
+    if original_preprocess is not None:
+        data_handler.LHCORD_data_handler.preprocess_ANODE_data = original_preprocess
     write_json(
         args.output / "protocol.json",
         {
@@ -510,6 +660,7 @@ def run_single(args, contract):
             "classifier_runs": parsed.cf_n_runs,
             "run_layout": contract["lacathode_run_layout"],
             "background_mode": getattr(args, "lacathode_background", "independent"),
+            "scan_background_reuse": background_reuse,
             "reference_samples": reference_samples,
             "selected_checkpoints": 10,
             "score": "Upstream ten-validation-checkpoint mean per classifier fit; no averaging across fits",
@@ -524,7 +675,8 @@ def run_single(args, contract):
     verify(args.sources)
 
 
-def evaluate(args, root, data_handler, *, config_file="DE_MAF_model.yml", classifier_runs=1):
+def evaluate(args, root, data_handler, *, config_file="DE_MAF_model.yml", classifier_runs=1,
+             background_reference=None):
     from riddle.production import score_diagnostics
     import numpy as np
     import torch
@@ -614,7 +766,8 @@ def evaluate(args, root, data_handler, *, config_file="DE_MAF_model.yml", classi
     epoch = int(np.argpartition(losses, 1)[0]) - 1
     if epoch < 0:
         raise ValueError("Inference selected the untrained flow entry")
-    reference = data_handler.load_dataset(np.load(args.data / "outerdata_train.npy").astype("float32"))
+    reference = (background_reference if background_reference is not None else
+                 data_handler.load_dataset(np.load(args.data / "outerdata_train.npy").astype("float32")))
     model = DensityEstimator(str(args.sources / config_file), eval_mode=True).model
     model.load_state_dict(
         torch.load(root / f"{FLOW_PREFIX}_epoch_{epoch}.par", map_location="cpu", weights_only=True)

@@ -6,6 +6,7 @@ import json
 import os
 import re
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -307,6 +308,98 @@ def stage_root(args, stage, config):
     return args.output / "fits" / f"fit_{config['fit_index']:03d}"
 
 
+def _background_reuse_signature(contract):
+    inputs = contract["inputs"]
+    settings = contract["settings"]
+    environment = contract["environment"]
+    return {
+        "scientific_version": contract["scientific_version"],
+        "source_commit": contract["source_commit"],
+        "source_sha256": contract["source_sha256"],
+        "variant": inputs.get("variant", "default"),
+        "source": inputs.get("source"),
+        "background_epochs": settings["background_epochs"],
+        "background_protocol": settings["background_protocol"],
+        "packages": environment.get("packages"),
+        "cuda": environment.get("cuda"),
+        "matmul_tf32": environment.get("matmul_tf32"),
+        "cudnn_tf32": environment.get("cudnn_tf32"),
+    }
+
+
+def _select_background_reuse(args):
+    if getattr(args, "scan_background_reuse_policy", None) != "shared_fixed_background_v1":
+        return None
+    expected = _background_reuse_signature(args.production_contract)
+    for candidate in getattr(args, "background_reuse_candidate", None) or ():
+        source = Path(candidate).resolve()
+        report_path = source / "result.json"
+        receipt_path = source / "background_complete.json"
+        if not report_path.is_file() or not receipt_path.is_file():
+            continue
+        try:
+            report = json.loads(report_path.read_text())
+            receipt = json.loads(receipt_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        artifacts = report.get("artifacts_sha256", {})
+        if artifacts.get("background_complete.json") != digest(receipt_path):
+            continue
+        if any(artifacts.get(name) != checksum for name, checksum in receipt.get("files", {}).items()):
+            continue
+        source_contract = report.get("contract", {})
+        if report.get("completed") is not True or report.get("method") != "ranode" or report.get("scenario") != "signal_injection":
+            continue
+        try:
+            signature = _background_reuse_signature(source_contract)
+        except (KeyError, TypeError):
+            continue
+        if signature != expected:
+            continue
+        try:
+            check_files(source, receipt["files"])
+        except (OSError, ValueError):
+            continue
+        attempt = source / receipt["attempt"]
+        if not attempt.is_dir():
+            continue
+        return source, report, receipt, attempt, expected
+    return None
+
+
+def _activate_background_reuse(args):
+    selected = _select_background_reuse(args)
+    if selected is None:
+        return None
+    source, report, receipt, source_attempt, signature = selected
+    attempts = args.output / "upstream_runs" / "background"
+    if attempts.exists():
+        for path in attempts.iterdir():
+            if path.name.startswith("attempt_") and path.is_dir():
+                shutil.rmtree(path)
+    attempts.mkdir(parents=True, exist_ok=True)
+    destination = Path(tempfile.mkdtemp(prefix="reuse_", dir=attempts))
+    shutil.copytree(source_attempt, destination, dirs_exist_ok=True)
+    relative = destination.relative_to(args.output)
+    files = {str(relative / name): value for name, value in fingerprint(destination).items()}
+    current_receipt = args.output / "background_complete.json"
+    write_json(current_receipt, {"attempt": str(relative), "files": files})
+    write_json(args.output / "background_reuse.json", {
+        "schema": 1,
+        "policy": "shared_fixed_background_v1",
+        "signature": signature,
+        "source_result": str(source),
+        "source_result_sha256": digest(source / "result.json"),
+        "source_background_receipt_sha256": digest(source / "background_complete.json"),
+        "source_attempt": receipt["attempt"],
+        "local_attempt": str(relative),
+        "training_reused": True,
+        "preprocessing_reused": True,
+    })
+    emit_message(f"Background: reuse frozen R-ANODE background from {source}", kind="PASS")
+    return destination
+
+
 def prepare_stage(args, stage, config, background=None):
     root = stage_root(args, stage, config)
     receipt = root / (stage + "_complete.json")
@@ -324,6 +417,10 @@ def prepare_stage(args, stage, config, background=None):
         emit_progress("reuse", "Verify saved stage artifacts", stream=label, completed=1)
         emit_message(f"{label}: reuse verified R-ANODE {stage} stage", kind="PASS")
         return args.output / saved["attempt"]
+    if stage == "background":
+        reused = _activate_background_reuse(args)
+        if reused is not None:
+            return reused
     attempts = root / "upstream_runs" / stage
     attempts.mkdir(parents=True, exist_ok=True)
     attempt = Path(tempfile.mkdtemp(prefix="attempt_", dir=attempts))
@@ -730,6 +827,8 @@ def run(args):
             "seed": "Upstream seed controls data ordering; fit_index selects the split and fraction initialization. Upstream does not seed Torch",
             "restart": "Reuse completed stages; restart interrupted stage from saved initial RNG, without changing upstream checkpoint format",
             "background_attempt": str(background.relative_to(args.output)),
+            "scan_background_reuse": (json.loads((args.output / "background_reuse.json").read_text())
+                                       if (args.output / "background_reuse.json").is_file() else None),
             "signal_attempts": [member["attempt"] for member in members],
             "members": members,
             "excluded_fits": excluded,
@@ -854,6 +953,8 @@ def main(argv=None):
     parser.add_argument("--io-workers", type=int, default=2)
     parser.add_argument("--torch-threads", type=int, default=2)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--scan-background-reuse-policy", help=argparse.SUPPRESS)
+    parser.add_argument("--background-reuse-candidate", action="append", help=argparse.SUPPRESS)
     parser.add_argument("--pilot-no-safeguards", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--pilot-rng-source", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--pilot-latent-inputs", type=Path, help=argparse.SUPPRESS)

@@ -114,15 +114,105 @@ def prepare_scan(args):
 
 
 
-def _riddle_background_candidates(output_root, point, variant, current_point):
+
+def _candidate_roots(output_root):
     roots = []
     for root in (Path("results").resolve(), output_root.parent / "results", output_root):
         root = root.resolve()
         if root.exists() and root not in roots:
             roots.append(root)
+    return roots
+
+
+def _source_priority(report):
+    scan = report.get("contract", {}).get("inputs", {}).get("injection_scan")
+    return 0 if scan is not None and scan.get("replica") == 0 else 1 if scan is None else 2
+
+
+def _matching_prepared_data(report, data_root):
+    inputs = report.get("contract", {}).get("inputs", {})
+    expected = inputs.get("files", {})
+    if not expected:
+        return None
+    candidates = []
+    scan = inputs.get("injection_scan")
+    if scan is not None:
+        candidates.append(data_root / point_name(scan) / "signal_injection")
+    candidates.extend((Path("data/lhco/signal_injection"), data_root.parent / "lhco/signal_injection"))
+    seen = set()
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        if candidate in seen or not candidate.is_dir():
+            continue
+        seen.add(candidate)
+        manifest_path = candidate / "inputs.json"
+        if not manifest_path.is_file():
+            continue
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if manifest.get("files") == expected and manifest.get("variant", "default") == inputs.get("variant", "default"):
+            return str(candidate)
+    return None
+
+
+def _lacathode_background_candidates(output_root, data_root, variant, current_point):
     candidates = []
     seen = set()
-    for root in roots:
+    for root in _candidate_roots(output_root):
+        for report_path in root.rglob("result.json"):
+            source = report_path.parent.resolve()
+            if source in seen or source == current_point.resolve() or current_point.resolve() in source.parents:
+                continue
+            try:
+                report = json.loads(report_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            if report.get("method") != "lacathode" or report.get("completed") is not True or report.get("scenario") != "signal_injection":
+                continue
+            source_variant = report.get("variant", report.get("contract", {}).get("inputs", {}).get("variant", "default"))
+            if source_variant != variant:
+                continue
+            training = source / "training"
+            losses = training / f"lacathode_model_val_losses.npy"
+            checkpoints = sorted(training.glob("lacathode_model_epoch_*.par"))
+            data = _matching_prepared_data(report, data_root)
+            if not losses.is_file() or len(checkpoints) < 10 or data is None:
+                continue
+            seen.add(source)
+            candidates.append((_source_priority(report), str(source), data))
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return [{"result": source, "data": data} for _, source, data in candidates]
+
+
+def _ranode_background_candidates(output_root, variant, current_point):
+    candidates = []
+    seen = set()
+    for root in _candidate_roots(output_root):
+        for report_path in root.rglob("result.json"):
+            source = report_path.parent.resolve()
+            if source in seen or source == current_point.resolve() or current_point.resolve() in source.parents:
+                continue
+            try:
+                report = json.loads(report_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            if report.get("method") != "ranode" or report.get("completed") is not True or report.get("scenario") != "signal_injection":
+                continue
+            source_variant = report.get("variant", report.get("contract", {}).get("inputs", {}).get("variant", "default"))
+            if source_variant != variant or not (source / "background_complete.json").is_file():
+                continue
+            seen.add(source)
+            candidates.append((_source_priority(report), str(source)))
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return [source for _, source in candidates]
+
+
+def _riddle_background_candidates(output_root, point, variant, current_point):
+    candidates = []
+    seen = set()
+    for root in _candidate_roots(output_root):
         for report_path in root.rglob("result.json"):
             source = report_path.parent.resolve()
             if source in seen or source == current_point.resolve() or current_point.resolve() in source.parents:
@@ -134,14 +224,12 @@ def _riddle_background_candidates(output_root, point, variant, current_point):
             method = str(report.get("method", ""))
             if not method.startswith("riddle") or report.get("completed") is not True:
                 continue
-            if report.get("scenario") != "signal_injection" or report.get("seed") != point["training_seed"]:
+            if report.get("scenario") != "signal_injection":
                 continue
             source_variant = report.get("variant", report.get("contract", {}).get("inputs", {}).get("variant", "default"))
             if source_variant != variant:
                 continue
             scan = report.get("contract", {}).get("inputs", {}).get("injection_scan")
-            if scan is not None and scan.get("replica") != point["replica"]:
-                continue
             required = (
                 source / "background" / "model.pt",
                 source / "background" / "preprocessing.pt",
@@ -151,7 +239,8 @@ def _riddle_background_candidates(output_root, point, variant, current_point):
             if not all(path.is_file() for path in required):
                 continue
             seen.add(source)
-            candidates.append((0 if scan is None else 1, str(source)))
+            priority = 0 if scan is None else 1 if scan.get("replica") == 0 else 2
+            candidates.append((priority, str(source)))
     candidates.sort(key=lambda item: (item[0], item[1]))
     return [source for _, source in candidates]
 
@@ -177,10 +266,21 @@ def run_scan(args):
         options.output = output_root / point_name(point)
         options.scenarios = ["signal_injection"]
         options.seeds = [point["training_seed"]]
+        manifest = validate(options.data / "signal_injection", require_event_ids="riddle" in args.methods)
+        variant = manifest.get("variant", "default")
         if "riddle" in args.methods:
-            manifest = validate(options.data / "signal_injection", require_event_ids=True)
-            options.scan_background_reuse_policy = "same_replica_fixed_background_v1"
+            options.scan_background_reuse_policy = "shared_fixed_background_v1"
             options.riddle_background_reuse_candidates = _riddle_background_candidates(
-                output_root, point, manifest.get("variant", "default"), options.output
+                output_root, point, variant, options.output
+            )
+        if "lacathode" in args.methods:
+            options.lacathode_scan_background_reuse_policy = "shared_fixed_background_v1"
+            options.lacathode_background_reuse_candidates = _lacathode_background_candidates(
+                output_root, data_root, variant, options.output
+            )
+        if "ranode" in args.methods:
+            options.ranode_scan_background_reuse_policy = "shared_fixed_background_v1"
+            options.ranode_background_reuse_candidates = _ranode_background_candidates(
+                output_root, variant, options.output
             )
         run_campaign(options)

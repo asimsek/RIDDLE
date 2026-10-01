@@ -251,6 +251,11 @@ def run_campaign(args):
                         command.extend(["--fits" if key == "runs" else "--" + key, str(value)])
                 command.extend(["--campaign-seed", str(base_seed), "--run-index", str(run_index),
                                 "--independent-run-count", str(run_overrides["runs"] or 1)])
+                reuse_policy = getattr(args, "ranode_scan_background_reuse_policy", None)
+                if reuse_policy is not None:
+                    command.extend(["--scan-background-reuse-policy", reuse_policy])
+                for candidate in getattr(args, "ranode_background_reuse_candidates", None) or ():
+                    command.extend(["--background-reuse-candidate", str(candidate)])
                 if args.resume:
                     command.append("--resume")
                 for key in ("resume_across_code_change", "resume_across_device_change"):
