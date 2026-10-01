@@ -287,10 +287,11 @@ kubectl exec -n cua-asimsek \
 ```bash
 cd /shared/work/RIDDLE
 python scripts/nrp_runtime.py
+
 python plot.py --results results --output plots --verbose 1 --io-workers 16 --overwrite
 
 python paper_plot.py --data data/lhco --results results \
-  --config config/settings.yaml --output paper_plots \
+  --config config/settings.yaml --output paper_plots --scenarios signal_injection background_only \
   --methods riddle lacathode ranode --variants default deltaR shifted \
   --plot-formats png --file-formats csv --overwrite --verbose 1
 ```
