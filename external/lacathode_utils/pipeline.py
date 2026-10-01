@@ -494,11 +494,33 @@ def _install_fixed_preprocessing(data_handler, reference):
     original = data_handler.LHCORD_data_handler.preprocess_ANODE_data
 
     def preprocess(self, *args, **kwargs):
-        if kwargs.get("external_param") is None:
+        positional = list(args)
+        if len(positional) >= 4:
+            positional[3] = reference
+            kwargs.pop("external_param", None)
+        else:
             kwargs["external_param"] = reference
-        return original(self, *args, **kwargs)
+        return original(self, *positional, **kwargs)
 
     data_handler.LHCORD_data_handler.preprocess_ANODE_data = preprocess
+    return original
+
+
+def _install_fixed_load_dataset(data_handler, reference):
+    if reference is None:
+        return None
+    original = data_handler.load_dataset
+
+    def load_dataset(data, *args, **kwargs):
+        positional = list(args)
+        if len(positional) >= 2:
+            positional[1] = reference
+            kwargs.pop("external_datadict", None)
+        else:
+            kwargs["external_datadict"] = reference
+        return original(data, *positional, **kwargs)
+
+    data_handler.load_dataset = load_dataset
     return original
 
 
@@ -644,10 +666,10 @@ def run_single(args, contract):
             sic_range=(0, 20),
             savefig=str(root / "internal_sic"),
         )
-    evaluate(args, root, data_handler, config_file=config_file, classifier_runs=parsed.cf_n_runs,
-             background_reference=evaluation_reference)
     if original_preprocess is not None:
         data_handler.LHCORD_data_handler.preprocess_ANODE_data = original_preprocess
+    evaluate(args, root, data_handler, config_file=config_file, classifier_runs=parsed.cf_n_runs,
+             background_reference=evaluation_reference)
     write_json(
         args.output / "protocol.json",
         {
@@ -693,6 +715,7 @@ def evaluate(args, root, data_handler, *, config_file="DE_MAF_model.yml", classi
 
     captured = []
     evaluation_checkpoints = []
+    original_load_dataset = _install_fixed_load_dataset(data_handler, background_reference)
 
     def evaluation_estimator(*a, **kw):
         if kw.get("load_path") is not None:
@@ -743,6 +766,8 @@ def evaluate(args, root, data_handler, *, config_file="DE_MAF_model.yml", classi
             num_clsf_models=10,
             multirun=True,
         )
+    if original_load_dataset is not None:
+        data_handler.load_dataset = original_load_dataset
     selection_path = root / "flow_checkpoint_selection.json"
     flow_selection = json.loads(selection_path.read_text())
     if len(evaluation_checkpoints) != classifier_runs or len(set(evaluation_checkpoints)) != 1:

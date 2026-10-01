@@ -126,7 +126,7 @@ def _candidate_roots(output_root):
 
 def _source_priority(report):
     scan = report.get("contract", {}).get("inputs", {}).get("injection_scan")
-    return 0 if scan is not None and scan.get("replica") == 0 else 1 if scan is None else 2
+    return 0 if scan is None else 1 if scan.get("replica") == 0 else 2
 
 
 def _matching_prepared_data(report, data_root):
