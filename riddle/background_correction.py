@@ -845,7 +845,9 @@ def train_oracle(directory, train_z, train_mass, val_z, val_mass, closure_z, clo
     if (directory / "model.pt").is_file() and (directory / "selection.json").is_file():
         selection = json.loads((directory / "selection.json").read_text())
         active = selection.get("status") == "activated" and bool(selection.get("active"))
-        return {"requested_mode": MODE, "active": active, "descriptor": descriptor(directory) if active else None, "selection": selection, "reuse": json.loads((directory / "reuse.json").read_text()) if (directory / "reuse.json").is_file() else None}
+        if not active:
+            raise ValueError("Oracle background q_phi failed Gaussian validation; refusing a Gaussian denominator fallback")
+        return {"requested_mode": MODE, "active": active, "descriptor": descriptor(directory), "selection": selection, "reuse": json.loads((directory / "reuse.json").read_text()) if (directory / "reuse.json").is_file() else None}
     write_json(contract_path, contract)
     torch.manual_seed(int(seed))
     np.random.seed(int(seed) % 2**32)
@@ -930,7 +932,7 @@ def train_oracle(directory, train_z, train_mass, val_z, val_mass, closure_z, clo
         "protocol": ORACLE_PROTOCOL,
         "selected_epoch": int(best_epoch),
         "epochs": epochs,
-        "status": "activated" if active else "gaussian_fallback",
+        "status": "activated" if active else "validation_failed",
         "active": active,
         "checkpoint_selection": {"metric": "equal_mass_stratum_validation_nll", "eligibility": "Gaussian-compatible natural validation", "eligible_checkpoint_found": bool(use_eligible), "mass_bins": mass_bins, "selected_nll": float(best)},
         "criterion": "best equal-mass-stratum checkpoint among Gaussian-compatible reserved pure-background signal-region validation epochs",
@@ -941,13 +943,16 @@ def train_oracle(directory, train_z, train_mass, val_z, val_mass, closure_z, clo
         "full_search_closure_status": "not_applicable",
         "truth_labels_used": True,
         "training_region": "pure background signal region",
-        "denominator": "q_phi_oracle(z|m)" if active else "standard_normal(z)",
-        "fallback_reason": "; ".join(reasons) if reasons else None,
+        "denominator": "q_phi_oracle(z|m)" if active else None,
+        "failure_reason": "; ".join(reasons) if reasons else None,
     }
     write_json(directory / "selection.json", decision)
     write_json(directory / "history.json", history)
-    emit_message("Oracle background correction activated" if active else "Oracle background correction failed Gaussian validation gate; using Gaussian denominator", level=0)
-    return {"requested_mode": MODE, "active": active, "descriptor": descriptor(directory) if active else None, "selection": decision, "reuse": json.loads((directory / "reuse.json").read_text()) if (directory / "reuse.json").is_file() else None}
+    if not active:
+        emit_message("Oracle background correction failed Gaussian validation gate; refusing Gaussian denominator fallback", level=0)
+        raise ValueError("Oracle background q_phi failed Gaussian validation; refusing a Gaussian denominator fallback")
+    emit_message("Oracle background correction activated", level=0)
+    return {"requested_mode": MODE, "active": True, "descriptor": descriptor(directory), "selection": decision, "reuse": json.loads((directory / "reuse.json").read_text()) if (directory / "reuse.json").is_file() else None}
 
 
 def _reuse_signature(settings):

@@ -302,7 +302,7 @@ def assess_fit(directory, epochs, fractions, validation, device, *, sigma, norma
 
 def train_member(rows, validation, output, *, relative, index, fraction, epochs, seed,
                  device, initialization, settings, label, normalization_tests, background_reference=None,
-                 background_correction=None, member_split_indices=None, source_ids=None):
+                 background_correction=None, member_split_indices=None, source_ids=None, truth_labels_used=False):
     """One persisted attempt budget shared by sequential and spawned workers."""
     from .production import NumericalFitError
     from .storage import locked, save_npz
@@ -324,11 +324,13 @@ def train_member(rows, validation, output, *, relative, index, fraction, epochs,
                            for i in range(1, policy["max_retries"] + 1)]
     if len(set(seeds)) != len(seeds):
         raise ValueError("Fit retry seeds collided")
+    if type(truth_labels_used) is not bool:
+        raise ValueError("truth_labels_used must be boolean")
     identity = dict(schema=2, scientific_version=SCIENTIFIC_VERSION, production_policy=PRODUCTION_POLICY,
                     seed=seed, fit_index=index,
                     attempt_seeds=seeds, settings=settings, fraction=fraction,
                     training_sha256=digest(rows), validation_sha256=digest(validation),
-                    normalization_tests=normalization_tests)
+                    normalization_tests=normalization_tests, truth_labels_used=truth_labels_used)
     if background_reference is not None:
         identity["background_reference_sha256"] = digest(background_reference)
     if background_correction is not None:
@@ -414,7 +416,7 @@ def train_member(rows, validation, output, *, relative, index, fraction, epochs,
                     rows[a], rows[b], directory, epochs=epochs, seed=training_seed, device=device,
                     checkpoint=checkpoint, fraction=fraction, initialization=initialization,
                     progress_label=f"{label} | Attempt {number + 1}/{len(seeds)}", settings=settings,
-                    background_correction=background_correction)
+                    background_correction=background_correction, truth_labels_used=truth_labels_used)
                 stein_core = settings.get("core", "residual") == "stein_witness"
                 weights = ([0.0 for _ in order] if stein_core else
                            [history[e]["signal_fraction"] for e in order])
@@ -474,6 +476,7 @@ def train_campaign(
     initialization="background", started=None, workers=1, io_workers=2, torch_threads=2, settings=None, background_reference=None,
     background_correction=None, selection_validation=None, member_splits=None, source_ids=None, mapping_identity=None,
     ensemble_reuse_candidates=None, ensemble_reuse_contract=None, allow_ensemble_reuse_code_change=False,
+    truth_labels_used=False,
 ):
     settings = deepcopy(DEFAULTS["riddle"] if settings is None else settings)
     settings.update(epochs=epochs, runs=runs, initialization=initialization)
@@ -482,6 +485,8 @@ def train_campaign(
     output.mkdir(parents=True, exist_ok=True)
     if min(runs, workers, io_workers, torch_threads) < 1:
         raise ValueError("Require positive runs/workers/io_workers/torch_threads")
+    if type(truth_labels_used) is not bool:
+        raise ValueError("truth_labels_used must be boolean")
     mass_conditioning = settings.get("mass_conditioning", False)
     physical_inputs = settings.get("input_space") == "physical"
     if physical_inputs and (background_reference is None or workers != 1):
@@ -509,7 +514,7 @@ def train_campaign(
     identity = dict(scientific_version=SCIENTIFIC_VERSION, production_policy=PRODUCTION_POLICY,
                     training_sha256=digest(ztrain), selection_sha256=digest(zval),
                     epochs=epochs, runs=runs, seed=seed, fractions=list(fraction_values),
-                    initialization=initialization, settings=settings)
+                    initialization=initialization, settings=settings, truth_labels_used=truth_labels_used)
     if mapping_identity is not None:
         identity["mapping_identity"] = mapping_identity
     if background_reference is not None:
@@ -549,7 +554,7 @@ def train_campaign(
         run_fits(rows, jobs, validation=zval, epochs=epochs, seed=seed, device=device,
                  initialization=initialization, workers=workers, io_workers=io_workers, torch_threads=torch_threads,
                  total=total, started=started, settings=settings, normalization_tests=tests, source_ids=source_ids,
-                 background_correction=background_correction)
+                 background_correction=background_correction, truth_labels_used=truth_labels_used)
     else:
         for job in jobs:
             train_member(rows, zval, output, relative=job["relative"], index=job["index"],
@@ -557,6 +562,7 @@ def train_campaign(
                          initialization=initialization, settings=settings,
                          label=f"RIDDLE fit {job['fit']}/{total}", normalization_tests=tests,
                          member_split_indices=job["member_split_indices"], source_ids=source_ids,
+                         truth_labels_used=truth_labels_used,
                          **({"background_reference": background_reference} if background_reference is not None else {}),
                          **({"background_correction": background_correction} if background_correction is not None else {}))
     configs, failures = [], []

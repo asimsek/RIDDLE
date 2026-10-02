@@ -470,7 +470,10 @@ def train_residual(
     on_training_start=None,
     settings=None,
     background_correction=None,
+    truth_labels_used=False,
 ):
+    if type(truth_labels_used) is not bool:
+        raise ValueError("truth_labels_used must be boolean")
     settings = deepcopy(DEFAULTS["riddle"] if settings is None else settings)
     settings.update(epochs=epochs, initialization=initialization)
     settings = validate_residual(settings)
@@ -481,6 +484,7 @@ def train_residual(
             after_epoch=after_epoch, fraction=fraction, initialization=initialization,
             progress_label=progress_label.replace("residual mixture", "Stein witness"),
             on_training_start=on_training_start, settings=settings, background_correction=background_correction,
+            truth_labels_used=truth_labels_used,
         )
     options = settings["training"]
     additions = feature_options(settings)
@@ -625,7 +629,7 @@ def train_residual(
             "train_latents_sha256": digest(ztrain),
             "validation_latents_sha256": digest(zval),
             "data_reference_label": 1,
-            "truth_labels_used": False,
+            "truth_labels_used": truth_labels_used,
             "mass_input_used": mass_conditioning,
             "initial_fraction": initial_fraction,
             "fraction_mode": ("learned_smooth_f(m)" if mass_fraction_active else

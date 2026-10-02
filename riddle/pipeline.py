@@ -290,6 +290,7 @@ def run(args, contract):
             **({"member_splits": member_splits} if member_splits is not None else {}),
             **({"source_ids": source_ids} if source_ids is not None else {}),
             mapping_identity=mapping_identity,
+            truth_labels_used=(oracle_roles["receipt"]["p_truth_role_selection"] if oracle_method else False),
             **({
                 "ensemble_reuse_candidates": getattr(args, "supervised_ensemble_reuse_candidates", None),
                 "ensemble_reuse_contract": contract,

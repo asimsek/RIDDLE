@@ -488,7 +488,10 @@ def _validate_recovery(checkpoint, epochs, settings, background_sha256):
 
 def train_stein_witness(train, validation, output, *, epochs, seed, device, checkpoint=None,
                          fraction=None, initialization="background", progress_label="Train Stein witness",
-                         on_training_start=None, settings=None, background_correction=None, after_epoch=None):
+                         on_training_start=None, settings=None, background_correction=None, after_epoch=None,
+                         truth_labels_used=False):
+    if type(truth_labels_used) is not bool:
+        raise ValueError("truth_labels_used must be boolean")
     settings = deepcopy(settings)
     settings.update(epochs=epochs, initialization=initialization)
     settings = validate_residual(settings)
@@ -563,7 +566,7 @@ def train_stein_witness(train, validation, output, *, epochs, seed, device, chec
         "background_score_train_sha256": digest(qtrain),
         "background_score_validation_sha256": digest(qval),
         "data_reference_label": 1,
-        "truth_labels_used": False,
+        "truth_labels_used": truth_labels_used,
         "mass_input_used": False,
         "witness_mass_input_used": False,
         "background_mass_conditioning": mass_conditioning,
