@@ -45,7 +45,7 @@ def positive(value):
 
 
 def parser():
-    p = argparse.ArgumentParser(description="Independent LaCathode, RIDDLE, R-ANODE, Idealized AD and Supervised AD LHCO pipelines")
+    p = argparse.ArgumentParser(description="Independent LaCathode, RIDDLE, R-ANODE, Idealized RIDDLE (IAD), and Supervised RIDDLE LHCO pipelines")
     subs = p.add_subparsers(dest="command", required=True)
     setup = subs.add_parser("setup", help="Verify manually cloned, pinned upstream checkouts")
     setup.add_argument("--sources", type=Path, default=ROOT / "external/lacathode")
@@ -81,7 +81,7 @@ def parser():
             "--workers",
             type=positive,
             default=1,
-            help="Concurrent RIDDLE/R-ANODE/IAD/Supervised fits, independent LaCathode runs, or fixed-background LaCathode classifier fits",
+            help="Concurrent RIDDLE/Idealized-RIDDLE/Supervised-RIDDLE/R-ANODE fits, independent LaCathode runs, or fixed-background LaCathode classifier fits",
         )
         run.add_argument("--io-workers", type=positive, default=2,
                          help="Filesystem/host I/O concurrency; independent of PyTorch compute threads")
@@ -91,11 +91,11 @@ def parser():
         run.add_argument("--runs", type=positive,
                          help="Complete independent runs per seed (default: 1); retrain background and signal models")
         run.add_argument("--fits", type=positive,
-                         help="Ensemble fits per RIDDLE/R-ANODE/IAD/Supervised run (default: method settings); does not change LaCathode")
+                         help="Ensemble fits per RIDDLE/Idealized-RIDDLE/Supervised-RIDDLE/R-ANODE run (default: method settings); does not change LaCathode")
         run.add_argument("--lacathode-background", choices=("independent", "fixed"), default="independent",
                          help="Retrain each LaCathode background flow (default), or share one flow across classifier fits")
         run.add_argument(
-            "--epochs", type=positive, help="Override RIDDLE/R-ANODE/IAD/Supervised signal-fit and LaCathode classifier epochs; background stages are unchanged"
+            "--epochs", type=positive, help="Override RIDDLE/Idealized-RIDDLE/Supervised-RIDDLE/R-ANODE fit epochs and LaCathode classifier epochs; background stages are unchanged"
         )
         run.add_argument("--fractions", nargs="+", help="Override YAML mixture-fraction configurations (residual only)")
         from .roles import POLICIES
@@ -172,14 +172,16 @@ def run_campaign(args):
     args.data, args.output, args.sources = (p.resolve() for p in (args.data, args.output, args.sources))
     if args.output.is_relative_to(args.data) or args.data.is_relative_to(args.output):
         raise ValueError("Keep data and results in separate directories")
+    native_requested = any(method in args.methods for method in ("riddle", "iad", "supervised"))
+    oracle_requested = any(method in args.methods for method in ("iad", "supervised"))
     for scenario in args.scenarios:
         if args.methods == ["ranode"]:
             from external.ranode_utils.data import validate as validate_ranode
             manifest, _ = validate_ranode(args.data / scenario)
         else:
             from .data import validate
-            manifest = validate(args.data / scenario, require_event_ids="riddle" in args.methods, require_baseline=any(method in args.methods for method in ("iad", "supervised")))
-        if "riddle" in args.methods:
+            manifest = validate(args.data / scenario, require_event_ids=native_requested, require_oracle=oracle_requested)
+        if native_requested:
             input_features(args.settings, manifest)
         if "ranode" in args.methods:
             from external.ranode_utils.data import validate_schema
@@ -222,7 +224,7 @@ def run_campaign(args):
             elif method == "riddle":
                 options["runs"] = args.fits
             elif method in ("iad", "supervised"):
-                options["fits"] = args.fits
+                options["runs"] = args.fits
             env = os.environ.copy()
             if args.device == "cpu":
                 env["CUDA_VISIBLE_DEVICES"] = ""

@@ -6,6 +6,8 @@ import numpy as np
 import torch
 
 SCIENTIFIC_VERSION = 6
+RIDDLE_BENCHMARK_SCIENTIFIC_VERSION = "riddle_oracle_benchmarks_v3"
+RIDDLE_BENCHMARK_LABELS = {"iad": "Idealized RIDDLE (IAD)", "supervised": "Supervised RIDDLE"}
 
 
 def require_finite(value, stage):

@@ -77,7 +77,7 @@ python run.py run --methods ranode --data data/lhco --output results \
   --io-workers 8 --resume
 ```
 
-**Idealized AD:** trains a signal-region data-vs-pure-background classifier without using RIDDLE's learned representation.
+**Idealized AD:**
 
 ```bash
 python run.py run --methods iad --data data/lhco --output results \
@@ -85,7 +85,7 @@ python run.py run --methods iad --data data/lhco --output results \
   --workers 5 --io-workers 2 --torch-threads 2 --mps on --resume
 ```
 
-**Supervised AD:** trains the same classifier architecture on independent pure simulated signal and background samples.
+**Supervised AD:**
 
 ```bash
 python run.py run --methods supervised --data data/lhco --output results \
@@ -103,13 +103,13 @@ python run.py run --methods lacathode riddle ranode --data data/lhco --output re
 ```
 
 `--device cpu` for CPU execution.<br>
-`--workers` controls concurrent RIDDLE/R-ANODE/IAD/Supervised fits, complete independent LaCathode runs, or fixed-background LaCathode classifier fits after the shared flow is ready.<br>
+`--workers` controls concurrent RIDDLE/Idealized/Supervised/R-ANODE fits, complete independent LaCathode runs, or fixed-background LaCathode classifier fits after the shared flow is ready.<br>
 `--io-workers` controls CPU threads per process.<br>
 MPS is optional on Linux NVIDIA GPUs; `auto` falls back to ordinary concurrency, while `on` requires MPS.
 
-`--fits` controls the ensemble fits inside RIDDLE/R-ANODE/IAD/Supervised.<br>
+`--fits` controls the ensemble fits inside RIDDLE/Idealized/Supervised/R-ANODE.<br>
 `--runs` controls complete independent method runs per base seed; default = 1.<br>
-`--epochs` controls signal/classifier epochs.<br>
+`--epochs` controls the native RIDDLE/Idealized/Supervised/R-ANODE fit epochs and LaCathode classifier epochs.<br>
 `--lacathode-background fixed` shares same LaCathode background flow across `--runs` classifiers; default = `independent`.
 
 For all methods, to continue compatible checkpoints after an implementation update, add `--resume-across-code-change`.<br>

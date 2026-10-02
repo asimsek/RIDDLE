@@ -309,10 +309,15 @@ def select_requested_methods(all_groups, requested):
         normalized = []
         for item in requested:
             if item == "all":
-                normalized = list(METHOD_ORDER) + sorted(available - set(METHOD_ORDER))
-                break
-            normalized.append(canonical_method(item))
-        return [item for item in normalized if item in available]
+                return [item for item in METHOD_ORDER if item in available] + sorted(available - set(METHOD_ORDER))
+            method = canonical_method(item)
+            if method not in normalized:
+                normalized.append(method)
+        missing = [method for method in normalized if method not in available]
+        if missing:
+            labels = ", ".join(METHOD_LABELS.get(method, method) for method in missing)
+            raise ValueError(f"Explicitly requested publication methods were not discovered: {labels}")
+        return normalized
     return [item for item in ("riddle", "iad", "supervised") if item in available]
 
 
@@ -333,7 +338,7 @@ def filter_groups(groups, methods, variants, scenarios, excluded_seeds):
 
 
 def score_scope(method, report):
-    if method == "riddle":
+    if method in ("riddle", "iad", "supervised"):
         return riddle_score_scope(report)
     if method == "ranode":
         return "signal_region"
@@ -346,12 +351,60 @@ def group_protocol_key(method, report):
     return method, scientific_protocol(report), result_variant(report), report.get("scenario"), json.dumps(inputs.get("files", None), sort_keys=True)
 
 
+def aggregation_protocol_signature(method, report):
+    contract = report.get("contract", {})
+    settings = contract.get("settings", {})
+    if method in ("riddle", "iad", "supervised"):
+        payload = {
+            "scientific_version": contract.get("scientific_version"),
+            "riddle": settings.get("riddle"),
+            "background": settings.get("background"),
+            "inputs": settings.get("inputs"),
+            "oracle_benchmark": contract.get("oracle_benchmark") if method in ("iad", "supervised") else None,
+            "score_scope": score_scope(method, report),
+        }
+    else:
+        volatile = {"seed", "scenario", "device", "run_index", "campaign_seed"}
+        payload = {
+            "scientific_version": contract.get("scientific_version"),
+            "settings": {key: value for key, value in settings.items() if key not in volatile},
+            "score_scope": score_scope(method, report),
+        }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def require_riddle_benchmark_alignment(group):
+    native = {}
+    for method in ("riddle", "iad", "supervised"):
+        if method not in group:
+            continue
+        report = group[method][1]
+        contract = report.get("contract", {})
+        settings = contract.get("settings", {})
+        riddle_settings = settings.get("riddle")
+        background_settings = settings.get("background")
+        inputs_settings = settings.get("inputs")
+        if not isinstance(riddle_settings, dict) or not isinstance(background_settings, dict) or not isinstance(inputs_settings, dict):
+            raise ValueError(f"{METHOD_LABELS[method]} is missing its RIDDLE configuration")
+        if method in ("iad", "supervised"):
+            oracle = contract.get("oracle_benchmark")
+            if (report.get("benchmark_protocol") != "riddle_oracle" or not isinstance(oracle, dict)
+                    or oracle.get("method") != method or oracle.get("core") != "riddle_stein_witness"):
+                raise ValueError(f"{METHOD_LABELS[method]} is not a valid RIDDLE oracle benchmark result")
+        native[method] = {"riddle": riddle_settings, "background": background_settings, "inputs": inputs_settings}
+    if not native:
+        return
+    configurations = {json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False) for value in native.values()}
+    if len(configurations) > 1:
+        raise ValueError("RIDDLE, Idealized AD, and Supervised AD do not share one RIDDLE configuration")
+
+
 def load_record(loader, method, root, report, region):
     if region == "full_region" and score_scope(method, report) != "full_region":
         return None
     partition = "signal_region" if region == "signal_region" else "test"
     record = loader(root, report, partition)
-    if method == "riddle":
+    if method in ("riddle", "iad", "supervised"):
         record["paper_mass_conditioning"] = bool(report.get("contract", {}).get("settings", {}).get("riddle", {}).get("mass_conditioning", False))
     if region == "signal_region":
         if "is_signal_region" in record and not np.asarray(record["is_signal_region"]).all():
@@ -467,9 +520,11 @@ def aggregate_metric_runs(run_rows, curve_kind):
 def metric_cache(groups, loader, regions, min_background, verbose):
     cache = {}
     records = {}
+    protocol_groups = defaultdict(set)
     total = sum(len(group) * len(regions) for group in groups.values())
     index = 0
     for (scenario, seed, variant), group in sorted(groups.items()):
+        require_riddle_benchmark_alignment(group)
         for method, (root, report) in group.items():
             for region in regions:
                 index += 1
@@ -481,21 +536,61 @@ def metric_cache(groups, loader, regions, min_background, verbose):
                     continue
                 key = (method, scenario, variant, region, seed)
                 records[key] = record
+                protocol_groups[(method, scenario, variant, region)].add(aggregation_protocol_signature(method, report))
                 if scenario == "signal_injection":
                     cache[key] = central_metrics(record, min_background)
                 else:
                     labels = np.asarray(record["labels"])
                     cache[key] = {"auc": None, "max_sic": None, "working_points": {}, "acceptance": {"background": {"total": int(np.sum(labels == 0)), "mapped": int(np.sum((labels == 0) & np.asarray(record["mask"], bool))), "acceptance": float(np.mean(np.asarray(record["mask"], bool)[labels == 0])) if np.any(labels == 0) else None}}}
+    for (method, scenario, variant, region), signatures in protocol_groups.items():
+        if len(signatures) != 1:
+            raise ValueError(f"Incompatible scientific protocols across independent runs for {METHOD_LABELS.get(method, method)}, {scenario}, {variant}, {region}")
+    population_groups = defaultdict(dict)
+    for (method, scenario, variant, region, seed), record in records.items():
+        population_groups[(scenario, variant, region, seed)][method] = record
+    for (scenario, variant, region, seed), population in population_groups.items():
+        try:
+            require_population_compatibility(population)
+        except ValueError as error:
+            raise ValueError(
+                f"Incompatible cross-method evaluation population for {scenario}, {variant}, {region}, seed {seed}"
+            ) from error
     return cache, records
 
 
-def compatible_run_rows(cache, method, scenario, variant, region):
+def compatible_run_rows(cache, method, scenario, variant, region, seeds=None):
+    allowed = None if seeds is None else set(seeds)
     rows = []
     for key, metrics in cache.items():
         m, s, v, r, seed = key
-        if (m, s, v, r) == (method, scenario, variant, region) and metrics is not None:
+        if ((m, s, v, r) == (method, scenario, variant, region) and metrics is not None
+                and (allowed is None or seed in allowed)):
             rows.append({"seed": seed, "metrics": metrics})
     return sorted(rows, key=lambda row: row["seed"])
+
+
+def comparison_seed_set(cache, methods, scenario, variant, region):
+    populations = [
+        {row["seed"] for row in compatible_run_rows(cache, method, scenario, variant, region)}
+        for method in methods
+    ]
+    populations = [values for values in populations if values]
+    if not populations:
+        return []
+    if len(methods) > 1 and len(populations) != len(methods):
+        return []
+    return sorted(set.intersection(*populations))
+
+
+def comparison_seed_set_across_variants(cache, methods, scenario, variants, region):
+    populations = []
+    for method in methods:
+        for variant in variants:
+            values = {row["seed"] for row in compatible_run_rows(cache, method, scenario, variant, region)}
+            if not values:
+                return []
+            populations.append(values)
+    return sorted(set.intersection(*populations)) if populations else []
 
 
 def comparison_methods(cache, scenario, variant, region):
@@ -511,13 +606,17 @@ def plot_performance(cache, output, formats, overwrite, scenarios, variants, reg
                 methods = comparison_methods(cache, scenario, variant, region)
                 if not methods:
                     continue
+                common_seeds = comparison_seed_set(cache, methods, scenario, variant, region)
+                if len(methods) > 1 and not common_seeds:
+                    say(f"[SKIP] {scenario} {variant} {region}: selected methods have no common independent seeds", 1)
+                    continue
                 destination = figure_path(output, scenario, variant, region)
                 title = REGION_LABELS[region] + " · " + VARIANT_LABELS.get(variant, variant)
                 for kind, ylabel, stem in (("sic", r"Significance improvement, $\epsilon_S/\sqrt{\epsilon_B}$", "sic_vs_background_efficiency"), ("roc", r"Signal efficiency, $\epsilon_S$", "roc_vs_background_efficiency")):
                     fig, ax = new_figure(r"Background efficiency, $\epsilon_B$", ylabel)
                     drawn = 0
                     for method in methods:
-                        rows = compatible_run_rows(cache, method, scenario, variant, region)
+                        rows = compatible_run_rows(cache, method, scenario, variant, region, common_seeds)
                         aggregated = aggregate_metric_runs(rows, kind)
                         if aggregated is None:
                             continue
@@ -546,7 +645,7 @@ def plot_performance(cache, output, formats, overwrite, scenarios, variants, reg
                 ax.plot(random_x, 1.0 / random_x, color="0.45", ls="--", lw=0.55, label="Random", zorder=1)
                 drawn = 0
                 for method in methods:
-                    rows = compatible_run_rows(cache, method, scenario, variant, region)
+                    rows = compatible_run_rows(cache, method, scenario, variant, region, common_seeds)
                     curves = []
                     grid = np.linspace(0, 1, 300)
                     for row in rows:
@@ -586,7 +685,7 @@ def plot_performance(cache, output, formats, overwrite, scenarios, variants, reg
                 drawn = 0
                 xs = np.asarray(PLOT_WORKING_POINTS)
                 for method in methods:
-                    rows = compatible_run_rows(cache, method, scenario, variant, region)
+                    rows = compatible_run_rows(cache, method, scenario, variant, region, common_seeds)
                     values = np.asarray([[row["metrics"]["working_points"].get(wp) for wp in PLOT_WORKING_POINTS] for row in rows], float)
                     if not values.size or not np.isfinite(values).any():
                         continue
@@ -612,6 +711,17 @@ def plot_variant_summaries(cache, output, formats, overwrite, regions):
         methods = [m for m in METHOD_ORDER if any(key[0] == m and key[1] == "signal_injection" and key[3] == region for key in cache)]
         if not methods:
             continue
+        active_variants = [variant for variant in VARIANT_ORDER if any(compatible_run_rows(cache, method, "signal_injection", variant, region) for method in methods)]
+        if len(methods) > 1:
+            comparable_variants = [variant for variant in active_variants if all(compatible_run_rows(cache, method, "signal_injection", variant, region) for method in methods)]
+        else:
+            comparable_variants = active_variants
+        if not comparable_variants:
+            continue
+        common_seeds = comparison_seed_set_across_variants(cache, methods, "signal_injection", comparable_variants, region)
+        if not common_seeds:
+            say(f"[SKIP] dataset-variant summary {region}: selected methods/variants have no common independent seeds", 1)
+            continue
         destination = output / "01_comparison" / "Signal-Injected" / "Dataset-Variant-Summary" / folder_region(region)
         specs = [("auc", "AUC", "auc_vs_dataset_variant"), ("max_sic", "Maximum significance improvement", "max_sic_vs_dataset_variant")]
         for metric, ylabel, stem in specs:
@@ -622,17 +732,21 @@ def plot_variant_summaries(cache, output, formats, overwrite, regions):
                 lows = []
                 highs = []
                 positions = []
+                spreads = []
                 for i, variant in enumerate(VARIANT_ORDER):
-                    rows = compatible_run_rows(cache, method, "signal_injection", variant, region)
+                    if variant not in comparable_variants:
+                        continue
+                    rows = compatible_run_rows(cache, method, "signal_injection", variant, region, common_seeds)
                     values = [row["metrics"].get(metric) for row in rows if row["metrics"].get(metric) is not None]
                     if values:
                         positions.append(i)
                         medians.append(float(np.median(values)))
                         lows.append(float(np.percentile(values, 16)))
                         highs.append(float(np.percentile(values, 84)))
+                        spreads.append(len(values) >= 2)
                 if positions:
                     ax.plot(positions, medians, label=METHOD_LABELS.get(method, method), color=METHOD_COLORS.get(method), ls=METHOD_LINES.get(method, "-"), marker=METHOD_MARKERS.get(method, "o"))
-                    if len(positions) > 1 and any(len(compatible_run_rows(cache, method, "signal_injection", VARIANT_ORDER[p], region)) >= 2 for p in positions):
+                    if len(positions) > 1 and any(spreads):
                         ax.fill_between(positions, lows, highs, color=METHOD_COLORS.get(method), alpha=0.15, linewidth=0)
                     drawn += 1
             if drawn:
@@ -647,18 +761,21 @@ def plot_variant_summaries(cache, output, formats, overwrite, regions):
             fig, ax = new_figure("Dataset variant", r"Signal efficiency, $\epsilon_S$")
             drawn = 0
             for method in methods:
-                positions, medians, lows, highs = [], [], [], []
+                positions, medians, lows, highs, spreads = [], [], [], [], []
                 for i, variant in enumerate(VARIANT_ORDER):
-                    rows = compatible_run_rows(cache, method, "signal_injection", variant, region)
+                    if variant not in comparable_variants:
+                        continue
+                    rows = compatible_run_rows(cache, method, "signal_injection", variant, region, common_seeds)
                     values = [row["metrics"]["working_points"].get(wp) for row in rows if row["metrics"]["working_points"].get(wp) is not None]
                     if values:
                         positions.append(i)
                         medians.append(float(np.median(values)))
                         lows.append(float(np.percentile(values, 16)))
                         highs.append(float(np.percentile(values, 84)))
+                        spreads.append(len(values) >= 2)
                 if positions:
                     ax.plot(positions, medians, label=METHOD_LABELS.get(method, method), color=METHOD_COLORS.get(method), ls=METHOD_LINES.get(method, "-"), marker=METHOD_MARKERS.get(method, "o"))
-                    if any(len(compatible_run_rows(cache, method, "signal_injection", VARIANT_ORDER[p], region)) >= 2 for p in positions):
+                    if any(spreads):
                         ax.fill_between(positions, lows, highs, color=METHOD_COLORS.get(method), alpha=0.15, linewidth=0)
                     drawn += 1
             if drawn:
@@ -669,7 +786,6 @@ def plot_variant_summaries(cache, output, formats, overwrite, regions):
                 save_figure(fig, ax, destination / f"epsS_{token}_vs_dataset_variant", formats, overwrite, legend)
             else:
                 plt.close(fig)
-
 
 def plot_score_distributions(groups, records, output, formats, overwrite):
     representative = representative_records(records)
@@ -820,7 +936,7 @@ def plot_features(records, output, formats, overwrite, verbose):
                 legend = inside_legend(ax, title="Signal region · " + VARIANT_LABELS.get(variant, variant), fontsize=8.0, borderaxespad=0.9)
                 save_figure(fig, ax, base / "input_2d" / f"{safe_component(names[i])}_vs_{safe_component(names[j])}", formats, overwrite, legend)
         plot_correlations(base, names, values, labels, record, variant, formats, overwrite)
-        if method == "riddle":
+        if method in ("riddle", "iad", "supervised"):
             plot_latents(base, method, scenario, variant, record, formats, overwrite, verbose)
 
 
@@ -1012,11 +1128,15 @@ def plot_mass_sculpting(cache, records, output, formats, overwrite, scenarios, v
         for variant in variants:
             for region in regions:
                 methods = comparison_methods(cache, scenario, variant, region)
+                common_seeds = comparison_seed_set(cache, methods, scenario, variant, region)
+                if len(methods) > 1 and not common_seeds:
+                    say(f"[SKIP] mass sculpting {scenario} {variant} {region}: selected methods have no common independent seeds", verbose)
+                    continue
                 method_curves = {}
                 for method in methods:
                     curves = []
                     for (m, sc, v, rg, seed), record in records.items():
-                        if (m, sc, v, rg) != (method, scenario, variant, region):
+                        if (m, sc, v, rg) != (method, scenario, variant, region) or (common_seeds and seed not in common_seeds):
                             continue
                         curve = exact_mass_sculpt_curve(record, efficiencies)
                         if curve is not None:
@@ -1026,7 +1146,7 @@ def plot_mass_sculpting(cache, records, output, formats, overwrite, scenarios, v
                 if not method_curves:
                     continue
                 fig, ax = new_figure(r"Target background efficiency, $\epsilon_B$", r"$\chi^2/n_{\mathrm{dof}}$")
-                first_record = next(record for (m, sc, v, rg, seed), record in records.items() if (sc, v, rg) == (scenario, variant, region))
+                first_record = next(record for (m, sc, v, rg, seed), record in records.items() if (sc, v, rg) == (scenario, variant, region) and (not common_seeds or seed in common_seeds))
                 mass = np.asarray(first_record["mass"])[np.asarray(first_record["labels"]) == 0]
                 if len(mass) >= 300:
                     reference = random_reference_band(mass, efficiencies)
@@ -1051,7 +1171,7 @@ def plot_mass_sculpting(cache, records, output, formats, overwrite, scenarios, v
                 for wp in PLOT_WORKING_POINTS[::-1]:
                     rows = []
                     for method in methods:
-                        candidates = [(seed, record) for (m, sc, v, rg, seed), record in records.items() if (m, sc, v, rg) == (method, scenario, variant, region)]
+                        candidates = [(seed, record) for (m, sc, v, rg, seed), record in records.items() if (m, sc, v, rg) == (method, scenario, variant, region) and (not common_seeds or seed in common_seeds)]
                         if not candidates:
                             continue
                         seed, record = sorted(candidates)[0]
@@ -1316,11 +1436,16 @@ def plot_training(groups, output, formats, overwrite):
                 continue
             represented.add(key)
             destination = output / "02_training" / METHOD_LABELS.get(method, safe_component(method))
-            if method == "riddle":
+            if method in ("riddle", "iad", "supervised"):
                 history = history_rows(root, report, "background/history.json")
                 arrays = objective_arrays(history, False) if history is not None else None
                 if arrays is not None:
                     plot_history(arrays, "Negative log likelihood", destination / "background_nll", formats, overwrite)
+                if method in ("iad", "supervised"):
+                    oracle_history = history_rows(root, report, "density/background_correction/history.json")
+                    oracle_arrays = objective_arrays(oracle_history, False) if oracle_history is not None else None
+                    if oracle_arrays is not None:
+                        plot_history(oracle_arrays, "Negative log likelihood", destination / "oracle_background_nll", formats, overwrite)
                 selection_path = verify_requested_artifact(root, report, "density/ensemble_selection.json")
                 if selection_path is not None:
                     selection = json.loads(selection_path.read_text())
@@ -1336,11 +1461,6 @@ def plot_training(groups, output, formats, overwrite):
                         train = np.asarray([item[0][:min_len] for item in histories])
                         validation = np.asarray([item[1][:min_len] for item in histories])
                         plot_history_band(train, validation, "Stein objective", destination / "stein_witness_objective", formats, overwrite)
-            elif method in ("iad", "supervised"):
-                paths = [verify_requested_artifact(root, report, "training/" + name) for name in ("train_bce.npy", "validation_bce.npy")]
-                if all(path is not None for path in paths):
-                    values = [np.atleast_2d(np.load(path, allow_pickle=False)) for path in paths]
-                    plot_history_band(values[0], values[1], "Binary cross-entropy", destination / "classifier_bce", formats, overwrite, method=method, labels=("Train BCE", "Validation BCE"))
             elif method == "lacathode":
                 for stem, names, ylabel in (("background_nll", ("lacathode_model_train_losses.npy", "lacathode_model_val_losses.npy"), "Negative log likelihood"), ("classifier_bce", ("loss_matris.npy", "val_loss_matris.npy"), "Binary cross-entropy")):
                     paths = [verify_requested_artifact(root, report, "training/" + name) for name in names]
@@ -1382,13 +1502,16 @@ def plot_stability(cache, output, formats, overwrite, regions):
             methods = comparison_methods(cache, "signal_injection", variant, region)
             if not methods:
                 continue
+            common_seeds = comparison_seed_set(cache, methods, "signal_injection", variant, region)
+            if len(methods) > 1 and not common_seeds:
+                continue
             for field, ylabel, stem, wp in (("auc", "AUC", "auc_run_stability", None), ("max_sic", "Maximum significance improvement", "max_sic_run_stability", None), ("working", r"Signal efficiency at 0.5% BG", "exact_wp_signal_efficiency_run_stability_0p5pct", 0.005)):
                 fig, ax = new_figure("Independent run / seed", ylabel)
                 drawn = 0
-                all_seeds = sorted({row["seed"] for method in methods for row in compatible_run_rows(cache, method, "signal_injection", variant, region)})
+                all_seeds = common_seeds or sorted({row["seed"] for method in methods for row in compatible_run_rows(cache, method, "signal_injection", variant, region)})
                 seed_pos = {seed: i for i, seed in enumerate(all_seeds)}
                 for method in methods:
-                    rows = compatible_run_rows(cache, method, "signal_injection", variant, region)
+                    rows = compatible_run_rows(cache, method, "signal_injection", variant, region, all_seeds)
                     if len(rows) < 2:
                         continue
                     xs, ys = [], []
@@ -1409,13 +1532,25 @@ def plot_stability(cache, output, formats, overwrite, regions):
 
 
 def plot_acceptance(cache, output, formats, overwrite):
-    groups = defaultdict(dict)
-    for (method, scenario, variant, region, seed), metrics in cache.items():
-        acceptance = metrics.get("acceptance", {})
-        bg = acceptance.get("background", {}).get("acceptance")
-        sig = acceptance.get("signal", {}).get("acceptance") if scenario == "signal_injection" else None
-        groups[(scenario, variant, region)][method] = groups[(scenario, variant, region)].get(method, []) + [(bg, sig)]
-    for (scenario, variant, region), method_values in groups.items():
+    identities = sorted({(scenario, variant, region) for (_, scenario, variant, region, _) in cache})
+    for scenario, variant, region in identities:
+        methods = comparison_methods(cache, scenario, variant, region)
+        if not methods:
+            continue
+        common_seeds = comparison_seed_set(cache, methods, scenario, variant, region)
+        if len(methods) > 1 and not common_seeds:
+            continue
+        method_values = {}
+        for method in methods:
+            rows = compatible_run_rows(cache, method, scenario, variant, region, common_seeds)
+            values = []
+            for row in rows:
+                acceptance = row["metrics"].get("acceptance", {})
+                bg = acceptance.get("background", {}).get("acceptance")
+                sig = acceptance.get("signal", {}).get("acceptance") if scenario == "signal_injection" else None
+                values.append((bg, sig))
+            if values:
+                method_values[method] = values
         flattened = [value for values in method_values.values() for pair in values for value in pair if value is not None]
         if not flattened or max(flattened) - min(flattened) < 0.005:
             continue
@@ -1436,20 +1571,22 @@ def plot_acceptance(cache, output, formats, overwrite):
         legend = inside_legend(ax, title=REGION_LABELS[region] + " · " + VARIANT_LABELS.get(variant, variant))
         save_figure(fig, ax, figure_path(output, scenario, variant, region) / "mapping_acceptance", formats, overwrite, legend)
 
-
 def plot_variant_robustness(cache, output, formats, overwrite, regions):
     for region in regions:
         for target in ("shifted", "deltaR"):
             methods = [m for m in METHOD_ORDER if compatible_run_rows(cache, m, "signal_injection", "default", region) and compatible_run_rows(cache, m, "signal_injection", target, region)]
             if not methods:
                 continue
+            common_seeds = comparison_seed_set_across_variants(cache, methods, "signal_injection", ("default", target), region)
+            if len(methods) > 1 and not common_seeds:
+                continue
             fig, ax = new_figure(r"Signal efficiency, $\epsilon_S$", "SIC ratio")
             ax.axhline(1, color="0.5", ls="--", lw=0.5, zorder=1)
             drawn = 0
             signal_grid = np.linspace(0.05, 0.95, 250)
             for method in methods:
-                default_rows = {row["seed"]: row for row in compatible_run_rows(cache, method, "signal_injection", "default", region)}
-                target_rows = {row["seed"]: row for row in compatible_run_rows(cache, method, "signal_injection", target, region)}
+                default_rows = {row["seed"]: row for row in compatible_run_rows(cache, method, "signal_injection", "default", region, common_seeds)}
+                target_rows = {row["seed"]: row for row in compatible_run_rows(cache, method, "signal_injection", target, region, common_seeds)}
                 seeds = sorted(set(default_rows) & set(target_rows))
                 ratios = []
                 for seed in seeds:
@@ -1645,7 +1782,7 @@ def export_tables(groups, cache, loader, output, file_formats, data_root, verbos
         raw_usage = []
     table1 = []
     seen_usage = set()
-    component_order = {"Background map": 0, "Background correction": 1, "Stein witness": 2, "Background density estimator": 3, "Classifier": 4}
+    component_order = {"Background map": 0, "Oracle background q_phi": 1, "Background correction": 1, "Stein witness": 2, "Background density estimator": 3, "Classifier": 4}
     for row in raw_usage:
         component = str(row.get("component", row.get("Component", row.get("type", row.get("Type", "")))))
         model_type = str(row.get("model_type", row.get("Model type", "")))
@@ -1657,12 +1794,6 @@ def export_tables(groups, cache, loader, output, file_formats, data_root, verbos
         training = event_count_text(row.get("train_events", row.get("Training events")), row.get("train_sample", row.get("Training sample", "")))
         validation = event_count_text(row.get("validation_events", row.get("Validation events")), row.get("validation_sample", row.get("Validation sample", "")), True)
         canonical = canonical_method(str(row.get("method_id", method)))
-        if canonical == "iad":
-            training = f"{int(row.get('train_class1_events', 0)):,} actual SR data + {int(row.get('train_class0_events', 0)):,} pure BG simulation"
-            validation = f"{int(row.get('validation_class1_events', 0)):,} actual SR validation data + {int(row.get('validation_class0_events', 0)):,} pure BG simulation"
-        elif canonical == "supervised":
-            training = f"{int(row.get('train_class1_events', 0)):,} pure simulated signal + {int(row.get('train_class0_events', 0)):,} pure simulated background"
-            validation = f"{int(row.get('validation_class1_events', 0)):,} pure simulated signal + {int(row.get('validation_class0_events', 0)):,} pure simulated background"
         reference_count = row.get("generated_reference_samples", row.get("Generated reference events"))
         reference = event_count_text(reference_count, "reference samples") if reference_count not in (None, "") else ""
         background = row.get("evaluation_background", row.get("Evaluation background"))
@@ -1719,8 +1850,12 @@ def export_tables(groups, cache, loader, output, file_formats, data_root, verbos
     performance = []
     for variant in VARIANT_ORDER:
         methods = [m for m in METHOD_ORDER if compatible_run_rows(cache, m, "signal_injection", variant, "signal_region")]
+        common_seeds = comparison_seed_set(cache, methods, "signal_injection", variant, "signal_region")
+        if len(methods) > 1 and not common_seeds:
+            say(f"[SKIP] Table 3 {variant}: selected methods have no common independent seeds", verbose)
+            continue
         for method in methods:
-            rows = compatible_run_rows(cache, method, "signal_injection", variant, "signal_region")
+            rows = compatible_run_rows(cache, method, "signal_injection", variant, "signal_region", common_seeds)
             values = lambda getter: [getter(row["metrics"]) for row in rows if getter(row["metrics"]) is not None]
             auc = values(lambda m: m["auc"])
             sic = values(lambda m: m["max_sic"])
@@ -1730,24 +1865,67 @@ def export_tables(groups, cache, loader, output, file_formats, data_root, verbos
 
 
 def scan_identity_data(scan_groups, methods):
-    result = defaultdict(lambda: defaultdict(dict))
+    result = defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
     for identity, group in scan_groups.items():
         signal_events, replica, run_index, variant = identity
         if variant != "default":
             continue
         for method, source in group.items():
             family = canonical_method(method)
-            if family in methods:
-                result[family][signal_events][replica] = source
+            if family not in methods:
+                continue
+            runs = result[family][signal_events][replica]
+            if run_index in runs:
+                raise ValueError(f"Duplicate injection-scan result for {METHOD_LABELS.get(family, family)}, N_inj={signal_events}, replica={replica}, run={run_index}")
+            runs[run_index] = source
     return result
 
 
 def scan_realized_counts(report):
-    candidates = [report.get("uncut_signal_region"), report.get("metrics", {}).get("uncut_signal_region"), report.get("contract", {}).get("uncut_signal_region")]
+    contract = report.get("contract", {})
+    inputs = contract.get("inputs", {})
+    candidates = [inputs.get("uncut_signal_region"), report.get("uncut_signal_region"), report.get("metrics", {}).get("uncut_signal_region"), contract.get("uncut_signal_region")]
     for candidate in candidates:
         if isinstance(candidate, dict) and "background" in candidate and "signal" in candidate:
-            return int(candidate["background"]), int(candidate["signal"])
+            background = int(candidate["background"])
+            signal = int(candidate["signal"])
+            if background < 0 or signal < 0:
+                raise ValueError("Invalid uncut signal-region population counts")
+            return background, signal
     return None
+
+
+def scan_method_run_indices(method_data, configured, replicas):
+    indices = set()
+    for level in configured:
+        for replica in range(replicas):
+            indices.update(method_data.get(level, {}).get(replica, {}))
+    return sorted(indices)
+
+
+def aggregate_scan_replica(run_rows):
+    counts = {(row["background"], row["signal"]) for row in run_rows}
+    if len(counts) != 1:
+        raise ValueError("Independent runs of one injection replica disagree on the uncut physical population")
+    background, signal = next(iter(counts))
+    working_points = {}
+    for wp in WORKING_POINTS:
+        values = [row["metrics"]["working_points"].get(wp) for row in run_rows if row["metrics"]["working_points"].get(wp) is not None]
+        working_points[wp] = None if not values else float(np.median(values))
+    auc = [row["metrics"]["auc"] for row in run_rows if row["metrics"]["auc"] is not None]
+    max_sic = [row["metrics"]["max_sic"] for row in run_rows if row["metrics"]["max_sic"] is not None]
+    return {
+        "metrics": {
+            "auc": None if not auc else float(np.median(auc)),
+            "max_sic": None if not max_sic else float(np.median(max_sic)),
+            "working_points": working_points,
+        },
+        "background": background,
+        "signal": signal,
+        "s_over_b": signal / background if background else None,
+        "nominal": signal / math.sqrt(background) if background else None,
+        "runs": len(run_rows),
+    }
 
 
 def process_injection_scan(scan_groups, methods, loader, settings, output, formats, file_formats, overwrite, min_background, allow_partial, verbose):
@@ -1756,55 +1934,127 @@ def process_injection_scan(scan_groups, methods, loader, settings, output, forma
     if not configured or replicas < 1:
         say("[SKIP] Injection scan: configuration is missing signal_events or replicas", verbose)
         return
+    if not scan_groups:
+        say("[SKIP] Injection scan: no completed scan results were discovered", verbose)
+        return
     data = scan_identity_data(scan_groups, methods)
-    summaries = {}
-    missing_messages = []
-    for method in methods:
-        if method not in data:
+    if allow_partial:
+        requested_methods = [method for method in methods if method in data]
+    else:
+        missing_methods = [method for method in methods if method not in data]
+        if missing_methods:
+            labels = ", ".join(METHOD_LABELS.get(method, method) for method in missing_methods)
+            raise ValueError(f"Strict injection-scan comparison is missing requested methods: {labels}")
+        requested_methods = list(methods)
+    expected_runs = {method: scan_method_run_indices(data[method], configured, replicas) for method in requested_methods}
+    if not allow_partial and len(requested_methods) > 1:
+        cohorts = {tuple(expected_runs[method]) for method in requested_methods}
+        if len(cohorts) != 1:
+            raise ValueError("Injection-scan methods do not share the same independent run-index cohort")
+    method_reports = defaultdict(list)
+    invalid = defaultdict(list)
+    loaded = defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
+    point_records = defaultdict(dict)
+    point_counts = defaultdict(set)
+    for method in requested_methods:
+        runs_expected = expected_runs[method]
+        if not runs_expected:
+            invalid[method].append("no independent runs discovered")
             continue
-        missing = []
         for level in configured:
-            found = set(data[method].get(level, {}))
-            expected = set(range(replicas))
-            if found != expected:
-                missing.append((level, sorted(expected - found)))
-        if missing and not allow_partial:
-            missing_messages.append(f"{METHOD_LABELS.get(method, method)}: " + "; ".join(f"N_inj={level} replicas={reps}" for level, reps in missing))
+            for replica in range(replicas):
+                runs = data[method].get(level, {}).get(replica, {})
+                if set(runs) != set(runs_expected):
+                    missing = sorted(set(runs_expected) - set(runs))
+                    extra = sorted(set(runs) - set(runs_expected))
+                    invalid[method].append(f"N_inj={level} replica={replica} missing_runs={missing} extra_runs={extra}")
+                for run_index, (root, report) in sorted(runs.items()):
+                    method_reports[method].append(report)
+                    try:
+                        record = loader(root, report, "signal_region")
+                        metrics = central_metrics(record, min_background)
+                        if metrics is None:
+                            raise ValueError("signal metrics are unavailable")
+                        counts = scan_realized_counts(report)
+                        if counts is None:
+                            raise ValueError("uncut_signal_region provenance is missing")
+                        background, signal = counts
+                        loaded[method][level][replica][run_index] = {
+                            "metrics": metrics,
+                            "background": background,
+                            "signal": signal,
+                        }
+                        point_records[(level, replica, run_index)][method] = record
+                        point_counts[(level, replica)].add(counts)
+                    except Exception as error:
+                        invalid[method].append(f"N_inj={level} replica={replica} run={run_index}: {type(error).__name__}: {error}")
+    for method, reports in method_reports.items():
+        signatures = {aggregation_protocol_signature(method, report) for report in reports}
+        if len(signatures) > 1:
+            invalid[method].append("incompatible scientific protocols across scan points/runs")
+    for identity, group in scan_groups.items():
+        level, replica, run_index, variant = identity
+        if variant != "default" or level not in configured or replica not in range(replicas):
             continue
-        rows = []
+        normalized = {canonical_method(method): source for method, source in group.items() if canonical_method(method) in requested_methods}
+        if len(normalized) > 1:
+            require_riddle_benchmark_alignment(normalized)
+    for (level, replica, run_index), records in point_records.items():
+        if len(records) > 1:
+            try:
+                require_population_compatibility(records)
+            except ValueError as error:
+                raise ValueError(f"Incompatible injection-scan evaluation population for N_inj={level}, replica={replica}, run={run_index}") from error
+    for (level, replica), counts in point_counts.items():
+        if len(counts) > 1:
+            raise ValueError(f"Injection-scan methods disagree on uncut physical counts for N_inj={level}, replica={replica}")
+    summaries = {}
+    if not allow_partial:
+        failures = [f"{METHOD_LABELS.get(method, method)}: " + "; ".join(invalid[method]) for method in requested_methods if invalid[method]]
+        if failures:
+            raise ValueError("Strict injection-scan comparison is incomplete: " + " | ".join(failures))
+    for method in requested_methods:
+        if invalid[method] and allow_partial:
+            say("[WARN] Partial injection scan: " + METHOD_LABELS.get(method, method) + ": " + "; ".join(invalid[method]), verbose)
+        levels = []
         for level in configured:
             replicas_data = []
-            for replica, (root, report) in sorted(data[method].get(level, {}).items()):
-                try:
-                    record = loader(root, report, "signal_region")
-                    metrics = central_metrics(record, min_background)
-                except Exception:
+            for replica in range(replicas):
+                run_rows = list(loaded[method].get(level, {}).get(replica, {}).values())
+                if not run_rows:
                     continue
-                counts = scan_realized_counts(report)
-                if counts is None:
-                    labels = np.asarray(record["labels"])
-                    counts = (int(np.sum(labels == 0)), int(np.sum(labels == 1)))
-                b, s = counts
-                replicas_data.append({"metrics": metrics, "background": b, "signal": s, "s_over_b": s / b if b else None, "nominal": s / math.sqrt(b) if b else None})
+                replicas_data.append(aggregate_scan_replica(run_rows))
             if replicas_data:
-                rows.append((level, replicas_data))
-        if rows:
-            summaries[method] = rows
-    for message in missing_messages:
-        say("[SKIP] Incomplete injection scan: " + message, verbose)
+                levels.append((level, replicas_data))
+        if levels and (allow_partial or (len(levels) == len(configured) and all(len(rows) == replicas for _, rows in levels))):
+            summaries[method] = levels
+    if not allow_partial and set(summaries) != set(requested_methods):
+        missing = [method for method in requested_methods if method not in summaries]
+        labels = ", ".join(METHOD_LABELS.get(method, method) for method in missing)
+        raise ValueError(f"Strict injection-scan comparison could not build complete summaries for: {labels}")
     if not summaries:
         return
     destination = output / "06_injection_scan" / "Default"
     figure_specs = [("max_sic", "Maximum significance improvement", "maximum_sic_vs_s_over_b"), ("nominal_selected", "Maximum nominal significance after anomaly selection", "maximum_nominal_significance_vs_s_over_b"), ("auc", "AUC", "auc_vs_s_over_b")]
     for wp in PLOT_WORKING_POINTS[::-1]:
         figure_specs.append((f"wp_{wp}", r"Signal efficiency, $\epsilon_S$", f"epsS_{WORKING_POINT_LABELS[wp].replace('%','pct').replace('.','p')}_vs_s_over_b"))
+    reference_axis = None
+    for method, levels in summaries.items():
+        axis = []
+        for level, replicas_data in levels:
+            sob = [row["s_over_b"] for row in replicas_data if row["s_over_b"] is not None]
+            nominal = [row["nominal"] for row in replicas_data if row["nominal"] is not None]
+            if sob and nominal:
+                axis.append((level, 100 * float(np.median(sob)), float(np.median(nominal))))
+        if reference_axis is None:
+            reference_axis = axis
+        elif axis != reference_axis:
+            raise ValueError("Injection-scan methods do not share the same realized S/B and S/sqrt(B) axis")
     for field, ylabel, stem in figure_specs:
         fig, ax = new_figure("Injected SR S/B (%)", ylabel)
-        top_values = []
-        bottom_values = []
         drawn = 0
         for method, levels in summaries.items():
-            x, y, low, high, nominal = [], [], [], [], []
+            x, y, low, high = [], [], [], []
             for level, replicas_data in levels:
                 sob = [row["s_over_b"] for row in replicas_data if row["s_over_b"] is not None]
                 if not sob:
@@ -1825,22 +2075,19 @@ def process_injection_scan(scan_groups, methods, loader, settings, output, forma
                 y.append(float(np.median(values)))
                 low.append(float(np.percentile(values, 16)))
                 high.append(float(np.percentile(values, 84)))
-                nominal.append(float(np.median([row["nominal"] for row in replicas_data if row["nominal"] is not None])))
             if x:
                 order = np.argsort(x)
-                x, y, low, high, nominal = [np.asarray(values)[order] for values in (x, y, low, high, nominal)]
+                x, y, low, high = [np.asarray(values)[order] for values in (x, y, low, high)]
                 ax.plot(x, y, color=METHOD_COLORS.get(method), ls="-", label=METHOD_LABELS.get(method, method))
                 ax.fill_between(x, low, high, color=METHOD_COLORS.get(method), alpha=0.15, linewidth=0)
-                if not bottom_values:
-                    bottom_values = x.tolist()
-                    top_values = nominal.tolist()
                 drawn += 1
         if drawn:
             top = ax.twiny()
             top.set_xlim(ax.get_xlim())
-            if bottom_values and len(bottom_values) == len(top_values):
-                top.set_xticks(bottom_values)
-                top.set_xticklabels([f"{value:.2g}" for value in top_values])
+            if reference_axis:
+                ordered_axis = sorted(reference_axis, key=lambda item: item[1])
+                top.set_xticks([item[1] for item in ordered_axis])
+                top.set_xticklabels([f"{item[2]:.2g}" for item in ordered_axis])
             top.set_xlabel(r"Uncut $S/\sqrt{B}$")
             legend = inside_legend(ax, title="Default")
             save_figure(fig, ax, destination / stem, formats, overwrite, legend)
@@ -1854,7 +2101,7 @@ def process_injection_scan(scan_groups, methods, loader, settings, output, forma
             sic = values(lambda m: m["max_sic"])
             wpvals = {wp: values(lambda m, wp=wp: m["working_points"].get(wp)) for wp in WORKING_POINTS}
             rows.append({"N_inj": int(level), "AUC": normalize_scalar(np.median(auc) if auc else None), "Max. SIC": normalize_scalar(np.median(sic) if sic else None), "εS@10%": normalize_scalar(np.median(wpvals[0.10]) if wpvals[0.10] else None), "εS@5%": normalize_scalar(np.median(wpvals[0.05]) if wpvals[0.05] else None), "εS@1%": normalize_scalar(np.median(wpvals[0.01]) if wpvals[0.01] else None), "εS@0.5%": normalize_scalar(np.median(wpvals[0.005]) if wpvals[0.005] else None), "εS@0.4%": normalize_scalar(np.median(wpvals[0.004]) if wpvals[0.004] else None)})
-        if rows and (allow_partial or all(len(data["riddle"].get(level, {})) == replicas for level in configured)):
+        if rows and (allow_partial or (len(rows) == len(configured) and all(len(replicas_data) == replicas for _, replicas_data in summaries["riddle"]))):
             write_table_rows(output / "07_tables" / "table_04_default_signal_injection_dependence", rows, file_formats)
 
 

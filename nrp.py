@@ -291,7 +291,7 @@ def main(argv=None):
     p.add_argument("--data", help="Prepared dataset path; defaults to data/lhco or data/injection_scan for scans")
     p.add_argument("--results", help="Result directory; defaults to results or results/injection_scan for scans")
     p.add_argument("--runs", type=positive, help="Complete independent runs per seed (default: 1)")
-    p.add_argument("--fits", type=positive, help="Ensemble fits per RIDDLE/R-ANODE/IAD/Supervised run; does not change LaCathode")
+    p.add_argument("--fits", type=positive, help="Ensemble fits per RIDDLE/Idealized-RIDDLE/Supervised-RIDDLE/R-ANODE run; does not change LaCathode")
     from riddle.options import add_feature_arguments
     add_feature_arguments(p)
     p.add_argument("--mass-conditioning", action=argparse.BooleanOptionalAction, default=None,
@@ -300,7 +300,7 @@ def main(argv=None):
                    help="Use the shared 40-epoch corrected latent background denominator and corrected guide")
     p.add_argument("--lacathode-background", choices=("independent", "fixed"), default="independent",
                    help="Retrain each LaCathode background flow (default), or share one flow across classifier fits")
-    p.add_argument("--epochs", type=positive, help="Override RIDDLE/R-ANODE/IAD/Supervised signal-fit and LaCathode classifier epochs; background stages are unchanged")
+    p.add_argument("--epochs", type=positive, help="Override RIDDLE/Idealized-RIDDLE/Supervised-RIDDLE/R-ANODE fit epochs and LaCathode classifier epochs; background stages are unchanged")
     p.add_argument("--workers", type=positive, default=2)
     p.add_argument("--io-workers", type=positive, default=4,
                    help="Filesystem/host I/O concurrency")

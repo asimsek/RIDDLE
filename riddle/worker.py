@@ -10,32 +10,18 @@ from .storage import code_hashes, environment, file_digest, write_json, verify_a
 from .data import validate
 from .worker_progress import emit_message
 from .resume import inspect_resume, record_transition, resume_policy
-from .integrity import SCIENTIFIC_VERSION
+from .integrity import SCIENTIFIC_VERSION, RIDDLE_BENCHMARK_LABELS, RIDDLE_BENCHMARK_SCIENTIFIC_VERSION
 from .production import validate_result_scores, NumericalFitError
 
 
 def runtime_code(method, root=None):
     package = Path(root) if root is not None else Path(__file__).parent
-    if method == "riddle":
+    if method in ("riddle", "iad", "supervised"):
         return {
             f"riddle/{p.name}": file_digest(p)
             for p in sorted(package.glob("*.py"))
             if p.name not in ("figures.py", "plotting.py")
         }
-    if method in ("iad", "supervised"):
-        framework = (
-            "integrity.py", "production.py", "metrics.py", "scan.py", "cli.py", "worker.py",
-            "data.py", "data_spec.py", "features.py", "controls.py", "datasets.py", "storage.py",
-            "worker_progress.py", "progress.py", "resume.py", "mps.py", "gpu_identity.py",
-            "acceleration.py", "settings.py", "training.py", "parallel.py", "recovery.py", "pipeline.py",
-        )
-        code = {f"framework/{name}": file_digest(package / name) for name in framework}
-        baseline_root = package.parent / "baselines"
-        code.update({
-            f"baselines/{path.relative_to(baseline_root)}": file_digest(path)
-            for path in sorted(baseline_root.rglob("*.py"))
-        })
-        return code
     if method != "lacathode":
         raise ValueError("Unknown method")
     framework = (
@@ -74,10 +60,11 @@ def main():
         raise SystemExit(128 + signum)
 
     signal.signal(signal.SIGTERM, terminate)
-    concurrent = args.method in ("riddle", "iad", "supervised")
+    native_method = args.method in ("riddle", "iad", "supervised")
+    concurrent = native_method
     workers = getattr(args, "workers", 1)
-    if args.method in ("iad", "supervised"):
-        workers = min(workers, int(args.settings["ad_baselines"]["classifier"]["fits"]))
+    if native_method:
+        workers = min(workers, int(args.runs))
     if args.method == "lacathode" and not getattr(args, "lacathode_replica", False):
         from external.lacathode_utils.pipeline import run_settings
 
@@ -138,11 +125,9 @@ def main():
         record(audit_environment)
     if args.device != "cpu" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but unavailable; refusing CPU fallback")
-    baseline_method = args.method in ("iad", "supervised")
-    if baseline_method:
-        args.effective_workers = workers
-    inputs = validate(args.data, require_event_ids=args.method == "riddle" or baseline_method, require_baseline=baseline_method)
-    if args.method == "riddle":
+    oracle_method = args.method in ("iad", "supervised")
+    inputs = validate(args.data, require_event_ids=native_method, require_oracle=oracle_method)
+    if native_method:
         from .settings import input_features
 
         input_features(args.settings, inputs)
@@ -153,19 +138,19 @@ def main():
         if pilot_script.is_file():
             code["scripts/cpu_mass_dependence.py"] = file_digest(pilot_script)
     settings = {"seed": args.seed, "scenario": args.scenario, "device": args.device}
-    if args.method == "riddle":
+    if native_method:
         settings.update(args.settings)
-    elif baseline_method:
-        settings.update(ad_baselines=args.settings["ad_baselines"], run_index=getattr(args, "run_index", 0),
-                        campaign_seed=getattr(args, "campaign_seed", args.seed))
+        if oracle_method:
+            settings.update(oracle_benchmark=args.method, run_index=getattr(args, "run_index", 0),
+                            campaign_seed=getattr(args, "campaign_seed", args.seed))
     else:
         from external.lacathode_utils.resume import contract_settings
 
         settings.update(contract_settings(getattr(args, "runs", None), getattr(args, "epochs", None),
                                           getattr(args, "lacathode_background", "independent")))
     contract = {
-        "scientific_version": (SCIENTIFIC_VERSION if args.method == "riddle" else
-                               "ad_baselines_v1" if baseline_method else "pinned_upstream"),
+        "scientific_version": (RIDDLE_BENCHMARK_SCIENTIFIC_VERSION if oracle_method else
+                               SCIENTIFIC_VERSION if args.method == "riddle" else "pinned_upstream"),
         "flow_checkpoint_prefix": args.method + "_model",
         "schema": 1,
         "method": args.method,
@@ -174,12 +159,20 @@ def main():
         "code": code,
         "settings": settings,
     }
-    if args.method == "riddle":
+    if native_method:
         from .production import PRODUCTION_POLICY
 
         contract["riddle_production_policy"] = PRODUCTION_POLICY
         contract["riddle_score_scope"] = ("signal_region" if args.settings["riddle"].get("mass_conditioning")
                                           else "full_region")
+        if oracle_method:
+            contract["oracle_benchmark"] = {
+                "method": args.method,
+                "public_label": RIDDLE_BENCHMARK_LABELS[args.method],
+                "p": "signal_region_data_mixture" if args.method == "iad" else "pure_signal",
+                "q": "pure_background",
+                "core": "riddle_stein_witness",
+            }
         if mapping_experiment is not None:
             contract["mapping_experiment"] = mapping_experiment
     if args.method == "lacathode":
@@ -214,7 +207,7 @@ def main():
             kind="WARNING",
         )
     if completed:
-        if baseline_method:
+        if oracle_method:
             history_path = args.output / ".resume" / "resume_history.json"
             saved["resume_history"] = json.loads(history_path.read_text()) if history_path.is_file() else {"schema": 1, "transitions": []}
             write_json(path, saved)
@@ -231,16 +224,13 @@ def main():
     }
     if args.method == "lacathode" and getattr(args, "lacathode_replica", False):
         report.update(campaign_seed=args.campaign_seed, run_index=args.run_index)
-    if baseline_method:
-        from baselines import LABELS
-        report.update(public_label=LABELS[args.method], scientific_version="ad_baselines_v1",
-                      score_scope=args.settings["ad_baselines"]["classifier"]["score_scope"],
-                      score_kind="classifier_probability", fit_score_kind="classifier_probability",
+    if oracle_method:
+        report.update(public_label=RIDDLE_BENCHMARK_LABELS[args.method], scientific_version=RIDDLE_BENCHMARK_SCIENTIFIC_VERSION,
+                      benchmark_protocol="riddle_oracle", score_scope=contract["riddle_score_scope"],
                       campaign_seed=getattr(args, "campaign_seed", args.seed),
                       run_index=getattr(args, "run_index", 0),
                       independent_run_count=getattr(args, "independent_run_count", 1),
-                      ensemble_fits=args.settings["ad_baselines"]["classifier"]["fits"],
-                      epochs=args.settings["ad_baselines"]["classifier"]["epochs"],
+                      ensemble_fits=args.runs, epochs=args.epochs,
                       device=args.device, workers=workers, io_workers=args.io_workers,
                       torch_threads=args.torch_threads, mps=args.runtime_mps)
     if args.method == "riddle":
@@ -252,50 +242,27 @@ def main():
     if saved is not None and (changes or "initial_contract" in saved):
         report["initial_contract"] = saved.get("initial_contract", saved["contract"])
     write_json(path, report)
-    if args.method == "riddle":
+    if native_method:
         from .pipeline import run
-    elif baseline_method:
-        from .pipeline import run_classifier_baseline
     else:
         if getattr(args, "lacathode_replica", False):
             from external.lacathode_utils.pipeline import run_single as run
         else:
             from external.lacathode_utils.pipeline import run
     try:
-        provenance = (run_classifier_baseline(args, contract, args.method)
-                      if baseline_method else run(args, contract))
-        if baseline_method and isinstance(provenance, dict):
-            report.update(
-                feature_order=provenance["feature_order"],
-                include_mass=provenance["include_mass"],
-                classifier=provenance["classifier"],
-                preprocessing=provenance["preprocessing"],
-                training_population_hashes=provenance["training_populations"],
-                evaluation_population_hashes=provenance["evaluation_population_hashes"],
-                accepted_fit_indices=provenance["accepted_fit_indices"],
-                accepted_fit_seeds=provenance["accepted_fit_seeds"],
-                fit_members=provenance["fit_members"],
-                checkpoint_selection=provenance["checkpoint_selection"],
-                selected_checkpoints_per_fit=provenance["selected_checkpoints_per_fit"],
-                ensemble_rule=provenance["ensemble_rule"],
-                ensemble_fit_selection=provenance["ensemble_fit_selection"],
-                preprocessing_rule=provenance["preprocessing_rule"],
-                class_balance=provenance["class_balance"],
-                truth_blind_training=provenance["truth_blind_training"],
-                truth_supervised_training=provenance["truth_supervised_training"],
-                data_class_definition=provenance["data_class_definition"],
-                simulation_background_class_definition=provenance["simulation_background_class_definition"],
-                signal_simulation_source=provenance["signal_simulation_source"],
-                background_simulation_source=provenance["background_simulation_source"],
-                architecture=provenance["architecture"],
-                optimizer=provenance["optimizer"],
-                loss=provenance["loss"],
-                saved_prediction=provenance["saved_prediction"],
-                training_history_sha256=provenance["training_history_sha256"],
-                reuse=provenance["reuse"],
-            )
-            write_json(path, report)
-        validate(args.data, require_baseline=baseline_method)
+        run(args, contract)
+        if oracle_method:
+            protocol_path = args.output / "protocol.json"
+            if protocol_path.is_file():
+                protocol = json.loads(protocol_path.read_text())
+                report.update(oracle_benchmark=protocol.get("oracle_benchmark"),
+                              score_scope=protocol.get("score_scope"),
+                              objective=protocol.get("objective"),
+                              selected_checkpoints=protocol.get("selected_checkpoints"),
+                              accepted_fits=protocol.get("accepted_fits"),
+                              ensemble_fits=protocol.get("ensemble_fits"))
+                write_json(path, report)
+        validate(args.data, require_oracle=oracle_method)
         write_json(args.output / "score_health.json", validate_result_scores(args.output, args.method))
     except (FloatingPointError, NumericalFitError) as error:
         report["failure"] = dict(kind="numerical", error=str(error), error_type=type(error).__name__,
@@ -311,7 +278,7 @@ def main():
         and p.name != "training.log"
     ]
     history_path = args.output / ".resume" / "resume_history.json"
-    if baseline_method:
+    if oracle_method:
         report["resume_history"] = json.loads(history_path.read_text()) if history_path.is_file() else {"schema": 1, "transitions": []}
     report.update(completed=True, artifacts_sha256=fingerprint_files(args.output, artifacts, args.io_workers))
     write_json(path, report)

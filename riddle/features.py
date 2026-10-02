@@ -143,8 +143,6 @@ def build_dataset_roles(
         raise RuntimeError("Dataset has too few signal rows for the configured injection reservoir")
     if spec.injected_signal_rows > spec.injection_reservoir_rows:
         raise RuntimeError("Injected signal count exceeds the fixed injection reservoir")
-    if not 0.0 < spec.signal_training_fraction < 1.0:
-        raise RuntimeError("Signal training fraction must lie strictly between zero and one")
     background_partition = partition_labels(len(background))
     signal_region = np.asarray(arrays["is_signal_region"], dtype=bool)
     final_background = background[background_partition == "final_test"]
@@ -177,23 +175,22 @@ def build_dataset_roles(
         extra_order = np.arange(len(extra_labels), dtype=np.uint32)
         rng.shuffle(extra_order)
         extra_order = extra_order[extra_signal_region[extra_order]]
-        if len(extra_order) <= spec.sic_background_validation_stop:
-            raise RuntimeError("The dedicated SIC background source is too small after the signal-region cut")
-        reserved_background = extra_order[: spec.sic_background_validation_stop]
-        background_train_stop = len(reserved_background) // 2
-        if background_train_stop == 0 or background_train_stop == len(reserved_background):
-            raise RuntimeError("The dedicated background reservation cannot be split for classifier training")
-        roles["baseline_background_train"] = _take(
+        extra_partition = partition_labels(len(extra_order))
+        background_train = extra_order[extra_partition == "training"]
+        background_val = extra_order[extra_partition == "validation"]
+        extra_test = extra_order[extra_partition == "final_test"]
+        if min(len(background_train), len(background_val), len(extra_test)) == 0:
+            raise RuntimeError("The dedicated background source cannot satisfy the RIDDLE benchmark partitions")
+        roles["oracle_background_train"] = _take(
             sic_background_arrays,
-            reserved_background[:background_train_stop],
-            np.full(background_train_stop, "baseline_training", dtype="U24"),
+            background_train,
+            np.full(len(background_train), "benchmark_training", dtype="U24"),
         )
-        roles["baseline_background_val"] = _take(
+        roles["oracle_background_val"] = _take(
             sic_background_arrays,
-            reserved_background[background_train_stop:],
-            np.full(len(reserved_background) - background_train_stop, "baseline_validation", dtype="U24"),
+            background_val,
+            np.full(len(background_val), "benchmark_validation", dtype="U24"),
         )
-        extra_test = extra_order[spec.sic_background_validation_stop :]
         primary_test_sr = final_background[signal_region[final_background]]
         primary_role = _take(
             arrays, primary_test_sr, np.full(len(primary_test_sr), "sic_evaluation", dtype="U16")
@@ -210,25 +207,22 @@ def build_dataset_roles(
     )
     remaining_signal = signal[spec.injection_reservoir_rows :]
     remaining_signal_sr = remaining_signal[signal_region[remaining_signal]]
-    if len(remaining_signal_sr) <= spec.signal_simulation_rows:
-        raise RuntimeError(
-            "Insufficient signal-region simulation after injection-reservoir removal for the configured classifier pool and final evaluation"
-        )
-    simulation_signal = remaining_signal_sr[: spec.signal_simulation_rows]
-    signal_train_stop = int(round(len(simulation_signal) * spec.signal_training_fraction))
-    if signal_train_stop <= 0 or signal_train_stop >= len(simulation_signal):
-        raise RuntimeError("The configured signal simulation split leaves an empty training or validation pool")
-    roles["baseline_signal_train"] = _take(
+    signal_simulation_partition = partition_labels(len(remaining_signal_sr))
+    signal_train = remaining_signal_sr[signal_simulation_partition == "training"]
+    signal_val = remaining_signal_sr[signal_simulation_partition == "validation"]
+    evaluation_signal = remaining_signal_sr[signal_simulation_partition == "final_test"]
+    if min(len(signal_train), len(signal_val), len(evaluation_signal)) == 0:
+        raise RuntimeError("Signal simulation cannot satisfy the RIDDLE benchmark partitions after reservoir removal")
+    roles["oracle_signal_train"] = _take(
         arrays,
-        simulation_signal[:signal_train_stop],
-        np.full(signal_train_stop, "baseline_training", dtype="U24"),
+        signal_train,
+        np.full(len(signal_train), "benchmark_training", dtype="U24"),
     )
-    roles["baseline_signal_val"] = _take(
+    roles["oracle_signal_val"] = _take(
         arrays,
-        simulation_signal[signal_train_stop:],
-        np.full(len(simulation_signal) - signal_train_stop, "baseline_validation", dtype="U24"),
+        signal_val,
+        np.full(len(signal_val), "benchmark_validation", dtype="U24"),
     )
-    evaluation_signal = remaining_signal_sr[spec.signal_simulation_rows :]
     roles["sic_evaluation_signal_background_only"] = _take(
         arrays, evaluation_signal, np.full(len(evaluation_signal), "sic_evaluation", dtype="U16")
     )
@@ -244,15 +238,18 @@ def build_dataset_roles(
     return roles
 
 
-def partition_row_order(partition: np.ndarray, *, preparation_seed: int = 1) -> np.ndarray:
+def partition_row_order(partition: np.ndarray, *, preparation_seed: int = 1, signal_rows: int | None = None, sic_background_rows: int | None = None) -> np.ndarray:
     partition = np.asarray(partition).astype(str)
     if set(partition.tolist()) != {"training", "validation", "final_test"}:
         raise ValueError("Scenario does not contain all three data partitions")
+    spec = DatasetSpec()
+    signal_rows = spec.signal_rows if signal_rows is None else int(signal_rows)
+    sic_background_rows = spec.sic_background_rows if sic_background_rows is None else int(sic_background_rows)
     rng = np.random.RandomState(preparation_seed)
     if preparation_seed != 1:
-        dummy_signal = np.arange(100000, dtype=np.uint32)
+        dummy_signal = np.arange(signal_rows, dtype=np.uint32)
         rng.shuffle(dummy_signal)
-    dummy_extra_qcd = np.arange(612858, dtype=np.uint32)
+    dummy_extra_qcd = np.arange(sic_background_rows, dtype=np.uint32)
     rng.shuffle(dummy_extra_qcd)
     ordered: list[np.ndarray] = []
     for name in ("training", "validation", "final_test"):

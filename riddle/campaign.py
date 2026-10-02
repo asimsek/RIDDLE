@@ -1,4 +1,5 @@
 import json
+import shutil
 from pathlib import Path
 import numpy as np
 import torch
@@ -48,6 +49,84 @@ def _compatible_identity(saved, current, *, allow_new_mapping_identity=False):
     if saved != current:
         return False
     return _fit_training_settings(saved_settings or {}) == _fit_training_settings(current_settings or {})
+
+
+def _activate_supervised_ensemble_reuse(output, candidates, identity, contract, allow_code_change):
+    output = Path(output)
+    if not candidates or (output / "ensemble_inputs.json").exists():
+        return None
+    if output.exists() and any(path.is_file() for path in output.rglob("*") if "background_correction" not in path.relative_to(output).parts):
+        return None
+    current_code = {} if contract is None else contract.get("code", {})
+    current_version = None if contract is None else contract.get("scientific_version")
+    for candidate in candidates:
+        source = Path(candidate).resolve()
+        result_path = source / "result.json"
+        if not result_path.is_file():
+            continue
+        try:
+            report = json.loads(result_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if report.get("completed") is not True or report.get("method") != "supervised":
+            continue
+        source_contract = report.get("contract", {})
+        if source_contract.get("scientific_version") != current_version:
+            continue
+        source_code = source_contract.get("code", {})
+        changed_code = sorted(name for name in set(source_code) | set(current_code) if source_code.get(name) != current_code.get(name))
+        if changed_code and not allow_code_change:
+            continue
+        artifacts = report.get("artifacts_sha256", {})
+        identity_key = "density/ensemble_inputs.json"
+        source_identity_path = source / identity_key
+        expected_identity = artifacts.get(identity_key)
+        if expected_identity is None or not source_identity_path.is_file() or file_digest(source_identity_path) != expected_identity:
+            continue
+        try:
+            source_identity = json.loads(source_identity_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not _compatible_identity(source_identity, identity):
+            continue
+        selected = []
+        valid = True
+        for relative, expected in sorted(artifacts.items()):
+            path = Path(relative)
+            if not path.parts or path.parts[0] != "density" or path.parts[1:2] == ("background_correction",) or path.name == "ensemble_reuse.json":
+                continue
+            source_path = source / path
+            if not source_path.is_file() or file_digest(source_path) != expected:
+                valid = False
+                break
+            selected.append((path.relative_to("density"), source_path))
+        if not valid or not selected:
+            continue
+        copied = []
+        try:
+            for relative, source_path in selected:
+                target = output / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source_path, target)
+                copied.append(target)
+        except Exception:
+            for target in reversed(copied):
+                target.unlink(missing_ok=True)
+            raise
+        reuse = {
+            "schema": 1,
+            "policy": "same_replica_supervised_oracle_ensemble_v1",
+            "source_result": str(source),
+            "source_result_sha256": file_digest(result_path),
+            "source_ensemble_inputs_sha256": expected_identity,
+            "changed_code": changed_code,
+            "code_change_approved": bool(changed_code),
+            "copied_artifacts": len(selected),
+        }
+        write_json(output / "ensemble_reuse.json", reuse)
+        emit_message(f"Reuse Supervised RIDDLE Stein ensemble from {source}", kind="PASS", level=0)
+        return reuse
+    return None
 
 
 class MemberScoreError(FloatingPointError):
@@ -394,6 +473,7 @@ def train_campaign(
     runs=DEFAULTS["riddle"]["runs"], seed=0, device="cpu", fraction_values=(None,),
     initialization="background", started=None, workers=1, io_workers=2, torch_threads=2, settings=None, background_reference=None,
     background_correction=None, selection_validation=None, member_splits=None, source_ids=None, mapping_identity=None,
+    ensemble_reuse_candidates=None, ensemble_reuse_contract=None, allow_ensemble_reuse_code_change=False,
 ):
     settings = deepcopy(DEFAULTS["riddle"] if settings is None else settings)
     settings.update(epochs=epochs, runs=runs, initialization=initialization)
@@ -418,7 +498,7 @@ def train_campaign(
     zselection = (None if selection_validation is None else real_sr_latents(
         selection_validation, mass_conditioning=mass_conditioning, physical_inputs=physical_inputs))
     coherent = effective_features(settings)["coherent_mixture"]
-    if coherent and zselection is None:
+    if coherent and settings.get("core", "residual") != "stein_witness" and zselection is None:
         raise ValueError("Coherent mixture requires separate internal selection and reserved evidence populations")
     if mass_conditioning:
         rows = train[train[:, -2] == 1].copy()
@@ -446,6 +526,9 @@ def train_campaign(
         if set(member_splits) != set(range(runs)): raise ValueError("Explicit splits required for every member")
         identity["explicit_splits"] = {str(i): {k:digest(v) for k,v in split.items()} for i,split in member_splits.items()}
     if source_ids is not None: identity["source_ids_sha256"] = digest(source_ids)
+    ensemble_reuse = _activate_supervised_ensemble_reuse(
+        output, ensemble_reuse_candidates, identity, ensemble_reuse_contract, allow_ensemble_reuse_code_change
+    )
     identity_path = output / "ensemble_inputs.json"
     if identity_path.exists() and not _compatible_identity(
             json.loads(identity_path.read_text()), identity, allow_new_mapping_identity=True):
@@ -661,6 +744,8 @@ def train_campaign(
                   accepted_runs=len(chosen["accepted_members"]), valid_runs=len(chosen["members"]),
                   accepted_checkpoints=len(chosen["accepted_members"]) * checkpoints,
                   selected_checkpoints=len(chosen["members"]) * checkpoints)
+    if ensemble_reuse is not None:
+        result["ensemble_reuse"] = ensemble_reuse
     if coherent:
         result["coherent_mixture"] = chosen["coherent_mixture"]
         write_json(output / "coherent_mixture.json", chosen["coherent_mixture"])

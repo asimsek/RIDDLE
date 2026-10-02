@@ -19,32 +19,6 @@ def default_config_path(name):
 
 DEFAULT_PATH = default_config_path("settings.yaml")
 
-AD_BASELINE_DEFAULTS = {
-    "classifier": {
-        "hidden_layers": [64, 64, 64],
-        "activation": "relu",
-        "optimizer": "adam",
-        "learning_rate": 0.001,
-        "batch_size": 128,
-        "epochs": 100,
-        "fits": 20,
-        "selected_checkpoints": 10,
-        "ensemble_fit_selection": "all-valid",
-        "checkpoint_selection": "lowest-validation-bce",
-        "ensemble": "mean_probability",
-        "preprocessing": "background_standardization",
-        "class_balance": "balanced_loss_weight",
-        "inference_batch_size": 65536,
-        "score_scope": "signal_region",
-        "include_mass": False,
-        "max_retries": 2,
-    },
-    "data": {
-        "signal_simulation_events": 55000,
-        "signal_training_fraction": 0.5,
-    },
-}
-
 
 def keys(mapping, expected, label):
     if not isinstance(mapping, dict) or set(mapping) != set(expected.split()):
@@ -418,50 +392,10 @@ def validate_residual(value):
 
 
 
-def validate_ad_baselines(value):
-    value = deepcopy(value)
-    keys(value, "classifier data", "AD baseline")
-    classifier = value["classifier"]
-    keys(classifier, "hidden_layers activation optimizer learning_rate batch_size epochs fits selected_checkpoints ensemble_fit_selection checkpoint_selection ensemble preprocessing class_balance inference_batch_size score_scope include_mass max_retries", "AD baseline classifier")
-    if not isinstance(classifier["hidden_layers"], list) or not classifier["hidden_layers"]:
-        raise ValueError("AD baseline hidden_layers must be a nonempty list")
-    for width in classifier["hidden_layers"]:
-        integer(width, "AD baseline hidden width")
-    if classifier["activation"] != "relu":
-        raise ValueError("AD baseline activation must be relu")
-    if classifier["optimizer"] != "adam":
-        raise ValueError("AD baseline optimizer must be adam")
-    number(classifier["learning_rate"], "AD baseline learning_rate")
-    for name in ("batch_size", "epochs", "fits", "selected_checkpoints", "inference_batch_size"):
-        integer(classifier[name], "AD baseline " + name)
-    integer(classifier["max_retries"], "AD baseline max_retries", 0)
-    if classifier["epochs"] < classifier["selected_checkpoints"]:
-        raise ValueError("AD baseline epochs must cover selected_checkpoints")
-    if classifier["ensemble_fit_selection"] != "all-valid":
-        raise ValueError("AD baseline ensemble_fit_selection must be all-valid")
-    if classifier["checkpoint_selection"] != "lowest-validation-bce":
-        raise ValueError("AD baseline checkpoint_selection must be lowest-validation-bce")
-    if classifier["ensemble"] != "mean_probability":
-        raise ValueError("AD baseline ensemble must be mean_probability")
-    if classifier["preprocessing"] != "background_standardization":
-        raise ValueError("AD baseline preprocessing must be background_standardization")
-    if classifier["class_balance"] != "balanced_loss_weight":
-        raise ValueError("AD baseline class_balance must be balanced_loss_weight")
-    if classifier["score_scope"] != "signal_region":
-        raise ValueError("AD baseline score_scope must be signal_region")
-    if type(classifier["include_mass"]) is not bool:
-        raise ValueError("AD baseline include_mass must be boolean")
-    data = value["data"]
-    keys(data, "signal_simulation_events signal_training_fraction", "AD baseline data")
-    integer(data["signal_simulation_events"], "AD baseline signal_simulation_events")
-    number(data["signal_training_fraction"], "AD baseline signal_training_fraction", maximum=1.0)
-    return value
-
 def load_settings(path=DEFAULT_PATH):
     path = Path(path).resolve()
     value = yaml.safe_load(path.read_text())
-    value.setdefault("ad_baselines", deepcopy(AD_BASELINE_DEFAULTS))
-    keys(value, "schema inputs riddle ad_baselines background injection_scan", "top-level")
+    keys(value, "schema inputs riddle background injection_scan", "top-level")
     if type(value["schema"]) is not int or value["schema"] != 1:
         raise ValueError("Unsupported settings schema")
     inputs = value["inputs"]
@@ -475,7 +409,6 @@ def load_settings(path=DEFAULT_PATH):
     if inputs["mass_column"] != "mjj" or inputs["label_column"] != "label":
         raise ValueError("Keep mjj and label separate from the input features")
     value["riddle"] = validate_residual(value["riddle"])
-    value["ad_baselines"] = validate_ad_baselines(value["ad_baselines"])
     b = value["background"]
     background_defaults = {"mapping_validation_batch_size": 65536, "mapping_inference_batch_size": 65536}
     for name, default in background_defaults.items():
@@ -540,31 +473,30 @@ DEFAULTS = load_settings()
 
 def resolve(args):
     effective = load_settings(args.config)
+    native_methods = any(method in args.methods for method in ("riddle", "iad", "supervised"))
     requested_fits = getattr(args, "fits", None)
     requested_epochs = getattr(args, "epochs", None)
-    if "riddle" in args.methods:
+    if native_methods:
+        common_overrides = {
+            "runs": requested_fits,
+            "epochs": requested_epochs,
+            "data_policy": getattr(args, "data_policy", None),
+            "ensemble_completion": getattr(args, "ensemble_completion", None),
+            "fractions": getattr(args, "fractions", None),
+            "mass_conditioning": getattr(args, "mass_conditioning", None),
+            "background_correction": getattr(args, "background_correction", None),
+        }
+        for key, override in common_overrides.items():
+            if override is not None:
+                effective["riddle"][key] = override
         from .options import FEATURES
         for key in FEATURES:
             override = getattr(args, key, None)
             if override is not None:
                 effective["riddle"]["enhancements"][key] = override
-        for key in ("runs", "epochs", "fractions", "data_policy", "ensemble_completion", "mass_conditioning", "background_correction"):
-            override = getattr(args, "fits" if key == "runs" else key, None)
-            if override is not None:
-                effective["riddle"][key] = override
         effective["riddle"] = validate_residual(effective["riddle"])
-    if any(method in args.methods for method in ("iad", "supervised")):
-        if requested_fits is not None:
-            effective["ad_baselines"]["classifier"]["fits"] = requested_fits
-        if requested_epochs is not None:
-            effective["ad_baselines"]["classifier"]["epochs"] = requested_epochs
-        effective["ad_baselines"] = validate_ad_baselines(effective["ad_baselines"])
-    if "riddle" in args.methods:
         args.fits = effective["riddle"]["runs"]
         args.epochs = effective["riddle"]["epochs"]
         args.fractions = effective["riddle"]["fractions"]
-    elif any(method in args.methods for method in ("iad", "supervised")):
-        args.fits = effective["ad_baselines"]["classifier"]["fits"]
-        args.epochs = effective["ad_baselines"]["classifier"]["epochs"]
     args.settings = effective
     return args

@@ -1,9 +1,4 @@
-"""Latent background correction used by the bgcorr_40_reguide RIDDLE profile.
-
-The correction q_phi(z|m) is trained once per RIDDLE method run on the reserved
-correction sidebands.  Every residual fit in that run reuses the same frozen
-q_phi for initialization, guide construction, likelihood ratios and scoring.
-"""
+"""Latent background correction used by the bgcorr_40_reguide RIDDLE family."""
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from copy import deepcopy
 from pathlib import Path
@@ -16,7 +11,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from .integrity import SCIENTIFIC_VERSION, require_finite
+from .integrity import SCIENTIFIC_VERSION, RIDDLE_BENCHMARK_SCIENTIFIC_VERSION, require_finite
 from .model import build_signal_flow, match_background
 from .storage import (atomic_torch_save, digest, file_digest, rng_state, restore_rng,
                       write_json, persist_boundary)
@@ -26,6 +21,7 @@ from .options import feature_options
 MODE = "bgcorr_40_reguide"
 EPOCHS = 40
 PROTOCOL = "shared_sideband_qphi_balanced_validation_uncertainty_gated_mean_supported_closure_reguide_decoupled_width"
+ORACLE_PROTOCOL = "riddle_oracle_sr_qphi_v2_gaussian_gate"
 CLOSURE_SCOPE = "correction_only_interpolation_on_fixed_upstream_map; not_full_search_closure"
 MIN_VALIDATION_IMPROVEMENT = 0.0
 # Leave training support on both sides of each interpolation gap.
@@ -707,6 +703,253 @@ def train(directory, train_z, train_mass, val_z, val_mass, *, settings, seed, de
                 selection=decision)
 
 
+def _oracle_mass_strata(mass, bins):
+    mass = np.asarray(mass)
+    if mass.ndim != 1 or len(mass) < 2 or not np.isfinite(mass).all():
+        raise ValueError("Invalid oracle-background mass sample")
+    count = min(int(bins), len(mass))
+    if count <= 1:
+        return [np.arange(len(mass), dtype=np.int64)]
+    ordered = np.argsort(mass, kind="stable")
+    groups = [np.asarray(group, dtype=np.int64) for group in np.array_split(ordered, count)]
+    if any(len(group) == 0 for group in groups):
+        raise ValueError("Could not construct oracle-background mass strata")
+    return groups
+
+
+def _oracle_balanced_indices(mass, bins, seed):
+    if bins <= 1:
+        return None
+    rng = np.random.default_rng(int(seed))
+    groups = _oracle_mass_strata(mass, bins)
+    target = int(math.ceil(len(mass) / len(groups)))
+    chosen = [rng.choice(group, size=target, replace=len(group) < target) for group in groups]
+    merged = np.concatenate(chosen)
+    rng.shuffle(merged)
+    return merged.astype(np.int64, copy=False)
+
+
+def _oracle_equal_stratum_mean(values, mass, bins):
+    values = np.asarray(values, dtype=np.float64)
+    if values.shape != (len(mass),) or not np.isfinite(values).all():
+        raise ValueError("Invalid oracle-background validation values")
+    return float(np.mean([values[group].mean() for group in _oracle_mass_strata(mass, bins)]))
+
+
+def _oracle_contract(settings, train_z, train_mass, val_z, val_mass, closure_z, closure_mass, seed, device):
+    epochs, mass_bins = _qphi_options(settings)
+    return {
+        "schema": 1,
+        "scientific_version": RIDDLE_BENCHMARK_SCIENTIFIC_VERSION,
+        "mode": MODE,
+        "protocol": ORACLE_PROTOCOL,
+        "epochs": epochs,
+        "mass_bins": mass_bins,
+        "flow": _qphi_flow(settings),
+        "learning_rate": settings["training"]["learning_rate"],
+        "weight_decay": 1e-4,
+        "gradient_clip_norm": 1.0,
+        "seed": int(seed),
+        "training_region": "signal_region",
+        "truth_role_selection": "pure_background",
+        "hashes": {
+            "train_z": digest(train_z),
+            "train_mass": digest(train_mass),
+            "validation_z": digest(val_z),
+            "validation_mass": digest(val_mass),
+            "closure_z": digest(closure_z),
+            "closure_mass": digest(closure_mass),
+        },
+    }
+
+
+def _activate_oracle_reuse(directory, candidates, contract, current_code, allow_code_change):
+    directory = Path(directory)
+    for candidate in candidates or ():
+        source = Path(candidate).resolve()
+        result_path = source / "result.json"
+        if not result_path.is_file():
+            continue
+        try:
+            report = json.loads(result_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if report.get("completed") is not True or report.get("method") not in ("iad", "supervised"):
+            continue
+        source_code = report.get("contract", {}).get("code", {})
+        changed_code = sorted(name for name in set(source_code) | set(current_code) if source_code.get(name) != current_code.get(name))
+        if changed_code and not allow_code_change:
+            continue
+        base = source / "density" / "background_correction"
+        names = ("contract.json", "model.pt", "selection.json")
+        verified = {}
+        valid = True
+        for name in names:
+            relative = f"density/background_correction/{name}"
+            path = base / name
+            expected = report.get("artifacts_sha256", {}).get(relative)
+            if expected is None or not path.is_file() or file_digest(path) != expected:
+                valid = False
+                break
+            verified[name] = path
+        if not valid:
+            continue
+        try:
+            source_contract = json.loads(verified["contract.json"].read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if source_contract != contract:
+            continue
+        directory.mkdir(parents=True, exist_ok=True)
+        for name, path in verified.items():
+            shutil.copy2(path, directory / name)
+        history = base / "history.json"
+        relative = "density/background_correction/history.json"
+        expected = report.get("artifacts_sha256", {}).get(relative)
+        if expected is not None and history.is_file() and file_digest(history) == expected:
+            shutil.copy2(history, directory / "history.json")
+        reuse = {
+            "policy": "shared_oracle_sr_background_v1",
+            "source_result": str(source),
+            "source_result_sha256": file_digest(result_path),
+            "contract_sha256": file_digest(directory / "contract.json"),
+            "model_sha256": file_digest(directory / "model.pt"),
+            "changed_code": changed_code,
+            "code_change_approved": bool(changed_code),
+        }
+        write_json(directory / "reuse.json", reuse)
+        return reuse
+    return None
+
+
+def train_oracle(directory, train_z, train_mass, val_z, val_mass, closure_z, closure_mass, *, settings, seed, device, reuse_candidates=None, current_code=None, allow_code_change=False):
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    arrays = [np.ascontiguousarray(value, dtype=np.float32) for value in (train_z, train_mass, val_z, val_mass, closure_z, closure_mass)]
+    train_z, train_mass, val_z, val_mass, closure_z, closure_mass = arrays
+    if train_z.ndim != 2 or val_z.shape[1:] != train_z.shape[1:] or closure_z.shape[1:] != train_z.shape[1:] or min(len(train_z), len(val_z), len(closure_z)) < 2:
+        raise ValueError("Oracle background requires aligned pure-background latent samples")
+    for z, mass in ((train_z, train_mass), (val_z, val_mass), (closure_z, closure_mass)):
+        if mass.shape != (len(z),) or not np.isfinite(z).all() or not np.isfinite(mass).all():
+            raise ValueError("Invalid oracle-background inputs")
+        if not np.all((mass > 3.3) & (mass < 3.7)):
+            raise ValueError("Oracle background requires pure signal-region background events")
+    epochs, mass_bins = _qphi_options(settings)
+    contract = _oracle_contract(settings, train_z, train_mass, val_z, val_mass, closure_z, closure_mass, seed, device)
+    current_code = {} if current_code is None else dict(current_code)
+    contract_path = directory / "contract.json"
+    if not contract_path.exists() and not (directory / ".resume/latest.pt").exists() and not (directory / "model.pt").exists():
+        _activate_oracle_reuse(directory, reuse_candidates, contract, current_code, allow_code_change)
+    if contract_path.exists() and json.loads(contract_path.read_text()) != contract:
+        raise ValueError("Oracle background inputs/settings changed; use a new output directory")
+    if (directory / "model.pt").is_file() and (directory / "selection.json").is_file():
+        selection = json.loads((directory / "selection.json").read_text())
+        active = selection.get("status") == "activated" and bool(selection.get("active"))
+        return {"requested_mode": MODE, "active": active, "descriptor": descriptor(directory) if active else None, "selection": selection, "reuse": json.loads((directory / "reuse.json").read_text()) if (directory / "reuse.json").is_file() else None}
+    write_json(contract_path, contract)
+    torch.manual_seed(int(seed))
+    np.random.seed(int(seed) % 2**32)
+    model = _model(settings, train_z.shape[1], device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=settings["training"]["learning_rate"], weight_decay=1e-4)
+    history, start = [], 0
+    best_any, best_any_epoch, best_any_model = float("inf"), None, None
+    best_eligible, best_eligible_epoch, best_eligible_model = float("inf"), None, None
+    latest = directory / ".resume/latest.pt"
+    if latest.exists():
+        state = torch.load(latest, map_location=device, weights_only=False)
+        if state.get("contract") != contract:
+            raise ValueError("Oracle background recovery contract changed")
+        model.load_state_dict(state["model"])
+        optimizer.load_state_dict(state["optimizer"])
+        history, start = state["history"], state["epoch"] + 1
+        best_any, best_any_epoch, best_any_model = state["best_any"], state["best_any_epoch"], state["best_any_model"]
+        best_eligible, best_eligible_epoch, best_eligible_model = state["best_eligible"], state["best_eligible_epoch"], state["best_eligible_model"]
+        restore_rng(state["rng"])
+    zt = torch.from_numpy(train_z)
+    mt = torch.from_numpy(((train_mass - 3.5) / 0.2).astype(np.float32))
+    zv = torch.from_numpy(val_z).to(device)
+    mv = torch.from_numpy(((val_mass - 3.5) / 0.2).astype(np.float32)).to(device)
+    dataset = TensorDataset(zt, mt)
+    for epoch in range(start, epochs):
+        generator = torch.Generator().manual_seed(int(seed) + 11000 + epoch)
+        balanced = _oracle_balanced_indices(train_mass, mass_bins, int(seed) + 11500 + epoch)
+        epoch_dataset = dataset if balanced is None else TensorDataset(zt[balanced], mt[balanced])
+        loader = DataLoader(epoch_dataset, batch_size=512, shuffle=balanced is None, generator=generator)
+        model.train()
+        total = 0.0
+        trained_events = 0
+        for z, mass in loader:
+            z, mass = z.to(device), mass.to(device)
+            optimizer.zero_grad()
+            loss = -log_prob(model, z, mass).mean()
+            require_finite(loss, "Oracle background loss")
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
+            optimizer.step()
+            total += float(loss.detach()) * len(z)
+            trained_events += len(z)
+        model.eval()
+        with torch.no_grad():
+            validation_log_prob = log_prob(model, zv, mv).double().cpu().numpy()
+            gaussian_log_prob = _gaussian_log_prob(zv).double().cpu().numpy()
+        validation_nll = -float(validation_log_prob.mean())
+        gaussian_nll = -float(gaussian_log_prob.mean())
+        selection_nll = -_oracle_equal_stratum_mean(validation_log_prob, val_mass, mass_bins)
+        gain = validation_log_prob - gaussian_log_prob
+        improvement = float(gain.mean())
+        improvement_standard_error = float(gain.std(ddof=1) / math.sqrt(len(gain))) if len(gain) > 1 else None
+        epoch_gate = _gaussian_gate({"events": int(len(gain)), "qphi_nll": validation_nll, "gaussian_nll": gaussian_nll, "improvement": improvement, "improvement_standard_error": improvement_standard_error})
+        row = {"epoch": epoch, "train_nll": total / trained_events, "validation_nll": validation_nll, "balanced_validation_nll": selection_nll, "gaussian_validation_nll": gaussian_nll, "improvement": improvement, "improvement_standard_error": improvement_standard_error, "gaussian_compatible": epoch_gate["gaussian_compatible"]}
+        history.append(row)
+        require_finite(validation_nll, "Oracle background validation NLL")
+        require_finite(selection_nll, "Oracle background checkpoint selection NLL")
+        if (selection_nll, epoch) < (best_any, best_any_epoch if best_any_epoch is not None else math.inf):
+            best_any, best_any_epoch, best_any_model = selection_nll, epoch, deepcopy(model.state_dict())
+        if epoch_gate["gaussian_compatible"] and (selection_nll, epoch) < (best_eligible, best_eligible_epoch if best_eligible_epoch is not None else math.inf):
+            best_eligible, best_eligible_epoch, best_eligible_model = selection_nll, epoch, deepcopy(model.state_dict())
+        if persist_boundary(epoch, epochs):
+            latest.parent.mkdir(parents=True, exist_ok=True)
+            atomic_torch_save(latest, {"contract": contract, "epoch": epoch, "model": model.state_dict(), "optimizer": optimizer.state_dict(), "history": history, "best_any": best_any, "best_any_epoch": best_any_epoch, "best_any_model": best_any_model, "best_eligible": best_eligible, "best_eligible_epoch": best_eligible_epoch, "best_eligible_model": best_eligible_model, "rng": rng_state()})
+            write_json(directory / "history.json", history)
+        emit_message(f"Oracle background {epoch+1}/{epochs}: validation NLL={validation_nll:.6g}; selection NLL={selection_nll:.6g}; Gaussian gate={epoch_gate['status']}")
+    use_eligible = best_eligible_model is not None
+    best = best_eligible if use_eligible else best_any
+    best_epoch = best_eligible_epoch if use_eligible else best_any_epoch
+    best_model = best_eligible_model if use_eligible else best_any_model
+    if best_model is None:
+        raise FloatingPointError("Oracle background produced no valid checkpoint")
+    atomic_torch_save(directory / "model.pt", {"model": best_model, "selected_epoch": best_epoch, "contract": contract})
+    model.load_state_dict(best_model)
+    model.eval().requires_grad_(False)
+    validation = _gaussian_gate(_validation_metrics(model, val_z, val_mass, device))
+    closure = _gaussian_gate(_validation_metrics(model, closure_z, closure_mass, device))
+    active = bool(validation["gaussian_compatible"])
+    reasons = [] if active else ["q_phi is significantly worse than Gaussian on reserved pure-background signal-region validation"]
+    decision = {
+        "mode": MODE,
+        "protocol": ORACLE_PROTOCOL,
+        "selected_epoch": int(best_epoch),
+        "epochs": epochs,
+        "status": "activated" if active else "gaussian_fallback",
+        "active": active,
+        "checkpoint_selection": {"metric": "equal_mass_stratum_validation_nll", "eligibility": "Gaussian-compatible natural validation", "eligible_checkpoint_found": bool(use_eligible), "mass_bins": mass_bins, "selected_nll": float(best)},
+        "criterion": "best equal-mass-stratum checkpoint among Gaussian-compatible reserved pure-background signal-region validation epochs",
+        "validation_gate": {**validation, "activation_eligible": active, "direct_oracle_background": True},
+        "pseudo_sr_closure": {"status": "not_applicable", "reason": "direct pure-background signal-region oracle"},
+        "independent_closure_diagnostic": {"status": "evaluated", "events": int(len(closure_z)), "candidate_qphi": closure, "role": "pure_background_signal_region_closure", "used_for_training": False, "used_for_checkpoint_selection": False, "used_for_activation": False},
+        "validation_scope": "reserved pure-background signal-region validation with Gaussian compatibility gate",
+        "full_search_closure_status": "not_applicable",
+        "truth_labels_used": True,
+        "training_region": "pure background signal region",
+        "denominator": "q_phi_oracle(z|m)" if active else "standard_normal(z)",
+        "fallback_reason": "; ".join(reasons) if reasons else None,
+    }
+    write_json(directory / "selection.json", decision)
+    write_json(directory / "history.json", history)
+    emit_message("Oracle background correction activated" if active else "Oracle background correction failed Gaussian validation gate; using Gaussian denominator", level=0)
+    return {"requested_mode": MODE, "active": active, "descriptor": descriptor(directory) if active else None, "selection": decision, "reuse": json.loads((directory / "reuse.json").read_text()) if (directory / "reuse.json").is_file() else None}
+
+
 def _reuse_signature(settings):
     epochs, mass_bins = _qphi_options(settings)
     return {
@@ -814,12 +1057,13 @@ def descriptor(directory):
     directory = Path(directory)
     state = torch.load(directory / "model.pt", map_location="cpu", weights_only=False)
     contract = state["contract"]
-    if contract.get("mode") != MODE or type(contract.get("epochs")) is not int or contract["epochs"] < 10:
-        raise ValueError("Invalid bgcorr_40_reguide model")
+    protocol = contract.get("protocol", PROTOCOL)
+    if contract.get("mode") != MODE or protocol not in (PROTOCOL, ORACLE_PROTOCOL) or type(contract.get("epochs")) is not int or contract["epochs"] < 10:
+        raise ValueError("Invalid RIDDLE background model")
     selection = json.loads((directory / "selection.json").read_text())
     if selection.get("status") != "activated" or not selection.get("active"):
         raise ValueError("Inactive background correction cannot be used as the RIDDLE denominator")
-    return dict(mode=MODE, protocol=PROTOCOL, epochs=int(contract["epochs"]),
+    return dict(mode=MODE, protocol=protocol, epochs=int(contract["epochs"]),
                 selected_epoch=int(state["selected_epoch"]), model_path=str((directory / "model.pt").resolve()),
                 model_sha256=file_digest(directory / "model.pt"), contract=contract,
                 validation_gate=selection["validation_gate"], pseudo_sr_closure=selection["pseudo_sr_closure"],
@@ -845,7 +1089,7 @@ def save_local(directory, model, description):
     """Persist the shared denominator state inside one fit for self-contained scoring."""
     directory = Path(directory)
     path = directory / "background_correction.pt"
-    payload = {"model": model.state_dict(), "mode": MODE, "protocol": PROTOCOL,
+    payload = {"model": model.state_dict(), "mode": MODE, "protocol": description["protocol"],
                "source_sha256": description["model_sha256"],
                "selected_epoch": description["selected_epoch"],
                "contract": description["contract"]}
@@ -863,7 +1107,7 @@ def load_local(directory, settings, features, device):
     if not path.exists():
         return None
     saved = torch.load(path, map_location=device, weights_only=False)
-    readable = (PROTOCOL, "shared_sideband_qphi_reguide_v3_multiwindow_closure")
+    readable = (PROTOCOL, ORACLE_PROTOCOL, "shared_sideband_qphi_reguide_v3_multiwindow_closure")
     if saved.get("mode") != MODE or saved.get("protocol") not in readable:
         raise ValueError("Invalid fit-local background correction")
     model = _model(settings, features, device)

@@ -9,7 +9,7 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from .enhancements import Rosenblatt, save_torch, load_torch, clip_gradients
-from .integrity import SCIENTIFIC_VERSION, require_finite, train_flow_epoch
+from .integrity import SCIENTIFIC_VERSION, RIDDLE_BENCHMARK_SCIENTIFIC_VERSION, require_finite, train_flow_epoch
 from .preprocessing import load_dataset
 from .storage import digest, file_digest, write_json, save_array, seed_start, rng_state, restore_rng, atomic_write, save_npz, persist_boundary
 from .worker_progress import emit_message
@@ -156,7 +156,7 @@ def _verified_source_artifact(source, report, relative):
     return path
 
 
-def _mapping_reuse_candidate(candidate, current_contract, seed):
+def _mapping_reuse_candidate(candidate, current_contract, seed, source_signature):
     source = Path(candidate).resolve()
     report_path = source / "result.json"
     if not report_path.is_file():
@@ -165,11 +165,22 @@ def _mapping_reuse_candidate(candidate, current_contract, seed):
         report = json.loads(report_path.read_text())
     except json.JSONDecodeError:
         return None
-    if report.get("completed") is not True or not str(report.get("method", "")).startswith("riddle"):
+    method = str(report.get("method", ""))
+    if report.get("completed") is not True or not (method.startswith("riddle") or method in ("iad", "supervised")):
         return None
-    if report.get("contract", {}).get("scientific_version") != SCIENTIFIC_VERSION:
+    scientific_version = report.get("contract", {}).get("scientific_version")
+    if scientific_version not in (SCIENTIFIC_VERSION, RIDDLE_BENCHMARK_SCIENTIFIC_VERSION):
         return None
     if report.get("scenario") != "signal_injection":
+        return None
+    if source_signature is None:
+        return None
+    try:
+        from .data import benchmark_source_signature
+        candidate_source_signature = benchmark_source_signature(report.get("contract", {}).get("inputs", {}))
+    except ValueError:
+        return None
+    if candidate_source_signature != source_signature:
         return None
     relative_files = (
         Path("background/model.pt"),
@@ -200,7 +211,7 @@ def _mapping_reuse_candidate(candidate, current_contract, seed):
     return source, report, metadata, selection, verified, optional
 
 
-def _activate_mapping_reuse(output, candidates, current_contract, seed):
+def _activate_mapping_reuse(output, candidates, current_contract, seed, source_signature):
     manifest_path = output / "mapping_reuse.json"
     if manifest_path.exists():
         manifest = json.loads(manifest_path.read_text())
@@ -208,6 +219,8 @@ def _activate_mapping_reuse(output, candidates, current_contract, seed):
             raise ValueError("Unrecognized mapping reuse policy")
         if manifest.get("target_seed") != seed or manifest.get("target_signature") != _reuse_signature(current_contract):
             raise ValueError("Mapping reuse target settings changed; use a new output")
+        if source_signature is None or manifest.get("source_signature") != source_signature:
+            raise ValueError("Mapping reuse source identity changed or is unverifiable; use a new output")
         for name, expected in manifest.get("local_artifacts_sha256", {}).items():
             path = output / name
             if not path.is_file() or file_digest(path) != expected:
@@ -215,7 +228,7 @@ def _activate_mapping_reuse(output, candidates, current_contract, seed):
         return manifest
     found = None
     for candidate in candidates or ():
-        candidate_result = _mapping_reuse_candidate(candidate, current_contract, seed)
+        candidate_result = _mapping_reuse_candidate(candidate, current_contract, seed, source_signature)
         if candidate_result is not None:
             found = candidate_result
             break
@@ -246,6 +259,7 @@ def _activate_mapping_reuse(output, candidates, current_contract, seed):
         "source_seed": report.get("seed"),
         "source_scenario": report.get("scenario"),
         "source_variant": report.get("variant", report.get("contract", {}).get("inputs", {}).get("variant", "default")),
+        "source_signature": source_signature,
         "target_seed": seed,
         "target_signature": _reuse_signature(current_contract),
         "source_mapping_settings_sha256": file_digest(verified["background/mapping_settings.json"]),
@@ -294,8 +308,16 @@ def prepare(data, output, seed, device, *, background, options, data_policy=None
         contract.update(data_policy=data_policy, residual_batch_size=residual_batch_size)
     if experiment is not None:
         contract["mapping_experiment"] = experiment
+    source_signature = None
+    manifest_path = Path(data) / "inputs.json"
+    if manifest_path.is_file():
+        try:
+            from .data import benchmark_source_signature
+            source_signature = benchmark_source_signature(json.loads(manifest_path.read_text()))
+        except (OSError, ValueError, json.JSONDecodeError):
+            source_signature = None
     mapping_reuse = None if experiment is not None else _activate_mapping_reuse(
-        output, reuse_candidates, contract, seed
+        output, reuse_candidates, contract, seed, source_signature
     )
     settings_path = output / "mapping_settings.json"
     write_json(output / "background_settings.json", background)

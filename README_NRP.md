@@ -208,10 +208,10 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   | kubectl apply -n cua-asimsek -f -
 ```
 
-For RIDDLE/R-ANODE/IAD/Supervised, `--fits 20` trains one ensemble with twenty fits.<br>
+For RIDDLE/Idealized/Supervised/R-ANODE, `--fits 20` trains one ensemble with twenty fits.<br>
 Add `--runs 10` to retrain the complete method ten times; method uncertainty bands use these independent runs.<br>
 
-For one combined RIDDLE benchmark job, request `--methods riddle iad supervised` with a different job name.<br>
+For one combined RIDDLE benchmark job, request `--methods riddle iad supervised`; the two oracle methods use the same RIDDLE Stein flow with their pure-reference data roles.<br>
 Do not submit that alongside the corresponding standalone jobs for the same result identities.
 
 Optional controls use the preparation commands in `README.md`.<br>

@@ -60,14 +60,15 @@ BUILTINS = {
     "lacathode": PlotMethod("LaCathode", "#0072B2", "-", "#CC79A7"),
     "riddle": PlotMethod("RIDDLE", "#D55E00", "--", "#009E73", "sigmoid"),
     "ranode": PlotMethod("R-ANODE", "#8B1A1A", "-.", "#56B4E9", "sigmoid", "signal_region"),
-    "iad": PlotMethod("Idealized AD", "#56B4E9", "-", "#0072B2", "identity", "signal_region"),
-    "supervised": PlotMethod("Supervised AD", "#009E73", "-", "#00543E", "identity", "signal_region"),
+    "iad": PlotMethod("Idealized RIDDLE (IAD)", "#56B4E9", "-", "#0072B2", "identity", "signal_region"),
+    "supervised": PlotMethod("Supervised RIDDLE", "#009E73", "-", "#00543E", "identity", "signal_region"),
 }
 # Canonicalize mass-conditioned RIDDLE IDs onto the shared plotting path.
 
 
 
 RIDDLE_METHOD_IDS = frozenset(("riddle", "riddlev2", "riddlev3"))
+RIDDLE_NATIVE_METHODS = frozenset(("riddle", "iad", "supervised"))
 METHOD_SPECS = dict(BUILTINS)
 
 
@@ -124,7 +125,7 @@ def scoped_target(output, scope, scenario, seed=None, variant="default"):
 
 
 def is_riddle_report(report):
-    return method_family(report.get("method")) == "riddle"
+    return method_family(report.get("method")) in RIDDLE_NATIVE_METHODS
 
 
 def riddle_plot_spec(report):
@@ -181,8 +182,8 @@ def register_method(report):
 KEYS = {"lacathode": "raw", "riddle": "residual", "ranode": "ranode", "iad": "iad", "supervised": "supervised"}
 STYLES = dict(f.METHODS)
 STYLES["ranode"] = ("R-ANODE", "#8B1A1A", "-.")
-STYLES["iad"] = ("Idealized AD", BUILTINS["iad"].color, "-")
-STYLES["supervised"] = ("Supervised AD", BUILTINS["supervised"].color, "-")
+STYLES["iad"] = ("Idealized RIDDLE (IAD)", BUILTINS["iad"].color, "-")
+STYLES["supervised"] = ("Supervised RIDDLE", BUILTINS["supervised"].color, "-")
 
 
 
@@ -394,7 +395,7 @@ def discover(root, requested=None, *, scan=False):
         point = report.get("contract", {}).get("inputs", {}).get("injection_scan")
         if bool(point) != scan:
             continue
-        if method == "riddle" and "protocol.json" in report.get("artifacts_sha256", {}):
+        if method in RIDDLE_NATIVE_METHODS and "protocol.json" in report.get("artifacts_sha256", {}):
             protocol = read_metadata(path.parent, report, "protocol.json")
             report = {**report, "protocol": protocol,
                       "score_scope": riddle_score_scope({**report, "protocol": protocol})}
@@ -412,12 +413,12 @@ def discover(root, requested=None, *, scan=False):
         group = groups.setdefault(identity, {})
         if method in group:
             old_root, old_report = group[method]
-            if method == "riddle" and scientific_protocol(old_report) != scientific_protocol(report):
+            if method in RIDDLE_NATIVE_METHODS and scientific_protocol(old_report) != scientific_protocol(report):
                 preferred = (path.parent, report) if protocol_rank(report) > protocol_rank(old_report) else (old_root, old_report)
                 discarded = old_report if preferred[1] is report else report
                 group[method] = preferred
                 colored_status(
-                    f"Multiple RIDDLE protocols for {scenario}/seed_{seed:03d}/{variant}; "
+                    f"Multiple {METHOD_SPECS[method].label} protocols for {scenario}/seed_{seed:03d}/{variant}; "
                     f"using {scientific_protocol(preferred[1])} and ignoring {scientific_protocol(discarded)} for this plot cohort",
                     kind="WARNING", level=0,
                 )
@@ -451,7 +452,7 @@ def load_scores(root, report, name, *, attempt=None, for_rebuild=False):
 
 
 
-        if method == "riddle" and "density_inputs" in archive:
+        if method in RIDDLE_NATIVE_METHODS and "density_inputs" in archive:
             data["density_inputs"] = archive["density_inputs"]
             if "background_log_density" in archive:
                 data["background_log_density"] = archive["background_log_density"]
@@ -479,19 +480,19 @@ def load_scores(root, report, name, *, attempt=None, for_rebuild=False):
                 raise ValueError("Invalid R-ANODE signal-region membership")
             if name == "signal_region" and not region.all():
                 raise ValueError("R-ANODE evaluation contains non-SR events")
-        if method == "riddle":
+        if method in RIDDLE_NATIVE_METHODS:
             from .production import validate_region
 
             if "is_signal_region" not in archive:
-                raise ValueError("RIDDLE SR membership is missing; regenerate its score artifacts")
+                raise ValueError(f"{BUILTINS[method].label} SR membership is missing; regenerate its score artifacts")
             data["is_signal_region"] = validate_region(archive["is_signal_region"], len(data["mass"]))
             if name == "signal_region" and not data["is_signal_region"].all():
-                raise ValueError("RIDDLE signal-region evaluation contains non-SR events")
+                raise ValueError(f"{BUILTINS[method].label} signal-region evaluation contains non-SR events")
             expected_scope = riddle_score_scope(report)
             if "score_scope" in data and str(np.asarray(data["score_scope"]).item()) != expected_scope:
-                raise ValueError("Score artifact scope disagrees with the RIDDLE result contract")
+                raise ValueError(f"Score artifact scope disagrees with the {BUILTINS[method].label} result contract")
             if expected_scope == "signal_region" and (data["mask"] & ~data["is_signal_region"]).any():
-                raise ValueError("SR-only RIDDLE result contains scored sideband events")
+                raise ValueError(f"SR-only {BUILTINS[method].label} result contains scored sideband events")
     n = len(data["mass"])
     contract = report.get("contract", {})
     inputs = contract.get("inputs", {})
@@ -499,9 +500,9 @@ def load_scores(root, report, name, *, attempt=None, for_rebuild=False):
     variant = report.get("variant", inputs.get("variant", "default"))
     physical_dimensions = (len(columns) - 2 if isinstance(columns, list) and len(columns) >= 3
                            else 5 if variant == "deltaR" else 4)
-    riddle_settings = contract.get("settings", {}).get("riddle", {}) if method == "riddle" else {}
+    riddle_settings = contract.get("settings", {}).get("riddle", {}) if method in RIDDLE_NATIVE_METHODS else {}
     mass_context = int(bool(riddle_settings.get("mass_conditioning", False)))
-    latent_dimensions = physical_dimensions + mass_context if method == "riddle" else physical_dimensions
+    latent_dimensions = physical_dimensions + mass_context if method in RIDDLE_NATIVE_METHODS else physical_dimensions
     if any(data[k].shape != (n,) for k in ("mass", "labels", "scores", "mask")):
         raise ValueError("Misaligned score arrays")
     mapped_rows = int(data["mask"].sum())
@@ -533,7 +534,7 @@ def load_scores(root, report, name, *, attempt=None, for_rebuild=False):
             or not np.isnan(data["scores"][~data["mask"]]).all()):
         raise InvalidFitScores(f"{path}: empty/nonfinite accepted scores or invalid rejected-event scores")
     validate_score_record(data, method=method, stage=str(path))
-    if method == "riddle" and "method_health.json" in report.get("artifacts_sha256", {}):
+    if method in RIDDLE_NATIVE_METHODS and "method_health.json" in report.get("artifacts_sha256", {}):
         data["plot_saved_ensemble"] = True
     if method == "lacathode":
         settings = report.get("contract", {}).get("settings", {})
@@ -564,7 +565,7 @@ def load_scores(root, report, name, *, attempt=None, for_rebuild=False):
                     or not np.array_equal(data["run_seeds"], [m["seed"] for m in members])
                     or len(set(data["run_seeds"].tolist())) != len(fits)):
                 raise ValueError("Invalid independent LaCathode run identities or latents")
-    if method in ("riddle", "ranode"):
+    if method in RIDDLE_NATIVE_METHODS or method == "ranode":
         data.pop("fit_scores", None)
     return data
 
@@ -1058,7 +1059,7 @@ class ScoreLoader:
         if identity not in self.validated:
             method = method_family(report["method"])
             legacy_riddle = method == "riddle" and report.get("contract", {}).get("scientific_version", 1) < 3
-            if method in ("riddle", "ranode") and (not self.safeguard_filtering or legacy_riddle or method == "ranode"):
+            if method in ("riddle", "iad", "supervised", "ranode") and (not self.safeguard_filtering or legacy_riddle or method == "ranode"):
                 if not self.safeguard_filtering:
                     records, audit = unfiltered_plot_ensemble(root, report)
                 elif legacy_riddle:
@@ -1074,13 +1075,13 @@ class ScoreLoader:
                     colored_status(f"{BUILTINS[method].label} {report['scenario']}/seed_{report['seed']:03d}: "
                                    f"using {audit['used_fits']}/{audit['requested_fits']} saved fits; "
                                    f"excluded fits {indices}; accepted ensemble verified", kind="INFO", level=0)
-            if self.safeguard_filtering and method == "riddle" and not legacy_riddle:
+            if self.safeguard_filtering and method in ("riddle", "iad", "supervised") and not legacy_riddle:
                 from .production import require_complete_ensemble
                 selection = (read_metadata(root, report, "density/ensemble_selection.json")
                              if "density/ensemble_selection.json" in report.get("artifacts_sha256", {}) else {})
                 require_complete_ensemble(selection)
                 chosen = next(c for c in selection["configurations"] if c["name"] == selection["selected_configuration"])
-                self.fit_audit[identity] = dict(method="riddle", source=identity, status="producer_selection",
+                self.fit_audit[identity] = dict(method=method, source=identity, status="producer_selection",
                     scenario=report["scenario"], seed=report["seed"], source_artifacts_modified=False,
                     requested_fits=selection["requested_runs"], used_fits=selection["valid_runs"],
                     used_members=selection["members"], excluded_members=chosen["excluded_fits"],
@@ -1097,7 +1098,7 @@ class ScoreLoader:
                 audit = read_metadata(root, report, "density/normalization_check.json")
                 if audit.get("status") != "passed":
                     raise ValueError(f"{root}: failed density normalization check")
-            if method == "riddle" and not legacy_riddle:
+            if method in ("riddle", "iad", "supervised") and not legacy_riddle:
                 records = {}
                 for name in ("validation", "test", "signal_region"):
                     key = (identity, name)
@@ -1109,7 +1110,7 @@ class ScoreLoader:
                 self.fit_audit[identity] = audit
                 policy = audit["ensemble_fit_selection"]
                 colored_status(
-                    f"RIDDLE {report['scenario']}/seed_{report['seed']:03d}: ensemble fit selection "
+                    f"{BUILTINS[method].label} {report['scenario']}/seed_{report['seed']:03d}: ensemble fit selection "
                     f"{policy['applied_mode']} uses {audit['used_fits']}/{audit['safeguard_used_fits']} safeguard-valid fits",
                     kind="INFO", level=0
                 )
@@ -1248,7 +1249,7 @@ def make_bundle(group, confidence, score_loader=None):
                 # Treat mass as context, not as an extra latent coordinate.
 
 
-                if (method == "riddle" and
+                if (method in RIDDLE_NATIVE_METHODS and
                         method_report.get("contract", {}).get("settings", {}).get("riddle", {}).get("mass_conditioning", False)):
                     values = values[..., :-1]
                 latents[key] = values
@@ -1381,7 +1382,14 @@ def render_injection_scan(groups, output, args, score_loader=None):
             if method == "ranode":
                 from external.ranode_utils.data import scientific_version
                 expected_protocol = scientific_version(inputs.get("variant", "default"))
-            allowed_protocols = (2, 3, 4, 5) if method == "riddle" else (expected_protocol,)
+            if method == "riddle":
+                from .integrity import SCIENTIFIC_VERSION
+                allowed_protocols = tuple(range(2, int(SCIENTIFIC_VERSION) + 1))
+            elif method in ("iad", "supervised"):
+                from .integrity import RIDDLE_BENCHMARK_SCIENTIFIC_VERSION
+                allowed_protocols = (RIDDLE_BENCHMARK_SCIENTIFIC_VERSION,)
+            else:
+                allowed_protocols = (expected_protocol,)
             if method in BUILTINS and report["contract"].get("scientific_version") not in allowed_protocols:
                 raise ValueError(f"Injection scans require protocol in {allowed_protocols!r} for {method}")
             point = inputs["injection_scan"]
@@ -1765,7 +1773,7 @@ def event_size_rows(groups, score_loader, *, data_root=None):
                 evaluation_sample="independent signal-region evaluation",
             )
             data_dir = _prepared_data_directory(data_root, report)
-            if method == "riddle":
+            if method in ("riddle", "iad", "supervised"):
                 roles = (read_metadata(root, report, "background/data_roles.json")
                          if "background/data_roles.json" in report.get("artifacts_sha256", {}) else {})
                 rows.append({**base, "component": "Background map", "model_type": "conditional density estimator",
@@ -1773,8 +1781,30 @@ def event_size_rows(groups, score_loader, *, data_root=None):
                              "train_sample": "sideband data (" + roles.get("map_train", {}).get("source", "prepared") + ")",
                              "validation_events": roles.get("map_val", {}).get("events"),
                              "validation_sample": "sideband data (" + roles.get("map_val", {}).get("source", "prepared") + ")",
-                             "generated_reference_samples": "", "notes": "Background transformation/map"})
-                if "correction_train" in roles:
+                             "generated_reference_samples": "", "notes": "RIDDLE background transformation/map"})
+                oracle = {}
+                if method in ("iad", "supervised"):
+                    oracle_path = "oracle_roles.json"
+                    oracle = (read_metadata(root, report, oracle_path)
+                              if oracle_path in report.get("artifacts_sha256", {}) else {})
+                    correction_path = "density/background_correction/selection.json"
+                    correction = (read_metadata(root, report, correction_path)
+                                  if correction_path in report.get("artifacts_sha256", {}) else {})
+                    rows.append({**base, "component": "Oracle background q_phi", "model_type": "conditional density estimator",
+                                 "train_events": oracle.get("q_training_events"),
+                                 "train_sample": "pure signal-region background",
+                                 "validation_events": oracle.get("q_validation_events"),
+                                 "validation_sample": "held-out pure signal-region background",
+                                 "generated_reference_samples": "",
+                                 "notes": f"selected epoch={correction.get('selected_epoch', '')}; same RIDDLE q_phi architecture and objective"})
+                    rows.append({**base, "component": "Oracle background closure role",
+                                 "model_type": "diagnostic only", "train_events": 0,
+                                 "train_sample": "not used for training",
+                                 "validation_events": oracle.get("q_closure_events"),
+                                 "validation_sample": "held-out pure signal-region background; no checkpoint selection",
+                                 "generated_reference_samples": "",
+                                 "notes": "Independent oracle q_phi closure diagnostic"})
+                elif "correction_train" in roles:
                     correction_path = "density/background_correction/selection.json"
                     correction = (read_metadata(root, report, correction_path)
                                   if correction_path in report.get("artifacts_sha256", {}) else {})
@@ -1803,55 +1833,42 @@ def event_size_rows(groups, score_loader, *, data_root=None):
                 selection = (read_metadata(root, report, "density/ensemble_selection.json")
                              if "density/ensemble_selection.json" in report.get("artifacts_sha256", {}) else {})
                 members = selection.get("members", [])
-                train_events = roles.get("residual_train", {}).get("events")
-                validation_events = None
+                train_events = oracle.get("p_training_events") if oracle else roles.get("residual_train", {}).get("events")
+                validation_events = oracle.get("p_validation_events") if oracle else None
                 if members:
                     name = "density/" + members[0]["directory"] + "/residual_training_inputs.json"
                     try:
                         inputs = read_metadata(root, report, name)
                         train_events = inputs.get("train_events", train_events)
-                        validation_events = inputs.get("validation_events")
+                        validation_events = inputs.get("validation_events", validation_events)
                     except (OSError, ValueError, KeyError):
                         pass
-                validation_parts = []
-                if validation_events is not None:
-                    validation_parts.append("internal residual validation")
-                for role, label in (("mixture_validation", "mixture selection"), ("evidence", "reserved evidence")):
-                    count = roles.get(role, {}).get("events")
-                    if count is not None:
-                        validation_parts.append(f"{int(count):,} {label}")
+                if method == "iad":
+                    train_sample = "RIDDLE signal-region data mixture p (unlabelled)"
+                    validation_sample = f"RIDDLE reserved p validation; {oracle.get('p_validation_events', '')} validation events"
+                elif method == "supervised":
+                    train_sample = "pure signal p (truth-selected oracle role)"
+                    validation_sample = f"held-out pure signal p; {oracle.get('p_validation_events', '')} validation events"
+                else:
+                    train_sample = "signal-region data (unlabelled)"
+                    validation_parts = []
+                    if validation_events is not None:
+                        validation_parts.append("internal residual validation")
+                    for role, label in (("mixture_validation", "mixture selection"), ("evidence", "reserved evidence")):
+                        count = roles.get(role, {}).get("events")
+                        if count is not None:
+                            validation_parts.append(f"{int(count):,} {label}")
+                    validation_sample = "; ".join(validation_parts) or "signal-region validation"
                 core = report.get("contract", {}).get("settings", {}).get("riddle", {}).get("core", "residual")
                 rows.append({**base,
                              "component": ("Stein witness" if _is_stein_core(core) else "Residual signal density"),
                              "model_type": ("neural Stein discrepancy witness" if _is_stein_core(core) else "residual density estimator"),
-                             "train_events": train_events, "train_sample": "signal-region data (unlabelled)",
+                             "train_events": train_events, "train_sample": train_sample,
                              "validation_events": validation_events,
-                             "validation_sample": "; ".join(validation_parts) or "signal-region validation",
+                             "validation_sample": validation_sample,
                              "generated_reference_samples": "",
                              "notes": f"{selection.get('accepted_runs', selection.get('valid_runs', ''))}/{selection.get('requested_runs', '')} safeguard-valid fits; "
                                       f"{selection.get('valid_runs', '')} ensemble fits; {selection.get('selected_checkpoints', '')} selected checkpoints"})
-            elif method in ("iad", "supervised"):
-                populations = read_metadata(root, report, "training/populations.json")
-                ensemble = read_metadata(root, report, "training/ensemble.json")
-                train_class1 = populations.get("training", {}).get("class1", {})
-                train_class0 = populations.get("training", {}).get("class0", {})
-                val_class1 = populations.get("validation", {}).get("class1", {})
-                val_class0 = populations.get("validation", {}).get("class0", {})
-                train_events = int(train_class1.get("events", 0)) + int(train_class0.get("events", 0))
-                validation_events = int(val_class1.get("events", 0)) + int(val_class0.get("events", 0))
-                train_sample = ("actual SR data + pure BG simulation" if method == "iad"
-                                else "pure simulated signal + pure simulated background")
-                validation_sample = ("actual SR validation data + pure BG simulation" if method == "iad"
-                                     else "pure simulated signal + pure simulated background")
-                rows.append({**base, "component": "Classifier", "model_type": "classifier",
-                             "train_events": train_events, "train_sample": train_sample,
-                             "train_class1_events": int(train_class1.get("events", 0)),
-                             "train_class0_events": int(train_class0.get("events", 0)),
-                             "validation_events": validation_events, "validation_sample": validation_sample,
-                             "validation_class1_events": int(val_class1.get("events", 0)),
-                             "validation_class0_events": int(val_class0.get("events", 0)),
-                             "generated_reference_samples": "",
-                             "notes": f"{ensemble.get('accepted_fits', '')}/{ensemble.get('requested_fits', '')} accepted fits; {ensemble.get('selected_checkpoints', '')} selected checkpoints/fit"})
             elif method == "lacathode":
                 metadata = read_metadata(root, report, "protocol.json")
                 rows.append({**base, "component": "Background flow", "model_type": "density estimator",
@@ -1941,7 +1958,7 @@ def settings_rows(group, score_loader=None):
         }
         if score_loader is not None and str(root.resolve()) in score_loader.fit_audit:
             payload["plot_ensemble"] = score_loader.fit_audit[str(root.resolve())]
-        if method == "riddle":
+        if method in RIDDLE_NATIVE_METHODS:
             result = read_metadata(root, report, "density/ensemble_selection.json")
             payload["ensemble"] = {
                 k: result[k]
@@ -2003,7 +2020,7 @@ def _history_rows(root, report, relative):
 def _background_nll_history(method, source):
     """Return train/validation NLL for the sideband-trained background model."""
     root, report = source
-    if method == "riddle":
+    if method in RIDDLE_NATIVE_METHODS:
         try:
             rows = _history_rows(root, report, "background/history.json")
         except (OSError, ValueError, KeyError):
@@ -2121,7 +2138,7 @@ def _lacathode_sr_classifier_history(source):
 
 def _sr_model_training_history(method, source, score_loader=None):
     """Return the native second-stage training objective for each method."""
-    if method == "riddle":
+    if method in RIDDLE_NATIVE_METHODS:
         return _riddle_sr_model_nll_history(source, score_loader)
     if method == "ranode":
         return _ranode_sr_model_nll_history(source, score_loader)
@@ -2233,14 +2250,14 @@ def training_figures(group, output, score_loader=None):
 
         destination = output / STYLES[KEYS[method]][0] / "02_training"
 
-        if method == "riddle":
+        if method in RIDDLE_NATIVE_METHODS:
 
 
             background_history = _history_rows(root, report, "background/history.json")
             if background_history is not None:
                 _plot_objective_history(
                     background_history, destination,
-                    title="RIDDLE | Background flow",
+                    title=f"{BUILTINS[method].label} | Background flow",
                     filename="background_nll",
                 )
 
@@ -2261,7 +2278,7 @@ def training_figures(group, output, score_loader=None):
             core = report.get("contract", {}).get("settings", {}).get("riddle", {}).get("core", "residual")
             _plot_objective_history(
                 history, destination,
-                title=("RIDDLE | SR Stein witness" if _is_stein_core(core) else "RIDDLE | SR residual density"),
+                title=(f"{BUILTINS[method].label} | SR Stein witness" if _is_stein_core(core) else f"{BUILTINS[method].label} | SR residual density"),
                 filename=("sr_stein_objective" if _is_stein_core(core) else "sr_residual_nll"),
                 ylabel=("Stein witness objective" if _is_stein_core(core) else "Negative log likelihood"),
             )
@@ -2269,8 +2286,8 @@ def training_figures(group, output, score_loader=None):
             if not _is_stein_core(core):
                 fig, ax, _ = f.canvas("Fitted mixture fraction", "Epoch")
                 x = [r["epoch"] + 1 for r in history]
-                plot_history_series(ax, x, [r["signal_fraction"] for r in history], "RIDDLE")
-                f.legend(fig, title="RIDDLE | Residual-mixture fraction")
+                plot_history_series(ax, x, [r["signal_fraction"] for r in history], BUILTINS[method].label)
+                f.legend(fig, title=f"{BUILTINS[method].label} | Residual-mixture fraction")
                 f.save(fig, destination / "mixture_fraction")
 
 
@@ -2282,7 +2299,7 @@ def training_figures(group, output, score_loader=None):
                 if correction_history is not None:
                     _plot_objective_history(
                         correction_history, destination,
-                        title=r"RIDDLE | Background correction $q_\phi$",
+                        title=rf"{BUILTINS[method].label} | Background correction $q_\phi$",
                         filename="background_correction_nll",
                     )
 
@@ -2296,7 +2313,7 @@ def training_figures(group, output, score_loader=None):
                         np.full(len(epochs), i),
                         s=12,
                         color=STYLES["residual"][1],
-                        label="RIDDLE" if i == positions[0] else None,
+                        label=BUILTINS[method].label if i == positions[0] else None,
                     )
                 ax.set(yticks=positions, ylim=(min(positions) - .7, max(positions) + .7))
                 f.legend(fig)
@@ -3208,7 +3225,7 @@ def _ensemble_member_scores(method, source, score_loader, *, scope="signal_regio
 
     path = verify_plot_input(root, report, f"{partition}_scores.npz")
     with np.load(path, allow_pickle=False) as archive:
-        if method == "riddle" and "accepted_fit_scores" in archive:
+        if method in RIDDLE_NATIVE_METHODS and "accepted_fit_scores" in archive:
             scores = np.asarray(archive["accepted_fit_scores"], dtype=np.float64)
             indices = np.asarray(archive["accepted_fit_indices"], dtype=int)
             score_kind = str(archive["accepted_fit_score_kind"]) if "accepted_fit_score_kind" in archive else "log_density_ratio"
@@ -3217,7 +3234,7 @@ def _ensemble_member_scores(method, source, score_loader, *, scope="signal_regio
                 archive["fit_scores"] if "fit_scores" in archive else archive["scores"][None, :],
                 dtype=np.float64,
             )
-            indices = np.asarray(archive["fit_indices"], dtype=int) if method == "riddle" and "fit_indices" in archive else None
+            indices = np.asarray(archive["fit_indices"], dtype=int) if method in RIDDLE_NATIVE_METHODS and "fit_indices" in archive else None
             score_kind = (
                 str(archive["fit_score_kind"])
                 if "fit_score_kind" in archive
@@ -3227,7 +3244,7 @@ def _ensemble_member_scores(method, source, score_loader, *, scope="signal_regio
             )
         if scores.ndim != 2 or scores.shape[1] != len(record["labels"]):
             raise ValueError(f"{METHOD_SPECS[method].label} ensemble-convergence score shape is invalid")
-        if method == "riddle" and indices is not None:
+        if method in RIDDLE_NATIVE_METHODS and indices is not None:
             audit = score_loader.fit_audit.get(identity, {})
             used = [m.get("fit_index") for m in audit.get("used_members", []) if m.get("fit_index") is not None]
             if used:
@@ -3238,7 +3255,7 @@ def _ensemble_member_scores(method, source, score_loader, *, scope="signal_regio
 
     if not np.isfinite(scores[:, record["mask"]]).all() or not np.isnan(scores[:, ~record["mask"]]).all():
         raise ValueError(f"{METHOD_SPECS[method].label} ensemble-convergence member scores are invalid")
-    if method == "riddle":
+    if method in RIDDLE_NATIVE_METHODS:
         settings = report.get("contract", {}).get("settings", {}).get("riddle", {})
         scoring = settings.get("stein", {}).get("scoring", {}) if isinstance(settings, dict) else {}
         support_guard = scoring.get("support_guard", {}) if isinstance(scoring, dict) else {}
@@ -4084,7 +4101,7 @@ def main(argv=None):
                     "schema": 5,
                     "methods": {m: dict(label=METHOD_SPECS[m].label, score_transform=METHOD_SPECS[m].score_transform,
                                         score_scopes=sorted({
-                                            riddle_plot_spec(g[m][1]).score_scope if m == "riddle" else METHOD_SPECS[m].score_scope
+                                            riddle_score_scope(g[m][1]) if m in RIDDLE_NATIVE_METHODS else METHOD_SPECS[m].score_scope
                                             for g in [*groups.values(), *scan_groups.values()] if m in g
                                         })) for m in sorted(available)},
                     "layout": "SR-Only/<scenario>[/variant_<name>]/{seed_<seed>,summary}/... and Full-Range/<scenario>[/variant_<name>]/{seed_<seed>,summary}/...; injection scans live below SR-Only/signal_injection/injection_scan; root CSV/JSON files are publication metadata, not plots.",
