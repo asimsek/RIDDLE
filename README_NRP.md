@@ -114,6 +114,10 @@ python run.py setup --methods ranode
 
 ```bash
 python run.py prepare --dataset lhco --catalog config/datasets.yaml --output data/lhco --io-workers 16 --verbose 1
+
+python run.py prepare --dataset lhco --catalog config/datasets.yaml --variant shifted --output data/lhco_shifted --io-workers 16 --verbose 1
+
+python run.py prepare --dataset lhco --catalog config/datasets.yaml --variant deltaR --output data/lhco_deltaR --io-workers 16 --verbose 1
 ```
 
 
@@ -328,7 +332,12 @@ In the Jupyter terminal, prepare the configured strengths and replicas once.
 
 ```bash
 cd /shared/work/RIDDLE
+
 python run.py prepare-scan --config config/settings.yaml --output data/injection_scan --io-workers 16 --resume
+
+python run.py prepare-scan --config config/settings.yaml --variant shifted --output data/injection_scan_shifted --io-workers 16 --resume
+
+python run.py prepare-scan --config config/settings.yaml --variant deltaR --output data/injection_scan_deltaR --io-workers 16 --resume
 ```
 
 After preparation is complete, submit the jobs below from your local terminal.

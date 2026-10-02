@@ -517,7 +517,7 @@ def aggregate_metric_runs(run_rows, curve_kind):
     return grid, median, low, high
 
 
-def metric_cache(groups, loader, regions, min_background, verbose):
+def metric_cache(groups, loader, regions, min_background, verbose, require_compatible_populations=False):
     cache = {}
     records = {}
     protocol_groups = defaultdict(set)
@@ -545,16 +545,17 @@ def metric_cache(groups, loader, regions, min_background, verbose):
     for (method, scenario, variant, region), signatures in protocol_groups.items():
         if len(signatures) != 1:
             raise ValueError(f"Incompatible scientific protocols across independent runs for {METHOD_LABELS.get(method, method)}, {scenario}, {variant}, {region}")
-    population_groups = defaultdict(dict)
-    for (method, scenario, variant, region, seed), record in records.items():
-        population_groups[(scenario, variant, region, seed)][method] = record
-    for (scenario, variant, region, seed), population in population_groups.items():
-        try:
-            require_population_compatibility(population)
-        except ValueError as error:
-            raise ValueError(
-                f"Incompatible cross-method evaluation population for {scenario}, {variant}, {region}, seed {seed}"
-            ) from error
+    if require_compatible_populations:
+        population_groups = defaultdict(dict)
+        for (method, scenario, variant, region, seed), record in records.items():
+            population_groups[(scenario, variant, region, seed)][method] = record
+        for (scenario, variant, region, seed), population in population_groups.items():
+            try:
+                require_population_compatibility(population)
+            except ValueError as error:
+                raise ValueError(
+                    f"Incompatible cross-method evaluation population for {scenario}, {variant}, {region}, seed {seed}"
+                ) from error
     return cache, records
 
 
@@ -1928,7 +1929,7 @@ def aggregate_scan_replica(run_rows):
     }
 
 
-def process_injection_scan(scan_groups, methods, loader, settings, output, formats, file_formats, overwrite, min_background, allow_partial, verbose):
+def process_injection_scan(scan_groups, methods, loader, settings, output, formats, file_formats, overwrite, min_background, allow_partial, verbose, require_compatible_populations=False):
     configured = [int(value) for value in settings.get("injection_scan", {}).get("signal_events", [])]
     replicas = int(settings.get("injection_scan", {}).get("replicas", 0))
     if not configured or replicas < 1:
@@ -1999,12 +2000,13 @@ def process_injection_scan(scan_groups, methods, loader, settings, output, forma
         normalized = {canonical_method(method): source for method, source in group.items() if canonical_method(method) in requested_methods}
         if len(normalized) > 1:
             require_riddle_benchmark_alignment(normalized)
-    for (level, replica, run_index), records in point_records.items():
-        if len(records) > 1:
-            try:
-                require_population_compatibility(records)
-            except ValueError as error:
-                raise ValueError(f"Incompatible injection-scan evaluation population for N_inj={level}, replica={replica}, run={run_index}") from error
+    if require_compatible_populations:
+        for (level, replica, run_index), records in point_records.items():
+            if len(records) > 1:
+                try:
+                    require_population_compatibility(records)
+                except ValueError as error:
+                    raise ValueError(f"Incompatible injection-scan evaluation population for N_inj={level}, replica={replica}, run={run_index}") from error
     for (level, replica), counts in point_counts.items():
         if len(counts) > 1:
             raise ValueError(f"Injection-scan methods disagree on uncut physical counts for N_inj={level}, replica={replica}")
@@ -2130,6 +2132,7 @@ def parse_args(argv=None):
     parser.add_argument("--exclude-seeds", nargs="*", type=int, default=())
     parser.add_argument("--min-background", type=int, default=10)
     parser.add_argument("--allow-partial-injection-scan", action="store_true")
+    parser.add_argument("--require-compatible-populations", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--verbose", type=int, choices=(0, 1, 2), default=1)
     return parser.parse_args(argv)
@@ -2157,7 +2160,7 @@ def main(argv=None):
     say("[STAGE] Validate result provenance", args.verbose)
     loader = ScoreLoader(safeguard_filtering=True, ensemble_fit_selection=True, io_workers=2, device="cpu")
     say("[STAGE] Build publication metric cache", args.verbose)
-    cache, records = metric_cache(groups, loader, regions, args.min_background, args.verbose)
+    cache, records = metric_cache(groups, loader, regions, args.min_background, args.verbose, args.require_compatible_populations)
     say("[STAGE] Render comparison performance plots", args.verbose)
     plot_performance(cache, args.output, args.plot_formats, args.overwrite, scenarios, variants, regions)
     plot_score_distributions(groups, records, args.output, args.plot_formats, args.overwrite)
@@ -2176,7 +2179,7 @@ def main(argv=None):
     say("[STAGE] Render training histories", args.verbose)
     plot_training(groups, args.output, args.plot_formats, args.overwrite)
     say("[STAGE] Render signal-injection dependence", args.verbose)
-    process_injection_scan(scan_all, methods, loader, settings, args.output, args.plot_formats, args.file_formats, args.overwrite, args.min_background, args.allow_partial_injection_scan, args.verbose)
+    process_injection_scan(scan_all, methods, loader, settings, args.output, args.plot_formats, args.file_formats, args.overwrite, args.min_background, args.allow_partial_injection_scan, args.verbose, args.require_compatible_populations)
     say("[STAGE] Export publication tables", args.verbose)
     export_tables(groups, cache, loader, args.output, args.file_formats, args.data, args.verbose)
     say(f"[DONE] Publication outputs written to {args.output}", args.verbose)
