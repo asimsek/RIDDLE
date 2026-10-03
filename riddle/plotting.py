@@ -63,7 +63,7 @@ BUILTINS = {
     "iad": PlotMethod("Idealized RIDDLE (IAD)", "#56B4E9", "-", "#0072B2", "identity", "signal_region"),
     "supervised": PlotMethod("Supervised RIDDLE", "#009E73", "-", "#00543E", "identity", "signal_region"),
 }
-# Canonicalize mass-conditioned RIDDLE IDs onto the shared plotting path.
+# Share plotting IDs across mass-conditioned RIDDLE variants.
 
 
 
@@ -219,13 +219,8 @@ def plot_task_count(groups, scan_groups):
 
 
 def summary_groups(groups, *, method=None, scope="signal_region"):
-    """Combine only statistically repeatable runs from one scientific protocol per method.
-
-    Per-seed comparisons may legitimately contain newer and older RIDDLE protocols in
-    the same results tree.  Uncertainty bands must never treat those protocols as
-    exchangeable repetitions, so each method is restricted to its highest numeric
-    protocol (or most common named protocol) before summary aggregation.
-    """
+    """Group repeatable runs within one protocol per method.
+    Prefer the highest numeric protocol or most common named protocol."""
     eligible = {}
     for identity, group in groups.items():
         cohort = scope_group(group, scope)
@@ -571,12 +566,8 @@ def load_scores(root, report, name, *, attempt=None, for_rebuild=False):
 
 
 def ranode_plot_ensemble(root, report):
-    """Recover a plotting ensemble from valid saved fits, without editing results.
-
-    One cohort is used for every partition. Exclusions depend only on numerical
-    validity; weak but valid fits stay. Missing/changed files and event alignment
-    errors still stop plotting rather than being mistaken for failed training.
-    """
+    """Recover one cohort across partitions, excluding only numerically invalid fits.
+    Missing files, integrity failures, and misaligned events remain errors."""
     from external.ranode_utils.ensemble import validate_mass_normalization
     from .production import NumericalFitError
 
@@ -598,7 +589,7 @@ def ranode_plot_ensemble(root, report):
     additional_exclusions = False
     for index, attempt in enumerate(attempts):
         member = {"fit_index": indices.get(attempt, index), "attempt": attempt}
-        # Let integrity errors propagate outside numerical-failure handling.
+        # Integrity errors must not become numerical fit exclusions.
         verify_plot_input(root, report, str(Path(attempt) / "results/upstream/signal/fit/samples.npy"))
         try:
             validate_mass_normalization(root / attempt)
@@ -1359,12 +1350,7 @@ def render_full_pipeline(bundle, output, args):
 
 
 def render_injection_scan(groups, output, args, score_loader=None):
-    """Render injection scans versus both S/B and injected signal-event count.
-
-    Every figure is saved independently.  The upper x axis shows the realized
-    uncut nominal ``S/sqrt(B)`` when all scan points share one SR background
-    population, matching the convention used in the reference studies.
-    """
+    """Plot S/B and injected event counts; add S/sqrt(B) when SR background is shared."""
     score_loader = load_scores if score_loader is None else score_loader
     rows, cohorts, classifier_fits = [], {}, []
     variants = {identity[3] if len(identity) > 3 else "default" for identity in groups}
@@ -1590,12 +1576,7 @@ def _sic_signal_curve(record, minimum_background):
 
 
 def render_variant_sic_ratio(groups, output, args, score_loader):
-    """Compare non-default dataset/control variants with default at fixed signal efficiency.
-
-    This figure is emitted only when a method has matching seed and scientific
-    protocol in both the default and alternate dataset.  It therefore cannot
-    accidentally compare a code/protocol change with a dataset shift.
-    """
+    """Compare variants at fixed signal efficiency using matching seeds and protocols."""
     indexed = {}
     for identity, group in groups.items():
         scenario, seed, variant = identity_parts(identity)
@@ -1748,12 +1729,7 @@ def _first_numeric(mapping, key):
 
 
 def event_size_rows(groups, score_loader, *, data_root=None):
-    """Build a paper-friendly event accounting table from saved provenance.
-
-    Counts come only from checksum-protected result metadata, score populations,
-    or the exact prepared-data manifest used by that result.  Missing counts are
-    left blank rather than inferred from a paper or hard-coded benchmark.
-    """
+    """Tabulate counts from verified result/data provenance; leave missing counts blank."""
     rows = []
     for identity, group in sorted(groups.items()):
         scenario, seed, variant = identity_parts(identity)
@@ -2757,19 +2733,8 @@ def background_cuts(record, budgets):
 
 
 def exact_background_selection(record, budget):
-    """Return score-only fractional selections at an exact empirical BG efficiency.
-
-    A finite unweighted sample cannot in general contain exactly ``budget * N``
-    background events.  For publication working points we therefore use the
-    standard randomized/interpolated ROC convention: events above the boundary
-    score receive weight one, events below receive zero, and all events tied at
-    the boundary receive the same fractional weight.  The fraction is chosen
-    from background ranks only and is then applied identically to signal.
-
-    This is a truth-assisted *evaluation* working point, never a training or
-    model-selection threshold.  It makes the reported background efficiency
-    exactly equal to ``budget`` while preserving a score-only decision rule.
-    """
+    """Set exact empirical BG efficiency using equal fractional weights at score ties.
+    Apply the BG-derived boundary weights to signal too; evaluation only."""
     labels = np.asarray(record["labels"])
     mask = np.asarray(record["mask"], dtype=bool)
     total_background = int(np.sum(labels == 0))
@@ -2843,7 +2808,7 @@ def weighted_selection_histogram(values, edges, selection, population):
 
 
 def working_point_relation(budget):
-    # Evaluate publication working points at exact physical background efficiency.
+    # Use exact physical background efficiency.
 
     return "="
 
@@ -3072,14 +3037,7 @@ def render_physical_efficiency(records, selected, edges, budget, output, *, scop
 
 
 def render_physical_no_cut_efficiency(records, output, *, scope="full_region"):
-    """Plot the uncut background score/mapping acceptance versus mass.
-
-    This is the no-selection companion to the fixed-B working-point plots.  The
-    numerator is every scorable background event and the denominator is every
-    physical background event in the same mass bin.  Thus a method with complete
-    score coverage is exactly one across the full range; any dip reflects only
-    score/mapping acceptance, not a background-selection threshold.
-    """
+    """Plot scorable/physical background counts versus mass, without score selection."""
     if scope != "full_region" or not records:
         return
     require_same_physical_population(records)
@@ -3201,11 +3159,7 @@ def render_ranode_training(source, output, *, signal_attempts=None):
         )
 
 def _ensemble_member_scores(method, source, score_loader, *, scope="signal_region"):
-    """Return saved member scores for ensemble-convergence diagnostics.
-
-    In SR-only scope, all three methods are supported.  In full-range scope,
-    only methods with saved full-range score artifacts contribute.
-    """
+    """Load member scores matching the requested SR-only or full-range scope."""
     root, report = source
     partition = "signal_region" if scope == "signal_region" else "test"
     record = score_loader(root, report, partition)
@@ -3269,7 +3223,7 @@ def _ensemble_member_scores(method, source, score_loader, *, scope="signal_regio
             else "arithmetic mean in saved member-score coordinate"
         )
     else:
-        # Use median member performance because pinned LaCATHODE does not average fits.
+        # LaCATHODE has no cross-fit ensemble; use median performance.
 
 
         aggregation = "median of per-fit performance; LaCATHODE production does not cross-fit-average scores"
@@ -3392,17 +3346,9 @@ def _set_convergence_ylim(ax, curves, *, floor=None):
 
 
 def ensemble_size_convergence(group, output, score_loader, *, repetitions=32):
-    """Fit-count convergence at the four exact publication background working points.
-
-    R-ANODE uses its native equal-weight likelihood-ratio ensemble rule.
-    CDF-calibrated Stein RIDDLE is excluded without subset-specific reference-B recalibration.
-    LaCATHODE has no cross-fit production ensemble, so its curve is the median
-    exact-WP performance of the included classifier fits.  Random fit orderings
-    provide a 16--84% subset band without using labels to choose members.
-
-    Saves only publication-style standalone figures, one per exact
-    background working point.
-    """
+    """Plot fit-count convergence at exact background working points.
+    Use R-ANODE ratio ensembles and LaCATHODE median-fit performance; exclude
+    CDF-calibrated RIDDLE without subset recalibration. Random subsets give 16–84% bands."""
     budgets = np.asarray((0.004, 0.01, 0.05, 0.10), dtype=float)
     results = {}
     excluded = {}
@@ -3501,15 +3447,7 @@ def ensemble_size_convergence(group, output, score_loader, *, repetitions=32):
 
 
 def ensemble_size_convergence_overall(group, output, score_loader, *, scope="signal_region", repetitions=32, min_background=10):
-    """Fit-count convergence for overall discrimination metrics.
-
-    Plots how AUC and maximum SIC stabilize as more saved fit members are
-    included in the ensemble.  In full-range scope, only methods with saved
-    full-range scores contribute.
-
-    Saves only standalone publication-style figures for each metric, each with
-    its own legend and no extra text.
-    """
+    """Plot AUC and maximum SIC versus fit count using scores for the requested scope."""
     scoped = scope_group(group, scope)
     scenario = next(iter(group.values()))[1].get("scenario") if group else None
     if not scoped:
@@ -3829,7 +3767,7 @@ def physical_mass_summary(groups, output, args, score_loader, *, scenario="backg
             for i, score_group in enumerate(run_score_groups(method, record)):
                 per_fit = [physical_mass_values(mass, mask, scores[pop], edges, full, f.EFFICIENCIES)
                            for scores in score_group]
-                # Aggregate classifier fits within complete runs before uncertainty bands.
+                # Compute uncertainty across complete runs, not classifier fits.
 
                 curves[method].append(np.median([v for v, _ in per_fit], axis=0).tolist())
                 efficiencies[method].append(np.median([e for _, e in per_fit], axis=0).tolist())

@@ -37,13 +37,8 @@ def install_validation_counts(module):
 
 
 class TensorBatchAcceleration:
-    """Exact TensorDataset gather acceleration with optional CUDA residency.
-
-    The Dataset object itself is never mutated.  When a CUDA device is supplied,
-    compatible CPU TensorDataset tensors are mirrored to that GPU once and the
-    DataLoader fetcher gathers batches from the mirror.  Samplers, generators,
-    batch membership/order and the upstream training loop remain unchanged.
-    """
+    """Gather TensorDataset batches from optional CUDA mirrors without changing
+    datasets, sampling order, or training loops."""
 
     def __init__(self, device=None):
         self.device = None

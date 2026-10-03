@@ -99,12 +99,16 @@ def compute_lhco_features(
     return result
 
 
-def partition_labels(rows: int) -> np.ndarray:
+def partition_labels(rows: int, percentages=None) -> np.ndarray:
     if rows < 0:
         raise ValueError("Partition size cannot be negative")
     result = np.empty(rows, dtype="U16")
     train_stop = rows // 2
     validation_stop = 2 * rows // 3
+    if percentages is not None:
+        from .populations import percentage_counts
+        train_count, validation_count, _ = percentage_counts(int(rows), percentages)
+        train_stop, validation_stop = train_count, train_count + validation_count
     result[:train_stop] = "training"
     result[train_stop:validation_stop] = "validation"
     result[validation_stop:] = "final_test"
@@ -126,6 +130,7 @@ def build_dataset_roles(
     sic_background_arrays: Mapping[str, np.ndarray] | None = None,
     enforce_expected_counts: bool = True,
     independent_partition: bool = False,
+    population=None,
 ) -> dict[str, dict[str, np.ndarray]]:
     labels = np.asarray(arrays["label"], dtype=np.int8)
     background = np.flatnonzero(labels == 0)
@@ -143,7 +148,8 @@ def build_dataset_roles(
         raise RuntimeError("Dataset has too few signal rows for the configured injection reservoir")
     if spec.injected_signal_rows > spec.injection_reservoir_rows:
         raise RuntimeError("Injected signal count exceeds the fixed injection reservoir")
-    background_partition = partition_labels(len(background))
+    splits = population["splits"] if population is not None else {}
+    background_partition = partition_labels(len(background), splits.get("background"))
     signal_region = np.asarray(arrays["is_signal_region"], dtype=bool)
     final_background = background[background_partition == "final_test"]
     sculpting_rows = (
@@ -175,7 +181,7 @@ def build_dataset_roles(
         extra_order = np.arange(len(extra_labels), dtype=np.uint32)
         rng.shuffle(extra_order)
         extra_order = extra_order[extra_signal_region[extra_order]]
-        extra_partition = partition_labels(len(extra_order))
+        extra_partition = partition_labels(len(extra_order), splits.get("additional_background"))
         background_train = extra_order[extra_partition == "training"]
         background_val = extra_order[extra_partition == "validation"]
         extra_test = extra_order[extra_partition == "final_test"]
@@ -207,7 +213,7 @@ def build_dataset_roles(
     )
     remaining_signal = signal[spec.injection_reservoir_rows :]
     remaining_signal_sr = remaining_signal[signal_region[remaining_signal]]
-    signal_simulation_partition = partition_labels(len(remaining_signal_sr))
+    signal_simulation_partition = partition_labels(len(remaining_signal_sr), splits.get("supervised_signal"))
     signal_train = remaining_signal_sr[signal_simulation_partition == "training"]
     signal_val = remaining_signal_sr[signal_simulation_partition == "validation"]
     evaluation_signal = remaining_signal_sr[signal_simulation_partition == "final_test"]
@@ -228,7 +234,7 @@ def build_dataset_roles(
     )
     if len(signal) >= spec.injected_signal_rows and spec.injected_signal_rows > 0:
         injected = reservoir[: spec.injected_signal_rows]
-        injected_partition = partition_labels(len(injected))
+        injected_partition = partition_labels(len(injected), splits.get("injected_signal"))
         injection_indices = np.concatenate((background, injected))
         injection_partition = np.concatenate((background_partition, injected_partition))
         roles["signal_injection"] = _take(arrays, injection_indices, injection_partition)

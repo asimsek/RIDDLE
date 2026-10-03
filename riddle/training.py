@@ -211,7 +211,7 @@ def enhanced_epoch(model, logit, ztrain, optimizer, options, additions, *, epoch
             with torch.no_grad():
                 logit.fill_(np.log(fraction/(1-fraction)))
     if (not warm) and float(additions.get("responsibility_temperature", 1.0)) < 1.0:
-        # Fit f(m) from unsharpened responsibilities; sharpening only guides the density update.
+        # Sharpen density weights only; fit f(m) from unsharpened weights.
 
         weights = sharpen_responsibilities(weights, float(additions["responsibility_temperature"]))
     if weights.shape != (len(z),):
@@ -237,7 +237,7 @@ def enhanced_epoch(model, logit, ztrain, optimizer, options, additions, *, epoch
                 -mixture_log_density(log_signal, lb, logit).mean())
         nc = torch.zeros((), device=device)
         if additions["contrastive_fit"]:
-            # Sample references from the same denominator while keeping mass as context only.
+            # Sample the same denominator at matched mass contexts.
 
             model.eval()
             if background_model is not None:
@@ -673,7 +673,6 @@ def train_residual(
     try:
         for epoch in range(start, epochs):
             if fraction is None and not active["guided_fit"]:
-                # Freeze fraction gradients during warm-up.
 
                 logit.requires_grad_(epoch >= warmup)
             losses = {}
@@ -689,7 +688,7 @@ def train_residual(
                         progress=lambda done, total: progress.substep("Train", done, total))
                     continue
                 if part == "validation" and enhanced:
-                    # Preserve training RNG state while computing validation losses.
+                    # Preserve training RNG state during validation.
 
 
                     from .enhancements import chunks, standard_normal_log_prob
@@ -783,7 +782,7 @@ def train_residual(
             if stopped:
                 break
     except BaseException:
-        # Publish history only through the last durable recovery point.
+        # Publish only checkpointed history.
 
         write_json(output / "residual_losses.json", {"history": durable_history})
         raise
@@ -961,11 +960,7 @@ def residual_scores(output, order, z, device, *, normalization_checks=None, norm
 
 
 def residual_fraction_probabilities(output, order, z, *, return_checkpoints=False):
-    """Evaluate the training-only mixture gate for saved residual checkpoints.
-
-    This helper is used for validation/configuration likelihood accounting only.
-    The exported RIDDLE anomaly score never multiplies by f(m).
-    """
+    """Evaluate the training-only mixture gate; final anomaly scores exclude f(m)."""
     output = Path(output)
     z = np.asarray(z, dtype=np.float32)
     if z.ndim != 2 or not len(z) or not np.isfinite(z).all():

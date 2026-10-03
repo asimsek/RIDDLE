@@ -24,7 +24,7 @@ PROTOCOL = "shared_sideband_qphi_balanced_validation_uncertainty_gated_mean_supp
 ORACLE_PROTOCOL = "riddle_oracle_sr_qphi_v2_gaussian_gate"
 CLOSURE_SCOPE = "correction_only_interpolation_on_fixed_upstream_map; not_full_search_closure"
 MIN_VALIDATION_IMPROVEMENT = 0.0
-# Leave training support on both sides of each interpolation gap.
+# Keep training support on both sides of each gap.
 
 PSEUDO_WINDOW_QUANTILES = ((0.15, 0.30), (0.425, 0.575), (0.70, 0.85))
 MIN_PSEUDO_WINDOW_EVENTS = 30
@@ -296,18 +296,9 @@ def _pseudo_probe_worker(task):
 
 
 def _pseudo_sr_closure(train_z, train_mass, val_z, val_mass, *, settings, seed, device):
-    """Test q_phi interpolation in three artificial gaps on each side of the SR.
-
-    Each probe masks one localized mass window from both correction-training and
-    checkpoint-selection rows, fits a fresh auxiliary q_phi, and evaluates only
-    the held-out validation rows in that window.  The six windows are defined by
-    mass quantiles and use no truth labels.
-
-    A sideband passes when all three windows are evaluable, at least one has a
-    positive Gaussian-relative NLL gain, their event-weighted mean gain is
-    positive, and every remaining window is compatible with Gaussian at the
-    configured compatibility threshold. Both sidebands must pass.
-    """
+    """Test three held-out mass gaps per sideband with fresh, label-free q_phi fits.
+    Each side must have evaluable gaps, positive mean gain, at least one positive
+    gap, and Gaussian-compatible remaining gaps."""
     all_mass = np.concatenate((train_mass, val_mass)).astype(np.float64, copy=False)
     reports = []
     tasks = []

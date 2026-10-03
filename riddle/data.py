@@ -62,7 +62,7 @@ def rows(arrays, variant="default"):
     return controls.transform(result, arrays, variant)
 
 
-def export_roles(roles, output, spec, source, *, smoke=False, variant="default", scan=None, scenarios=SCENARIOS):
+def export_roles(roles, output, spec, source, *, smoke=False, variant="default", scan=None, scenarios=SCENARIOS, population=None):
     output = Path(output)
     for scenario in scenarios:
         batch = roles[scenario]
@@ -105,6 +105,9 @@ def export_roles(roles, output, spec, source, *, smoke=False, variant="default",
             (reservoir["source_index"], reservoir["source_entry"])
         ).astype(np.uint64)
         from .storage import save_npz
+        if population is not None:
+            from .populations import EVALUATION_KEY, EVALUATION_FILES, contract
+            identities[EVALUATION_KEY] = np.concatenate([identities[n] for n in EVALUATION_FILES])
         save_npz(directory / "event_ids.npz", **identities)
         sr_labels = batch["label"][batch["is_signal_region"]]
         full_sr_b, full_sr_s = int((sr_labels == 0).sum()), int((sr_labels == 1).sum())
@@ -113,7 +116,8 @@ def export_roles(roles, output, spec, source, *, smoke=False, variant="default",
         write_json(
             directory / "inputs.json",
             {
-                "schema": 4,
+                "schema": 5 if population is not None else 4,
+                **({"shared_population": contract(population, identities)} if population is not None else {}),
                 "scenario": scenario,
                 "files": files,
                 "preparation": asdict(spec),
@@ -126,7 +130,8 @@ def export_roles(roles, output, spec, source, *, smoke=False, variant="default",
                 "signal_region_boundary": "strict",
                 "synthetic_smoke_fixture": smoke,
                 "event_ids_sha256": file_digest(directory / "event_ids.npz"),
-                "partition_policy": "independent_class_permutations" if scan else "fixed_upstream_partition",
+                "partition_policy": ("independent_class_permutations" if scan else
+                                     "shared_percentages_fixed_order_v1" if population is not None else "fixed_upstream_partition"),
                 "injection_scan": scan,
                 "injection_reservoir": {
                     "events": int(len(identities[INJECTION_RESERVOIR_KEY])),
@@ -135,7 +140,7 @@ def export_roles(roles, output, spec, source, *, smoke=False, variant="default",
                 },
                 "riddle_oracle_pools": {
                     "counts": oracle_counts,
-                    "partition_policy": "riddle_partition_labels",
+                    "partition_policy": "shared_percentages_v1" if population is not None else "riddle_partition_labels",
                     "injection_reservoir_removed_before_signal_partition": True,
                     "source_purpose_policy": "dataset_catalog_purpose_v1",
                     "primary_source_index": primary_source_index,
@@ -204,6 +209,11 @@ def read_sources(args, root, variant):
 
 
 def prepare(args):
+    from .populations import load_config, percentage_counts
+    from .settings import load_settings
+    population = load_config(getattr(args, "population_config", None))
+    settings = load_settings(getattr(args, "config", None) or load_settings.__defaults__[0])
+    reservoir_rows = max(population["injected_signal_events"], max(settings["injection_scan"]["signal_events"]))
     root = args.output.resolve()
     variant = getattr(args, "variant", "default")
     controls.columns(variant)
@@ -214,25 +224,29 @@ def prepare(args):
             )
         for scenario in SCENARIOS:
             manifest = validate(root / scenario)
+            if manifest.get("shared_population", {}).get("configuration") != population:
+                raise ValueError("Prepared populations differ; use a new output directory")
+            if manifest["preparation"]["injection_reservoir_rows"] != reservoir_rows:
+                raise ValueError("Prepared injection reservoir differs; use a new output directory")
             if manifest.get("variant", "default") != variant:
                 raise ValueError("Prepared variant differs; use a separate output directory")
         return
     root.parent.mkdir(parents=True, exist_ok=True)
     with locked(root.parent / ("." + root.name + ".prepare.lock")):
         primary, extra, by_source, provenance = read_sources(args, root, variant)
-        from .settings import load_settings
-        settings = load_settings(getattr(args, "config", None) or load_settings.__defaults__[0])
-        reservoir_rows = max(settings["injection_scan"]["signal_events"])
-        spec = replace(DatasetSpec(), injection_reservoir_rows=reservoir_rows)
+        spec = replace(DatasetSpec(), injection_reservoir_rows=reservoir_rows,
+                       injected_signal_rows=population["injected_signal_events"],
+                       preparation_seed=population["preparation_seed"],
+                       sculpting_test_rows=percentage_counts(DatasetSpec().background_rows, population["splits"]["background"])[2])
         with operation_progress("Construct deterministic LHCO partitions"):
             roles = build_dataset_roles(
-                primary, spec, sic_background_arrays=extra, enforce_expected_counts=True
+                primary, spec, sic_background_arrays=extra, enforce_expected_counts=True, population=population
             )
             if variant == "deltaR":
                 controls.attach_delta_r(roles, by_source)
         stage = Path(tempfile.mkdtemp(prefix="." + root.name + "-", dir=root.parent))
         with operation_progress("Write and verify prepared arrays"):
-            export_roles(roles, stage, spec, provenance, variant=variant)
+            export_roles(roles, stage, spec, provenance, variant=variant, population=population)
             for scenario in SCENARIOS:
                 validate(stage / scenario)
         os.rename(stage, root)
@@ -266,14 +280,22 @@ def validate(directory, *, require_event_ids=False, require_oracle=False):
     if manifest.get("control", controls.description(variant)) != controls.description(variant):
         raise ValueError("Prepared control definition changed")
     schema = manifest.get("schema")
-    expected_files = DATA_FILES if schema in (3, 4) else CORE_DATA_FILES
-    if (schema not in (1, 2, 3, 4) or manifest.get("scenario") not in SCENARIOS
+    from .populations import EVALUATION_KEY, verify_evaluation, validate_config, percentage_counts
+    population = validate_config(manifest["shared_population"]["configuration"]) if schema == 5 else None
+    if population is not None:
+        preparation = manifest.get("preparation", {})
+        if not manifest.get("injection_scan") and (
+                preparation.get("injected_signal_rows") != population["injected_signal_events"]
+                or preparation.get("preparation_seed") != population["preparation_seed"]):
+            raise ValueError("Shared population configuration differs from its preparation contract")
+    expected_files = DATA_FILES if schema in (3, 4, 5) else CORE_DATA_FILES
+    if (schema not in (1, 2, 3, 4, 5) or manifest.get("scenario") not in SCENARIOS
             or set(manifest.get("files", {})) != set(expected_files)):
         raise ValueError("Invalid prepared LHCO manifest")
-    if require_event_ids and schema not in (2, 3, 4):
+    if require_event_ids and schema not in (2, 3, 4, 5):
         raise ValueError("RIDDLE production training requires prepared data with event identities")
-    if require_oracle and schema != 4:
-        raise ValueError("Idealized RIDDLE and Supervised RIDDLE require schema-4 RIDDLE oracle data; re-run data preparation with the current framework")
+    if require_oracle and schema not in (4, 5):
+        raise ValueError("Idealized RIDDLE and Supervised RIDDLE require schema-4/5 RIDDLE oracle data; re-run data preparation with the current framework")
     verify_artifacts(directory, manifest["files"], "Verify prepared LHCO arrays")
     counts = {part: np.zeros(2, dtype=np.int64) for part in ("train", "val", "test")}
     sr_counts = np.zeros(2, dtype=np.int64)
@@ -295,16 +317,20 @@ def validate(directory, *, require_event_ids=False, require_oracle=False):
             part = name.rsplit("_", 1)[1].removesuffix(".npy")
             counts[part] += np.bincount(array[:, -1].astype(int), minlength=2)
             sr_counts += np.bincount(array[region, -1].astype(int), minlength=2)
-    if schema in (2, 3, 4):
+    if schema in (2, 3, 4, 5):
         id_path = directory / "event_ids.npz"
         if not id_path.is_file():
             raise ValueError("Prepared data is missing event identities")
         if file_digest(id_path) != manifest.get("event_ids_sha256"):
             raise ValueError("Prepared event identities changed")
-        expected_id_keys = set(expected_files) | ({INJECTION_RESERVOIR_KEY} if schema in (3, 4) else set())
+        expected_id_keys = set(expected_files) | ({INJECTION_RESERVOIR_KEY} if schema in (3, 4, 5) else set())
+        if schema == 5:
+            expected_id_keys.add(EVALUATION_KEY)
         with np.load(id_path, allow_pickle=False) as ids:
             if set(ids.files) != expected_id_keys:
                 raise ValueError("Missing event identity arrays")
+            if schema == 5:
+                verify_evaluation(manifest, ids)
             arrays = []
             saved_ids = {}
             for name in expected_files:
@@ -314,7 +340,7 @@ def validate(directory, *, require_event_ids=False, require_oracle=False):
                 arrays.append(values)
                 saved_ids[name] = values
             reservoir_ids = None
-            if schema in (3, 4):
+            if schema in (3, 4, 5):
                 reservoir_ids = ids[INJECTION_RESERVOIR_KEY]
                 reservation = manifest.get("injection_reservoir", {})
                 if (reservoir_ids.ndim != 2 or reservoir_ids.shape[1] != 2 or reservoir_ids.dtype != np.uint64
@@ -325,24 +351,24 @@ def validate(directory, *, require_event_ids=False, require_oracle=False):
         all_ids = np.ascontiguousarray(np.concatenate(arrays)).view("V16").ravel()
         if len(np.unique(all_ids)) != len(all_ids):
             raise ValueError("Event overlap between preparation partitions/evaluation sources")
-        if schema in (3, 4):
+        if schema in (3, 4, 5):
             reservoir_view = np.ascontiguousarray(reservoir_ids).view("V16").ravel()
             oracle_signal_names = ("innerdata_extrasig_train.npy", "innerdata_extrasig_val.npy", "innerdata_extrasig.npy")
             oracle_signal_ids = np.ascontiguousarray(np.concatenate([saved_ids[name] for name in oracle_signal_names])).view("V16").ravel()
             if np.intersect1d(reservoir_view, oracle_signal_ids).size:
                 raise ValueError("Injection reservoir overlaps reserved simulation or final signal evaluation")
             expected_counts = {name: lengths[name] for name in ORACLE_DATA_FILES + ("innerdata_extrabkg_test.npy", "innerdata_extrasig.npy")}
-            if schema == 4:
+            if schema in (4, 5):
                 pools = manifest.get("riddle_oracle_pools", {})
                 if (pools.get("counts") != expected_counts
-                        or pools.get("partition_policy") != "riddle_partition_labels"
+                        or pools.get("partition_policy") != ("shared_percentages_v1" if schema == 5 else "riddle_partition_labels")
                         or pools.get("injection_reservoir_removed_before_signal_partition") is not True):
                     raise ValueError("RIDDLE oracle prepared event pools changed")
                 background_names = ("innerdata_extrabkg_train.npy", "innerdata_extrabkg_val.npy", "innerdata_extrabkg_test.npy")
                 signal_names = ("innerdata_extrasig_train.npy", "innerdata_extrasig_val.npy", "innerdata_extrasig.npy")
-                for names in (background_names, signal_names):
+                for names, pool in ((background_names, "additional_background"), (signal_names, "supervised_signal")):
                     total = sum(lengths[name] for name in names)
-                    labels = partition_labels(total)
+                    labels = partition_labels(total, population["splits"][pool] if population else None)
                     expected_partition_counts = (
                         int(np.count_nonzero(labels == "training")),
                         int(np.count_nonzero(labels == "validation")),
@@ -391,10 +417,15 @@ def validate(directory, *, require_event_ids=False, require_oracle=False):
         if (stored.get("background"), stored.get("signal")) != tuple(sr_counts):
             raise ValueError("Uncut SR population counts changed")
     profile = diagnostic_profile(manifest)
+    if population is not None:
+        for label, pool in ((0, "background"), (1, "injected_signal")):
+            observed = tuple(int(counts[part][label]) for part in ("train", "val", "test"))
+            if observed != percentage_counts(sum(observed), population["splits"][pool]):
+                raise ValueError("Shared main-population percentages changed")
     if profile is not None and {name: lengths[name] for name in CORE_DATA_FILES} != profile["row_counts"]:
         raise ValueError("Diagnostic subset partition counts changed")
     if not manifest.get("synthetic_smoke_fixture") and profile is None:
-        if schema in (3, 4):
+        if schema in (3, 4, 5):
             preparation = manifest.get("preparation")
             if not isinstance(preparation, dict):
                 raise ValueError("Prepared data is missing its preparation contract")
@@ -405,10 +436,10 @@ def validate(directory, *, require_event_ids=False, require_oracle=False):
                 raise ValueError("Invalid prepared-data contract") from error
             if (spec.background_rows != DatasetSpec().background_rows or spec.signal_rows != DatasetSpec().signal_rows
                     or spec.sic_background_rows != DatasetSpec().sic_background_rows
-                    or spec.sculpting_test_rows != DatasetSpec().sculpting_test_rows
+                    or spec.sculpting_test_rows != (percentage_counts(spec.background_rows, population["splits"]["background"])[2] if population else DatasetSpec().sculpting_test_rows)
                     or spec.injected_signal_rows > spec.injection_reservoir_rows):
                 raise ValueError("Prepared data does not match the LHCO protocol")
-            if schema == 4 and preparation != asdict(spec):
+            if schema in (4, 5) and preparation != asdict(spec):
                 raise ValueError("Schema-4 prepared data contains a non-RIDDLE benchmark partition contract")
         else:
             spec = DatasetSpec()
@@ -418,7 +449,7 @@ def validate(directory, *, require_event_ids=False, require_oracle=False):
                 raise ValueError("Prepared data does not match the legacy LHCO protocol")
         scan = manifest.get("injection_scan")
         if scan is not None:
-            if manifest.get("partition_policy") != "independent_class_permutations" or schema not in (2, 3, 4):
+            if manifest.get("partition_policy") != "independent_class_permutations" or schema not in (2, 3, 4, 5):
                 raise ValueError("Scan requires traceable independently permuted partitions")
             if type(scan.get("signal_events")) is not int or not 3 <= scan["signal_events"] < spec.signal_rows:
                 raise ValueError("Invalid scan signal count")
@@ -429,7 +460,8 @@ def validate(directory, *, require_event_ids=False, require_oracle=False):
         if manifest.get("mass_unit") != "TeV":
             raise ValueError("Prepared data does not match the LHCO protocol")
         for label, total in ((0, spec.background_rows), (1, spec.injected_signal_rows if manifest["scenario"] == "signal_injection" else 0)):
-            expected = (total // 2, 2 * total // 3 - total // 2, total - 2 * total // 3)
+            expected = (percentage_counts(total, population["splits"]["background" if label == 0 else "injected_signal"])
+                        if population else (total // 2, 2 * total // 3 - total // 2, total - 2 * total // 3))
             if tuple(counts[part][label] for part in ("train", "val", "test")) != expected:
                 raise ValueError("LHCO partition event counts changed")
     return manifest

@@ -183,7 +183,7 @@ class Mapper:
             features, mask = self.physical(original)
             real.append(np.column_stack((original[mask, 0], features, np.ones(mask.sum()),
                                          original[mask, -1])).astype(np.float32))
-        # Keep reference-row positions fixed so compared protocols reserve identical real events.
+        # Fix reference positions to preserve real-event splits across protocols.
 
         placeholders = np.zeros((reference_samples, real[0].shape[1]), dtype=np.float32)
         count = int(len(real[0]) / (len(real[0]) + len(real[1])) * reference_samples)

@@ -56,6 +56,8 @@ def parser():
     prep.add_argument("--catalog", type=Path, default=default_config_path("datasets.yaml"))
     prep.add_argument("--output", type=Path, default=Path("data/lhco"))
     prep.add_argument("--config", type=Path, default=default_config_path("settings.yaml"))
+    prep.add_argument("--population-config", type=Path, default=default_config_path("populations.yaml"),
+                      help="Shared BG/signal percentages and independent validation reserves")
     prep.add_argument("--variant", choices=["default", "shifted", "deltaR"], default="default")
     prep.add_argument("--io-workers", type=positive, default=4)
     prep.add_argument("--resume", action="store_true")
@@ -183,6 +185,10 @@ def run_campaign(args):
             manifest = validate(args.data / scenario, require_event_ids=native_requested, require_oracle=oracle_requested)
         if native_requested:
             input_features(args.settings, manifest)
+            from .score_selection import validate_population_contract
+            for method in args.methods:
+                if method in ("riddle", "iad", "supervised"):
+                    validate_population_contract(args.settings["riddle"], manifest, method)
         if "ranode" in args.methods:
             from external.ranode_utils.data import validate_schema
 

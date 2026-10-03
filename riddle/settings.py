@@ -7,7 +7,7 @@ import yaml
 def default_config_path(name):
     """Locate bundled configuration files."""
     import sysconfig
-    if name not in ("settings.yaml", "datasets.yaml"):
+    if name not in ("settings.yaml", "datasets.yaml", "populations.yaml"):
         raise ValueError("Unknown bundled configuration")
     candidates = (Path(__file__).resolve().parents[1] / "config" / name,
                   Path(sysconfig.get_path("data")) / "config" / name)
@@ -73,6 +73,18 @@ def validate_residual(value):
             "final_power": 10.0,
             "qscore_batch_size": 32768,
             "inference_batch_size": 16384,
+            # Preserve legacy scoring when auto-switch settings are absent.
+            "auto_switch": {
+                "enabled": {"riddle": False, "iad": False, "supervised": False},
+                "fallback": {"riddle": "tail_focus", "iad": "tail_focus", "supervised": "potential_qnorm"},
+                "reference_c_samples": 131072,
+                "efficiencies": [0.004, 0.01, 0.05, 0.1],
+                "weights": [0.5, 0.3, 0.15, 0.05],
+                "confidence": 0.95,
+                "bootstrap_replicas": 1000,
+                "min_tail_events": 50,
+                "seed": 75501,
+            },
             "support_guard": {
                 "enabled": True,
                 "statistic": "radius",
@@ -97,6 +109,11 @@ def validate_residual(value):
     merged_scoring["support_guard"] = {
         **stein_defaults["scoring"]["support_guard"], **supplied_support_guard
     }
+    supplied_auto = supplied_scoring.get("auto_switch", {})
+    auto_defaults = stein_defaults["scoring"]["auto_switch"]
+    if not isinstance(supplied_auto, dict) or set(supplied_auto) - auto_defaults.keys():
+        raise ValueError("Invalid auto-switch settings")
+    merged_scoring["auto_switch"] = {**auto_defaults, **supplied_auto}
     value["stein"] = {**stein_defaults, **supplied_stein,
                       "scoring": merged_scoring}
     from .options import DEFAULT_ENHANCEMENTS, FEATURES, feature_options
@@ -142,12 +159,10 @@ def validate_residual(value):
 
     from .roles import DEFAULT_POLICY
     value.setdefault("data_policy", DEFAULT_POLICY)
-    # Require every requested residual member unless partial diagnostics are explicit.
 
     value.setdefault("ensemble_completion", "strict")
     value.setdefault("ensemble_fit_selection", "all")
     value.setdefault("ensemble_fit_count", 20)
-    # Learn a smooth f(m) from latent residual responsibilities.
 
 
     value.setdefault("mass_fraction", {
@@ -233,8 +248,36 @@ def validate_residual(value):
     number(support_guard["gate_quantile"], "stein.scoring.support_guard.gate_quantile", maximum=1)
     number(support_guard["weight"], "stein.scoring.support_guard.weight", strict=False)
     number(support_guard["temperature"], "stein.scoring.support_guard.temperature")
-    if support_guard["enabled"] and scoring["mode"] != "tail_focus":
-        raise ValueError("stein.scoring.support_guard.enabled requires mode=tail_focus")
+    if support_guard["enabled"] and scoring["mode"] not in ("tail_focus", "potential_qnorm"):
+        raise ValueError("stein.scoring.support_guard.enabled requires tail_focus or potential_qnorm")
+    auto = scoring["auto_switch"]
+    if (not isinstance(auto["enabled"], dict) or set(auto["enabled"]) != {"riddle", "iad", "supervised"}
+            or any(type(v) is not bool for v in auto["enabled"].values())):
+        raise ValueError("Auto-switch requires independent boolean riddle/iad/supervised switches")
+    if (not isinstance(auto["fallback"], dict) or set(auto["fallback"]) != {"riddle", "iad", "supervised"}
+            or any(v not in ("tail_focus", "potential_qnorm") for v in auto["fallback"].values())):
+        raise ValueError("Auto-switch requires a PEW or potential-qnorm fallback for each method")
+    integer(auto["reference_c_samples"], "auto-switch reference C samples", 512)
+    efficiencies, weights = auto["efficiencies"], auto["weights"]
+    if (not isinstance(efficiencies, list) or not isinstance(weights, list) or not efficiencies
+            or len(efficiencies) != len(weights)):
+        raise ValueError("Auto-switch efficiencies and weights must be aligned nonempty lists")
+    for v in efficiencies:
+        number(v, "auto-switch efficiency", maximum=1)
+    if efficiencies != sorted(set(efficiencies)):
+        raise ValueError("Auto-switch efficiencies must be unique and increasing")
+    for v in weights:
+        number(v, "auto-switch weight")
+    if not math.isclose(sum(weights), 1, abs_tol=1e-12):
+        raise ValueError("Auto-switch weights must sum to one")
+    number(auto["confidence"], "auto-switch confidence", minimum=0.5, maximum=1)
+    integer(auto["bootstrap_replicas"], "auto-switch bootstrap replicas", 100)
+    integer(auto["min_tail_events"], "auto-switch minimum tail events", 1)
+    integer(auto["seed"], "auto-switch seed", 0)
+    if auto["seed"] >= 2**32:
+        raise ValueError("Auto-switch seed exceeds NumPy seed range")
+    if any(auto["enabled"].values()) and (value["core"] != "stein_witness" or scoring["mode"] not in ("tail_focus", "potential_qnorm")):
+        raise ValueError("Auto-switch requires the Stein PEW or potential-qnorm score")
     if value["core"] == "stein_witness" and value.get("input_space") == "physical":
         raise ValueError("stein_witness is defined for mapped latent-space RIDDLE")
 

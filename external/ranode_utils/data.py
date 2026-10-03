@@ -72,7 +72,11 @@ def validate(root):
         raise ValueError(
             "R-ANODE dedicated evaluation sources have inconsistent truth labels"
         )
-    if meta.get("schema") in (2, 3):
+    if meta.get("schema") in (4, 5):
+        from riddle.data import validate as validate_prepared
+
+        validate_prepared(root, require_event_ids=True)
+    elif meta.get("schema") in (2, 3):
         identity_path = root / "event_ids.npz"
         if digest(identity_path) != meta.get("event_ids_sha256"):
             raise ValueError("R-ANODE event identity hash mismatch")
@@ -101,7 +105,7 @@ def validate(root):
         for p in ("train", "val", "test")
     ):
         raise ValueError("Signal found in background-only physical data")
-    # Reject ambiguous memberships instead of assigning duplicate rows.
+    # Reject ambiguous split membership.
     train = row_keys(
         np.concatenate([arrays[f"{r}data_train.npy"] for r in ("inner", "outer")])
     )

@@ -5,8 +5,8 @@ import json
 import numpy as np
 import torch
 
-SCIENTIFIC_VERSION = 6
-RIDDLE_BENCHMARK_SCIENTIFIC_VERSION = "riddle_oracle_benchmarks_v3"
+SCIENTIFIC_VERSION = 7
+RIDDLE_BENCHMARK_SCIENTIFIC_VERSION = "riddle_oracle_benchmarks_v4"
 RIDDLE_BENCHMARK_LABELS = {"iad": "Idealized RIDDLE (IAD)", "supervised": "Supervised RIDDLE"}
 
 

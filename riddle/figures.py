@@ -156,12 +156,7 @@ def _calculation_bytes(value):
 
 
 def cached_plot_calculation(function):
-    """Reuse exact numerical inputs within one plot run, with an LRU memory limit.
-
-    Hash contents rather than array identities: slices and copied SR records can
-    share results, while changed masks/scores never reuse a stale calculation.
-    Copies isolate callers that normalize histograms or annotate metric dicts.
-    """
+    """Cache by array content with an LRU limit; return isolated copies."""
     @wraps(function)
     def calculate(*args, **kwargs):
         cache = _PLOT_CACHE.get()
@@ -190,7 +185,7 @@ roc_auc_score = cached_plot_calculation(roc_auc_score)
 
 
 def _export_worker_init():
-    # Disable inference work in export workers to avoid BLAS oversubscription.
+    # Limit worker threads to avoid BLAS oversubscription.
     from threadpoolctl import threadpool_limits
 
     threadpool_limits(limits=1)
@@ -273,7 +268,7 @@ def plot_resources(*, workers=1, cache_mb=1024):
 def fit_scores(record):
     if (record.get("plot_saved_ensemble", False) or
             str(record.get("fit_score_kind", "")) == "member_ratio_mapped_by_frozen_ensemble_calibrator"):
-        # Evaluate calibrated ensembles instead of averaging component densities.
+        # Use the calibrated ensemble, not averaged component densities.
 
         return record["scores"][None, :]
     return record.get("fit_scores", record["scores"][None, :])
@@ -378,11 +373,7 @@ def validate_fit_counts(records):
 
 
 def fit_curve_summary(curves, run_groups=None):
-    """Upstream interpolation of rejection and SIC at 1000 common signal efficiencies.
-
-    The caller applies its statistical-support cut before interpolation. Every
-    fit must contribute over the shared domain; unsupported fits are not dropped.
-    """
+    """Interpolate rejection/SIC at 1,000 efficiencies supported by every fit."""
     if not curves or any(len(b) < 2 or len(np.unique(s)) < 2 for b, s in curves):
         raise ValueError("Insufficient common LaCathode ROC support across all fits")
     low = max(float(np.min(s)) for _, s in curves)
@@ -396,7 +387,7 @@ def fit_curve_summary(curves, run_groups=None):
         groups = np.asarray(run_groups)
         if groups.shape != (len(curves),):
             raise ValueError("Each curve needs a complete-run identity")
-        # Use median classifier predictions and complete runs for LaCATHODE uncertainty.
+        # Aggregate LaCATHODE classifiers within complete runs.
 
         rejection = np.asarray([np.median(rejection[groups == key], axis=0) for key in np.unique(groups)])
         sic = np.asarray([np.median(sic[groups == key], axis=0) for key in np.unique(groups)])
@@ -925,7 +916,6 @@ def _save_figure(fig, path):
     path.parent.mkdir(parents=True, exist_ok=True)
     for ax in fig.axes:
         kind = getattr(ax, "_publication_yaxis", None)
-        # Preserve explicitly requested axis windows.
 
         if kind is not None and not getattr(ax, "_publication_fixed_ylim", False):
             publication_ylim(ax, kind)
@@ -1387,12 +1377,8 @@ def render_mass(bundle, output):
 
 
 def strict_cut_histograms(values, edges, scores, mask, thresholds):
-    """Exact unweighted histograms for many strict cuts, in one event pass.
-
-    Bucket by the number of thresholds passed, then accumulate from high to
-    low. Match numpy.histogram's closed final bin, and exclude NaN scores just
-    as a direct score > cut comparison does. Preserve unsorted/repeated cuts.
-    """
+    """Histogram strict cuts in one pass, preserving repeated and unsorted cuts.
+    Match NumPy bin edges and exclude NaN scores."""
     thresholds = np.asarray(thresholds)
     bins = len(edges) - 1
     if not len(thresholds):
@@ -1406,18 +1392,13 @@ def strict_cut_histograms(values, edges, scores, mask, thresholds):
     cumulative = np.cumsum(counts.reshape(-1, bins)[::-1], axis=0)[::-1][1:]
     result = np.empty_like(cumulative)
     result[order] = cumulative
-    # A NaN threshold never passes.
     result[np.isnan(thresholds)] = 0
     return result
 
 
 def mass_scan_histograms(sample, keys, cuts=SCORE_CUTS):
-    """Histogram strict cuts in each method's displayed 0--1 score coordinate.
-
-    Invert any configured display transform before selecting events. Neither scores nor
-    thresholds are fitted on test labels. Retentions use all physical test events,
-    including rejected mapping rows.
-    """
+    """Histogram display-score cuts; include rejected mapping rows in retention totals.
+    Display transforms and thresholds are not fitted to test labels."""
     from scipy.special import logit
 
     mass, labels = sample["mass"], sample["labels"]
@@ -1429,7 +1410,7 @@ def mass_scan_histograms(sample, keys, cuts=SCORE_CUTS):
             raise ValueError("Mass-scan score thresholds must be strictly between zero and one")
     histograms = {}
     for key in keys:
-        # Match stored score precision so events at a cut are classified identically.
+        # Preserve stored precision at cut boundaries.
 
         transform = sample.get("display_transforms", {}).get(key, DISPLAY_TRANSFORMS.get(key, "identity"))
         thresholds = np.asarray([logit(cut) if transform == "sigmoid" else cut for cut in cuts],
@@ -1640,14 +1621,8 @@ def feature_density(values, edges):
 
 
 def render_representation(bundle, output, *, regions=None):
-    """Render event-level input/latent diagnostics as one figure per quantity.
-
-    ``regions`` can restrict rendering to ``("sr",)`` or ``("full",)``.  When
-    exactly one region is requested the region name is omitted from the path;
-    the caller is expected to have already placed the figure below the
-    top-level ``SR-Only`` or ``Full-Range`` directory.  This keeps publication
-    outputs flat enough to browse while preserving the legacy two-region mode.
-    """
+    """Render input/latent diagnostics per quantity and region.
+    Single-region output omits the region directory; callers supply it."""
     sample = bundle["samples"].get("test")
     if sample is None:
         bundle["warnings"].append("Input/latent plots unavailable without event-level features")

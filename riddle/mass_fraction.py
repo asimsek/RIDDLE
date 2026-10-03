@@ -1,9 +1,4 @@
-"""Smooth mass-dependent residual mixture fraction.
-
-The gate f(m) is learned only from soft residual responsibilities in latent
-feature space.  It is a training/mixture-model component and is deliberately
-excluded from the final RIDDLE anomaly score p_S(z|m)/q_B(z|m).
-"""
+"""Learn f(m) from latent responsibilities for training only; exclude it from anomaly scores."""
 
 from __future__ import annotations
 
@@ -22,7 +17,7 @@ def _logit(value):
 
 def _expit(value):
     value = np.asarray(value, dtype=np.float64)
-    # Use a stable sigmoid without adding a SciPy inference dependency.
+    # Stable sigmoid without SciPy.
     out = np.empty_like(value)
     positive = value >= 0
     out[positive] = 1.0 / (1.0 + np.exp(-value[positive]))
@@ -52,7 +47,6 @@ def _contexts(context):
     x = np.asarray(context, dtype=np.float64).reshape(-1)
     if not len(x) or not np.isfinite(x).all():
         raise ValueError("Mass-fraction contexts must be finite and nonempty")
-    # Validate normalized SR mass context before spline evaluation.
     if np.any(x < -1.00001) or np.any(x > 1.00001):
         raise ValueError("Mass-fraction context lies outside the signal region")
     return np.clip(x, -1.0, 1.0)
@@ -68,7 +62,7 @@ def _basis(context, control_points):
     basis = np.asarray(CubicSpline(nodes, eye, axis=0, bc_type="natural")(x), dtype=np.float64)
     if basis.shape != (len(x), len(nodes)) or not np.isfinite(basis).all():
         raise FloatingPointError("Invalid mass-fraction spline basis")
-    # Partition of unity preserves common logit shifts across all masses.
+    # Partition of unity preserves common logit shifts.
 
 
     if not np.allclose(basis.sum(axis=1), 1.0, rtol=1e-8, atol=1e-10):
@@ -150,7 +144,7 @@ def _mean_shift(controls, basis, target, cfg):
         values = np.clip(basis @ (controls + delta), low, high)
         return float(_expit(values).mean())
 
-    # Use a wide deterministic bracket so clipping reaches the configured limits.
+    # Bracket the configured clipping limits.
     lo, hi = -40.0, 40.0
     flo, fhi = mean_at(lo) - target, mean_at(hi) - target
     if flo > 1e-12 or fhi < -1e-12:
@@ -165,15 +159,8 @@ def _mean_shift(controls, basis, target, cfg):
 
 
 def fit(context, responsibilities, state, settings, *, source="residual_responsibilities"):
-    """Penalized logistic-spline M-step for a smooth f(m).
-
-    The soft labels are residual responsibilities computed from z-space density
-    evidence.  Event counts in the mjj spectrum are never fit as a bump model.
-    A five-control-point natural cubic spline (default) supplies the only mass
-    dependence. Weak first- and second-difference penalties suppress noisy
-    trends/wiggles; the configured update mode selects direct mean matching or a damped
-    mean update.
-    """
+    """Fit a penalized logistic spline to latent responsibilities, not mass-spectrum counts.
+    Apply the configured direct or damped mean update."""
     from scipy.optimize import minimize
 
     cfg = _config(settings)
@@ -196,7 +183,6 @@ def fit(context, responsibilities, state, settings, *, source="residual_responsi
 
     def objective(c):
         eta = basis @ c
-        # Compute BCE directly from logits for soft responsibilities.
         bce = float(np.mean(np.logaddexp(0.0, eta) - r * eta))
         slope = d1 @ c
         curvature = d2 @ c

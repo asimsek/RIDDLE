@@ -142,7 +142,7 @@ def execute_script(path, *, cpu_background=False, variant="default"):
     elif variant == "deltaR":
         tree = extend_delta_r(tree, path.name)
     if cpu_background:
-        # Switch only the upstream device flag when the pinned launcher runs on CPU.
+        # Override the upstream device flag for CPU runs.
         assignments = [
             node
             for node in tree.body

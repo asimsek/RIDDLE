@@ -21,10 +21,7 @@ class NumericalFitError(ValueError):
 
 
 def validation_improvement(log_mixture_ratios, *, sigma):
-    """Paired validation gain against the fixed background, without truth labels.
-
-    This is a label-free model-selection diagnostic, not a fit-retry criterion or calibrated discovery test.
-    """
+    """Label-free paired validation gain; not a retry rule or discovery test."""
     values = np.asarray(log_mixture_ratios, dtype=np.float64)
     if values.ndim != 1 or len(values) < 2:
         raise ValueError("Fit validation requires at least two reserved events")
@@ -129,13 +126,8 @@ def select_ensemble_members(members, *, mode, fit_count):
 
 
 def fit_acceptance(health):
-    """Separate usable densities from evidence and deployment decisions.
-
-    Derive the current assessment from numerical/quality receipts, including old
-    receipts, without trusting their combined production_guard_would_accept flag.
-    Reading an old receipt does not restore previously discarded fits or change
-    any historical training selection. Calibration must be assessed separately.
-    """
+    """Derive numerical acceptance, evidence, and deployment status from receipts.
+    Recompute legacy acceptance flags; assess calibration separately."""
     normal = health.get("normalization_status", health.get("normalization", {}).get("status"))
     quality = health.get("quality", {}) or {}
     evidence = "unavailable"
@@ -160,7 +152,7 @@ def fit_acceptance(health):
                 fit_status="valid_" + evidence if valid else "invalid_or_incomplete",
                 evidence_status=evidence, calibration_status=calibration,
                 deployment_status=deployment, production_ready=False,
-                # This alias records numerical acceptance, not production certification.
+                # Numerical acceptance only; not production certification.
                 production_guard_would_accept=valid)
 
 
@@ -299,13 +291,8 @@ def validate_result_scores(root, method):
 
 
 def validate_density_ratio(log_ratios, *, stage, tests=1):
-    """One-sided normalization test on independent samples from the denominator.
-
-    For normalized p/q, E_q[p/q]=1, so P_q(p/q >= t) <= 1/t.
-    The binomial survival bound detects inflated finite ratios without assuming
-    a finite variance or rejecting a valid, concentrated signal density. This
-    must only be called on reference draws, never on observed data or labels.
-    """
+    """Test normalized ratios using P_q(p/q >= t) <= 1/t and a binomial tail bound.
+    Use independent denominator draws only, never observed data or labels."""
     from scipy.stats import binom
 
     log_ratios = np.asarray(log_ratios)

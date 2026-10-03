@@ -51,6 +51,10 @@ def point_name(point):
 
 
 def prepare_scan(args):
+    from .populations import load_config, percentage_counts
+    population = load_config(getattr(args, "population_config", None))
+    prepared_settings = load_settings(args.config)
+    reservoir_rows = max(prepared_settings["injection_scan"]["signal_events"])
     root = args.output.resolve()
     plan = points(args)
     root.mkdir(parents=True, exist_ok=True)
@@ -65,6 +69,8 @@ def prepare_scan(args):
                     manifest = validate(destination / scenario)
                     if (
                         manifest.get("injection_scan") != point
+                        or manifest.get("shared_population", {}).get("configuration") != population
+                        or manifest.get("preparation", {}).get("injection_reservoir_rows") != reservoir_rows
                         or manifest.get("variant") != args.variant
                     ):
                         raise ValueError("Prepared scan identity changed")
@@ -73,17 +79,16 @@ def prepare_scan(args):
         if not pending:
             return
         primary, extra, by_source, provenance = read_sources(args, root, args.variant)
-        prepared_settings = load_settings(args.config)
-        reservoir_rows = max(prepared_settings["injection_scan"]["signal_events"])
         for point in pending:
             spec = replace(
                 DatasetSpec(),
                 injected_signal_rows=point["signal_events"],
                 injection_reservoir_rows=reservoir_rows,
                 preparation_seed=point["preparation_seed"],
+                sculpting_test_rows=percentage_counts(DatasetSpec().background_rows, population["splits"]["background"])[2],
             )
             roles = build_dataset_roles(
-                primary, spec, sic_background_arrays=extra, independent_partition=True
+                primary, spec, sic_background_arrays=extra, independent_partition=True, population=population
             )
             if args.variant == "deltaR":
                 controls.attach_delta_r(roles, by_source)
@@ -98,6 +103,7 @@ def prepare_scan(args):
                 variant=args.variant,
                 scan=point,
                 scenarios=("signal_injection",),
+                population=population,
             )
             for scenario in ("signal_injection",):
                 validate(stage / scenario)

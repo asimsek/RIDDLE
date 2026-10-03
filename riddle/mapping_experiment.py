@@ -1,8 +1,4 @@
-"""Opt-in CPU mapping interventions; ordinary production never enters this module.
-
-Mapping optimization remains in mapping.prepare. Residual fitting, safeguards,
-calibration and exports remain in the actual production worker/pipeline.
-"""
+"""Opt-in CPU mapping interventions; fitting and exports use the production pipeline."""
 import json
 from pathlib import Path
 import shutil

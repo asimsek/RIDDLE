@@ -13,7 +13,7 @@ from .settings import input_features
 from .resume import resume_policy
 from .production import evaluation_rows, region_acceptance, scoring_masks, PRODUCTION_POLICY
 from .roles import DEFAULT_POLICY
-from .integrity import require_finite, RIDDLE_BENCHMARK_LABELS, RIDDLE_BENCHMARK_SCIENTIFIC_VERSION
+from .integrity import require_finite, SCIENTIFIC_VERSION, RIDDLE_BENCHMARK_LABELS, RIDDLE_BENCHMARK_SCIENTIFIC_VERSION
 from .options import effective_features, feature_options
 
 
@@ -49,17 +49,29 @@ def _map_oracle_rows(mapper, rows, expected_label):
 
 def _prepare_oracle_roles(args, mapper, training, validation, development):
     from .storage import digest
+    from .populations import prepared_config, role_indices
+    from .model import with_mass_context
 
     data = Path(args.data)
     with np.load(data / "event_ids.npz", allow_pickle=False) as archive:
         ids = {name: archive[name] for name in archive.files}
     background_train = np.load(data / "innerdata_extrabkg_train.npy", allow_pickle=False)
     background_val = np.load(data / "innerdata_extrabkg_val.npy", allow_pickle=False)
-    qval_indices, qclosure_indices = _oracle_half_split(len(background_val), args.seed, "oracle_background_validation")
+    population = prepared_config(data)
+    selector = {}
+    if population is None:
+        qval_indices, qclosure_indices = _oracle_half_split(len(background_val), args.seed, "oracle_background_validation")
+    else:
+        qparts = role_indices(len(background_val), population["validation_roles"]["oracle_background"],
+                              ("fit", "closure", "selector"), _oracle_role_seed(args.seed, "oracle_background_validation"))
+        qval_indices, qclosure_indices = qparts["fit"], qparts["closure"]
     _, qtrain_z, qtrain_mass = _map_oracle_rows(mapper, background_train, 0)
     _, qval_all_z, qval_all_mass = _map_oracle_rows(mapper, background_val, 0)
     qval_z, qval_mass = qval_all_z[qval_indices], qval_all_mass[qval_indices]
     qclosure_z, qclosure_mass = qval_all_z[qclosure_indices], qval_all_mass[qclosure_indices]
+    if population is not None:
+        selector.update(q=with_mass_context(qval_all_z[qparts["selector"]], qval_all_mass[qparts["selector"]]),
+                        q_ids=ids["innerdata_extrabkg_val.npy"][qparts["selector"]])
     if args.method == "iad":
         ptrain = training
         pvalidation = validation
@@ -73,13 +85,20 @@ def _prepare_oracle_roles(args, mapper, training, validation, development):
         signal_train = np.load(data / "innerdata_extrasig_train.npy", allow_pickle=False)
         signal_val = np.load(data / "innerdata_extrasig_val.npy", allow_pickle=False)
         ptrain, _, _ = _map_oracle_rows(mapper, signal_train, 1)
-        pvalidation, _, _ = _map_oracle_rows(mapper, signal_val, 1)
+        pvalidation, pval_z, pval_mass = _map_oracle_rows(mapper, signal_val, 1)
         member_splits = None
         source_ids = ids["innerdata_extrasig_train.npy"]
         p_definition = "pure simulated signal in the signal region"
         p_truth_selection = True
         p_train_ids = source_ids
         p_validation_ids = ids["innerdata_extrasig_val.npy"]
+        if population is not None:
+            pparts = role_indices(len(signal_val), population["validation_roles"]["supervised_signal"],
+                                  ("assessment", "selector"), _oracle_role_seed(args.seed, "oracle_signal_validation"))
+            selector.update(p=with_mass_context(pval_z[pparts["selector"]], pval_mass[pparts["selector"]]),
+                            p_ids=p_validation_ids[pparts["selector"]])
+            pvalidation = pvalidation[pparts["assessment"]]
+            p_validation_ids = p_validation_ids[pparts["assessment"]]
     else:
         raise ValueError("Unknown RIDDLE oracle method")
     receipt = {
@@ -104,7 +123,13 @@ def _prepare_oracle_roles(args, mapper, training, validation, development):
         "q_training_event_ids_sha256": digest(ids["innerdata_extrabkg_train.npy"]),
         "q_validation_event_ids_sha256": digest(ids["innerdata_extrabkg_val.npy"][qval_indices]),
         "q_closure_event_ids_sha256": digest(ids["innerdata_extrabkg_val.npy"][qclosure_indices]),
+        "selector_reserves": {k: digest(v) for k, v in selector.items()},
+        "selector_counts": {k: len(v) for k, v in selector.items() if k in ("p", "q")},
     }
+    if population is not None:
+        selector["used_ids"] = np.concatenate([p_train_ids, p_validation_ids, ids["innerdata_extrabkg_train.npy"],
+                                              ids["innerdata_extrabkg_val.npy"][qval_indices],
+                                              ids["innerdata_extrabkg_val.npy"][qclosure_indices]])
     return {
         "training": ptrain,
         "validation": pvalidation,
@@ -117,6 +142,7 @@ def _prepare_oracle_roles(args, mapper, training, validation, development):
         "qclosure_z": qclosure_z,
         "qclosure_mass": qclosure_mass,
         "receipt": receipt,
+        "selector": selector,
     }
 
 
@@ -130,6 +156,8 @@ def run(args, contract):
     oracle_method = args.method in RIDDLE_BENCHMARK_LABELS
     active = effective_features(settings["riddle"])
     core = settings["riddle"].get("core", "residual")
+    from .score_selection import validate_population_contract
+    shared_scoring = validate_population_contract(settings["riddle"], contract["inputs"], args.method)
     enhanced = any(active.values()) or settings["riddle"].get("background_correction") == "bgcorr_40_reguide"
     development = None
     mass_conditioning = settings["riddle"].get("mass_conditioning", False)
@@ -170,6 +198,9 @@ def run(args, contract):
         "selection": selection,
     }
     selection_validation = np.load(latent_root / "mixture_validation_latents.npy") if enhanced else None
+    if shared_scoring:
+        # Reserve this mixture for score selection only.
+        selection_validation = None
     member_splits = development.get("member_splits") if development is not None else None
     source_ids = development["residual_train"].get("ids") if development is not None else None
     oracle_roles = None
@@ -261,8 +292,14 @@ def run(args, contract):
         if source_event_ids is not None:
             evaluation_ids[partition] = (np.concatenate([development[k]["source_ids"] for k in ("evidence", "closure")])
                 if enhanced and partition == "validation" else np.concatenate([source_event_ids[n] for n in names]))
+            if shared_scoring and partition == "signal_region":
+                from .populations import EVALUATION_KEY
+                if not np.array_equal(evaluation_ids[partition], source_event_ids[EVALUATION_KEY]):
+                    raise ValueError("Method evaluation IDs differ from the shared population")
         z, preprocessing_mask = mapper.physical(rows) if physical_inputs else mapper.map(rows)
         preprocessing_mask, score_domain_mask, mask = scoring_masks(preprocessing_mask, region, score_scope)
+        if shared_scoring and partition == "signal_region" and not mask.all():
+            raise ValueError("Shared SR evaluation requires every event to be scored; preprocessing rejected events")
         if mass_conditioning:
             from .model import with_mass_context
             z = z[score_domain_mask[preprocessing_mask]]
@@ -300,12 +337,25 @@ def run(args, contract):
         validate_normalization(output / "density", dimensions + int(mass_conditioning) + int(physical_inputs), args.device)
         exports = {}
         calibration_raw = {}
+        score_decision = None
+        effective_scoring = dict(settings["riddle"]["stein"]["scoring"]) if core == "stein_witness" else None
         try:
+            if shared_scoring:
+                from .score_selection import selector_populations, freeze, predict as adaptive_predict
+                selector_data = selector_populations(development, oracle_roles, args.method, evaluation_ids["signal_region"])
+                score_decision = freeze(output / "density", settings["riddle"], args.method,
+                    selector_data, contract["inputs"]["shared_population"], args.device)
+                effective_scoring["mode"] = score_decision["selected_mode"]
             for partition, (rows, region, z, mask, preprocessing_mask, score_domain_mask) in mapped.items():
-                prediction = ensemble_predict(
-                    output / "density", z, args.device, return_members=True, return_accepted_members=True,
-                    return_raw=core == "stein_witness", scoring_settings=settings["riddle"],
-                )
+                endpoints = {}
+                if shared_scoring:
+                    prediction, endpoints = adaptive_predict(output / "density", z, args.device, settings["riddle"],
+                                                            score_decision)
+                else:
+                    prediction = ensemble_predict(
+                        output / "density", z, args.device, return_members=True, return_accepted_members=True,
+                        return_raw=core == "stein_witness", scoring_settings=settings["riddle"],
+                    )
                 if core == "stein_witness":
                     scores, raw_scores, fit_scores, accepted_fit_scores = prediction
                 else:
@@ -349,12 +399,12 @@ def run(args, contract):
                     accepted_fit_seeds=np.array([m["seed"] for m in result["accepted_members"]], dtype=np.uint32),
                     accepted_fit_directories=np.array([m["directory"] for m in result["accepted_members"]]),
                     accepted_fit_score_kind=np.array(
-                        f"stein_{settings['riddle']['stein']['scoring']['mode']}" if core == "stein_witness"
+                        f"stein_{effective_scoring['mode']}" if core == "stein_witness"
                         else "log_density_ratio"
                     ),
                 )
                 if core == "stein_witness":
-                    scoring_cfg = settings["riddle"]["stein"]["scoring"]
+                    scoring_cfg = effective_scoring
                     support_suffix = "_support_guard" if scoring_cfg["support_guard"]["enabled"] else ""
                     arrays["score_kind"] = np.array(
                         f"stein_{scoring_cfg['mode']}{support_suffix}_{scoring_cfg['final_transform']}"
@@ -362,10 +412,18 @@ def run(args, contract):
                     arrays["fit_score_kind"] = np.array(
                         f"stein_{scoring_cfg['mode']}"
                     )
+                if shared_scoring:
+                    for mode, values in endpoints.items():
+                        aligned_endpoint = np.full(len(rows), np.nan, dtype=values.dtype)
+                        aligned_endpoint[mask] = values
+                        arrays["pew_scores" if mode == "tail_focus" else "potential_qnorm_scores"] = aligned_endpoint
+                    arrays["selected_scoring_mode"] = np.array(score_decision["selected_mode"])
+                    arrays["auto_switch_enabled"] = np.array(score_decision["enabled"])
+                    arrays["shared_evaluation_event_ids_sha256"] = np.array(contract["inputs"]["shared_population"]["evaluation_event_ids_sha256"])
+                    arrays["score_selection_sha256"] = np.array(file_digest(output / "density/score_selection.json"))
                 if partition in evaluation_ids: arrays["event_ids"] = evaluation_ids[partition]
                 exports[partition] = arrays
             if active["score_flow"]:
-                # Apply the same bounded retry budget to required density evaluations.
 
                 for role in ("calibration_train", "calibration_val", "closure"):
                     calibration_raw[role] = ensemble_predict(output / "density", development[role]["z"], args.device)
@@ -413,10 +471,29 @@ def run(args, contract):
     write_json(output / "method_health.json", health)
     for partition, arrays in exports.items():
         atomic_write(output / f"{partition}_scores.npz", lambda p: save_npz(p, **arrays))
+    if shared_scoring:
+        from .metrics import paired_score_metrics
+        write_json(output / "score_comparison.json", paired_score_metrics(
+            exports["signal_region"], settings["riddle"]["stein"]["scoring"]["auto_switch"]["efficiencies"]))
     write_json(output / "mapping_acceptance.json", acceptance)
     stein_scoring = (json.loads((output / "density/stein_scoring_calibration.json").read_text())
                      if core == "stein_witness" else None)
-    scoring_cfg = settings["riddle"]["stein"]["scoring"] if core == "stein_witness" else None
+    scoring_cfg = effective_scoring
+    if shared_scoring:
+        stein_scoring = {
+            "schema": 2, "mode": effective_scoring["mode"], "settings": effective_scoring,
+            "auto_switch": score_decision,
+            "configured_candidate_provenance": stein_scoring,
+            "final_reference": "full q-reference B; identical for both candidates and on/off",
+            "final_reference_sha256": score_decision["identity"]["reference_B_sha256"],
+            "final_reference_events": score_decision["identity"]["reference_B_events"],
+            "support_guard": effective_scoring["support_guard"],
+            "final_transform": effective_scoring["final_transform"],
+            "final_mass_bins": effective_scoring["final_mass_bins"],
+            "final_power": effective_scoring["final_power"],
+            "truth_labels_used_by_selector": False,
+        }
+        write_json(output / "density/selected_scoring_calibration.json", stein_scoring)
     support_enabled = bool(scoring_cfg["support_guard"]["enabled"]) if scoring_cfg is not None else False
     support_text = " with q-reference-B latent-radius support guard" if support_enabled else ""
     write_json(
@@ -426,6 +503,8 @@ def run(args, contract):
             "production_policy": PRODUCTION_POLICY,
             "score_scope": score_scope,
             "public_label": RIDDLE_BENCHMARK_LABELS.get(args.method, "RIDDLE"),
+            "shared_population": contract["inputs"].get("shared_population"),
+            "score_selection": score_decision,
             "oracle_benchmark": None if not oracle_method else oracle_roles["receipt"],
             "supervised_ensemble_reuse": result.get("ensemble_reuse") if args.method == "supervised" else None,
             "score_mask_definition": "preprocessing_mask AND score_domain_mask",
@@ -452,7 +531,7 @@ def run(args, contract):
             ),
             "ensemble_fit_selection": result["ensemble_fit_selection"],
             "settings": settings,
-            "implementation": ((f"riddle_stein_witness_v6_5_{scoring_cfg['mode']}"
+            "implementation": ((f"riddle_stein_witness_v{SCIENTIFIC_VERSION}_{scoring_cfg['mode']}"
                                 f"{'_support_guard' if support_enabled else ''}_scoring") if core == "stein_witness" else
                                "riddle_v5_3_smooth_fm_bgcorr_40_reguide" if background_correction is not None
                                else "riddle_v5_3_smooth_fm_gaussian_fallback" if background_correction_decision is not None

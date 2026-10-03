@@ -9,8 +9,9 @@ from scipy.special import ndtri
 from .integrity import SCIENTIFIC_VERSION, require_finite
 from .storage import atomic_write, digest, file_digest, save_array, save_npz, write_json
 
-SCORING_PROTOCOL = "stein_scoring_v5_qanchored_pew_tail_focus_support_guard"
+SCORING_PROTOCOL = "stein_scoring_v6_full_b_reserved_selection"
 REFERENCE_SEEDS = {"mass_context": 93001, "background_sample": 93002, "split": 93003}
+SELECTOR_REFERENCE_SEEDS = {"mass_context": 94001, "background_sample": 94002}
 
 
 def _json_digest(value):
@@ -329,6 +330,67 @@ def prepare_reference(root, members, validation, device, settings, mapping_ident
     }
     write_json(meta_path, metadata)
     return metadata
+
+
+def prepare_selector_reference(root, selected, settings, device):
+    root = Path(root)
+    reference, reference_meta = _load_reference_b(root)
+    cfg = _scoring(settings)
+    count = cfg["auto_switch"]["reference_c_samples"]
+    if not selected:
+        raise ValueError("Selector reference C requires selected Stein fits")
+    for member in selected:
+        inputs = json.loads((root / member["directory"] / "residual_training_inputs.json").read_text())
+        if (inputs.get("core") != "stein_witness" or inputs.get("features") != reference.shape[1]
+                or _background_identity(inputs) != reference_meta["background_model_hash"]):
+            raise ValueError("Selector reference C background identity differs from A/B")
+        correction = inputs.get("background_correction")
+        if correction is not None and file_digest(root / member["directory"] / "background_correction.pt") != correction["local_sha256"]:
+            raise ValueError("Selector reference C fit-local background changed")
+    contract = {
+        "scoring_protocol": SCORING_PROTOCOL,
+        "reference_C_events": count,
+        "seeds": SELECTOR_REFERENCE_SEEDS,
+        "background_model_hash": reference_meta["background_model_hash"],
+        "mapping_hash": reference_meta["mapping_hash"],
+        "mass_context_source": "reference_B_mass_empirical_distribution",
+        "mass_context_source_sha256": digest(reference[:, -1]),
+        "reference_B_sha256": reference_meta["reference_B_sha256"],
+    }
+    directory = root / "stein_scoring_reference_C" / _json_digest(contract)
+    directory.mkdir(parents=True, exist_ok=True)
+    meta_path, npz_path = directory / "reference.json", directory / "reference.npz"
+    if meta_path.exists():
+        saved = json.loads(meta_path.read_text())
+        if (saved.get("sampling_contract") != contract or not npz_path.is_file()
+                or saved.get("reference_file_sha256") != file_digest(npz_path)):
+            raise ValueError("Persisted selector reference C changed")
+        with np.load(npz_path, allow_pickle=False) as archive:
+            if set(archive.files) != {"reference_C"}:
+                raise ValueError("Invalid selector reference C arrays")
+            c = archive["reference_C"]
+        if (c.shape != (count, reference.shape[1]) or c.dtype != np.float32
+                or not np.isfinite(c).all() or digest(c) != saved.get("reference_C_sha256")):
+            raise ValueError("Persisted selector reference C changed")
+        return c, saved
+    from .training import residual_background_sample
+
+    contexts = np.random.default_rng(SELECTOR_REFERENCE_SEEDS["mass_context"]).choice(
+        reference[:, -1], count, replace=True
+    ).astype(np.float32)
+    c = np.ascontiguousarray(residual_background_sample(
+        root / selected[0]["directory"], contexts, count,
+        SELECTOR_REFERENCE_SEEDS["background_sample"], device,
+        batch_size=cfg["inference_batch_size"],
+    ), dtype=np.float32)
+    if c.shape != (count, reference.shape[1]) or not np.isfinite(c).all():
+        raise ValueError("Invalid generated selector reference C")
+    atomic_write(npz_path, lambda path: save_npz(path, reference_C=c))
+    saved = {"schema": 1, "sampling_contract": contract, "reference_C_sha256": digest(c),
+             "reference_file": str(npz_path.relative_to(root)),
+             "reference_file_sha256": file_digest(npz_path), "truth_labels_used": False}
+    write_json(meta_path, saved)
+    return c, saved
 
 
 def _load_background(output, inputs, device):
@@ -654,7 +716,7 @@ def _ensemble_reference(root, selected, device, cfg, settings, reference=None, r
         "truth_labels_used": False,
     }
     write_json(meta_path, metadata)
-    return raw, reference, metadata
+    return raw.astype(np.float32).astype(np.float64), reference, metadata
 
 
 def final_transform(root, selected, raw, z, device, settings):
@@ -673,7 +735,8 @@ def final_transform(root, selected, raw, z, device, settings):
     reference_penalty = None
     transform = cfg["final_transform"]
     if cfg["support_guard"]["enabled"]:
-        reference, reference_meta = _load_reference_b(root)
+        if reference is None:
+            reference, reference_meta = _load_reference_b(root)
         penalty, reference_penalty, radius_metadata = _support_penalties(
             reference, z, cfg, include_reference=transform != "identity"
         )

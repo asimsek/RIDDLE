@@ -67,3 +67,28 @@ def oracle_metrics(labels, scores, mask, *, min_background=10, min_efficiency=1e
     result["minimum_background_count"] = min_background
     result["minimum_background_efficiency"] = min_efficiency
     return result
+
+
+def paired_score_metrics(record, efficiencies):
+    """Post-freeze MC evaluation; never call this to choose a scoring mode."""
+    labels, mask = np.asarray(record["labels"]), np.asarray(record["mask"])
+    candidates = {}
+    for name, key in (("PEW", "pew_scores"), ("potential_qnorm", "potential_qnorm_scores"), ("selected", "scores")):
+        scores = np.asarray(record[key])
+        report = oracle_metrics(labels, scores, mask)
+        rows = []
+        bg, signal = scores[mask & (labels == 0)], scores[mask & (labels == 1)]
+        for efficiency in efficiencies:
+            threshold = float(np.quantile(bg, 1 - efficiency, method="higher")) if len(bg) else None
+            eb = float(np.mean(bg > threshold)) if len(bg) else None
+            es = float(np.mean(signal > threshold)) if len(signal) and threshold is not None else None
+            rows.append({"target_background_efficiency": efficiency, "background_efficiency": eb,
+                         "signal_efficiency": es, "sic": es / np.sqrt(eb) if es is not None and eb else None,
+                         "threshold": threshold})
+        candidates[name] = {**report, "tail_points": rows}
+    return {"schema": 1, "purpose": "truth-assisted evaluation after score selection was frozen",
+            "used_for_score_selection": False, "selected_mode": str(record["selected_scoring_mode"].item()),
+            "auto_switch_enabled": bool(record["auto_switch_enabled"].item()),
+            "event_ids_sha256": str(record["shared_evaluation_event_ids_sha256"].item()),
+            "score_selection_sha256": str(record["score_selection_sha256"].item()),
+            "candidates": candidates}

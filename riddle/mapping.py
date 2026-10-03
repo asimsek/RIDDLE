@@ -88,7 +88,7 @@ def split_roles(data, seed, *, calibration):
             if len(indices) < 2:
                 raise ValueError(f"Too few events for independent {name}")
             roles[name] = dict(source=source, indices=indices)
-    # Keep upstream populations fixed when disabling score-flow ablations.
+    # Keep populations fixed across score-flow ablations.
 
 
     assign("outerdata_train", ("map_train", "calibration_train"), (.75, .25), 100)
@@ -124,7 +124,7 @@ class Mapper:
         self.last_inference_batch_size = None
 
     def map(self, rows):
-        # Remove truth labels before preprocessing.
+        # Strip truth labels before preprocessing.
         clean = np.asarray(rows, dtype=np.float32).copy(); clean[:, -1] = 0
         prepared = load_dataset(clean, external_datadict=self.reference)
         x, m = prepared["tensor2"], prepared["labels"]

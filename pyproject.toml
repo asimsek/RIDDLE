@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "riddle-lhco"
-version = "6.0.0"
+version = "7.0.0"
 description = "Independent LaCathode and RIDDLE LHCO pipelines"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -25,7 +25,7 @@ include = ["riddle*", "external", "external.lacathode_utils*", "external.ranode_
 "external.ranode_utils" = ["ranode.yaml"]
 
 [tool.setuptools.data-files]
-"config" = ["config/settings.yaml", "config/datasets.yaml"]
+"config" = ["config/settings.yaml", "config/datasets.yaml", "config/populations.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

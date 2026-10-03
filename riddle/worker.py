@@ -131,6 +131,8 @@ def main():
         from .settings import input_features
 
         input_features(args.settings, inputs)
+        from .score_selection import validate_population_contract
+        validate_population_contract(args.settings["riddle"], inputs, args.method)
     code = runtime_code(args.method)
     mass_pilot = args.method == "riddle" and args.settings["riddle"].get("mass_conditioning", False)
     if mass_pilot:

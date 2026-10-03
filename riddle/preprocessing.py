@@ -3,7 +3,7 @@ import torch
 from .integrity import require_finite
 
 
-# Keep finite tail events and clip only at the singular logit boundary.
+# Clip only the singular logit boundary; retain finite tails.
 
 
 

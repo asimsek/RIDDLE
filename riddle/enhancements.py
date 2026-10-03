@@ -1,11 +1,6 @@
-"""Label-free algorithms used by the default RIDDLE pipeline.
-
-Rosenblatt: doi:10.1214/aoms/1177729394; spline maps: arXiv:1906.04032.
-Hard sampling adapts arXiv:1604.03540 with importance-corrected reference loss.
-Contrastive fitting adapts proceedings.mlr.press/v9/gutmann10a.html.
-Conditional score calibration follows the motivation of arXiv:2211.02486.
-No API in this module receives signal labels or dataset-variation identifiers.
-"""
+"""Label-free RIDDLE enhancements.
+References: doi:10.1214/aoms/1177729394; arXiv:1906.04032, 1604.03540,
+2211.02486; proceedings.mlr.press/v9/gutmann10a.html."""
 from copy import deepcopy
 import json
 import math
@@ -174,12 +169,7 @@ def _legacy_teacher_weights(directory, z, fraction, *, seed, options, batch_size
 
 def _legacy_corrected_teacher_weights(directory, z, context, fraction, *, seed, options, batch_size,
                                       background_model, background_sha256, device="cpu"):
-    """Two-fold mass-blind guide using q_phi(z|m) samples at matched SR masses.
-
-    This is the production form of the validated bgcorr_40_reguide control.  The
-    classifier never receives mass; mass is used only to sample the denominator
-    at the same contexts as the data events.
-    """
+    """Two-fold mass-blind guide; use mass only to sample matched q_phi references."""
     from .background_correction import sample as sample_background
     directory = Path(directory); directory.mkdir(parents=True, exist_ok=True)
     z = torch.as_tensor(z, dtype=torch.float32).cpu()
@@ -324,13 +314,7 @@ def _corrected_reference(background_model, context, dimensions, count, *, seed, 
 
 def _teacher_weights_plus(directory, z, context, fraction, *, seed, options, batch_size,
                           reference_kind, background_model=None, background_sha256=None, device="cpu"):
-    """Configurable OOF guide used only by the tail-sensitivity ablation study.
-
-    The default production path stays byte-for-byte on the legacy two-fold guide.
-    Guide+ can use more OOF folds, matched mass as a classifier context, a larger
-    refreshable reference reservoir, and an independent density-ratio
-    normalization E_q[exp(log r)]=1.  No truth labels enter this routine.
-    """
+    """Label-free OOF guide for tail ablations; production uses the legacy guide."""
     directory = Path(directory); directory.mkdir(parents=True, exist_ok=True)
     z = torch.as_tensor(z, dtype=torch.float32).cpu()
     context = None if context is None else torch.as_tensor(context, dtype=torch.float32).flatten().cpu()
@@ -564,7 +548,7 @@ def contrastive_loss(positive, negative, weights, mean_weight, *, positive_weigh
 
 
 def standard_normal_log_prob(z):
-    # Keep the validated float32 reduction because alternatives change EM weights.
+    # Preserve float32 reduction to keep EM weights unchanged.
 
     return -.5 * (z.square() + math.log(2 * math.pi)).sum(-1)
 

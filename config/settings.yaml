@@ -27,6 +27,16 @@ riddle:
     ensemble_fit_selection: all-valid
     scoring:
       mode: tail_focus
+      auto_switch:
+        enabled: {riddle: true, iad: true, supervised: true}
+        fallback: {riddle: tail_focus, iad: tail_focus, supervised: potential_qnorm}
+        reference_c_samples: 131072
+        efficiencies: [0.004, 0.01, 0.05, 0.1]
+        weights: [0.5, 0.3, 0.15, 0.05]
+        confidence: 0.95
+        bootstrap_replicas: 1000
+        min_tail_events: 50
+        seed: 75501
       reference_samples: 524288
       reference_split: 0.5
       mass_bins: 8

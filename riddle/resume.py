@@ -58,11 +58,8 @@ def _linux_runtime(platform):
 
 def check_contract(previous, current, *, allow_code_change=False, allow_device_change=False,
                    reuse_completed=False):
-    """Check scientific compatibility separately from reusing finished artifacts.
-
-    Callers must still verify all artifact hashes before reusing a completed result.
-    Thread changes remain protected when training will actually continue.
-    """
+    """Check scientific compatibility; callers must also verify artifact hashes.
+    Continuing training requires unchanged thread counts."""
     if not isinstance(previous, dict) or not isinstance(current, dict):
         raise ValueError("Invalid resume contract")
     cuda_only = all(
@@ -83,7 +80,7 @@ def check_contract(previous, current, *, allow_code_change=False, allow_device_c
             _linux_runtime(values["previous"]) is not None
             and _linux_runtime(values["previous"]) == _linux_runtime(values["current"])
         ):
-            # Ignore node-kernel string changes when the numerical runtime is otherwise identical.
+            # Ignore kernel changes when architecture and C runtime match.
 
             kind, allowed = "host", True
         elif reuse_completed and path in thread_fields and all(

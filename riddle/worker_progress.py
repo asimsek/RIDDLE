@@ -306,7 +306,7 @@ class WorkerDisplay:
                 self.activity.bar.reset()
                 self.activity.bar.set_description_str(f"  {self.phase_label}", refresh=False)
                 self.activity.bar.update(initial)
-        # Keep heartbeat updates separate from durable epoch counters.
+        # Heartbeats must not advance durable epoch counters.
 
         if self.activity.unit == "epoch":
             self.activity.report_every = 1

@@ -15,7 +15,6 @@ from riddle.resume import add_resume_options
 ROOT = Path(__file__).resolve().parent
 PYTHON = "/opt/conda/bin/python"
 
-# Use the exact NRP resource key and product label required by the cluster.
 GPU_TYPES = {
     "a100": ("nvidia.com/a100", None),
     "l40": ("nvidia.com/gpu", "NVIDIA-L40"),

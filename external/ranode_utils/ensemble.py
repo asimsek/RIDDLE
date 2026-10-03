@@ -23,12 +23,7 @@ def validate_upstream_likelihood(namespace):
 
 
 def validate_mass_normalization(attempt):
-    """The sampled mass denominator must have support throughout the scored SR.
-
-    An empty bin invokes upstream's 1e-31 floor: finite but unphysical ratios
-    which can dominate every other fit. Reject that fit; never repair its scores
-    by smoothing or clipping the denominator.
-    """
+    """Reject empty SR denominator bins; upstream's 1e-31 floor inflates ratios."""
     attempt = Path(attempt)
     path = attempt / "results/upstream/signal/fit/samples.npy"
     samples = np.load(path, mmap_mode="r", allow_pickle=False)
@@ -116,7 +111,6 @@ def selected_epochs(attempt, epochs, *, safeguards=True):
 def combine_fits(attempts, output, *, requested_runs, safeguards=True):
     if not attempts or len(attempts) != requested_runs or len(set(attempts)) != requested_runs:
         raise ValueError("All requested R-ANODE fits must complete before ensembling")
-    # Validate every denominator before writing ensemble outputs.
     for attempt in attempts:
         mass_normalization_check(attempt, safeguards=safeguards)
     fields = ("mass", "physical", "labels", "scores", "mask", "is_signal_region")

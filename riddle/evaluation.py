@@ -115,12 +115,8 @@ def common_acceptance_auc(records, region=None):
     )
 
 def riddle_score_scope(report):
-    """Resolve scope per result, never from the last-discovered global method.
-
-    Older mass-conditioned RIDDLE archives used riddlev2/riddlev3 and sometimes
-    recorded only protocol.scope.  They are SR-only even though their test NPZ
-    also stores unscored sideband rows.  Conflicting declarations fail closed.
-    """
+    """Resolve scope per result, including legacy SR-only archives with sideband rows.
+    Reject conflicting declarations."""
     contract = report.get("contract", {})
     settings = contract.get("settings", {}).get("riddle", {})
     conditional = settings.get("mass_conditioning", report.get("method") in ("riddlev2", "riddlev3"))
