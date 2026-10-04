@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import tempfile
 
-from .data import read_sources, export_roles, validate
+from .data import read_sources, export_roles, validate, supervised_sources, validate_source_configuration
 from .data_spec import DatasetSpec
 from .features import build_dataset_roles
 from . import controls
@@ -67,6 +67,7 @@ def prepare_scan(args):
                     raise FileExistsError("Prepared scan point exists; use --resume or a new output")
                 for scenario in ("signal_injection",):
                     manifest = validate(destination / scenario)
+                    validate_source_configuration(manifest, args.catalog)
                     if (
                         manifest.get("injection_scan") != point
                         or manifest.get("shared_population", {}).get("configuration") != population
@@ -88,7 +89,8 @@ def prepare_scan(args):
                 sculpting_test_rows=percentage_counts(DatasetSpec().background_rows, population["splits"]["background"])[2],
             )
             roles = build_dataset_roles(
-                primary, spec, sic_background_arrays=extra, independent_partition=True, population=population
+                primary, spec, sic_background_arrays=extra, independent_partition=True, population=population,
+                supervised_signal_arrays=supervised_sources(by_source, provenance),
             )
             if args.variant == "deltaR":
                 controls.attach_delta_r(roles, by_source)
@@ -342,6 +344,7 @@ def run_scan(args):
             data_root / point_name(point) / "signal_injection",
             require_event_ids=native_requested,
             require_oracle=oracle_requested,
+            require_supervised="supervised" in args.methods,
         )
         if manifest.get("injection_scan") != point:
             raise ValueError(
@@ -353,7 +356,8 @@ def run_scan(args):
         options.output = output_root / point_name(point)
         options.scenarios = ["signal_injection"]
         options.seeds = [point["training_seed"]]
-        manifest = validate(options.data / "signal_injection", require_event_ids=native_requested, require_oracle=oracle_requested)
+        manifest = validate(options.data / "signal_injection", require_event_ids=native_requested, require_oracle=oracle_requested,
+                            require_supervised="supervised" in args.methods)
         variant = manifest.get("variant", "default")
         if any(method in args.methods for method in ("riddle", "iad", "supervised")):
             options.scan_background_reuse_policy = "shared_fixed_background_v1"

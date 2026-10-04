@@ -11,6 +11,7 @@ from .storage import digest
 
 EVALUATION_FILES = ("innerdata_test.npy", "innerdata_extrabkg_test.npy", "innerdata_extrasig.npy")
 EVALUATION_KEY = "shared_evaluation_event_ids"
+REMAINING_SIGNAL_KEY = "remaining_signal_event_ids"
 SPLIT_NAMES = ("training", "validation", "evaluation")
 
 
@@ -22,7 +23,7 @@ def percentage_counts(rows, percentages, names=SPLIT_NAMES):
     values = []
     for name in names:
         value = percentages[name]
-        if type(value) not in (int, float) or not np.isfinite(value) or not 0 < value < 100:
+        if type(value) not in (int, float) or not np.isfinite(value) or not 0 <= value <= 100:
             raise ValueError(f"Invalid population percentage: {name}")
         values.append(Decimal(str(value)))
     if sum(values) != Decimal(100):
@@ -36,21 +37,30 @@ def validate_config(value):
     value = deepcopy(value)
     if not isinstance(value, dict) or set(value) != {"schema", "injected_signal_events", "preparation_seed", "splits", "validation_roles"}:
         raise ValueError("Invalid population configuration keys")
-    if type(value["schema"]) is not int or value["schema"] != 1:
+    if type(value["schema"]) is not int or value["schema"] not in (1, 2):
         raise ValueError("Unsupported population configuration schema")
     for key, low, high in (("injected_signal_events", 3, 100000), ("preparation_seed", 0, 2**32)):
         if type(value[key]) is not int or not low <= value[key] < high:
             raise ValueError(f"Invalid population {key}")
     splits = value["splits"]
-    if not isinstance(splits, dict) or set(splits) != {"background", "injected_signal", "additional_background", "supervised_signal"}:
+    pools = {"background", "injected_signal", "additional_background", "supervised_signal"}
+    if value["schema"] == 2:
+        pools.add("remaining_signal")
+    if not isinstance(splits, dict) or set(splits) != pools:
         raise ValueError("Invalid population split pools")
-    for percentages in splits.values():
-        percentage_counts(100, percentages)
+    for pool, percentages in splits.items():
+        names = (("evaluation", "unused") if pool == "remaining_signal" else
+                 ("training", "validation") if pool == "supervised_signal" and value["schema"] == 2 else SPLIT_NAMES)
+        percentage_counts(100, percentages, names)
+        if any(percentages[name] <= 0 for name in names if name != "unused"):
+            raise ValueError("Active population percentages must be positive")
     roles = value["validation_roles"]
     if not isinstance(roles, dict) or set(roles) != {"oracle_background", "supervised_signal"}:
         raise ValueError("Invalid reserved validation pools")
     percentage_counts(100, roles["oracle_background"], ("fit", "closure", "selector"))
     percentage_counts(100, roles["supervised_signal"], ("assessment", "selector"))
+    if any(p <= 0 for percentages in roles.values() for p in percentages.values()):
+        raise ValueError("Validation role percentages must be positive")
     return value
 
 

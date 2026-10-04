@@ -182,7 +182,8 @@ def run_campaign(args):
             manifest, _ = validate_ranode(args.data / scenario)
         else:
             from .data import validate
-            manifest = validate(args.data / scenario, require_event_ids=native_requested, require_oracle=oracle_requested)
+            manifest = validate(args.data / scenario, require_event_ids=native_requested, require_oracle=oracle_requested,
+                                require_supervised="supervised" in args.methods)
         if native_requested:
             input_features(args.settings, manifest)
             from .score_selection import validate_population_contract

@@ -15,7 +15,7 @@ from .progress import operation_progress
 DATASET_CATALOG_SCHEMA = "riddle.datasets.v1"
 SUPPORTED_INPUT_FORMATS = frozenset({"auto", "hdf5"})
 SUPPORTED_CHECKSUMS = frozenset({"md5", "sha256"})
-SUPPORTED_PURPOSES = frozenset({"primary", "sic_background"})
+SUPPORTED_PURPOSES = frozenset({"primary", "sic_background", "supervised_signal"})
 
 
 class DatasetCatalogError(ValueError):

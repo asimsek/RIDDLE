@@ -16,6 +16,7 @@ from .data import BACKGROUND_PROTOCOL, MatchedPartitions, evaluation, export_sco
 from .source import digest, verify
 from .ensemble import signal_fit_health
 from .variants import background_diagnostics, extend_delta_r, model_config
+from .stability import bounded_background, stability_contract
 from riddle.worker_progress import emit_progress as stage_progress
 from riddle.production import NumericalFitError
 
@@ -190,6 +191,8 @@ def initial_rng(path):
 
 def main():
     options = json.loads(sys.argv[1])
+    if options.get("background_stability") != stability_contract():
+        raise ValueError("R-ANODE background stability contract changed; start a fresh run")
     sources, data, attempt = (
         Path(options[k]).resolve() for k in ("sources", "data", "attempt")
     )
@@ -283,7 +286,7 @@ def main():
     (attempt / "command.json").write_text(json.dumps(argv, indent=2) + "\n")
     sys.argv = argv
     stage_progress("setup", "Prepare upstream model and data split")
-    with matched_inputs(
+    with bounded_background(importlib.import_module("src.flows")), matched_inputs(
         arrays, stage, resample_training=options.get("resample_training", False)
     ) as adapter:
         namespace = execute_script(

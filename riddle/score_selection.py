@@ -15,9 +15,9 @@ PROTOCOL = "reserved_ensemble_score_selection_v2_single_comparison"
 def validate_population_contract(settings, manifest, method):
     cfg = settings["stein"]["scoring"]
     enabled = cfg["auto_switch"]["enabled"][method]
-    shared = manifest.get("schema") == 5
+    shared = manifest.get("schema") in (5, 6)
     if enabled and not shared:
-        raise ValueError("Auto-switch requires fresh shared schema-5 data. Prepare a new directory with config/populations.yaml.")
+        raise ValueError("Auto-switch requires shared schema-5/6 data. Prepare a new directory with config/populations.yaml.")
     if shared and settings.get("core") == "stein_witness":
         from .roles import PRODUCTION_POLICIES, DEFAULT_POLICY
         from .options import effective_features

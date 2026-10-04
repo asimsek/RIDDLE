@@ -20,6 +20,7 @@ from .data import BACKGROUND_PROTOCOL, input_features, latent_inputs, scientific
 from .ensemble import combine_fits, selected_epochs, mass_normalization_check, validate_result_normalization
 from .resume import check_contract, policy, transition_history
 from .source import COMMIT, REPOSITORY, digest, verify
+from .stability import stability_contract
 from riddle.worker_progress import EVENT_PREFIX, ProgressStage, emit_message, emit_progress, BufferedLog
 from riddle.production import NumericalFitError
 
@@ -321,6 +322,7 @@ def _background_reuse_signature(contract):
         "source": inputs.get("source"),
         "background_epochs": settings["background_epochs"],
         "background_protocol": settings["background_protocol"],
+        "background_stability": settings.get("background_stability"),
         "packages": environment.get("packages"),
         "cuda": environment.get("cuda"),
         "matmul_tf32": environment.get("matmul_tf32"),
@@ -438,6 +440,7 @@ def prepare_stage(args, stage, config, background=None):
         "fit_index": config["fit_index"],
         "epochs": config[stage + "_epochs"],
         "resample_training": config["split_mode"] == "resample_training",
+        "background_stability": stability_contract(),
     }
     if not safeguards_active(args):
         options["safeguards"] = False
@@ -696,6 +699,7 @@ def run(args):
             "torch_threads": args.torch_threads,
             "ensemble": "mean_upstream_ratios_v1",
             "background_protocol": BACKGROUND_PROTOCOL,
+            "background_stability": stability_contract(),
             "fit_failure_policy": "exclude_numerically_invalid_fits_v1",
         },
         "code": {**{p.name: digest(p) for p in sorted(Path(__file__).parent.glob("*.py"))},
@@ -816,15 +820,16 @@ def run(args):
             "signal_script": "scripts/r_anode.py",
             "background_scope": "sideband development data only; no signal-region or held-out test rows",
             "background_protocol": BACKGROUND_PROTOCOL,
+            "background_stability": stability_contract(),
             "background_preprocessing": "Original preprocessing fitted on outerdata_train.npy + outerdata_val.npy only",
             "background_split": "Original 50/50 ShuffleSplit on accepted sideband development rows; random_state=22",
-            "background_diagnostics": "Align original diagnostic sample indices with physical features; no training changes",
+            "background_diagnostics": "Align diagnostic sample indices with physical feature columns",
             "signal_scope": "strict 3.3 < mjj < 3.7",
             "evaluation_scope": "signal region only",
             "input_adapter": "Sideband-only background pool; signal fits use upstream 80/20 ShuffleSplit within prepared training rows only" if config["split_mode"] == "resample_training" else "Sideband-only background pool; signal fits retain prepared train/validation membership",
             "optimizer": "Upstream AdamW unchanged, including decay on the learned fraction logit",
             "ensemble": "Equal-weight arithmetic mean of upstream per-fit density ratios; ten original validation-selected checkpoints per accepted fit; numerical failures excluded and recorded",
-            "score": "Unmodified upstream likelihood; require sampled signal-mass support in every SR bin and finite likelihood before nan_to_num; final score is log(mean(exp(per-fit log ratio)))",
+            "score": "Upstream likelihood formula with bounded background affine scales; require sampled signal-mass support in every SR bin and finite likelihood before nan_to_num; final score is log(mean(exp(per-fit log ratio)))",
             "seed": "Upstream seed controls data ordering; fit_index selects the split and fraction initialization. Upstream does not seed Torch",
             "restart": "Reuse completed stages; restart interrupted stage from saved initial RNG, without changing upstream checkpoint format",
             "background_attempt": str(background.relative_to(args.output)),
@@ -846,7 +851,7 @@ def run(args):
             protocol.update(method="ranodev2", safeguards=False,
                 rng_pairing=contract["settings"]["rng_pairing"],
                 ensemble="Equal-weight upstream ratios from every requested fit; no helper fit filtering",
-                score="Original upstream likelihood including its density floors and nan_to_num; no helper repair",
+                score="Upstream likelihood formula with bounded background affine scales, including density floors and nan_to_num; no helper score repair",
                 integrity_checks="Event alignment, complete artifacts, hashes, and finite exported scores remain required")
         if latent is not None:
             protocol.update(method="riddlev4", safeguards=True, benchmark="Pinned R-ANODE applied to frozen RIDDLE latent features",
@@ -854,7 +859,7 @@ def run(args):
                 latent_transformation=latent_meta, rng_pairing=contract["settings"]["rng_pairing"],
                 background_preprocessing="Original upstream preprocessing fitted on mapped sideband development rows",
                 signal_inputs="Latent features plus original mass as a joint density coordinate",
-                background_density="Original upstream learned conditional background on latent inputs, not an imposed Gaussian",
+                background_density="Learned conditional background with bounded affine scales on latent inputs",
                 coordinate_ratio="Signal and background densities use the same latent coordinates; mapping Jacobians cancel",
                 export="All original physical event rows retained; both mapping and upstream-domain rejections recorded in mask",
                 riddle_residual_training=False)

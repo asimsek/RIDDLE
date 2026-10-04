@@ -123,6 +123,35 @@ def _take(arrays: Mapping[str, np.ndarray], indices: np.ndarray, partition: np.n
     return {name: result[name] for name in EVENT_COLUMNS}
 
 
+def physical_event_keys(values):
+    values = np.ascontiguousarray(values, dtype="<f8")
+    return values.view(np.dtype((np.void, values.dtype.itemsize * values.shape[1]))).ravel()
+
+
+def independent_signal_roles(primary, sources, percentages, seed):
+    if not sources:
+        empty = np.empty(0, dtype=np.int64)
+        return tuple(_take(primary, empty, np.empty(0, dtype="U24")) for _ in range(2))
+    from .populations import percentage_counts
+
+    signal = {name: np.concatenate([source[name] for source in sources])
+              for name in EVENT_COLUMNS if name != "partition"}
+    if not np.all(signal["label"] == 1):
+        raise ValueError("Independent Supervised signal sources must contain only signal events")
+    features = ("mjj", *FEATURES)
+    keys = physical_event_keys(np.column_stack([signal[name] for name in features]))
+    primary_keys = physical_event_keys(np.column_stack([primary[name] for name in features]))
+    if len(np.unique(keys)) != len(keys) or np.intersect1d(keys, primary_keys).size:
+        raise ValueError("Independent Supervised signal duplicates itself or primary LHCO events")
+    order = np.flatnonzero(signal["is_signal_region"])
+    order = np.random.default_rng([seed, 92011]).permutation(order)
+    train_count, val_count = percentage_counts(len(order), percentages, ("training", "validation"))
+    if min(train_count, val_count) < 2:
+        raise ValueError("Independent Supervised signal has too few SR training/validation events")
+    return tuple(_take(signal, ix, np.full(len(ix), role, dtype="U24")) for ix, role in (
+        (order[:train_count], "benchmark_training"), (order[train_count:], "benchmark_validation")))
+
+
 def build_dataset_roles(
     arrays: Mapping[str, np.ndarray],
     spec: DatasetSpec,
@@ -131,6 +160,7 @@ def build_dataset_roles(
     enforce_expected_counts: bool = True,
     independent_partition: bool = False,
     population=None,
+    supervised_signal_arrays=(),
 ) -> dict[str, dict[str, np.ndarray]]:
     labels = np.asarray(arrays["label"], dtype=np.int8)
     background = np.flatnonzero(labels == 0)
@@ -213,22 +243,28 @@ def build_dataset_roles(
     )
     remaining_signal = signal[spec.injection_reservoir_rows :]
     remaining_signal_sr = remaining_signal[signal_region[remaining_signal]]
-    signal_simulation_partition = partition_labels(len(remaining_signal_sr), splits.get("supervised_signal"))
-    signal_train = remaining_signal_sr[signal_simulation_partition == "training"]
-    signal_val = remaining_signal_sr[signal_simulation_partition == "validation"]
-    evaluation_signal = remaining_signal_sr[signal_simulation_partition == "final_test"]
-    if min(len(signal_train), len(signal_val), len(evaluation_signal)) == 0:
-        raise RuntimeError("Signal simulation cannot satisfy the RIDDLE benchmark partitions after reservoir removal")
-    roles["oracle_signal_train"] = _take(
-        arrays,
-        signal_train,
-        np.full(len(signal_train), "benchmark_training", dtype="U24"),
-    )
-    roles["oracle_signal_val"] = _take(
-        arrays,
-        signal_val,
-        np.full(len(signal_val), "benchmark_validation", dtype="U24"),
-    )
+    if population is not None and population["schema"] == 2:
+        from .populations import percentage_counts
+
+        count, _ = percentage_counts(len(remaining_signal_sr), splits["remaining_signal"], ("evaluation", "unused"))
+        evaluation_signal = remaining_signal_sr[:count]
+        roles["remaining_signal"] = _take(arrays, remaining_signal_sr,
+            np.full(len(remaining_signal_sr), "evaluation_signal_pool", dtype="U24"))
+        roles["oracle_signal_train"], roles["oracle_signal_val"] = independent_signal_roles(
+            arrays, supervised_signal_arrays, splits["supervised_signal"], spec.preparation_seed)
+    else:
+        if supervised_signal_arrays:
+            raise ValueError("Independent Supervised signal requires population schema 2")
+        signal_simulation_partition = partition_labels(len(remaining_signal_sr), splits.get("supervised_signal"))
+        signal_train = remaining_signal_sr[signal_simulation_partition == "training"]
+        signal_val = remaining_signal_sr[signal_simulation_partition == "validation"]
+        evaluation_signal = remaining_signal_sr[signal_simulation_partition == "final_test"]
+        if min(len(signal_train), len(signal_val), len(evaluation_signal)) == 0:
+            raise RuntimeError("Signal simulation cannot satisfy the RIDDLE benchmark partitions after reservoir removal")
+        roles["oracle_signal_train"] = _take(
+            arrays, signal_train, np.full(len(signal_train), "benchmark_training", dtype="U24"))
+        roles["oracle_signal_val"] = _take(
+            arrays, signal_val, np.full(len(signal_val), "benchmark_validation", dtype="U24"))
     roles["sic_evaluation_signal_background_only"] = _take(
         arrays, evaluation_signal, np.full(len(evaluation_signal), "sic_evaluation", dtype="U16")
     )

@@ -27,7 +27,7 @@ def input_features(variant):
 
 def scientific_version(variant):
     input_features(variant)
-    return "pinned_upstream_sidebands_deltaR_v1" if variant == "deltaR" else "pinned_upstream_sidebands_v1"
+    return "pinned_upstream_sidebands_deltaR_bounded_affine_v2" if variant == "deltaR" else "pinned_upstream_sidebands_bounded_affine_v2"
 
 
 def validate_schema(meta):
@@ -72,7 +72,7 @@ def validate(root):
         raise ValueError(
             "R-ANODE dedicated evaluation sources have inconsistent truth labels"
         )
-    if meta.get("schema") in (4, 5):
+    if meta.get("schema") in (4, 5, 6):
         from riddle.data import validate as validate_prepared
 
         validate_prepared(root, require_event_ids=True)

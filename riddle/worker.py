@@ -33,6 +33,7 @@ def runtime_code(method, root=None):
         "worker.py",
         "data.py",
         "data_spec.py",
+        "populations.py",
         "features.py",
         "controls.py",
         "datasets.py",
@@ -126,7 +127,8 @@ def main():
     if args.device != "cpu" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but unavailable; refusing CPU fallback")
     oracle_method = args.method in ("iad", "supervised")
-    inputs = validate(args.data, require_event_ids=native_method, require_oracle=oracle_method)
+    inputs = validate(args.data, require_event_ids=native_method, require_oracle=oracle_method,
+                      require_supervised=args.method == "supervised")
     if native_method:
         from .settings import input_features
 
@@ -264,7 +266,7 @@ def main():
                               accepted_fits=protocol.get("accepted_fits"),
                               ensemble_fits=protocol.get("ensemble_fits"))
                 write_json(path, report)
-        validate(args.data, require_oracle=oracle_method)
+        validate(args.data, require_oracle=oracle_method, require_supervised=args.method == "supervised")
         write_json(args.output / "score_health.json", validate_result_scores(args.output, args.method))
     except (FloatingPointError, NumericalFitError) as error:
         report["failure"] = dict(kind="numerical", error=str(error), error_type=type(error).__name__,

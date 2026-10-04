@@ -1,13 +1,12 @@
-# Percentages refer to each row's own pool, before any model-specific subdivision.
-schema: 1
+schema: 2
 injected_signal_events: 1000
 preparation_seed: 1
 splits:
-  background: {training: 50, validation: 17, evaluation: 33}
-  injected_signal: {training: 50, validation: 17, evaluation: 33}
-  additional_background: {training: 50, validation: 17, evaluation: 33}
-  supervised_signal: {training: 50, validation: 17, evaluation: 33}
-# Percentages BELOW refer only to the validation slice above.
+  background: {training: 50, validation: 16.7, evaluation: 33.3}
+  injected_signal: {training: 50, validation: 16.7, evaluation: 33.3}
+  additional_background: {training: 32.6, validation: 10.9, evaluation: 56.5}
+  remaining_signal: {evaluation: 100, unused: 0}
+  supervised_signal: {training: 75, validation: 25}
 validation_roles:
-  oracle_background: {fit: 50, closure: 25, selector: 25}
+  oracle_background: {fit: 40, closure: 20, selector: 40}
   supervised_signal: {assessment: 50, selector: 50}
