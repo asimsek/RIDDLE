@@ -92,7 +92,8 @@ class StageReporter:
         text = line.strip()
         if text.startswith(EVENT_PREFIX):
             event = json.loads(text[len(EVENT_PREFIX):])
-            self.phase(event["phase"], event["label"])
+            self.phase(event["phase"], event["label"],
+                       total=event.get("total", 1), unit=event.get("unit", "step"))
             if event.get("completed") is not None:
                 self.publish(completed=event["completed"])
             return
