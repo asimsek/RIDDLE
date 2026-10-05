@@ -466,6 +466,7 @@ def prepare_stage(args, stage, config, background=None):
         options["background"] = str(background / "results/upstream/background/fit")
     env = os.environ.copy()
     env.update(
+        PYTHONHASHSEED=str(args.seed),
         PYTHONDONTWRITEBYTECODE="1",
         PYTHONUNBUFFERED="1",
         MPLBACKEND="Agg",
@@ -917,17 +918,13 @@ def run(args):
         emit_message("Independent upstream R-ANODE result verified", kind="PASS")
 
 
-def run_repetitions(args):
-    """The direct adapter CLI also distinguishes whole runs from signal fits."""
-    from riddle.cli import independent_run_seeds
-
-    count = getattr(args, "runs", None) or 1
-    for index, seed in enumerate(independent_run_seeds(args.seed, count)):
+def run_requested_seeds(args):
+    for seed in args.seeds:
         options = copy(args)
-        if count > 1:
+        if len(args.seeds) > 1:
             options.output = args.output / f"seed_{seed:03d}"
-            options.campaign_seed, options.run_index = args.seed, index
-            options.independent_run_count = count
+            options.campaign_seed, options.run_index = seed, 0
+            options.independent_run_count = 1
         options.seed = seed
         run(options)
 
@@ -940,11 +937,9 @@ def main(argv=None):
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--config", type=Path, default=ROOT / "external/ranode_utils/ranode.yaml")
-    from riddle.cli import positive
+    from riddle.cli import positive, add_seed_argument
 
     parser.add_argument("--fits", type=positive, help="Override YAML signal-fit count per complete run")
-    parser.add_argument("--runs", type=positive, default=1,
-                        help="Complete independent runs including background retraining (default: 1)")
     parser.add_argument("--campaign-seed", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--run-index", type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument("--independent-run-count", type=positive, default=1, help=argparse.SUPPRESS)
@@ -952,7 +947,7 @@ def main(argv=None):
     parser.add_argument(
         "--scenario", choices=("signal_injection", "background_only"), required=True
     )
-    parser.add_argument("--seed", type=int, default=42)
+    add_seed_argument(parser)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--workers", type=int, default=1, help="Concurrent signal fits after the shared background stage")
     parser.add_argument("--mps", choices=("auto", "on", "off"), default="auto")
@@ -973,7 +968,7 @@ def main(argv=None):
         help="With --resume, permit recorded CUDA GPU changes; software and precision stay strict",
     )
     args = parser.parse_args(argv)
-    if args.workers < 1 or args.io_workers < 1 or args.torch_threads < 1 or not 0 <= args.seed < 2**32:
+    if args.workers < 1 or args.io_workers < 1 or args.torch_threads < 1:
         parser.error("Positive workers/I/O workers/PyTorch threads and a nonnegative 32-bit seed are required")
 
     def terminate(signum, frame):
@@ -986,14 +981,14 @@ def main(argv=None):
         os.environ[key] = str(args.torch_threads)
     try:
         if os.environ.get("RIDDLE_WORKER_PROGRESS") == "1":
-            run_repetitions(args)
+            run_requested_seeds(args)
         else:
             from riddle.progress import set_verbosity
             from riddle.worker_progress import local_progress
 
             set_verbosity(int(os.environ.get("RIDDLE_VERBOSE", "1")))
             with local_progress(f"ranode | {args.scenario}"):
-                run_repetitions(args)
+                run_requested_seeds(args)
     except (ValueError, OSError, RuntimeError, subprocess.SubprocessError) as error:
         parser.exit(1, f"[ERROR] {error}\n")
 

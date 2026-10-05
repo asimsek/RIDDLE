@@ -36,6 +36,19 @@ def enabled(settings):
     return settings.get("background_correction", "none") == MODE
 
 
+def _training_batches(dataset, *, shuffle, generator):
+    if len(dataset) < 2:
+        raise ValueError("Background-correction training requires at least two events")
+    loader = DataLoader(dataset, batch_size=512, shuffle=shuffle, generator=generator)
+    merge_at = len(loader) - 2 if len(dataset) % loader.batch_size == 1 else -1
+    batches = iter(loader)
+    for index, batch in enumerate(batches):
+        if index == merge_at:
+            batch = tuple(torch.cat((values, tail), dim=0)
+                          for values, tail in zip(batch, next(batches)))
+        yield batch
+
+
 def _qphi_options(settings):
     options = feature_options(settings)
     epochs = int(options.get("qphi_epochs", EPOCHS))
@@ -234,9 +247,9 @@ def _fit_probe(train_z, train_mass, val_z, val_mass, *, settings, seed, device):
         generator = torch.Generator().manual_seed(int(seed) + 21000 + epoch)
         balanced = _balanced_indices(train_mass, mass_bins, int(seed) + 21500 + epoch)
         epoch_dataset = dataset if balanced is None else TensorDataset(dataset.tensors[0][balanced], dataset.tensors[1][balanced])
-        loader = DataLoader(epoch_dataset, batch_size=512, shuffle=balanced is None, generator=generator)
+        batches = _training_batches(epoch_dataset, shuffle=balanced is None, generator=generator)
         model.train()
-        for z, m in loader:
+        for z, m in batches:
             z, m = z.to(device), m.to(device)
             optimizer.zero_grad()
             loss = -log_prob(model, z, m).mean()
@@ -559,9 +572,9 @@ def train(directory, train_z, train_mass, val_z, val_mass, *, settings, seed, de
         generator = torch.Generator().manual_seed(int(seed) + 11000 + epoch)
         balanced = _balanced_indices(train_mass, mass_bins, int(seed) + 11500 + epoch)
         epoch_dataset = dataset if balanced is None else TensorDataset(zt[balanced], mt[balanced])
-        loader = DataLoader(epoch_dataset, batch_size=512, shuffle=balanced is None, generator=generator)
+        batches = _training_batches(epoch_dataset, shuffle=balanced is None, generator=generator)
         model.train(); total = 0.0; trained_events = 0
-        for z, m in loader:
+        for z, m in batches:
             z, m = z.to(device), m.to(device)
             optimizer.zero_grad()
             loss = -log_prob(model, z, m).mean()
@@ -867,11 +880,11 @@ def train_oracle(directory, train_z, train_mass, val_z, val_mass, closure_z, clo
         generator = torch.Generator().manual_seed(int(seed) + 11000 + epoch)
         balanced = _oracle_balanced_indices(train_mass, mass_bins, int(seed) + 11500 + epoch)
         epoch_dataset = dataset if balanced is None else TensorDataset(zt[balanced], mt[balanced])
-        loader = DataLoader(epoch_dataset, batch_size=512, shuffle=balanced is None, generator=generator)
+        batches = _training_batches(epoch_dataset, shuffle=balanced is None, generator=generator)
         model.train()
         total = 0.0
         trained_events = 0
-        for z, mass in loader:
+        for z, mass in batches:
             z, mass = z.to(device), mass.to(device)
             optimizer.zero_grad()
             loss = -log_prob(model, z, mass).mean()

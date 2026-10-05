@@ -6,6 +6,7 @@ import re
 import shutil
 import sys
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import matplotlib
@@ -16,9 +17,11 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Rectangle
 from matplotlib.ticker import LogLocator, NullFormatter
 import numpy as np
+import torch
 import yaml
 from scipy.special import ndtri
 from sklearn.metrics import roc_curve
+from threadpoolctl import threadpool_limits
 
 from riddle.evaluation import common_acceptance_auc, riddle_score_scope
 from riddle.metrics import efficiency_curve, oracle_metrics
@@ -46,7 +49,7 @@ FEATURE_LABELS = {"m1": r"$m_1$ (TeV)", "delta_m": r"$\Delta m$ (TeV)", "tau21_j
 FEATURE_NAMES = {"default": ("m1", "delta_m", "tau21_j1", "tau21_j2"), "shifted": ("m1", "delta_m", "tau21_j1", "tau21_j2"), "deltaR": ("m1", "delta_m", "tau21_j1", "tau21_j2", "deltaR")}
 SINGLE_COLUMN_IN = 8.6 / 2.54
 DOUBLE_COLUMN_IN = 17.6 / 2.54
-STYLE = {"font.family": "sans-serif", "font.sans-serif": ["DejaVu Sans"], "mathtext.fontset": "dejavusans", "text.usetex": False, "font.size": 8.2, "axes.labelsize": 8.8, "axes.linewidth": 0.8, "xtick.labelsize": 7.7, "ytick.labelsize": 7.7, "legend.fontsize": 7.3, "legend.title_fontsize": 7.3, "lines.linewidth": 1.35, "lines.markersize": 3.2, "xtick.direction": "in", "ytick.direction": "in", "xtick.top": True, "ytick.right": True, "xtick.minor.visible": True, "ytick.minor.visible": True, "pdf.fonttype": 42, "ps.fonttype": 42, "savefig.dpi": 600, "savefig.facecolor": "white", "savefig.edgecolor": "white", "figure.facecolor": "white", "axes.facecolor": "white"}
+STYLE = {"font.family": "sans-serif", "font.sans-serif": ["DejaVu Sans"], "mathtext.fontset": "dejavusans", "text.usetex": False, "font.size": 8.2, "axes.labelsize": 8.8, "axes.linewidth": 0.8, "xtick.labelsize": 7.7, "ytick.labelsize": 7.7, "legend.fontsize": 7.3, "legend.title_fontsize": 7.3, "lines.linewidth": 1.0, "lines.markersize": 3.2, "xtick.direction": "in", "ytick.direction": "in", "xtick.top": True, "ytick.right": True, "xtick.minor.visible": True, "ytick.minor.visible": True, "pdf.fonttype": 42, "ps.fonttype": 42, "savefig.dpi": 600, "savefig.facecolor": "white", "savefig.edgecolor": "white", "figure.facecolor": "white", "axes.facecolor": "white"}
 
 
 def say(message, verbose=1, level=1):
@@ -182,6 +185,9 @@ def inside_legend(ax, title=None, ncol=None, fontsize=None, borderaxespad=0.5, a
             best = (score, location)
         legend.remove()
     score, location = best
+    if score >= 1000 and columns > 1:
+        return inside_legend(ax, title=title, ncol=columns - 1, fontsize=font,
+                             borderaxespad=borderaxespad, allow_headroom=allow_headroom)
     if score > 2.5 and allow_headroom:
         add_y_headroom(ax, 0.12)
     legend = ax.legend(handles, labels, loc=location, frameon=True, framealpha=0.93, borderpad=0.42, labelspacing=0.32, handlelength=1.9, columnspacing=0.8, ncol=columns, title=title, fontsize=max(6.7, font - 0.2 if score > 3.5 else font), borderaxespad=borderaxespad)
@@ -243,6 +249,12 @@ def cleanup_legacy_summary_folders(output):
         if path.is_dir():
             shutil.rmtree(path)
     if output.is_dir():
+        for method in METHOD_LABELS.values():
+            for stem in ("background_nll", "oracle_background_nll", "stein_witness_objective", "classifier_bce"):
+                for extension in ("png", "pdf"):
+                    path = output / "02_training" / method / f"{stem}.{extension}"
+                    if path.is_file():
+                        path.unlink()
         full_region_paths = sorted((path for path in output.rglob("Full-Region") if path.is_dir()), key=lambda path: len(path.parts), reverse=True)
         for path in full_region_paths:
             shutil.rmtree(path)
@@ -335,6 +347,42 @@ def filter_groups(groups, methods, variants, scenarios, excluded_seeds):
         if normalized:
             selected[(scenario, seed, variant)] = normalized
     return selected
+
+
+def discover_paper_results(root, *, scan=False):
+    groups = discover(root, requested=None, scan=scan)
+    for path in sorted(root.rglob("result.json")):
+        report = json.loads(path.read_text())
+        if report.get("method") != "lacathode" or not report.get("completed") or "run_index" not in report:
+            continue
+        parent_path = path.parent.parent.parent / "result.json"
+        if parent_path.is_file() and json.loads(parent_path.read_text()).get("completed"):
+            continue
+        for identity, group in discover(path.parent, requested=("lacathode",), scan=scan).items():
+            target = groups.setdefault(identity, {})
+            if "lacathode" in target:
+                if target["lacathode"][0].resolve() == path.parent.resolve():
+                    continue
+                raise ValueError("Duplicate independent LaCATHODE run")
+            target.update(group)
+    return groups
+
+
+def independent_records(record, seed):
+    if not record.get("independent_runs", False) or "run_seeds" not in record:
+        yield seed, record
+        return
+    scores = np.asarray(record["fit_scores"])
+    seeds = np.asarray(record["run_seeds"])
+    if scores.ndim != 2 or len(scores) != len(seeds) or len(np.unique(seeds)) != len(seeds):
+        raise ValueError("Invalid independent run score inventory")
+    for index, run_seed in enumerate(seeds):
+        run = {key: value for key, value in record.items()
+               if key not in ("fit_scores", "fit_latents", "run_seeds")}
+        run.update(scores=scores[index], independent_runs=False, plot_saved_ensemble=True)
+        if "fit_latents" in record:
+            run["latent"] = record["fit_latents"][index]
+        yield int(run_seed), run
 
 
 def score_scope(method, report):
@@ -480,15 +528,27 @@ def interpolate_curve(x, y, grid):
 
 
 
-def finite_column_percentiles(matrix, percentiles):
+def run_summary(matrix):
     matrix = np.asarray(matrix, float)
-    outputs = [np.full(matrix.shape[1], np.nan) for _ in percentiles]
-    supported = np.isfinite(matrix).any(axis=0)
-    if np.any(supported):
-        values = np.nanpercentile(matrix[:, supported], percentiles, axis=0)
-        for output, row in zip(outputs, np.atleast_2d(values)):
-            output[supported] = row
-    return outputs
+    if matrix.ndim != 2 or not len(matrix):
+        raise ValueError("Run summary requires a nonempty run-by-point matrix")
+    finite = np.isfinite(matrix)
+    counts = finite.sum(axis=0)
+    mean = np.divide(np.where(finite, matrix, 0).sum(axis=0), counts,
+                     out=np.full(matrix.shape[1], np.nan), where=counts > 0)
+    low = np.where(counts >= 2, np.min(np.where(finite, matrix, np.inf), axis=0), np.nan)
+    high = np.where(counts >= 2, np.max(np.where(finite, matrix, -np.inf), axis=0), np.nan)
+    return mean, low, high
+
+
+def draw_run_summary(ax, x, matrix, *, label, color, linestyle="-", **kwargs):
+    mean, low, high = run_summary(matrix)
+    ax.plot(x, mean, label=label, color=color, ls=linestyle, **kwargs)
+    band = np.isfinite(low) & np.isfinite(high)
+    if band.any():
+        ax.fill_between(x, low, high, where=band, color=color, alpha=0.2, linewidth=0)
+    return mean, low, high
+
 
 def aggregate_metric_runs(run_rows, curve_kind):
     if not run_rows:
@@ -496,8 +556,10 @@ def aggregate_metric_runs(run_rows, curve_kind):
     grid = np.geomspace(1e-4, 1, 350)
     curves = []
     for row in run_rows:
-        b = row["metrics"]["background_efficiency"]
-        s = row["metrics"]["signal_efficiency"]
+        metrics = row["metrics"]
+        supported = np.asarray(metrics["supported"], bool)
+        b = np.asarray(metrics["background_efficiency"])[supported]
+        s = np.asarray(metrics["signal_efficiency"])[supported]
         if curve_kind == "sic":
             y = np.divide(s, np.sqrt(b), out=np.full_like(s, np.nan), where=b > 0)
         elif curve_kind == "roc":
@@ -505,22 +567,14 @@ def aggregate_metric_runs(run_rows, curve_kind):
         else:
             raise ValueError(curve_kind)
         curves.append(interpolate_curve(b, y, grid))
-    matrix = np.asarray(curves, float)
-    median = np.full(len(grid), np.nan)
-    low = np.full(len(grid), np.nan)
-    high = np.full(len(grid), np.nan)
-    supported = np.isfinite(matrix).any(axis=0)
-    if np.any(supported):
-        median[supported] = np.nanpercentile(matrix[:, supported], 50, axis=0)
-        low[supported] = np.nanpercentile(matrix[:, supported], 16, axis=0)
-        high[supported] = np.nanpercentile(matrix[:, supported], 84, axis=0)
-    return grid, median, low, high
+    return grid, *run_summary(curves)
 
 
-def metric_cache(groups, loader, regions, min_background, verbose, require_compatible_populations=False):
+def metric_cache(groups, loader, regions, min_background, verbose, require_compatible_populations=False, io_workers=1):
     cache = {}
     records = {}
     protocol_groups = defaultdict(set)
+    populations = {}
     total = sum(len(group) * len(regions) for group in groups.values())
     index = 0
     for (scenario, seed, variant), group in sorted(groups.items()):
@@ -534,28 +588,46 @@ def metric_cache(groups, loader, regions, min_background, verbose, require_compa
                     if method == "riddle" and region == "full_region":
                         say("[SKIP] RIDDLE Full Region plots: saved scores are Signal Region only", verbose)
                     continue
-                key = (method, scenario, variant, region, seed)
-                records[key] = record
-                protocol_groups[(method, scenario, variant, region)].add(aggregation_protocol_signature(method, report))
-                if scenario == "signal_injection":
-                    cache[key] = central_metrics(record, min_background)
-                else:
-                    labels = np.asarray(record["labels"])
-                    cache[key] = {"auc": None, "max_sic": None, "working_points": {}, "acceptance": {"background": {"total": int(np.sum(labels == 0)), "mapped": int(np.sum((labels == 0) & np.asarray(record["mask"], bool))), "acceptance": float(np.mean(np.asarray(record["mask"], bool)[labels == 0])) if np.any(labels == 0) else None}}}
+                cohort = (method, scenario, variant, region)
+                protocol_groups[cohort].add(aggregation_protocol_signature(method, report))
+                for run_seed, run in independent_records(record, seed):
+                    key = (*cohort, run_seed)
+                    if key in records:
+                        raise ValueError(f"Duplicate independent run: {key}")
+                    if cohort in populations:
+                        require_population_compatibility({"first": populations[cohort], "current": run})
+                    else:
+                        populations[cohort] = run
+                    records[key] = run
     for (method, scenario, variant, region), signatures in protocol_groups.items():
         if len(signatures) != 1:
             raise ValueError(f"Incompatible scientific protocols across independent runs for {METHOD_LABELS.get(method, method)}, {scenario}, {variant}, {region}")
     if require_compatible_populations:
         population_groups = defaultdict(dict)
-        for (method, scenario, variant, region, seed), record in records.items():
-            population_groups[(scenario, variant, region, seed)][method] = record
-        for (scenario, variant, region, seed), population in population_groups.items():
+        for (method, scenario, variant, region), record in populations.items():
+            population_groups[(scenario, variant, region)][method] = record
+        for (scenario, variant, region), population in population_groups.items():
             try:
                 require_population_compatibility(population)
             except ValueError as error:
                 raise ValueError(
-                    f"Incompatible cross-method evaluation population for {scenario}, {variant}, {region}, seed {seed}"
+                    f"Incompatible cross-method evaluation population for {scenario}, {variant}, {region}"
                 ) from error
+    def compute(item):
+        key, record = item
+        if key[1] == "signal_injection":
+            return key, central_metrics(record, min_background)
+        labels = np.asarray(record["labels"])
+        mask = np.asarray(record["mask"], bool)
+        bg = labels == 0
+        return key, {"auc": None, "max_sic": None, "working_points": {}, "acceptance": {
+            "background": {"total": int(bg.sum()), "mapped": int((bg & mask).sum()),
+                           "acceptance": float(mask[bg].mean()) if bg.any() else None}}}
+    with ThreadPoolExecutor(max_workers=io_workers) as executor:
+        cache.update(executor.map(compute, records.items()))
+    for method, scenario, variant, region in sorted(populations):
+        count = len(compatible_run_rows(cache, method, scenario, variant, region))
+        say(f"[SEEDS] {METHOD_LABELS.get(method, method)} {scenario} {variant} {region}: {count} completed seeds", verbose)
     return cache, records
 
 
@@ -607,28 +679,24 @@ def plot_performance(cache, output, formats, overwrite, scenarios, variants, reg
                 methods = comparison_methods(cache, scenario, variant, region)
                 if not methods:
                     continue
-                common_seeds = comparison_seed_set(cache, methods, scenario, variant, region)
-                if len(methods) > 1 and not common_seeds:
-                    say(f"[SKIP] {scenario} {variant} {region}: selected methods have no common independent seeds", 1)
-                    continue
                 destination = figure_path(output, scenario, variant, region)
                 title = REGION_LABELS[region] + " · " + VARIANT_LABELS.get(variant, variant)
                 for kind, ylabel, stem in (("sic", r"Significance improvement, $\epsilon_S/\sqrt{\epsilon_B}$", "sic_vs_background_efficiency"), ("roc", r"Signal efficiency, $\epsilon_S$", "roc_vs_background_efficiency")):
                     fig, ax = new_figure(r"Background efficiency, $\epsilon_B$", ylabel)
                     drawn = 0
                     for method in methods:
-                        rows = compatible_run_rows(cache, method, scenario, variant, region, common_seeds)
+                        rows = compatible_run_rows(cache, method, scenario, variant, region)
                         aggregated = aggregate_metric_runs(rows, kind)
                         if aggregated is None:
                             continue
-                        x, median, low, high = aggregated
-                        valid = np.isfinite(median)
+                        x, mean, low, high = aggregated
+                        valid = np.isfinite(mean)
                         if not np.any(valid):
                             continue
-                        ax.plot(x[valid], median[valid], label=METHOD_LABELS.get(method, method), color=METHOD_COLORS.get(method), ls="-")
+                        ax.plot(x, mean, label=METHOD_LABELS.get(method, method), color=METHOD_COLORS.get(method), ls="-")
                         if len(rows) >= 2:
                             band = valid & np.isfinite(low) & np.isfinite(high)
-                            ax.fill_between(x[band], low[band], high[band], color=METHOD_COLORS.get(method), alpha=0.15, linewidth=0)
+                            ax.fill_between(x, low, high, where=band, color=METHOD_COLORS.get(method), alpha=0.2, linewidth=0)
                         drawn += 1
                     if not drawn:
                         plt.close(fig)
@@ -646,13 +714,13 @@ def plot_performance(cache, output, formats, overwrite, scenarios, variants, reg
                 ax.plot(random_x, 1.0 / random_x, color="0.45", ls="--", lw=0.55, label="Random", zorder=1)
                 drawn = 0
                 for method in methods:
-                    rows = compatible_run_rows(cache, method, scenario, variant, region, common_seeds)
+                    rows = compatible_run_rows(cache, method, scenario, variant, region)
                     curves = []
                     grid = np.linspace(0, 1, 300)
                     for row in rows:
                         b = row["metrics"]["background_efficiency"]
                         s = row["metrics"]["signal_efficiency"]
-                        good = np.isfinite(b) & np.isfinite(s) & (b > 0)
+                        good = np.isfinite(b) & np.isfinite(s) & (b > 0) & row["metrics"]["supported"]
                         if np.sum(good) < 2:
                             continue
                         order = np.argsort(s[good])
@@ -665,14 +733,8 @@ def plot_performance(cache, output, formats, overwrite, scenarios, variants, reg
                         curves.append(values)
                     if not curves:
                         continue
-                    matrix = np.asarray(curves)
-                    median, = finite_column_percentiles(matrix, (50,))
-                    valid = np.isfinite(median)
-                    ax.plot(grid[valid], median[valid], label=METHOD_LABELS.get(method, method), color=METHOD_COLORS.get(method), ls="-")
-                    if len(curves) >= 2:
-                        low, high = finite_column_percentiles(matrix, (16, 84))
-                        band = valid & np.isfinite(low) & np.isfinite(high)
-                        ax.fill_between(grid[band], low[band], high[band], color=METHOD_COLORS.get(method), alpha=0.15, linewidth=0)
+                    draw_run_summary(ax, grid, curves, label=METHOD_LABELS.get(method, method),
+                                     color=METHOD_COLORS.get(method))
                     drawn += 1
                 if drawn:
                     ax.set_xlim(0, 1)
@@ -686,15 +748,12 @@ def plot_performance(cache, output, formats, overwrite, scenarios, variants, reg
                 drawn = 0
                 xs = np.asarray(PLOT_WORKING_POINTS)
                 for method in methods:
-                    rows = compatible_run_rows(cache, method, scenario, variant, region, common_seeds)
+                    rows = compatible_run_rows(cache, method, scenario, variant, region)
                     values = np.asarray([[row["metrics"]["working_points"].get(wp) for wp in PLOT_WORKING_POINTS] for row in rows], float)
                     if not values.size or not np.isfinite(values).any():
                         continue
-                    median = np.nanmedian(values, axis=0)
-                    ax.plot(xs, median, label=METHOD_LABELS.get(method, method), color=METHOD_COLORS.get(method), ls="-")
-                    if len(values) >= 2:
-                        low, high = np.nanpercentile(values, [16, 84], axis=0)
-                        ax.fill_between(xs, low, high, color=METHOD_COLORS.get(method), alpha=0.15, linewidth=0)
+                    draw_run_summary(ax, xs, values, label=METHOD_LABELS.get(method, method),
+                                     color=METHOD_COLORS.get(method))
                     drawn += 1
                 if drawn:
                     ax.set_xscale("log")
@@ -719,17 +778,13 @@ def plot_variant_summaries(cache, output, formats, overwrite, regions):
             comparable_variants = active_variants
         if not comparable_variants:
             continue
-        common_seeds = comparison_seed_set_across_variants(cache, methods, "signal_injection", comparable_variants, region)
-        if not common_seeds:
-            say(f"[SKIP] dataset-variant summary {region}: selected methods/variants have no common independent seeds", 1)
-            continue
         destination = output / "01_comparison" / "Signal-Injected" / "Dataset-Variant-Summary" / folder_region(region)
         specs = [("auc", "AUC", "auc_vs_dataset_variant"), ("max_sic", "Maximum significance improvement", "max_sic_vs_dataset_variant")]
         for metric, ylabel, stem in specs:
             fig, ax = new_figure("Dataset variant", ylabel)
             drawn = 0
             for method in methods:
-                medians = []
+                means = []
                 lows = []
                 highs = []
                 positions = []
@@ -737,16 +792,16 @@ def plot_variant_summaries(cache, output, formats, overwrite, regions):
                 for i, variant in enumerate(VARIANT_ORDER):
                     if variant not in comparable_variants:
                         continue
-                    rows = compatible_run_rows(cache, method, "signal_injection", variant, region, common_seeds)
+                    rows = compatible_run_rows(cache, method, "signal_injection", variant, region)
                     values = [row["metrics"].get(metric) for row in rows if row["metrics"].get(metric) is not None]
                     if values:
                         positions.append(i)
-                        medians.append(float(np.median(values)))
-                        lows.append(float(np.percentile(values, 16)))
-                        highs.append(float(np.percentile(values, 84)))
+                        means.append(float(np.mean(values)))
+                        lows.append(float(np.min(values)))
+                        highs.append(float(np.max(values)))
                         spreads.append(len(values) >= 2)
                 if positions:
-                    ax.plot(positions, medians, label=METHOD_LABELS.get(method, method), color=METHOD_COLORS.get(method), ls=METHOD_LINES.get(method, "-"), marker=METHOD_MARKERS.get(method, "o"))
+                    ax.plot(positions, means, label=METHOD_LABELS.get(method, method), color=METHOD_COLORS.get(method), ls=METHOD_LINES.get(method, "-"), marker=METHOD_MARKERS.get(method, "o"))
                     if len(positions) > 1 and any(spreads):
                         ax.fill_between(positions, lows, highs, color=METHOD_COLORS.get(method), alpha=0.15, linewidth=0)
                     drawn += 1
@@ -762,20 +817,20 @@ def plot_variant_summaries(cache, output, formats, overwrite, regions):
             fig, ax = new_figure("Dataset variant", r"Signal efficiency, $\epsilon_S$")
             drawn = 0
             for method in methods:
-                positions, medians, lows, highs, spreads = [], [], [], [], []
+                positions, means, lows, highs, spreads = [], [], [], [], []
                 for i, variant in enumerate(VARIANT_ORDER):
                     if variant not in comparable_variants:
                         continue
-                    rows = compatible_run_rows(cache, method, "signal_injection", variant, region, common_seeds)
+                    rows = compatible_run_rows(cache, method, "signal_injection", variant, region)
                     values = [row["metrics"]["working_points"].get(wp) for row in rows if row["metrics"]["working_points"].get(wp) is not None]
                     if values:
                         positions.append(i)
-                        medians.append(float(np.median(values)))
-                        lows.append(float(np.percentile(values, 16)))
-                        highs.append(float(np.percentile(values, 84)))
+                        means.append(float(np.mean(values)))
+                        lows.append(float(np.min(values)))
+                        highs.append(float(np.max(values)))
                         spreads.append(len(values) >= 2)
                 if positions:
-                    ax.plot(positions, medians, label=METHOD_LABELS.get(method, method), color=METHOD_COLORS.get(method), ls=METHOD_LINES.get(method, "-"), marker=METHOD_MARKERS.get(method, "o"))
+                    ax.plot(positions, means, label=METHOD_LABELS.get(method, method), color=METHOD_COLORS.get(method), ls=METHOD_LINES.get(method, "-"), marker=METHOD_MARKERS.get(method, "o"))
                     if any(spreads):
                         ax.fill_between(positions, lows, highs, color=METHOD_COLORS.get(method), alpha=0.15, linewidth=0)
                     drawn += 1
@@ -789,23 +844,21 @@ def plot_variant_summaries(cache, output, formats, overwrite, regions):
                 plt.close(fig)
 
 def plot_score_distributions(groups, records, output, formats, overwrite):
-    representative = representative_records(records)
-    collections = defaultdict(dict)
-    for (method, scenario, variant, region), (seed, record) in representative.items():
+    collections = defaultdict(lambda: defaultdict(list))
+    for (method, scenario, variant, region, seed), record in sorted(records.items()):
         if region != "signal_region":
             continue
-        collections[(scenario, variant, region)][method] = record
+        collections[(scenario, variant, region)][method].append(record)
     for (scenario, variant, region), method_records in collections.items():
         prepared = {}
         density_peak = 0.0
         count_peak = 0.0
-        for method, selected in method_records.items():
-            values = display_score_values(method, selected["scores"])
-            labels = np.asarray(selected["labels"])
-            mask = np.asarray(selected["mask"], bool) & np.isfinite(values)
-            if not np.any(mask):
+        for method, runs in method_records.items():
+            scores = [display_score_values(method, run["scores"]) for run in runs]
+            masks = [np.asarray(run["mask"], bool) & np.isfinite(values) for run, values in zip(runs, scores)]
+            finite_values = np.concatenate([values[mask] for values, mask in zip(scores, masks)])
+            if not len(finite_values):
                 continue
-            finite_values = values[mask]
             if np.min(finite_values) >= 0.0 and np.max(finite_values) <= 1.0:
                 edges = np.linspace(0.0, 1.0, 51)
             else:
@@ -816,15 +869,22 @@ def plot_score_distributions(groups, records, output, formats, overwrite):
             population_specs = ((0, "BG", METHOD_LIGHT.get(method, METHOD_COLORS.get(method)), "-"),) if scenario == "background_only" else ((0, "BG", METHOD_LIGHT.get(method, METHOD_COLORS.get(method)), "-"), (1, "signal", METHOD_DARK.get(method, METHOD_COLORS.get(method)), "--"))
             populations = []
             for truth, noun, color, style in population_specs:
-                population = mask & (labels == truth)
-                if not np.any(population):
+                densities, counts = [], []
+                for run, values, mask in zip(runs, scores, masks):
+                    population = mask & (np.asarray(run["labels"]) == truth)
+                    if not np.any(population):
+                        continue
+                    count_hist = np.histogram(values[population], bins=edges)[0]
+                    density_hist = np.divide(count_hist, count_hist.sum() * np.diff(edges),
+                                             out=np.full(len(count_hist), np.nan), where=count_hist.sum() > 0)
+                    densities.append(density_hist)
+                    counts.append(count_hist)
+                if not counts:
                     continue
-                density_hist, _ = np.histogram(values[population], bins=edges, density=True)
-                count_hist, _ = np.histogram(values[population], bins=edges)
+                density_hist, count_hist = np.asarray(densities), np.asarray(counts)
                 if np.isfinite(density_hist).any():
                     density_peak = max(density_peak, float(np.nanmax(density_hist)))
-                if len(count_hist):
-                    count_peak = max(count_peak, float(np.max(count_hist)))
+                count_peak = max(count_peak, float(np.max(count_hist)))
                 populations.append((noun, color, style, density_hist, count_hist))
             if populations:
                 prepared[method] = (edges, populations)
@@ -837,8 +897,11 @@ def plot_score_distributions(groups, records, output, formats, overwrite):
             for density, stem, ylabel in ((True, "score_density", "Density"), (False, "score_counts", "Events / bin")):
                 fig, ax = new_figure("Anomaly score", ylabel)
                 for noun, color, style, density_hist, count_hist in populations:
-                    histogram = density_hist if density else count_hist
-                    ax.stairs(histogram, edges, baseline=None, label=f"{METHOD_LABELS.get(method, method)} {noun}", color=color, ls=style)
+                    histograms = density_hist if density else count_hist
+                    mean, low, high = run_summary(histograms)
+                    ax.stairs(mean, edges, baseline=None, label=f"{METHOD_LABELS.get(method, method)} {noun}", color=color, ls=style)
+                    if len(histograms) > 1:
+                        ax.fill_between(edges, np.r_[low, low[-1]], np.r_[high, high[-1]], step="post", color=color, alpha=0.2, linewidth=0)
                 if edges[0] >= 0.0 and edges[-1] <= 1.0:
                     ax.set_xlim(0.0, 1.0)
                 if density:
@@ -1129,15 +1192,11 @@ def plot_mass_sculpting(cache, records, output, formats, overwrite, scenarios, v
         for variant in variants:
             for region in regions:
                 methods = comparison_methods(cache, scenario, variant, region)
-                common_seeds = comparison_seed_set(cache, methods, scenario, variant, region)
-                if len(methods) > 1 and not common_seeds:
-                    say(f"[SKIP] mass sculpting {scenario} {variant} {region}: selected methods have no common independent seeds", verbose)
-                    continue
                 method_curves = {}
                 for method in methods:
                     curves = []
                     for (m, sc, v, rg, seed), record in records.items():
-                        if (m, sc, v, rg) != (method, scenario, variant, region) or (common_seeds and seed not in common_seeds):
+                        if (m, sc, v, rg) != (method, scenario, variant, region):
                             continue
                         curve = exact_mass_sculpt_curve(record, efficiencies)
                         if curve is not None:
@@ -1147,7 +1206,7 @@ def plot_mass_sculpting(cache, records, output, formats, overwrite, scenarios, v
                 if not method_curves:
                     continue
                 fig, ax = new_figure(r"Target background efficiency, $\epsilon_B$", r"$\chi^2/n_{\mathrm{dof}}$")
-                first_record = next(record for (m, sc, v, rg, seed), record in records.items() if (sc, v, rg) == (scenario, variant, region) and (not common_seeds or seed in common_seeds))
+                first_record = next(record for (m, sc, v, rg, seed), record in records.items() if (sc, v, rg) == (scenario, variant, region))
                 mass = np.asarray(first_record["mass"])[np.asarray(first_record["labels"]) == 0]
                 if len(mass) >= 300:
                     reference = random_reference_band(mass, efficiencies)
@@ -1156,11 +1215,8 @@ def plot_mass_sculpting(cache, records, output, formats, overwrite, scenarios, v
                     ax.fill_between(efficiencies, low, high, color="0.5", alpha=0.12, linewidth=0, zorder=0)
                     ax.plot(efficiencies, median, color="0.45", ls="--", lw=0.675, label="Random subset", zorder=1)
                 for method, matrix in method_curves.items():
-                    median = np.nanmedian(matrix, axis=0)
-                    ax.plot(efficiencies, median, color=METHOD_COLORS.get(method), ls="-", label=METHOD_LABELS.get(method, method))
-                    if len(matrix) >= 2:
-                        low, high = finite_column_percentiles(matrix, (16, 84))
-                        ax.fill_between(efficiencies, low, high, color=METHOD_COLORS.get(method), alpha=0.15, linewidth=0)
+                    draw_run_summary(ax, efficiencies, matrix, label=METHOD_LABELS.get(method, method),
+                                     color=METHOD_COLORS.get(method))
                 ax.set_xscale("linear")
                 ax.set_xlim(0.20, 0.01)
                 ax.set_yscale("log")
@@ -1172,13 +1228,10 @@ def plot_mass_sculpting(cache, records, output, formats, overwrite, scenarios, v
                 for wp in PLOT_WORKING_POINTS[::-1]:
                     rows = []
                     for method in methods:
-                        candidates = [(seed, record) for (m, sc, v, rg, seed), record in records.items() if (m, sc, v, rg) == (method, scenario, variant, region) and (not common_seeds or seed in common_seeds)]
+                        candidates = [(seed, record) for (m, sc, v, rg, seed), record in records.items() if (m, sc, v, rg) == (method, scenario, variant, region)]
                         if not candidates:
                             continue
                         seed, record = sorted(candidates)[0]
-                        selection = exact_background_selection(record, wp)
-                        if selection is None:
-                            continue
                         labels = np.asarray(record["labels"])
                         mass = np.asarray(record["mass"], float)
                         if np.nanmedian(np.abs(mass)) > 20:
@@ -1186,11 +1239,19 @@ def plot_mass_sculpting(cache, records, output, formats, overwrite, scenarios, v
                         bg = labels == 0
                         edges = equal_occupancy(mass[bg], min(24, max(10, len(mass[bg]) // 50)))
                         total = np.histogram(mass[bg], edges)[0]
-                        selected_counts = np.histogram(mass[bg], edges, weights=np.mean(selection["weights"], axis=0)[bg])[0]
-                        efficiency = np.divide(selected_counts, total, out=np.full_like(selected_counts, np.nan, dtype=float), where=total > 0)
+                        efficiencies_by_run = []
+                        for _, candidate in sorted(candidates):
+                            selection = exact_background_selection(candidate, wp)
+                            if selection is None:
+                                continue
+                            selected_counts = np.histogram(mass[bg], edges, weights=np.mean(selection["weights"], axis=0)[bg])[0]
+                            efficiencies_by_run.append(np.divide(selected_counts, total, out=np.full_like(selected_counts, np.nan, dtype=float), where=total > 0))
+                        if not efficiencies_by_run:
+                            continue
                         centers = 0.5 * (edges[:-1] + edges[1:])
-                        rows.append((method, centers, efficiency))
-                        all_efficiencies.extend(efficiency[np.isfinite(efficiency)].tolist())
+                        matrix = np.asarray(efficiencies_by_run)
+                        rows.append((method, centers, matrix))
+                        all_efficiencies.extend(matrix[np.isfinite(matrix)].tolist())
                     if rows:
                         working_point_plots[wp] = rows
                 if working_point_plots:
@@ -1199,8 +1260,9 @@ def plot_mass_sculpting(cache, records, output, formats, overwrite, scenarios, v
                     for wp, rows in working_point_plots.items():
                         fig, ax = new_figure(r"$m_{jj}$ (TeV)", r"Background efficiency, $\epsilon_B$")
                         ax.axhline(wp, color="0.55", ls="--", lw=0.5, zorder=1)
-                        for method, centers, efficiency in rows:
-                            ax.plot(centers, efficiency, color=METHOD_COLORS.get(method), ls="-", label=METHOD_LABELS.get(method, method))
+                        for method, centers, matrix in rows:
+                            draw_run_summary(ax, centers, matrix, label=METHOD_LABELS.get(method, method),
+                                             color=METHOD_COLORS.get(method))
                         ax.set_ylim(0, shared_ymax)
                         legend = inside_legend(ax, title=REGION_LABELS[region] + " · " + VARIANT_LABELS.get(variant, variant), borderaxespad=0.75, allow_headroom=False)
                         token = WORKING_POINT_LABELS[wp].replace("%", "pct").replace(".", "p")
@@ -1430,23 +1492,28 @@ def objective_arrays(history, stein=False):
 
 def plot_training(groups, output, formats, overwrite):
     represented = set()
+    histories_by_type = defaultdict(lambda: ([], []))
+    def add(method, identity, stem, ylabel, train, validation, independent=False):
+        key = (method, identity[0], identity[2], stem, ylabel)
+        for target, values in zip(histories_by_type[key], (train, validation)):
+            values = np.atleast_2d(values)
+            target.extend(values if independent else [run_summary(values)[0]])
     for identity, group in groups.items():
         for method, (root, report) in group.items():
             key = (method, str(root))
             if key in represented:
                 continue
             represented.add(key)
-            destination = output / "02_training" / METHOD_LABELS.get(method, safe_component(method))
             if method in ("riddle", "iad", "supervised"):
                 history = history_rows(root, report, "background/history.json")
                 arrays = objective_arrays(history, False) if history is not None else None
                 if arrays is not None:
-                    plot_history(arrays, "Negative log likelihood", destination / "background_nll", formats, overwrite)
+                    add(method, identity, "background_nll", "Negative log likelihood", *arrays)
                 if method in ("iad", "supervised"):
                     oracle_history = history_rows(root, report, "density/background_correction/history.json")
                     oracle_arrays = objective_arrays(oracle_history, False) if oracle_history is not None else None
                     if oracle_arrays is not None:
-                        plot_history(oracle_arrays, "Negative log likelihood", destination / "oracle_background_nll", formats, overwrite)
+                        add(method, identity, "oracle_background_nll", "Negative log likelihood", *oracle_arrays)
                 selection_path = verify_requested_artifact(root, report, "density/ensemble_selection.json")
                 if selection_path is not None:
                     selection = json.loads(selection_path.read_text())
@@ -1458,16 +1525,27 @@ def plot_training(groups, output, formats, overwrite):
                         if arrays is not None:
                             histories.append(arrays)
                     if histories:
-                        min_len = min(len(item[0]) for item in histories)
-                        train = np.asarray([item[0][:min_len] for item in histories])
-                        validation = np.asarray([item[1][:min_len] for item in histories])
-                        plot_history_band(train, validation, "Stein objective", destination / "stein_witness_objective", formats, overwrite)
+                        train = history_matrix([item[0] for item in histories])
+                        validation = history_matrix([item[1] for item in histories])
+                        add(method, identity, "stein_witness_objective", "Stein objective", train, validation)
             elif method == "lacathode":
                 for stem, names, ylabel in (("background_nll", ("lacathode_model_train_losses.npy", "lacathode_model_val_losses.npy"), "Negative log likelihood"), ("classifier_bce", ("loss_matris.npy", "val_loss_matris.npy"), "Binary cross-entropy")):
                     paths = [verify_requested_artifact(root, report, "training/" + name) for name in names]
                     if all(path is not None for path in paths):
                         values = [np.atleast_2d(np.load(path, allow_pickle=False)) for path in paths]
-                        plot_history_band(values[0], values[1], ylabel, destination / stem, formats, overwrite)
+                        independent = report.get("contract", {}).get("lacathode_run_layout") == "independent_background_classifier_v1"
+                        add(method, identity, stem, ylabel, *values, independent=independent)
+    for (method, scenario, variant, stem, ylabel), (train, validation) in sorted(histories_by_type.items()):
+        destination = output / "02_training" / METHOD_LABELS.get(method, safe_component(method)) / SCENARIO_LABELS[scenario] / folder_variant(variant)
+        plot_history_band(history_matrix(train), history_matrix(validation), ylabel,
+                          destination / stem, formats, overwrite, method=method)
+
+
+def history_matrix(histories):
+    matrix = np.full((len(histories), max(map(len, histories))), np.nan)
+    for index, values in enumerate(histories):
+        matrix[index, :len(values)] = values
+    return matrix
 
 
 def plot_history(arrays, ylabel, stem, formats, overwrite):
@@ -1487,11 +1565,8 @@ def plot_history_band(train, validation, ylabel, stem, formats, overwrite, metho
     x = np.arange(1, length + 1)
     fig, ax = new_figure("Epoch", ylabel)
     for values, label, color, style in ((train[:, :length], labels[0], METHOD_LIGHT[method], "-"), (validation[:, :length], labels[1], METHOD_DARK[method], "--")):
-        median = np.median(values, axis=0)
-        ax.plot(x, median, label=label, color=color, ls=style)
-        if len(values) >= 2:
-            low, high = np.percentile(values, [16, 84], axis=0)
-            ax.fill_between(x, low, high, color=color, alpha=0.15, linewidth=0)
+        draw_run_summary(ax, x, values, label=label, color=color,
+                         linestyle=style)
     add_y_headroom(ax, 0.14)
     legend = inside_legend(ax, borderaxespad=0.75)
     save_figure(fig, ax, stem, formats, overwrite, legend)
@@ -1503,13 +1578,11 @@ def plot_stability(cache, output, formats, overwrite, regions):
             methods = comparison_methods(cache, "signal_injection", variant, region)
             if not methods:
                 continue
-            common_seeds = comparison_seed_set(cache, methods, "signal_injection", variant, region)
-            if len(methods) > 1 and not common_seeds:
-                continue
             for field, ylabel, stem, wp in (("auc", "AUC", "auc_run_stability", None), ("max_sic", "Maximum significance improvement", "max_sic_run_stability", None), ("working", r"Signal efficiency at 0.5% BG", "exact_wp_signal_efficiency_run_stability_0p5pct", 0.005)):
-                fig, ax = new_figure("Independent run / seed", ylabel)
+                fig, ax = new_figure("Seed", ylabel)
+                fig.set_figheight(fig.get_figheight() + 0.7)
                 drawn = 0
-                all_seeds = common_seeds or sorted({row["seed"] for method in methods for row in compatible_run_rows(cache, method, "signal_injection", variant, region)})
+                all_seeds = sorted({row["seed"] for method in methods for row in compatible_run_rows(cache, method, "signal_injection", variant, region)})
                 seed_pos = {seed: i for i, seed in enumerate(all_seeds)}
                 for method in methods:
                     rows = compatible_run_rows(cache, method, "signal_injection", variant, region, all_seeds)
@@ -1525,7 +1598,8 @@ def plot_stability(cache, output, formats, overwrite, regions):
                         ax.plot(xs, ys, marker=METHOD_MARKERS.get(method, "o"), ls="none", color=METHOD_COLORS.get(method), label=METHOD_LABELS.get(method, method))
                         drawn += 1
                 if drawn:
-                    ax.set_xticks(range(len(all_seeds)), [str(seed) for seed in all_seeds])
+                    labels = [str(seed) for seed in all_seeds]
+                    ax.set_xticks(range(len(all_seeds)), labels, rotation=90)
                     legend = inside_legend(ax, title=REGION_LABELS[region] + " · " + VARIANT_LABELS.get(variant, variant))
                     save_figure(fig, ax, output / "01_comparison" / "Signal-Injected" / folder_variant(variant) / folder_region(region) / stem, formats, overwrite, legend)
                 else:
@@ -1538,12 +1612,9 @@ def plot_acceptance(cache, output, formats, overwrite):
         methods = comparison_methods(cache, scenario, variant, region)
         if not methods:
             continue
-        common_seeds = comparison_seed_set(cache, methods, scenario, variant, region)
-        if len(methods) > 1 and not common_seeds:
-            continue
         method_values = {}
         for method in methods:
-            rows = compatible_run_rows(cache, method, scenario, variant, region, common_seeds)
+            rows = compatible_run_rows(cache, method, scenario, variant, region)
             values = []
             for row in rows:
                 acceptance = row["metrics"].get("acceptance", {})
@@ -1560,12 +1631,15 @@ def plot_acceptance(cache, output, formats, overwrite):
         labels = []
         for i, method in enumerate(method_values):
             pairs = method_values[method]
-            bg = np.median([pair[0] for pair in pairs if pair[0] is not None])
-            ax.plot(i - 0.08, bg, marker="o", ls="none", color=METHOD_LIGHT.get(method, METHOD_COLORS.get(method)), label="BG" if i == 0 else "_nolegend_")
+            backgrounds = [pair[0] for pair in pairs if pair[0] is not None]
+            if backgrounds:
+                bg = np.mean(backgrounds)
+                ax.errorbar(i - 0.08, bg, yerr=[[bg - min(backgrounds)], [max(backgrounds) - bg]], marker="o", ls="none", color=METHOD_LIGHT.get(method, METHOD_COLORS.get(method)), label="BG" if i == 0 else "_nolegend_", capsize=2)
             if scenario == "signal_injection":
                 sigs = [pair[1] for pair in pairs if pair[1] is not None]
                 if sigs:
-                    ax.plot(i + 0.08, np.median(sigs), marker="^", ls="none", color=METHOD_DARK.get(method, METHOD_COLORS.get(method)), label="Signal" if i == 0 else "_nolegend_")
+                    mean = np.mean(sigs)
+                    ax.errorbar(i + 0.08, mean, yerr=[[mean - min(sigs)], [max(sigs) - mean]], marker="^", ls="none", color=METHOD_DARK.get(method, METHOD_COLORS.get(method)), label="Signal" if i == 0 else "_nolegend_", capsize=2)
             labels.append(METHOD_LABELS.get(method, method))
         ax.set_xticks(positions, labels, rotation=15)
         ax.set_ylim(0, 1.02)
@@ -1578,16 +1652,13 @@ def plot_variant_robustness(cache, output, formats, overwrite, regions):
             methods = [m for m in METHOD_ORDER if compatible_run_rows(cache, m, "signal_injection", "default", region) and compatible_run_rows(cache, m, "signal_injection", target, region)]
             if not methods:
                 continue
-            common_seeds = comparison_seed_set_across_variants(cache, methods, "signal_injection", ("default", target), region)
-            if len(methods) > 1 and not common_seeds:
-                continue
             fig, ax = new_figure(r"Signal efficiency, $\epsilon_S$", "SIC ratio")
             ax.axhline(1, color="0.5", ls="--", lw=0.5, zorder=1)
             drawn = 0
             signal_grid = np.linspace(0.05, 0.95, 250)
             for method in methods:
-                default_rows = {row["seed"]: row for row in compatible_run_rows(cache, method, "signal_injection", "default", region, common_seeds)}
-                target_rows = {row["seed"]: row for row in compatible_run_rows(cache, method, "signal_injection", target, region, common_seeds)}
+                default_rows = {row["seed"]: row for row in compatible_run_rows(cache, method, "signal_injection", "default", region)}
+                target_rows = {row["seed"]: row for row in compatible_run_rows(cache, method, "signal_injection", target, region)}
                 seeds = sorted(set(default_rows) & set(target_rows))
                 ratios = []
                 for seed in seeds:
@@ -1595,7 +1666,10 @@ def plot_variant_robustness(cache, output, formats, overwrite, regions):
                     for row in (default_rows[seed], target_rows[seed]):
                         b = row["metrics"]["background_efficiency"]
                         s = row["metrics"]["signal_efficiency"]
-                        good = np.isfinite(b) & np.isfinite(s) & (b > 0)
+                        good = np.isfinite(b) & np.isfinite(s) & (b > 0) & row["metrics"]["supported"]
+                        if np.sum(good) < 2:
+                            curves.append(np.full_like(signal_grid, np.nan))
+                            continue
                         order = np.argsort(s[good])
                         sx = s[good][order]
                         sic = s[good][order] / np.sqrt(b[good][order])
@@ -1607,13 +1681,8 @@ def plot_variant_robustness(cache, output, formats, overwrite, regions):
                     ratio = np.divide(curves[1], curves[0], out=np.full_like(signal_grid, np.nan), where=np.isfinite(curves[0]) & (curves[0] != 0))
                     ratios.append(ratio)
                 if ratios:
-                    matrix = np.asarray(ratios)
-                    median = np.nanmedian(matrix, axis=0)
-                    valid = np.isfinite(median)
-                    ax.plot(signal_grid[valid], median[valid], color=METHOD_COLORS.get(method), ls="-", label=METHOD_LABELS.get(method, method))
-                    if len(matrix) >= 2:
-                        low, high = finite_column_percentiles(matrix, (16, 84))
-                        ax.fill_between(signal_grid[valid], low[valid], high[valid], color=METHOD_COLORS.get(method), alpha=0.15, linewidth=0)
+                    draw_run_summary(ax, signal_grid, ratios, label=METHOD_LABELS.get(method, method),
+                                     color=METHOD_COLORS.get(method))
                     drawn += 1
             if drawn:
                 legend = inside_legend(ax, title=REGION_LABELS[region])
@@ -1650,6 +1719,20 @@ def normalize_scalar(value):
         value = float(value)
         return value if np.isfinite(value) else None
     return value
+
+
+def performance_summary(metrics):
+    row = {"Runs": len(metrics)}
+    values = {"AUC": [m.get("auc") for m in metrics], "Max. SIC": [m.get("max_sic") for m in metrics]}
+    for wp in reversed(WORKING_POINTS):
+        values[f"εS@{WORKING_POINT_LABELS[wp]}"] = [m["working_points"].get(wp) for m in metrics]
+    for name, samples in values.items():
+        samples = np.asarray(samples, float)
+        samples = samples[np.isfinite(samples)]
+        row[name] = float(samples.mean()) if len(samples) else None
+        row[name + " min"] = float(samples.min()) if len(samples) else None
+        row[name + " max"] = float(samples.max()) if len(samples) else None
+    return row
 
 
 def concise_sample_name(value, validation=False):
@@ -1851,17 +1934,11 @@ def export_tables(groups, cache, loader, output, file_formats, data_root, verbos
     performance = []
     for variant in VARIANT_ORDER:
         methods = [m for m in METHOD_ORDER if compatible_run_rows(cache, m, "signal_injection", variant, "signal_region")]
-        common_seeds = comparison_seed_set(cache, methods, "signal_injection", variant, "signal_region")
-        if len(methods) > 1 and not common_seeds:
-            say(f"[SKIP] Table 3 {variant}: selected methods have no common independent seeds", verbose)
-            continue
         for method in methods:
-            rows = compatible_run_rows(cache, method, "signal_injection", variant, "signal_region", common_seeds)
-            values = lambda getter: [getter(row["metrics"]) for row in rows if getter(row["metrics"]) is not None]
-            auc = values(lambda m: m["auc"])
-            sic = values(lambda m: m["max_sic"])
-            wpvals = {wp: values(lambda m, wp=wp: m["working_points"].get(wp)) for wp in WORKING_POINTS}
-            performance.append({"Dataset": VARIANT_LABELS.get(variant, variant), "Method": METHOD_LABELS.get(method, method), "AUC": normalize_scalar(np.median(auc) if auc else None), "Max. SIC": normalize_scalar(np.median(sic) if sic else None), "εS@10%": normalize_scalar(np.median(wpvals[0.10]) if wpvals[0.10] else None), "εS@5%": normalize_scalar(np.median(wpvals[0.05]) if wpvals[0.05] else None), "εS@1%": normalize_scalar(np.median(wpvals[0.01]) if wpvals[0.01] else None), "εS@0.5%": normalize_scalar(np.median(wpvals[0.005]) if wpvals[0.005] else None), "εS@0.4%": normalize_scalar(np.median(wpvals[0.004]) if wpvals[0.004] else None)})
+            rows = compatible_run_rows(cache, method, "signal_injection", variant, "signal_region")
+            performance.append({"Dataset": VARIANT_LABELS.get(variant, variant),
+                                "Method": METHOD_LABELS.get(method, method),
+                                **performance_summary([row["metrics"] for row in rows])})
     write_table_rows(tables / "table_03_performance_summary", performance, file_formats)
 
 
@@ -1912,13 +1989,13 @@ def aggregate_scan_replica(run_rows):
     working_points = {}
     for wp in WORKING_POINTS:
         values = [row["metrics"]["working_points"].get(wp) for row in run_rows if row["metrics"]["working_points"].get(wp) is not None]
-        working_points[wp] = None if not values else float(np.median(values))
+        working_points[wp] = None if not values else float(np.mean(values))
     auc = [row["metrics"]["auc"] for row in run_rows if row["metrics"]["auc"] is not None]
     max_sic = [row["metrics"]["max_sic"] for row in run_rows if row["metrics"]["max_sic"] is not None]
     return {
         "metrics": {
-            "auc": None if not auc else float(np.median(auc)),
-            "max_sic": None if not max_sic else float(np.median(max_sic)),
+            "auc": None if not auc else float(np.mean(auc)),
+            "max_sic": None if not max_sic else float(np.mean(max_sic)),
             "working_points": working_points,
         },
         "background": background,
@@ -1926,6 +2003,7 @@ def aggregate_scan_replica(run_rows):
         "s_over_b": signal / background if background else None,
         "nominal": signal / math.sqrt(background) if background else None,
         "runs": len(run_rows),
+        "run_metrics": [row["metrics"] for row in run_rows],
     }
 
 
@@ -2047,7 +2125,7 @@ def process_injection_scan(scan_groups, methods, loader, settings, output, forma
             sob = [row["s_over_b"] for row in replicas_data if row["s_over_b"] is not None]
             nominal = [row["nominal"] for row in replicas_data if row["nominal"] is not None]
             if sob and nominal:
-                axis.append((level, 100 * float(np.median(sob)), float(np.median(nominal))))
+                axis.append((level, 100 * float(np.mean(sob)), float(np.mean(nominal))))
         if reference_axis is None:
             reference_axis = axis
         elif axis != reference_axis:
@@ -2061,27 +2139,29 @@ def process_injection_scan(scan_groups, methods, loader, settings, output, forma
                 sob = [row["s_over_b"] for row in replicas_data if row["s_over_b"] is not None]
                 if not sob:
                     continue
+                completed = [{"metrics": metrics, "nominal": row["nominal"]}
+                             for row in replicas_data for metrics in row["run_metrics"]]
                 if field == "max_sic":
-                    values = [row["metrics"]["max_sic"] for row in replicas_data]
+                    values = [row["metrics"]["max_sic"] for row in completed]
                 elif field == "nominal_selected":
-                    values = [row["metrics"]["max_sic"] * row["nominal"] for row in replicas_data if row["metrics"]["max_sic"] is not None and row["nominal"] is not None]
+                    values = [row["metrics"]["max_sic"] * row["nominal"] for row in completed if row["metrics"]["max_sic"] is not None and row["nominal"] is not None]
                 elif field == "auc":
-                    values = [row["metrics"]["auc"] for row in replicas_data]
+                    values = [row["metrics"]["auc"] for row in completed]
                 else:
                     wp = float(field.split("_", 1)[1])
-                    values = [row["metrics"]["working_points"].get(wp) for row in replicas_data if row["metrics"]["working_points"].get(wp) is not None]
-                values = [value for value in values if value is not None]
+                    values = [row["metrics"]["working_points"].get(wp) for row in completed if row["metrics"]["working_points"].get(wp) is not None]
+                values = [value for value in values if value is not None and np.isfinite(value)]
                 if not values:
                     continue
-                x.append(100 * float(np.median(sob)))
-                y.append(float(np.median(values)))
-                low.append(float(np.percentile(values, 16)))
-                high.append(float(np.percentile(values, 84)))
+                x.append(100 * float(np.mean(sob)))
+                y.append(float(np.mean(values)))
+                low.append(float(np.min(values)) if len(values) > 1 else np.nan)
+                high.append(float(np.max(values)) if len(values) > 1 else np.nan)
             if x:
                 order = np.argsort(x)
                 x, y, low, high = [np.asarray(values)[order] for values in (x, y, low, high)]
                 ax.plot(x, y, color=METHOD_COLORS.get(method), ls="-", label=METHOD_LABELS.get(method, method))
-                ax.fill_between(x, low, high, color=METHOD_COLORS.get(method), alpha=0.15, linewidth=0)
+                ax.fill_between(x, low, high, where=np.isfinite(low) & np.isfinite(high), color=METHOD_COLORS.get(method), alpha=0.2, linewidth=0)
                 drawn += 1
         if drawn:
             top = ax.twiny()
@@ -2098,11 +2178,8 @@ def process_injection_scan(scan_groups, methods, loader, settings, output, forma
     if "riddle" in summaries:
         rows = []
         for level, replicas_data in summaries["riddle"]:
-            values = lambda getter: [getter(row["metrics"]) for row in replicas_data if getter(row["metrics"]) is not None]
-            auc = values(lambda m: m["auc"])
-            sic = values(lambda m: m["max_sic"])
-            wpvals = {wp: values(lambda m, wp=wp: m["working_points"].get(wp)) for wp in WORKING_POINTS}
-            rows.append({"N_inj": int(level), "AUC": normalize_scalar(np.median(auc) if auc else None), "Max. SIC": normalize_scalar(np.median(sic) if sic else None), "εS@10%": normalize_scalar(np.median(wpvals[0.10]) if wpvals[0.10] else None), "εS@5%": normalize_scalar(np.median(wpvals[0.05]) if wpvals[0.05] else None), "εS@1%": normalize_scalar(np.median(wpvals[0.01]) if wpvals[0.01] else None), "εS@0.5%": normalize_scalar(np.median(wpvals[0.005]) if wpvals[0.005] else None), "εS@0.4%": normalize_scalar(np.median(wpvals[0.004]) if wpvals[0.004] else None)})
+            metrics = [metrics for row in replicas_data for metrics in row["run_metrics"]]
+            rows.append({"N_inj": int(level), **performance_summary(metrics)})
         if rows and (allow_partial or (len(rows) == len(configured) and all(len(replicas_data) == replicas for _, replicas_data in summaries["riddle"]))):
             write_table_rows(output / "07_tables" / "table_04_default_signal_injection_dependence", rows, file_formats)
 
@@ -2131,22 +2208,36 @@ def parse_args(argv=None):
     parser.add_argument("--file-formats", nargs="+", choices=("csv", "json", "yaml"), default=("csv",))
     parser.add_argument("--exclude-seeds", nargs="*", type=int, default=())
     parser.add_argument("--min-background", type=int, default=10)
+    parser.add_argument("--io-workers", type=int, default=2, help="Parallel metric workers and CPU numerical threads")
     parser.add_argument("--allow-partial-injection-scan", action="store_true")
     parser.add_argument("--require-compatible-populations", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--verbose", type=int, choices=(0, 1, 2), default=1)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.io_workers < 1 or args.min_background < 1:
+        parser.error("--io-workers and --min-background must be positive")
+    return args
 
 
 def main(argv=None):
     args = parse_args(argv)
+    previous_threads = torch.get_num_threads()
+    try:
+        torch.set_num_threads(args.io_workers)
+        with threadpool_limits(limits=args.io_workers):
+            return run(args)
+    finally:
+        torch.set_num_threads(previous_threads)
+
+
+def run(args):
     configure_style()
     if args.overwrite:
         cleanup_legacy_summary_folders(args.output)
     settings = load_settings_file(args.config)
     say("[STAGE] Discover completed results", args.verbose)
-    groups_all = discover(args.results, requested=None, scan=False) if args.results.exists() else {}
-    scan_all = discover(args.scan_results, requested=None, scan=True) if args.scan_results.exists() else {}
+    groups_all = discover_paper_results(args.results) if args.results.exists() else {}
+    scan_all = discover_paper_results(args.scan_results, scan=True) if args.scan_results.exists() else {}
     methods = select_requested_methods(groups_all, args.methods)
     if not methods:
         raise SystemExit("No requested publication methods were discovered")
@@ -2158,9 +2249,10 @@ def main(argv=None):
     if not groups:
         raise SystemExit("No completed results remain after applying method, variant, scenario, and seed filters")
     say("[STAGE] Validate result provenance", args.verbose)
-    loader = ScoreLoader(safeguard_filtering=True, ensemble_fit_selection=True, io_workers=2, device="cpu")
+    loader = ScoreLoader(safeguard_filtering=True, ensemble_fit_selection=True, io_workers=args.io_workers, device="cpu")
     say("[STAGE] Build publication metric cache", args.verbose)
-    cache, records = metric_cache(groups, loader, regions, args.min_background, args.verbose, args.require_compatible_populations)
+    cache, records = metric_cache(groups, loader, regions, args.min_background, args.verbose, args.require_compatible_populations, args.io_workers)
+    say("[SUMMARY] Mean across completed seeds; bands show the min–max range across seeds", args.verbose)
     say("[STAGE] Render comparison performance plots", args.verbose)
     plot_performance(cache, args.output, args.plot_formats, args.overwrite, scenarios, variants, regions)
     plot_score_distributions(groups, records, args.output, args.plot_formats, args.overwrite)

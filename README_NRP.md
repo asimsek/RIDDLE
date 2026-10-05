@@ -123,7 +123,7 @@ python run.py prepare --dataset lhco --catalog config/datasets.yaml --variant de
 
 ## Local terminal: batch job submission
 
-Each block submits one seed-42 job requesting **exactly one GPU, 16 CPUs and 64 GiB RAM**.<br>
+Each block submits one job running seeds 40–44 sequentially, requesting **exactly one GPU, 16 CPUs and 64 GiB RAM**.<br>
 A100 remains the default accelerator. Separate jobs use separate one-GPU allocations and may run concurrently.
 
 **These examples use `signal_injection` inputs; replace the scenario with `background_only`, or list both scenarios for sequential runs within each job.**
@@ -133,18 +133,18 @@ A100 remains the default accelerator. Separate jobs use separate one-GPU allocat
 ```bash
 kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
-  --name riddle-seed42 --methods riddle --scenarios signal_injection \
-  --seeds 42 --config config/settings.yaml --workers 5 --io-workers 2 --torch-threads 2 --mps on \
-  --runs 10 --fits 20 --epochs 100 --data data/lhco --results results \
+  --name riddle-seeds40-44 --methods riddle --scenarios signal_injection \
+  --seed 40 41 42 43 44 --config config/settings.yaml --workers 5 --io-workers 2 --torch-threads 2 --mps on \
+  --fits 20 --epochs 100 --data data/lhco --results results \
   | kubectl apply -n cua-asimsek -f -
 ```
 
 ```bash
 kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
-  --name riddle-bg-seed42 --methods riddle --scenarios background_only \
-  --seeds 42 --config config/settings.yaml --workers 5 --io-workers 2 --torch-threads 2 --mps on \
-  --runs 10 --fits 20 --epochs 100 --data data/lhco --results results \
+  --name riddle-bg-seeds40-44 --methods riddle --scenarios background_only \
+  --seed 40 41 42 43 44 --config config/settings.yaml --workers 5 --io-workers 2 --torch-threads 2 --mps on \
+  --fits 20 --epochs 100 --data data/lhco --results results \
   | kubectl apply -n cua-asimsek -f -
 ```
 
@@ -153,8 +153,8 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
 ```bash
 kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
-  --name lacathode-seed42 --methods lacathode --scenarios signal_injection \
-  --seeds 42 --runs 10 --epochs 100 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
+  --name lacathode-seeds40-44 --methods lacathode --scenarios signal_injection \
+  --seed 40 41 42 43 44 --epochs 100 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
   --lacathode-background independent --data data/lhco --results results \
   | kubectl apply -n cua-asimsek -f -
 ```
@@ -162,21 +162,21 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
 ```bash
 kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
-  --name lacathode-bg-seed42 --methods lacathode --scenarios background_only \
-  --seeds 42 --runs 10 --epochs 100 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
+  --name lacathode-bg-seeds40-44 --methods lacathode --scenarios background_only \
+  --seed 40 41 42 43 44 --epochs 100 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
   --lacathode-background independent --data data/lhco --results results \
   | kubectl apply -n cua-asimsek -f -
 ```
 
-Add `--lacathode-background fixed` to share one background flow across `--runs` classifiers; after the flow is ready, up to `--workers` classifier fits run concurrently. In the default `independent` mode, up to `--workers` complete runs train concurrently, each with its own background flow.
+Each LaCathode seed trains its own background flow and classifier.
 
 **R-ANODE:**
 
 ```bash
 kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
-  --name ranode-seed42 --methods ranode --scenarios signal_injection \
-  --runs 10 --fits 20 --epochs 300 --seeds 42 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
+  --name ranode-seeds40-44 --methods ranode --scenarios signal_injection \
+  --fits 20 --epochs 300 --seed 40 41 42 43 44 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
   --data data/lhco --results results \
   | kubectl apply -n cua-asimsek -f -
 ```
@@ -184,8 +184,8 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
 ```bash
 kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
-  --name ranode-bg-seed42 --methods ranode --scenarios background_only \
-  --runs 10 --fits 20 --epochs 300 --seeds 42 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
+  --name ranode-bg-seeds40-44 --methods ranode --scenarios background_only \
+  --fits 20 --epochs 300 --seed 40 41 42 43 44 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
   --data data/lhco --results results \
   | kubectl apply -n cua-asimsek -f -
 ```
@@ -195,9 +195,9 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
 ```bash
 kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
-  --name iad-seed42 --methods iad --scenarios signal_injection \
-  --seeds 42 --config config/settings.yaml --workers 5 --io-workers 2 --torch-threads 2 --mps on \
-  --runs 1 --fits 20 --epochs 100 --data data/lhco --results results \
+  --name iad-seeds40-44 --methods iad --scenarios signal_injection \
+  --seed 40 41 42 43 44 --config config/settings.yaml --workers 5 --io-workers 2 --torch-threads 2 --mps on \
+  --fits 20 --epochs 100 --data data/lhco --results results \
   | kubectl apply -n cua-asimsek -f -
 ```
 
@@ -206,14 +206,14 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
 ```bash
 kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
-  --name supervised-seed42 --methods supervised --scenarios signal_injection \
-  --seeds 42 --config config/settings.yaml --workers 5 --io-workers 2 --torch-threads 2 --mps on \
-  --runs 1 --fits 20 --epochs 100 --data data/lhco --results results \
+  --name supervised-seeds40-44 --methods supervised --scenarios signal_injection \
+  --seed 40 41 42 43 44 --config config/settings.yaml --workers 5 --io-workers 2 --torch-threads 2 --mps on \
+  --fits 20 --epochs 100 --data data/lhco --results results \
   | kubectl apply -n cua-asimsek -f -
 ```
 
 For RIDDLE/Idealized/Supervised/R-ANODE, `--fits 20` trains one ensemble with twenty fits.<br>
-Add `--runs 10` to retrain the complete method ten times; method uncertainty bands use these independent runs.<br>
+`--seed 40 41 42 43 44` runs every requested method once per seed; uncertainty bands use the completed seed runs.<br>
 
 For one combined RIDDLE benchmark job, request `--methods riddle iad supervised`; the two oracle methods use the same RIDDLE Stein flow with their pure-reference data roles.<br>
 Do not submit that alongside the corresponding standalone jobs for the same result identities.
@@ -236,44 +236,44 @@ Supported values (case-insensitive): `a100`, `l40`, `l40s`, `l4`, `a40`, `rtxa60
 
 ```bash
 kubectl get jobs,pods -n cua-asimsek -o wide
-kubectl get pods -n cua-asimsek -l job-name=riddle-seed42 -o wide
-kubectl get pods -n cua-asimsek -l job-name=riddle-bg-seed42 -o wide
+kubectl get pods -n cua-asimsek -l job-name=riddle-seeds40-44 -o wide
+kubectl get pods -n cua-asimsek -l job-name=riddle-bg-seeds40-44 -o wide
 ```
 
 **Check logs:**
 
 ```bash
-kubectl logs -n cua-asimsek -f job/riddle-seed42 -c campaign
-kubectl logs -n cua-asimsek -f job/riddle-bg-seed42 -c campaign
+kubectl logs -n cua-asimsek -f job/riddle-seeds40-44 -c campaign
+kubectl logs -n cua-asimsek -f job/riddle-bg-seeds40-44 -c campaign
 ```
 
 **!!! CAUTION !!! Delete jobs:**
 
 ```bash
-kubectl delete job riddle-seed42 -n cua-asimsek --ignore-not-found --wait=true
-kubectl delete job riddle-bg-seed42 -n cua-asimsek --ignore-not-found --wait=true
+kubectl delete job riddle-seeds40-44 -n cua-asimsek --ignore-not-found --wait=true
+kubectl delete job riddle-bg-seeds40-44 -n cua-asimsek --ignore-not-found --wait=true
 ```
 
 ### LaCathode:
 
 ```bash
 kubectl get jobs,pods -n cua-asimsek -o wide
-kubectl get pods -n cua-asimsek -l job-name=lacathode-seed42 -o wide
-kubectl get pods -n cua-asimsek -l job-name=lacathode-bg-seed42 -o wide
+kubectl get pods -n cua-asimsek -l job-name=lacathode-seeds40-44 -o wide
+kubectl get pods -n cua-asimsek -l job-name=lacathode-bg-seeds40-44 -o wide
 ```
 
 **Check logs:**
 
 ```bash
-kubectl logs -n cua-asimsek -f job/lacathode-seed42 -c campaign
-kubectl logs -n cua-asimsek -f job/lacathode-bg-seed42 -c campaign
+kubectl logs -n cua-asimsek -f job/lacathode-seeds40-44 -c campaign
+kubectl logs -n cua-asimsek -f job/lacathode-bg-seeds40-44 -c campaign
 ```
 
 **!!! CAUTION !!! Delete jobs:**
 
 ```bash
-kubectl delete job lacathode-seed42 -n cua-asimsek --ignore-not-found --wait=true
-kubectl delete job lacathode-bg-seed42 -n cua-asimsek --ignore-not-found --wait=true
+kubectl delete job lacathode-seeds40-44 -n cua-asimsek --ignore-not-found --wait=true
+kubectl delete job lacathode-bg-seeds40-44 -n cua-asimsek --ignore-not-found --wait=true
 ```
 
 ### R-ANODE:
@@ -281,29 +281,29 @@ kubectl delete job lacathode-bg-seed42 -n cua-asimsek --ignore-not-found --wait=
 
 ```bash
 kubectl get jobs,pods -n cua-asimsek -o wide
-kubectl get pods -n cua-asimsek -l job-name=ranode-seed42 -o wide
-kubectl get pods -n cua-asimsek -l job-name=ranode-bg-seed42 -o wide
+kubectl get pods -n cua-asimsek -l job-name=ranode-seeds40-44 -o wide
+kubectl get pods -n cua-asimsek -l job-name=ranode-bg-seeds40-44 -o wide
 ```
 
 **Check logs:**
 
 ```bash
-kubectl logs -n cua-asimsek -f job/ranode-seed42 -c campaign
-kubectl logs -n cua-asimsek -f job/ranode-bg-seed42 -c campaign
+kubectl logs -n cua-asimsek -f job/ranode-seeds40-44 -c campaign
+kubectl logs -n cua-asimsek -f job/ranode-bg-seeds40-44 -c campaign
 ```
 
 **!!! CAUTION !!! Delete jobs:**
 
 ```bash
-kubectl delete job ranode-seed42 -n cua-asimsek --ignore-not-found --wait=true
-kubectl delete job ranode-bg-seed42 -n cua-asimsek --ignore-not-found --wait=true
+kubectl delete job ranode-seeds40-44 -n cua-asimsek --ignore-not-found --wait=true
+kubectl delete job ranode-bg-seeds40-44 -n cua-asimsek --ignore-not-found --wait=true
 ```
 
 ## Monitor GPU usage of a batch job:
 
 ```bash
 kubectl exec -n cua-asimsek \
-  $(kubectl get pod -n cua-asimsek -l job-name=riddle-seed42 -o jsonpath='{.items[0].metadata.name}') \
+  $(kubectl get pod -n cua-asimsek -l job-name=riddle-seeds40-44 -o jsonpath='{.items[0].metadata.name}') \
   -c campaign -- nvidia-smi
 ```
 
@@ -318,7 +318,7 @@ python plot.py --results results --output plots --verbose 1 --io-workers 16 --ov
 python paper_plot.py --data data/lhco --results results \
   --config config/settings.yaml --output paper_plots \
   --methods riddle lacathode ranode iad supervised --variants default deltaR shifted \
-  --plot-formats png --file-formats csv --overwrite --verbose 1
+  --plot-formats png --file-formats csv --io-workers 16 --overwrite --verbose 1
 ```
 
 All completed methods are discovered automatically.<br>
@@ -328,7 +328,7 @@ Add `--overwrite` to regenerate matching plots and tables.
 
 ## Optional injection scan
 
-In the Jupyter terminal, prepare the configured strengths and replicas once.
+In the Jupyter terminal, prepare the configured strengths and replicas once; scan seeds come from those replicas.
 
 ```bash
 cd /shared/work/RIDDLE
@@ -349,7 +349,7 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --workflow scan --name "riddle-injection-scan" --methods riddle --replicas 0-4 \
   --config config/settings.yaml --data data/injection_scan --results results_injection_scan \
-  --runs 1 --fits 20 --epochs 100 --workers 5 --io-workers 2 --torch-threads 2 --mps on --resume --resume-across-code-change \
+  --fits 20 --epochs 100 --workers 5 --io-workers 2 --torch-threads 2 --mps on --resume --resume-across-code-change \
   | kubectl apply -n cua-asimsek -f -
 ```
 
@@ -360,12 +360,12 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --workflow scan --name "lacathode-injection-scan" --methods lacathode --replicas 0-4 \
   --config config/settings.yaml --data data/injection_scan --results results_injection_scan \
-  --runs 1 --epochs 100 --workers 5 --io-workers 2 --torch-threads 2 --mps on --resume --resume-across-code-change \
+  --epochs 100 --workers 5 --io-workers 2 --torch-threads 2 --mps on --resume --resume-across-code-change \
   --lacathode-background independent \
   | kubectl apply -n cua-asimsek -f -
 ```
 
-LaCathode scan points use the same concurrency: independent mode parallelizes complete `--runs` and only reuses a compatible background from the same run/seed, while fixed mode parallelizes classifier fits after the shared or reused background flow is ready.
+LaCathode scan points only reuse a compatible background from the same seed.
 
 **R-ANODE:**
 
@@ -374,7 +374,7 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --workflow scan --name "ranode-injection-scan" --methods ranode --replicas 0-4 \
   --data data/injection_scan --results results_injection_scan --resume --resume-across-code-change \
-  --runs 1 --fits 20 --epochs 300 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
+  --fits 20 --epochs 300 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
   | kubectl apply -n cua-asimsek -f -
 ```
 
@@ -385,7 +385,7 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --workflow scan --name "iad-injection-scan" --methods iad --replicas 0-9 \
   --config config/settings.yaml --data data/injection_scan --results results_injection_scan \
-  --runs 1 --fits 20 --epochs 100 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
+  --fits 20 --epochs 100 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
   | kubectl apply -n cua-asimsek -f -
 ```
 
@@ -396,7 +396,7 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --workflow scan --name "supervised-injection-scan" --methods supervised --replicas 0-9 \
   --config config/settings.yaml --data data/injection_scan --results results_injection_scan \
-  --runs 1 --fits 20 --epochs 100 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
+  --fits 20 --epochs 100 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
   | kubectl apply -n cua-asimsek -f -
 ```
 

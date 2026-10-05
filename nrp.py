@@ -8,7 +8,7 @@ import sys
 
 import yaml
 
-from riddle.cli import METHODS, DEFAULT_METHODS, SCENARIOS, seeds, positive, method_name
+from riddle.cli import METHODS, DEFAULT_METHODS, SCENARIOS, seeds, positive, method_name, add_seed_argument
 from riddle.storage import atomic_write
 from riddle.resume import add_resume_options
 
@@ -46,7 +46,7 @@ def job(args):
     if "lacathode" in args.methods:
         from external.lacathode_utils.pipeline import run_settings
 
-        run_settings(getattr(args, "runs", None), getattr(args, "epochs", None),
+        run_settings(1, getattr(args, "epochs", None),
                      getattr(args, "lacathode_background", "independent"))
     if "ranode" in args.methods:
         fits, epochs = getattr(args, "fits", None), getattr(args, "epochs", None)
@@ -90,15 +90,17 @@ def job(args):
         "1",
     ]
     if getattr(args, "workflow", "run") == "scan":
+        if getattr(args, "seeds", None) is not None:
+            raise ValueError("Scan training seeds come from its configuration; --seed applies to --workflow run")
         for key in ("replicas", "signal_events"):
             if getattr(args, key, None) is not None:
                 command.extend(["--" + key.replace("_", "-"), ",".join(map(str, getattr(args, key)))])
     else:
-        command.extend(["--scenarios", *args.scenarios, "--seeds", ",".join(map(str, args.seeds))])
+        command.extend(["--scenarios", *args.scenarios, "--seed", *map(str, args.seeds or [42])])
     for option in ("resume_across_code_change", "resume_across_device_change"):
         if getattr(args, option, False):
             command.append("--" + option.replace("_", "-"))
-    for key in ("runs", "fits", "epochs"):
+    for key in ("fits", "epochs"):
         value = getattr(args, key, None)
         if value is not None:
             command.extend(["--" + key, str(value)])
@@ -284,12 +286,11 @@ def main(argv=None):
     p.add_argument("--replicas", type=seeds, help="Scan replica indices, e.g. 0-9")
     p.add_argument("--signal-events", type=seeds, help="Scan total signal counts, e.g. 1000,667")
     p.add_argument("--scenarios", nargs="+", choices=SCENARIOS, default=["signal_injection"])
-    p.add_argument("--seeds", type=seeds, default=[42])
+    add_seed_argument(p, default=None)
     p.add_argument("--config", default="config/settings.yaml", help="Settings path inside the job")
     p.add_argument("--ranode-config", default="external/ranode_utils/ranode.yaml", help="Independent upstream R-ANODE settings")
     p.add_argument("--data", help="Prepared dataset path; defaults to data/lhco or data/injection_scan for scans")
     p.add_argument("--results", help="Result directory; defaults to results or results/injection_scan for scans")
-    p.add_argument("--runs", type=positive, help="Complete independent runs per seed (default: 1)")
     p.add_argument("--fits", type=positive, help="Ensemble fits per RIDDLE/Idealized-RIDDLE/Supervised-RIDDLE/R-ANODE run; does not change LaCathode")
     from riddle.options import add_feature_arguments
     add_feature_arguments(p)

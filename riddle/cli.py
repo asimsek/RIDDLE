@@ -37,6 +37,20 @@ def seeds(value):
     return result
 
 
+class SeedList(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        result = [seed for group in values for seed in group]
+        if len(result) != len(set(result)):
+            raise argparse.ArgumentError(self, "Duplicate seeds")
+        setattr(namespace, self.dest, result)
+
+
+def add_seed_argument(parser, default=(42,)):
+    parser.add_argument("--seed", "--seeds", dest="seeds", nargs="+", type=seeds,
+                        action=SeedList, default=None if default is None else list(default),
+                        help="Explicit seeds; one complete run per seed (default: 42)")
+
+
 def positive(value):
     value = int(value)
     if value < 1:
@@ -90,8 +104,6 @@ def parser():
         run.add_argument("--torch-threads", type=positive, default=2,
                          help="Intra-op CPU threads per training process (default: 2)")
         run.add_argument("--mps", choices=["auto", "on", "off"], default="auto")
-        run.add_argument("--runs", type=positive,
-                         help="Complete independent runs per seed (default: 1); retrain background and signal models")
         run.add_argument("--fits", type=positive,
                          help="Ensemble fits per RIDDLE/Idealized-RIDDLE/Supervised-RIDDLE/R-ANODE run (default: method settings); does not change LaCathode")
         run.add_argument("--lacathode-background", choices=("independent", "fixed"), default="independent",
@@ -113,7 +125,7 @@ def parser():
         run.add_argument("--verbose", type=int, choices=[0, 1, 2], default=1)
         if command == "run":
             run.add_argument("--scenarios", nargs="+", choices=SCENARIOS, default=["signal_injection"])
-            run.add_argument("--seeds", type=seeds, default=[42])
+            add_seed_argument(run)
         else:
             run.set_defaults(data=Path("data/injection_scan"), output=Path("results/injection_scan"))
             run.add_argument("--signal-events", type=seeds, help="Subset of configured total signal counts")
@@ -134,24 +146,20 @@ def independent_run_seeds(seed, count):
 
 
 def campaign_runs(args):
-    """LaCathode manages its own runs; other methods repeat the whole pipeline."""
     requests, used = [], set()
-    for base in args.seeds:
-        for index, seed in enumerate(independent_run_seeds(base, getattr(args, "runs", None) or 1)):
-            for method in args.methods:
-                identity = (method, seed)
-                if identity in used:
-                    raise ValueError("Requested seeds overlap independent method runs; choose distinct base seeds")
-                used.add(identity)
-                if method == "lacathode" and index:
-                    continue
-                requests.append((method, base, index, seed))
+    for seed in args.seeds:
+        for method in args.methods:
+            identity = (method, seed)
+            if identity in used:
+                raise ValueError("Duplicate method/seed combination")
+            used.add(identity)
+            requests.append((method, seed, 0, seed))
     return requests
 
 
 def run_campaign(args):
     resume_policy(args)
-    run_overrides = {key: getattr(args, key, None) for key in ("runs", "epochs")}
+    run_overrides = {"runs": 1, "epochs": getattr(args, "epochs", None)}
     fit_overrides = dict(runs=getattr(args, "fits", None), epochs=getattr(args, "epochs", None))
     requests = campaign_runs(args)
     if "lacathode" in args.methods:

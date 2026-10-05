@@ -56,15 +56,15 @@ python run.py prepare --variant deltaR --output data/lhco_deltaR --io-workers 8
 
 ```bash
 python run.py run --methods riddle --data data/lhco --output results \
-  --scenarios signal_injection --seeds 42 --device cuda:0 --fits 20 --epochs 100 \
-  --runs 10 --workers 2 --io-workers 8 --mps auto --resume
+  --scenarios signal_injection --seed 40 41 42 43 44 --device cuda:0 --fits 20 --epochs 100 \
+  --workers 2 --io-workers 8 --mps auto --resume
 ```
 
 **LaCathode:**
 
 ```bash
 python run.py run --methods lacathode --data data/lhco --output results \
-  --scenarios signal_injection --seeds 42 --device cuda:0 --runs 10 --epochs 100 \
+  --scenarios signal_injection --seed 40 41 42 43 44 --device cuda:0 --epochs 100 \
   --lacathode-background fixed --workers 5 --io-workers 8 --torch-threads 2 --mps auto --resume
 ```
 
@@ -72,8 +72,8 @@ python run.py run --methods lacathode --data data/lhco --output results \
 
 ```bash
 python run.py run --methods ranode --data data/lhco --output results \
-  --scenarios signal_injection background_only --seeds 42 --device cuda:0 \
-  --runs 10 --fits 20 --epochs 300 \
+  --scenarios signal_injection background_only --seed 40 41 42 43 44 --device cuda:0 \
+  --fits 20 --epochs 300 \
   --io-workers 8 --resume
 ```
 
@@ -81,7 +81,7 @@ python run.py run --methods ranode --data data/lhco --output results \
 
 ```bash
 python run.py run --methods iad --data data/lhco --output results \
-  --scenarios signal_injection --seeds 42 --device cuda:0 --runs 1 --fits 20 --epochs 100 \
+  --scenarios signal_injection --seed 40 41 42 43 44 --device cuda:0 --fits 20 --epochs 100 \
   --workers 5 --io-workers 2 --torch-threads 2 --mps on --resume
 ```
 
@@ -89,7 +89,7 @@ python run.py run --methods iad --data data/lhco --output results \
 
 ```bash
 python run.py run --methods supervised --data data/lhco --output results \
-  --scenarios signal_injection --seeds 42 --device cuda:0 --runs 1 --fits 20 --epochs 100 \
+  --scenarios signal_injection --seed 40 41 42 43 44 --device cuda:0 --fits 20 --epochs 100 \
   --workers 5 --io-workers 2 --torch-threads 2 --mps on --resume
 ```
 
@@ -97,20 +97,20 @@ Run the three original methods and both scenarios (`signal_injection`, `backgrou
 
 ```bash
 python run.py run --methods lacathode riddle ranode --data data/lhco --output results \
-  --scenarios signal_injection background_only --seeds 42 \
-  --runs 10 --fits 20 --epochs 100 \
+  --scenarios signal_injection background_only --seed 40 41 42 43 44 \
+  --fits 20 --epochs 100 \
   --device cuda:0 --workers 2 --io-workers 8 --mps auto --resume
 ```
 
 `--device cpu` for CPU execution.<br>
-`--workers` controls concurrent RIDDLE/Idealized/Supervised/R-ANODE fits, complete independent LaCathode runs, or fixed-background LaCathode classifier fits after the shared flow is ready.<br>
+`--workers` controls concurrent RIDDLE/Idealized/Supervised/R-ANODE ensemble fits; different seeds run sequentially.<br>
 `--io-workers` controls CPU threads per process.<br>
 MPS is optional on Linux NVIDIA GPUs; `auto` falls back to ordinary concurrency, while `on` requires MPS.
 
 `--fits` controls the ensemble fits inside RIDDLE/Idealized/Supervised/R-ANODE.<br>
-`--runs` controls complete independent method runs per base seed; default = 1.<br>
+`--seed 40 41 42 43 44` runs each listed seed once for every requested method; default = 42.<br>
 `--epochs` controls the native RIDDLE/Idealized/Supervised/R-ANODE fit epochs and LaCathode classifier epochs.<br>
-`--lacathode-background fixed` shares same LaCathode background flow across `--runs` classifiers; default = `independent`.
+Each LaCathode seed trains its own background flow and classifier; the default background mode is `independent`.
 
 For all methods, to continue compatible checkpoints after an implementation update, add `--resume-across-code-change`.<br>
 To continue unfinished training on a different CUDA GPU, add `--resume-across-device-change`.<br>
@@ -120,7 +120,7 @@ To run a control, change both the data and results locations, for example:
 
 ```bash
 python run.py run --methods lacathode riddle ranode --data data/lhco_deltaR \
-  --output results_deltaR --scenarios signal_injection --seeds 42 \
+  --output results_deltaR --scenarios signal_injection --seed 40 41 42 43 44 \
   --device cuda:0 --workers 2 --io-workers 8 --mps auto --resume
 python plot.py --results results_deltaR --output plots_deltaR --io-workers 8 --verbose 1 --overwrite
 ```
@@ -147,7 +147,7 @@ python run.py prepare-scan --config config/settings.yaml --output data/injection
 ```bash
 python run.py scan --methods lacathode riddle ranode --config config/settings.yaml \
   --data data/injection_scan --output results_injection_scan \
-  --runs 1 --fits 20 --epochs 100 \
+  --fits 20 --epochs 100 \
   --device cuda:0 --workers 2 --io-workers 8 --mps auto --resume
 ```
 
