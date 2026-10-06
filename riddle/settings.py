@@ -40,6 +40,14 @@ def number(value, label, minimum=0, maximum=math.inf, *, strict=True):
         raise ValueError(f"Invalid {label}")
 
 
+def sr_closure_mode(value):
+    if type(value) is bool:
+        value = "on" if value else "off"
+    if value not in ("auto", "on", "off"):
+        raise ValueError("riddle.sr_closure must be auto, on, or off")
+    return value
+
+
 def validate_residual(value):
     value = deepcopy(value)
     value.setdefault("core", "residual")
@@ -176,7 +184,7 @@ def validate_residual(value):
         "max_iterations": 100,
     })
 
-    extra = "".join(" " + k for k in ("mass_conditioning", "input_space", "optimization", "data_policy", "ensemble_completion", "ensemble_fit_selection", "ensemble_fit_count", "background_correction") if k in value)
+    extra = "".join(" " + k for k in ("mass_conditioning", "input_space", "optimization", "data_policy", "ensemble_completion", "ensemble_fit_selection", "ensemble_fit_count", "background_correction", "sr_closure") if k in value)
     keys(value, "core runs epochs fractions initialization flow training fit_recovery enhancements stein mass_fraction" + extra, "RIDDLE")
     if "data_policy" in value:
         from .roles import policy_parts, DIAGNOSTIC_POLICIES
@@ -314,6 +322,7 @@ def validate_residual(value):
     if correction not in ("none", "bgcorr_40_reguide"):
         raise ValueError("background_correction must be none or bgcorr_40_reguide")
     value["background_correction"] = correction
+    value["sr_closure"] = sr_closure_mode(value.get("sr_closure", "auto"))
     if correction == "bgcorr_40_reguide":
         if not value.get("mass_conditioning"):
             raise ValueError("bgcorr_40_reguide requires mass_conditioning=true")

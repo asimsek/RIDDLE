@@ -534,6 +534,7 @@ def run(args, contract):
             "implementation": ((f"riddle_stein_witness_v{SCIENTIFIC_VERSION}_{scoring_cfg['mode']}"
                                 f"{'_support_guard' if support_enabled else ''}_scoring") if core == "stein_witness" else
                                "riddle_v5_3_smooth_fm_bgcorr_40_reguide" if background_correction is not None
+                               else "riddle_v5_3_smooth_fm_gaussian_disabled" if settings["riddle"].get("sr_closure") == "off"
                                else "riddle_v5_3_smooth_fm_gaussian_fallback" if background_correction_decision is not None
                                else "riddle_v5_3_smooth_fm"),
             "data_policy": ("mapping_component_diagnostic_v1" if getattr(args,"mapping_experiment",None)
@@ -620,6 +621,7 @@ def run(args, contract):
             "acceleration": execution_report(acceleration),
             **({"name": (RIDDLE_BENCHMARK_LABELS[args.method] if oracle_method else
                          "RIDDLE bgcorr_40_reguide" if background_correction is not None else
+                         "RIDDLE Gaussian denominator (correction disabled)" if settings["riddle"].get("sr_closure") == "off" else
                          "RIDDLE bgcorr Gaussian fallback" if background_correction_decision is not None else
                          "RIDDLE + mass-conditioned residual"),
                 "mass_conditioning": True,

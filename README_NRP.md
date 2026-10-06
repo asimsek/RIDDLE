@@ -229,6 +229,9 @@ Both require `--resume` (already enabled by `nrp.py`) and can be combined.
 Add `--gpu l40` or `--gpu l40s` to any `nrp.py` submission, including injection scans and any method. Omitting `--gpu` keeps the existing A100 request.<br>
 Supported values (case-insensitive): `a100`, `l40`, `l40s`, `l4`, `a40`, `rtxa6000`, `rtx8000`, `rtx3090`, `rtx4090`, `h100`, `h200`.
 
+Add `--exclude-node node-2-2.sdsc.optiputer.net` to exclude any server that fails your jobs.<br>
+Space-separated multiple servers can be excluded at the same time.
+
 
 ## Monitoring and resuming
 

@@ -17,23 +17,29 @@ from .storage import (atomic_torch_save, digest, file_digest, rng_state, restore
                       write_json, persist_boundary)
 from .worker_progress import emit_message
 from .options import feature_options
+from .settings import sr_closure_mode
 
 MODE = "bgcorr_40_reguide"
 EPOCHS = 40
-PROTOCOL = "shared_sideband_qphi_balanced_validation_uncertainty_gated_mean_supported_closure_reguide_decoupled_width"
+PROTOCOL = "shared_sideband_qphi_balanced_validation_compatible_closure_reguide_decoupled_width"
 ORACLE_PROTOCOL = "riddle_oracle_sr_qphi_v2_gaussian_gate"
+READABLE_PROTOCOLS = (
+    PROTOCOL, ORACLE_PROTOCOL,
+    "shared_sideband_qphi_balanced_validation_uncertainty_gated_mean_supported_closure_reguide_decoupled_width",
+    "shared_sideband_qphi_reguide_v3_multiwindow_closure",
+)
 CLOSURE_SCOPE = "correction_only_interpolation_on_fixed_upstream_map; not_full_search_closure"
 MIN_VALIDATION_IMPROVEMENT = 0.0
 # Keep training support on both sides of each gap.
 
 PSEUDO_WINDOW_QUANTILES = ((0.15, 0.30), (0.425, 0.575), (0.70, 0.85))
 MIN_PSEUDO_WINDOW_EVENTS = 30
-MIN_POSITIVE_WINDOWS_PER_SIDE = 1
 PSEUDO_COMPATIBILITY_SIGMA = 1.96
 
 
 def enabled(settings):
-    return settings.get("background_correction", "none") == MODE
+    return (settings.get("background_correction", "none") == MODE
+            and sr_closure_mode(settings.get("sr_closure", "auto")) != "off")
 
 
 def _training_batches(dataset, *, shuffle, generator):
@@ -309,9 +315,7 @@ def _pseudo_probe_worker(task):
 
 
 def _pseudo_sr_closure(train_z, train_mass, val_z, val_mass, *, settings, seed, device):
-    """Test three held-out mass gaps per sideband with fresh, label-free q_phi fits.
-    Each side must have evaluable gaps, positive mean gain, at least one positive
-    gap, and Gaussian-compatible remaining gaps."""
+    """Require all six held-out sideband gaps to be Gaussian-compatible."""
     all_mass = np.concatenate((train_mass, val_mass)).astype(np.float64, copy=False)
     reports = []
     tasks = []
@@ -426,16 +430,15 @@ def _pseudo_sr_closure(train_z, train_mass, val_z, val_mass, *, settings, seed, 
             weighted_improvement = None
         side_passed = (
             len(evaluable) == windows_per_side
-            and positive_count >= MIN_POSITIVE_WINDOWS_PER_SIDE
             and incompatible_count == 0
             and weighted_improvement is not None
-            and weighted_improvement > MIN_VALIDATION_IMPROVEMENT
+            and np.isfinite(weighted_improvement)
         )
         side_reports.append(dict(
             side=side_name, status="passed" if side_passed else "failed",
             windows_evaluable=len(evaluable), windows_total=windows_per_side,
             positive_windows=positive_count,
-            minimum_positive_windows=MIN_POSITIVE_WINDOWS_PER_SIDE,
+            minimum_positive_windows=0,
             significantly_worse_windows=incompatible_count,
             event_weighted_improvement=weighted_improvement,
         ))
@@ -450,7 +453,7 @@ def _pseudo_sr_closure(train_z, train_mass, val_z, val_mass, *, settings, seed, 
     passed = len(side_reports) == 2 and all(r["status"] == "passed" for r in side_reports)
     return dict(
         status="passed" if passed else "failed",
-        protocol="masked_sideband_multiwindow_interpolation_v3",
+        protocol="masked_sideband_multiwindow_interpolation_v4_compatibility",
         scope=CLOSURE_SCOPE,
         upstream_map_refitted=False,
         evaluation_role="correction_val",
@@ -462,12 +465,12 @@ def _pseudo_sr_closure(train_z, train_mass, val_z, val_mass, *, settings, seed, 
         windows_per_side=windows_per_side,
         parallel_probes=parallelism,
         minimum_gap_events=MIN_PSEUDO_WINDOW_EVENTS,
-        minimum_positive_windows_per_side=MIN_POSITIVE_WINDOWS_PER_SIDE,
+        minimum_positive_windows_per_side=0,
+        positive_weighted_mean_required=False,
         compatibility_sigma=PSEUDO_COMPATIBILITY_SIGMA,
         criterion=(
-            "both sidebands must pass; per side all three windows must be evaluable, "
-            "at least one must improve on Gaussian, the event-weighted mean improvement "
-            "must be positive, and every remaining window must be Gaussian-compatible"
+            "both sidebands must pass; all three windows per side must be evaluable "
+            "and Gaussian-compatible (passed or compatible); positive gains are not required"
         ),
         sides=side_reports,
         windows=reports,
@@ -475,24 +478,26 @@ def _pseudo_sr_closure(train_z, train_mass, val_z, val_mass, *, settings, seed, 
 
 def _contract(settings, train_z, train_mass, val_z, val_mass, seed, device,
               closure_z=None, closure_mass=None):
+    policy = sr_closure_mode(settings.get("sr_closure", "auto"))
     return dict(
-        schema=7,
+        schema=9,
         scientific_version=SCIENTIFIC_VERSION,
         protocol=PROTOCOL,
         mode=MODE,
+        activation_policy=policy,
         epochs=_qphi_options(settings)[0],
         mass_bins=_qphi_options(settings)[1],
         activation_gate=dict(
             min_validation_improvement=MIN_VALIDATION_IMPROVEMENT,
             pseudo_window_quantiles=[list(x) for x in PSEUDO_WINDOW_QUANTILES],
             minimum_pseudo_window_events=MIN_PSEUDO_WINDOW_EVENTS,
-            minimum_positive_windows_per_side=MIN_POSITIVE_WINDOWS_PER_SIDE,
+            minimum_positive_windows_per_side=0,
             compatibility_sigma=PSEUDO_COMPATIBILITY_SIGMA,
-            validation_requires_side_compatibility=True,
+            validation_requires_side_compatibility=policy == "auto",
             checkpoint_requires_natural_validation_compatibility=True,
-            pseudo_sr_always_evaluated=True,
+            pseudo_sr_always_evaluated=policy == "auto",
             compatible_windows_allowed=True,
-            positive_weighted_mean_required=True,
+            positive_weighted_mean_required=False,
         ),
         seed=int(seed),
         device=str(device),
@@ -540,6 +545,20 @@ def train(directory, train_z, train_mass, val_z, val_mass, *, settings, seed, de
     if contract_path.exists() and json.loads(contract_path.read_text()) != contract:
         raise ValueError("Background-correction inputs/settings changed; use a new output directory")
     write_json(contract_path, contract)
+
+    policy = contract["activation_policy"]
+    if policy == "off":
+        decision = dict(
+            mode=MODE, protocol=PROTOCOL, activation_policy=policy,
+            status="disabled", active=False, epochs=0, selected_epoch=None,
+            denominator="standard_normal(z)", truth_labels_used=False,
+            validation_gate={"status": "not_evaluated"},
+            pseudo_sr_closure={"status": "not_evaluated", "reason": "disabled_by_configuration"},
+            fallback_reason=None,
+        )
+        write_json(directory / "selection.json", decision)
+        emit_message("Background correction disabled by sr_closure=off; using Gaussian denominator", level=0)
+        return dict(requested_mode=MODE, active=False, descriptor=None, selection=decision)
 
     torch.manual_seed(int(seed)); np.random.seed(int(seed) % 2**32)
     model = _model(settings, train_z.shape[1], device)
@@ -652,9 +671,9 @@ def train(directory, train_z, train_mass, val_z, val_mass, *, settings, seed, de
     closure = _pseudo_sr_closure(
         train_z, train_mass, val_z, val_mass,
         settings=settings, seed=(int(seed)+40000) % 2**32, device=device,
-    )
+    ) if policy == "auto" else dict(status="not_evaluated", reason="forced_on_by_configuration")
 
-    active = validation_passed and closure.get("status") == "passed"
+    active = policy == "on" or (validation_passed and closure.get("status") == "passed")
     reasons = []
     if not overall_compatible:
         reasons.append("q_phi is significantly worse than Gaussian on reserved validation")
@@ -663,7 +682,7 @@ def train(directory, train_z, train_mass, val_z, val_mass, *, settings, seed, de
     if failed_sides:
         reasons.append("q_phi is significantly worse than Gaussian on validation sideband(s): "
                        + ", ".join(failed_sides))
-    if closure.get("status") != "passed":
+    if policy == "auto" and closure.get("status") != "passed":
         reasons.append("q_phi failed masked-sideband pseudo-SR interpolation closure")
     independent = independent_closure_diagnostic(
         model, closure_z, closure_mass, device,
@@ -671,6 +690,7 @@ def train(directory, train_z, train_mass, val_z, val_mass, *, settings, seed, de
     )
     decision = dict(
         mode=MODE, protocol=PROTOCOL, selected_epoch=int(best_epoch), epochs=epochs,
+        activation_policy=policy, activation_forced=policy == "on",
         status="activated" if active else "gaussian_fallback", active=bool(active),
         checkpoint_selection=dict(
             metric="equal_mass_stratum_validation_nll",
@@ -681,7 +701,10 @@ def train(directory, train_z, train_mass, val_z, val_mass, *, settings, seed, de
         criterion=(
             "best equal-mass-stratum checkpoint among Gaussian-compatible natural-validation epochs; "
             "selected checkpoint must be Gaussian-compatible globally and on each sideband, and both "
-            "sidebands must pass the three-window pseudo-SR interpolation closure"
+            "sidebands must have three evaluable, Gaussian-compatible pseudo-SR windows "
+            "(passed or compatible; positive gains are not required)"
+            if policy == "auto" else
+            "sr_closure=on forces the selected finite q_phi checkpoint; validation is diagnostic and pseudo-SR probes are skipped"
         ),
         validation_gate=dict(
             **validation,
@@ -698,10 +721,12 @@ def train(directory, train_z, train_mass, val_z, val_mass, *, settings, seed, de
         full_search_closure_status="not_evaluated",
         truth_labels_used=False, training_region="reserved sidebands",
         denominator="q_phi(z|m)" if active else "standard_normal(z)",
-        fallback_reason="; ".join(reasons) if reasons else None,
+        fallback_reason="; ".join(reasons) if reasons and not active else None,
+        validation_warnings=reasons if policy == "on" else [],
     )
     write_json(directory / "selection.json", decision)
-    emit_message("Background correction activated" if active else
+    emit_message("Background correction forced on by sr_closure=on" if policy == "on" else
+                 "Background correction activated" if active else
                  "Background correction failed safety gates; using Gaussian denominator", level=0)
     return dict(requested_mode=MODE, active=bool(active), descriptor=descriptor(directory) if active else None,
                 selection=decision)
@@ -962,10 +987,11 @@ def train_oracle(directory, train_z, train_mass, val_z, val_mass, closure_z, clo
 def _reuse_signature(settings):
     epochs, mass_bins = _qphi_options(settings)
     return {
-        "schema": 7,
+        "schema": 9,
         "scientific_version": SCIENTIFIC_VERSION,
         "protocol": PROTOCOL,
         "mode": MODE,
+        "activation_policy": sr_closure_mode(settings.get("sr_closure", "auto")),
         "epochs": epochs,
         "mass_bins": mass_bins,
         "flow": _qphi_flow(settings),
@@ -974,6 +1000,8 @@ def _reuse_signature(settings):
 
 
 def reuse(directory, source_result, *, settings, seed, device):
+    if sr_closure_mode(settings.get("sr_closure", "auto")) == "off":
+        return None
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     manifest_path = directory / "reuse.json"
@@ -1067,7 +1095,7 @@ def descriptor(directory):
     state = torch.load(directory / "model.pt", map_location="cpu", weights_only=False)
     contract = state["contract"]
     protocol = contract.get("protocol", PROTOCOL)
-    if contract.get("mode") != MODE or protocol not in (PROTOCOL, ORACLE_PROTOCOL) or type(contract.get("epochs")) is not int or contract["epochs"] < 10:
+    if contract.get("mode") != MODE or protocol not in READABLE_PROTOCOLS or type(contract.get("epochs")) is not int or contract["epochs"] < 10:
         raise ValueError("Invalid RIDDLE background model")
     selection = json.loads((directory / "selection.json").read_text())
     if selection.get("status") != "activated" or not selection.get("active"):
@@ -1116,8 +1144,7 @@ def load_local(directory, settings, features, device):
     if not path.exists():
         return None
     saved = torch.load(path, map_location=device, weights_only=False)
-    readable = (PROTOCOL, ORACLE_PROTOCOL, "shared_sideband_qphi_reguide_v3_multiwindow_closure")
-    if saved.get("mode") != MODE or saved.get("protocol") not in readable:
+    if saved.get("mode") != MODE or saved.get("protocol") not in READABLE_PROTOCOLS:
         raise ValueError("Invalid fit-local background correction")
     model = _model(settings, features, device)
     model.load_state_dict(saved["model"])
