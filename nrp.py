@@ -59,6 +59,10 @@ def job(args):
     region = getattr(args, "region", None) or default_region
     if region and (not re.fullmatch(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?", region) or len(region) > 63):
         raise ValueError("Use a valid Kubernetes region label value for --region")
+    excluded_nodes = list(dict.fromkeys(getattr(args, "exclude_node", None) or []))
+    for node in excluded_nodes:
+        if len(node) > 253 or not re.fullmatch(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*", node):
+            raise ValueError(f"Invalid Kubernetes node name for --exclude-node: {node!r}")
     if not re.fullmatch(r"[^\s@]+/[^\s@]+@sha256:[0-9a-f]{64}", image):
         raise ValueError("Provide an immutable registry/image@sha256:<64 hex digits> reference")
     if not re.fullmatch("[a-z0-9]([-a-z0-9]*[a-z0-9])?", args.name) or len(args.name) > 63:
@@ -231,6 +235,14 @@ def job(args):
         }
     elif gpu_product is not None:
         pod_spec["nodeSelector"]["nvidia.com/gpu.product"] = gpu_product
+    if excluded_nodes:
+        affinity = pod_spec.setdefault("affinity", {}).setdefault("nodeAffinity", {})
+        required = affinity.setdefault("requiredDuringSchedulingIgnoredDuringExecution", {})
+        for term in required.setdefault("nodeSelectorTerms", [{}]):
+            term.setdefault("matchFields", []).extend(
+                {"key": "metadata.name", "operator": "NotIn", "values": [node]}
+                for node in excluded_nodes
+            )
     secrets = [dict(item) for item in default_secrets]
     for name in getattr(args, "image_pull_secret", None) or []:
         if not re.fullmatch(r"[a-z0-9]([-a-z0-9.]*[a-z0-9])?", name) or len(name) > 253:
@@ -316,6 +328,10 @@ def main(argv=None):
     p.add_argument(
         "--region",
         help="Optional Kubernetes region constraint; defaults to the Jupyter node selector when present",
+    )
+    p.add_argument(
+        "--exclude-node", nargs="+", action="extend", metavar="NODE",
+        help="Exclude these Kubernetes node names (space-separated)",
     )
     p.add_argument(
         "--image", help="Override the pinned runtime image from config/nrp/jupyter.yaml"
