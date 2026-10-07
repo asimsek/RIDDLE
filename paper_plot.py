@@ -25,7 +25,7 @@ from threadpoolctl import threadpool_limits
 
 from riddle.evaluation import common_acceptance_auc, riddle_score_scope
 from riddle.metrics import efficiency_curve, oracle_metrics
-from riddle.plotting import ScoreLoader, discover, event_size_rows, exact_background_selection, method_family, read_metadata, result_variant, scientific_protocol, settings_rows, verify_plot_input
+from riddle.plotting import ScoreLoader, discover, event_size_rows, exact_background_selection, method_family, read_metadata, result_paths, result_variant, scientific_protocol, settings_rows, verify_plot_input
 from riddle.figures import equal_occupancy, shape_chi2
 from riddle.stein_scoring import conditional_gaussianize
 from riddle.storage import file_digest
@@ -349,9 +349,12 @@ def filter_groups(groups, methods, variants, scenarios, excluded_seeds):
     return selected
 
 
-def discover_paper_results(root, *, scan=False):
-    groups = discover(root, requested=None, scan=scan)
-    for path in sorted(root.rglob("result.json")):
+def discover_paper_results(root, requested=None, *, scan=False):
+    requested = None if requested is None else {canonical_method(method) for method in requested}
+    groups = discover(root, requested=requested, scan=scan)
+    if requested is not None and "lacathode" not in requested:
+        return groups
+    for path in result_paths(root, requested=("lacathode",)):
         report = json.loads(path.read_text())
         if report.get("method") != "lacathode" or not report.get("completed") or "run_index" not in report:
             continue
@@ -2236,8 +2239,11 @@ def run(args):
         cleanup_legacy_summary_folders(args.output)
     settings = load_settings_file(args.config)
     say("[STAGE] Discover completed results", args.verbose)
-    groups_all = discover_paper_results(args.results) if args.results.exists() else {}
-    scan_all = discover_paper_results(args.scan_results, scan=True) if args.scan_results.exists() else {}
+    requested = None if args.methods and "all" in args.methods else tuple(
+        canonical_method(method) for method in (args.methods or ("riddle", "iad", "supervised"))
+    )
+    groups_all = discover_paper_results(args.results, requested=requested) if args.results.exists() else {}
+    scan_all = discover_paper_results(args.scan_results, requested=requested, scan=True) if args.scan_results.exists() else {}
     methods = select_requested_methods(groups_all, args.methods)
     if not methods:
         raise SystemExit("No requested publication methods were discovered")

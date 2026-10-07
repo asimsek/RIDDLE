@@ -376,10 +376,21 @@ def methods(keys, *, view=None):
         f.METHODS, f.VIEWS, f.POPULATIONS, f.DISPLAY_TRANSFORMS = previous
 
 
-def discover(root, requested=None, *, scan=False):
+def result_paths(root, requested=None):
     paths = [root / "result.json"] if (root / "result.json").is_file() else sorted(root.rglob("result.json"))
-    groups = {}
+    requested = None if requested is None else {method_family(method) for method in requested}
     for path in paths:
+        directory_method = next((method_family(parent.parent.name) for parent in path.parents
+                                 if parent.name in f.SCENARIOS), None)
+        if requested is not None and directory_method is not None and directory_method not in requested:
+            continue
+        yield path
+
+
+def discover(root, requested=None, *, scan=False):
+    requested = None if requested is None else {method_family(method) for method in requested}
+    groups = {}
+    for path in result_paths(root, requested):
         report = json.loads(path.read_text())
         stored_method = report.get("method")
         method = method_family(stored_method)
