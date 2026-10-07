@@ -8,7 +8,7 @@ riddle:
   core: stein_witness
   mass_conditioning: true
   background_correction: bgcorr_40_reguide
-  sr_closure: auto
+  sr_closure: on
   ensemble_completion: strict
   ensemble_fit_selection: all
   ensemble_fit_count: 20
