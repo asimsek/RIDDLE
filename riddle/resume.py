@@ -18,7 +18,7 @@ def add_resume_options(parser, *, always_resume=False):
     )
     parser.add_argument(
         "--resume-across-device-change", action="store_true",
-        help="With --resume, permit CUDA GPU identity changes; software and precision stay strict",
+        help="With --resume, permit any CUDA GPU model/index and remapped latent inputs; data, software and precision stay strict",
     )
 
 
@@ -131,6 +131,32 @@ def record_transition(path, previous, current, changes, *, action):
         "current_contract": current,
     })
     write_json(path, history)
+
+
+def check_derived_contract(previous, current, *, allow_device_change=False,
+                           hash_paths=(), device_paths=(), history_path=None):
+    if not isinstance(previous, dict) or not isinstance(current, dict):
+        raise ValueError("Invalid derived-input resume contract")
+    changes, protected = [], []
+    for path, values in _differences(previous, current):
+        hashes = path in hash_paths and all(
+            isinstance(values[key], str) and re.fullmatch(r"[0-9a-f]{64}", values[key])
+            for key in ("previous", "current")
+        )
+        devices = path in device_paths and all(
+            isinstance(values[key], str) and re.fullmatch(r"cuda(?::\d+)?", values[key])
+            for key in ("previous", "current")
+        )
+        if not allow_device_change or not (hashes or devices):
+            protected.append(".".join(path))
+        else:
+            changes.append({"field": ".".join(path), "kind": "device", **values})
+    if protected:
+        raise ValueError("Derived inputs/settings changed: " + ", ".join(protected))
+    if changes and history_path is not None:
+        record_transition(history_path, previous, current, changes,
+                          action="resume_remapped_inputs")
+    return changes
 
 
 def inspect_resume(output, contract, *, resume=False, **policy):

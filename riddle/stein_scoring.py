@@ -238,7 +238,7 @@ def _load_reference_b(root):
     return reference, reference_meta
 
 
-def prepare_reference(root, members, validation, device, settings, mapping_identity):
+def prepare_reference(root, members, validation, device, settings, mapping_identity, *, allow_device_change=False):
     root = Path(root)
     if not members:
         raise ValueError("Stein scoring reference requires at least one valid fit")
@@ -278,8 +278,11 @@ def prepare_reference(root, members, validation, device, settings, mapping_ident
         if not (meta_path.exists() and npz_path.exists()):
             raise ValueError("Incomplete persisted Stein scoring reference")
         saved = json.loads(meta_path.read_text())
-        if saved.get("sampling_contract") != sampling_contract:
-            raise ValueError("Stein scoring reference provenance changed; use a new output")
+        from .resume import check_derived_contract
+        check_derived_contract(saved.get("sampling_contract"), sampling_contract,
+                               allow_device_change=allow_device_change,
+                               hash_paths={("mapping_hash",)},
+                               history_path=root / ".resume/reference_device_history.json")
         if saved.get("reference_file_sha256") != file_digest(npz_path):
             raise ValueError("Persisted Stein scoring reference file changed")
         with np.load(npz_path, allow_pickle=False) as archive:

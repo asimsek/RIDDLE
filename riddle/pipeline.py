@@ -152,6 +152,7 @@ def run(args, contract):
     output = args.output
     latent_root = output / "background"
     recovery = EpochRecovery(latent_root, contract, args.resume, **resume_policy(args))
+    allow_device_change = resume_policy(args)["allow_device_change"] and str(args.device).startswith("cuda")
     settings = args.settings
     oracle_method = args.method in RIDDLE_BENCHMARK_LABELS
     active = effective_features(settings["riddle"])
@@ -182,6 +183,7 @@ def run(args, contract):
                 data_policy=settings["riddle"].get("data_policy", DEFAULT_POLICY),
                 residual_batch_size=settings["riddle"]["training"]["batch_size"],
                 reuse_candidates=getattr(args, "riddle_background_reuse_candidates", None),
+                allow_device_change=allow_device_change,
             )
     else:
         selection = prepare(args.data, latent_root, args.seed, args.device, recovery, settings=settings["background"])
@@ -246,6 +248,7 @@ def run(args, contract):
             reuse_candidates=getattr(args, "oracle_background_reuse_candidates", None),
             current_code=contract.get("code", {}),
             allow_code_change=resume_policy(args)["allow_code_change"],
+            allow_device_change=allow_device_change,
         )
         background_correction = background_correction_decision["descriptor"]
     elif settings["riddle"].get("background_correction", "none") == "bgcorr_40_reguide":
@@ -267,7 +270,8 @@ def run(args, contract):
                 development["correction_train"]["z"], development["correction_train"]["mass"],
                 development["correction_val"]["z"], development["correction_val"]["mass"],
                 settings=settings["riddle"], seed=(int(args.seed)+91000) % 2**32, device=args.device,
-                closure_z=development["closure"]["z"], closure_mass=development["closure"]["mass"])
+                closure_z=development["closure"]["z"], closure_mass=development["closure"]["mass"],
+                allow_device_change=allow_device_change)
         background_correction = background_correction_decision["descriptor"]
     acceptance, mapped = {}, {}
     evaluation_ids = {}
@@ -327,6 +331,7 @@ def run(args, contract):
             **({"member_splits": member_splits} if member_splits is not None else {}),
             **({"source_ids": source_ids} if source_ids is not None else {}),
             mapping_identity=mapping_identity,
+            allow_device_change=allow_device_change,
             truth_labels_used=(oracle_roles["receipt"]["p_truth_role_selection"] if oracle_method else False),
             **({
                 "ensemble_reuse_candidates": getattr(args, "supervised_ensemble_reuse_candidates", None),

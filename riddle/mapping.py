@@ -17,6 +17,25 @@ from .worker_progress import emit_message
 PREPROCESS_KEYS = ("min", "max", "mean2", "std2", "std2_logit_fix")
 
 
+def _save_preprocessing(path, values, allow_device_change):
+    if not path.exists():
+        save_torch(path, values)
+        return
+    saved = load_torch(path)
+    if set(saved) != set(values):
+        raise ValueError("Saved mapping preprocessing fields changed")
+    for name, value in values.items():
+        original = saved[name]
+        if (not isinstance(original, torch.Tensor) or original.shape != value.shape
+                or original.dtype != value.dtype or not torch.isfinite(original).all()
+                or not torch.isfinite(value).all()):
+            raise ValueError("Invalid saved mapping preprocessing")
+        matches = (torch.allclose(original, value, rtol=1e-6, atol=1e-7)
+                   if allow_device_change else torch.equal(original, value))
+        if not matches:
+            raise ValueError("Saved mapping preprocessing differs from unchanged source data")
+
+
 def _inference_chunks(function, *arrays, device, size):
     if not arrays or not len(arrays[0]) or any(len(a) != len(arrays[0]) for a in arrays):
         raise ValueError("Inference requires aligned, nonempty arrays")
@@ -274,7 +293,7 @@ def _activate_mapping_reuse(output, candidates, current_contract, seed, source_s
     return manifest
 
 def prepare(data, output, seed, device, *, background, options, data_policy=None, residual_batch_size=256,
-            experiment=None, reuse_candidates=None):
+            experiment=None, reuse_candidates=None, allow_device_change=False):
     output = Path(output); output.mkdir(parents=True, exist_ok=True)
     sources, roles = split_roles(data, seed, calibration=options["score_flow"])
     from .roles import DEFAULT_POLICY, override_roles, attach_source_ids, finalize_mapped
@@ -326,8 +345,14 @@ def prepare(data, output, seed, device, *, background, options, data_policy=None
                indices_sha256=digest(v["indices"]), truth_labels_used=False) for k, v in roles.items()})
     validation_batch_used = None
     if mapping_reuse is None:
-        if settings_path.exists() and json.loads(settings_path.read_text()) != contract:
-            raise ValueError("Mapping data/settings changed; use a new output")
+        if settings_path.exists():
+            from .resume import check_derived_contract
+            saved_contract = json.loads(settings_path.read_text())
+            check_derived_contract(saved_contract, contract,
+                                   allow_device_change=allow_device_change,
+                                   device_paths={("device",)},
+                                   history_path=output / ".resume/device_history.json")
+            contract = saved_contract
         if not settings_path.exists() and (output / ".resume/latest.pt").exists():
             raise ValueError("Mapping checkpoint has no provenance contract")
         write_json(settings_path, contract)
@@ -391,7 +416,8 @@ def prepare(data, output, seed, device, *, background, options, data_policy=None
                 write_json(output / "history.json", history)
             emit_message(f"Background map {epoch+1}/{background['epochs']}: validation NLL={loss:.6g}")
         save_torch(output / "model.pt", best_model)
-        save_torch(output / "preprocessing.pt", {k: fit[k].cpu() for k in PREPROCESS_KEYS})
+        _save_preprocessing(output / "preprocessing.pt", {k: fit[k].cpu() for k in PREPROCESS_KEYS},
+                            allow_device_change)
         selection = dict(training_mapping_epoch=best_epoch, inference_mapping_epoch=best_epoch,
                          trained_epochs=background["epochs"], criterion="lowest independent map-validation NLL",
                          implementation="production_conditional_mapping_v2_tail_safe_preprocessing",
@@ -433,4 +459,3 @@ def prepare(data, output, seed, device, *, background, options, data_policy=None
                        ("mixture_validation_latents.npy", "mixture_validation")):
         atomic_write(output / name, lambda p, value=latent_rows(mapped[role]): save_array(p, value))
     return selection, mapper, mapped, mapping_reuse
-

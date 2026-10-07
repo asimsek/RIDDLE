@@ -53,7 +53,8 @@ def _fit_worker(events, job, rows, validation, options):
                     label=label, normalization_tests=options["normalization_tests"],
                     member_split_indices=job.get("member_split_indices"), source_ids=options.get("source_ids"),
                     background_correction=options.get("background_correction"),
-                    truth_labels_used=options["truth_labels_used"])
+                    truth_labels_used=options["truth_labels_used"],
+                    allow_device_change=options.get("allow_device_change", False))
                 result = dict(status=saved["status"], initial_epoch=0,
                               new_epochs=sum(epoch_progress.values()),
                               trained_epochs=saved.get("trained_epochs", options["epochs"]),
@@ -86,7 +87,8 @@ def fitting_eta(mean_fit, epochs, active, queued, workers):
 
 def run_fits(
     rows, jobs, *, validation, epochs, seed, device, initialization, workers, io_workers, total, started=None,
-    settings, normalization_tests, source_ids=None, background_correction=None, torch_threads=2, truth_labels_used=False
+    settings, normalization_tests, source_ids=None, background_correction=None, torch_threads=2, truth_labels_used=False,
+    allow_device_change=False,
 ):
     if not jobs:
         return
@@ -110,6 +112,7 @@ def run_fits(
         source_ids=source_ids,
         background_correction=background_correction,
         truth_labels_used=truth_labels_used,
+        allow_device_change=allow_device_change,
     )
     previous_handler = signal.getsignal(signal.SIGTERM)
 

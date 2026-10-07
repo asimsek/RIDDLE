@@ -512,8 +512,19 @@ def _contract(settings, train_z, train_mass, val_z, val_mass, seed, device,
     )
 
 
+def _check_mapped_contract(previous, current, allow_device_change, history_path=None):
+    from .resume import check_derived_contract
+
+    return check_derived_contract(
+        previous, current, allow_device_change=allow_device_change,
+        hash_paths={("hashes", name) for name in
+                    ("train_z", "validation_z", "closure_z", "independent_closure_z")},
+        device_paths={("device",)}, history_path=history_path,
+    )
+
+
 def train(directory, train_z, train_mass, val_z, val_mass, *, settings, seed, device,
-          closure_z=None, closure_mass=None):
+          closure_z=None, closure_mass=None, allow_device_change=False):
     """Fit q_phi, apply selection gates, and audit reserved sideband rows."""
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
@@ -542,8 +553,19 @@ def train(directory, train_z, train_mass, val_z, val_mass, *, settings, seed, de
     contract = _contract(settings, train_z, train_mass, val_z, val_mass, seed, device,
                          closure_z, closure_mass)
     contract_path = directory / "contract.json"
-    if contract_path.exists() and json.loads(contract_path.read_text()) != contract:
-        raise ValueError("Background-correction inputs/settings changed; use a new output directory")
+    if contract_path.exists():
+        previous = json.loads(contract_path.read_text())
+        changes = _check_mapped_contract(previous, contract, allow_device_change,
+                                         directory / ".resume/device_history.json")
+        if changes and (directory / "model.pt").is_file() and (directory / "selection.json").is_file():
+            state = torch.load(directory / "model.pt", map_location="cpu", weights_only=False)
+            if state.get("contract") != previous:
+                raise ValueError("Completed background-correction contract changed")
+            decision = json.loads((directory / "selection.json").read_text())
+            active = decision.get("status") == "activated" and bool(decision.get("active"))
+            emit_message("Reuse completed background correction after approved GPU migration", level=0)
+            return dict(requested_mode=MODE, active=active,
+                        descriptor=descriptor(directory) if active else None, selection=decision)
     write_json(contract_path, contract)
 
     policy = contract["activation_policy"]
@@ -569,8 +591,7 @@ def train(directory, train_z, train_mass, val_z, val_mass, *, settings, seed, de
     latest = directory / ".resume/latest.pt"
     if latest.exists():
         state = torch.load(latest, map_location=device, weights_only=False)
-        if state.get("contract") != contract:
-            raise ValueError("Background-correction recovery contract changed")
+        _check_mapped_contract(state.get("contract"), contract, allow_device_change)
         model.load_state_dict(state["model"])
         optimizer.load_state_dict(state["optimizer"])
         history, start = state["history"], state["epoch"] + 1
@@ -851,7 +872,7 @@ def _activate_oracle_reuse(directory, candidates, contract, current_code, allow_
     return None
 
 
-def train_oracle(directory, train_z, train_mass, val_z, val_mass, closure_z, closure_mass, *, settings, seed, device, reuse_candidates=None, current_code=None, allow_code_change=False):
+def train_oracle(directory, train_z, train_mass, val_z, val_mass, closure_z, closure_mass, *, settings, seed, device, reuse_candidates=None, current_code=None, allow_code_change=False, allow_device_change=False):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     arrays = [np.ascontiguousarray(value, dtype=np.float32) for value in (train_z, train_mass, val_z, val_mass, closure_z, closure_mass)]
@@ -869,8 +890,9 @@ def train_oracle(directory, train_z, train_mass, val_z, val_mass, closure_z, clo
     contract_path = directory / "contract.json"
     if not contract_path.exists() and not (directory / ".resume/latest.pt").exists() and not (directory / "model.pt").exists():
         _activate_oracle_reuse(directory, reuse_candidates, contract, current_code, allow_code_change)
-    if contract_path.exists() and json.loads(contract_path.read_text()) != contract:
-        raise ValueError("Oracle background inputs/settings changed; use a new output directory")
+    if contract_path.exists():
+        _check_mapped_contract(json.loads(contract_path.read_text()), contract, allow_device_change,
+                               directory / ".resume/device_history.json")
     if (directory / "model.pt").is_file() and (directory / "selection.json").is_file():
         selection = json.loads((directory / "selection.json").read_text())
         active = selection.get("status") == "activated" and bool(selection.get("active"))
@@ -888,8 +910,7 @@ def train_oracle(directory, train_z, train_mass, val_z, val_mass, closure_z, clo
     latest = directory / ".resume/latest.pt"
     if latest.exists():
         state = torch.load(latest, map_location=device, weights_only=False)
-        if state.get("contract") != contract:
-            raise ValueError("Oracle background recovery contract changed")
+        _check_mapped_contract(state.get("contract"), contract, allow_device_change)
         model.load_state_dict(state["model"])
         optimizer.load_state_dict(state["optimizer"])
         history, start = state["history"], state["epoch"] + 1

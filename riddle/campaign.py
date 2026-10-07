@@ -39,16 +39,33 @@ def _fit_training_settings(settings):
     return value
 
 
-def _compatible_identity(saved, current, *, allow_new_mapping_identity=False):
+def _compatible_identity(saved, current, *, allow_new_mapping_identity=False,
+                         allow_device_change=False, history_path=None):
+    from .resume import check_derived_contract
+
     saved = deepcopy(saved)
     current = deepcopy(current)
     saved_settings = saved.pop("settings", None)
     current_settings = current.pop("settings", None)
     if allow_new_mapping_identity and "mapping_identity" not in saved:
         current.pop("mapping_identity", None)
-    if saved != current:
+    saved["settings"] = _fit_training_settings(saved_settings or {})
+    current["settings"] = _fit_training_settings(current_settings or {})
+    paths = {(name,) for name in ("training_sha256", "validation_sha256", "selection_sha256",
+                                 "internal_selection_sha256")}
+    paths.update(("mapping_identity", name) for name in
+                 ("training_latents_sha256", "validation_latents_sha256",
+                  "p_training_sha256", "p_validation_sha256", "preprocessing.pt"))
+    paths.update(("mapping_identity", "oracle_roles", name) for name in
+                 ("p_training_sha256", "p_validation_sha256", "q_training_latents_sha256",
+                  "q_validation_latents_sha256", "q_closure_latents_sha256"))
+    paths.update(("mapping_identity", "oracle_roles", "selector_reserves", name) for name in ("p", "q"))
+    try:
+        check_derived_contract(saved, current, allow_device_change=allow_device_change,
+                               hash_paths=paths, history_path=history_path)
+    except ValueError:
         return False
-    return _fit_training_settings(saved_settings or {}) == _fit_training_settings(current_settings or {})
+    return True
 
 
 def _activate_supervised_ensemble_reuse(output, candidates, identity, contract, allow_code_change):
@@ -302,7 +319,8 @@ def assess_fit(directory, epochs, fractions, validation, device, *, sigma, norma
 
 def train_member(rows, validation, output, *, relative, index, fraction, epochs, seed,
                  device, initialization, settings, label, normalization_tests, background_reference=None,
-                 background_correction=None, member_split_indices=None, source_ids=None, truth_labels_used=False):
+                 background_correction=None, member_split_indices=None, source_ids=None, truth_labels_used=False,
+                 allow_device_change=False):
     """One persisted attempt budget shared by sequential and spawned workers."""
     from .production import NumericalFitError
     from .storage import locked, save_npz
@@ -348,7 +366,9 @@ def train_member(rows, validation, output, *, relative, index, fraction, epochs,
     with locked(root / ".resume/fit.lock"):
         if state_path.exists():
             state = json.loads(state_path.read_text())
-            if not _compatible_identity(state["identity"], identity):
+            if not _compatible_identity(state["identity"], identity,
+                                        allow_device_change=allow_device_change,
+                                        history_path=root / ".resume/device_history.json"):
                 raise ValueError("Fit inputs or retry policy changed; use a new output directory")
             attempts = state.get("attempts")
             if (not isinstance(attempts, list) or len(attempts) > len(seeds)
@@ -476,7 +496,7 @@ def train_campaign(
     initialization="background", started=None, workers=1, io_workers=2, torch_threads=2, settings=None, background_reference=None,
     background_correction=None, selection_validation=None, member_splits=None, source_ids=None, mapping_identity=None,
     ensemble_reuse_candidates=None, ensemble_reuse_contract=None, allow_ensemble_reuse_code_change=False,
-    truth_labels_used=False,
+    truth_labels_used=False, allow_device_change=False,
 ):
     settings = deepcopy(DEFAULTS["riddle"] if settings is None else settings)
     settings.update(epochs=epochs, runs=runs, initialization=initialization)
@@ -536,7 +556,9 @@ def train_campaign(
     )
     identity_path = output / "ensemble_inputs.json"
     if identity_path.exists() and not _compatible_identity(
-            json.loads(identity_path.read_text()), identity, allow_new_mapping_identity=True):
+            json.loads(identity_path.read_text()), identity, allow_new_mapping_identity=True,
+            allow_device_change=allow_device_change,
+            history_path=output / ".resume/device_history.json"):
         raise ValueError("Residual ensemble training inputs/settings changed; use a new output")
     write_json(identity_path, identity)
     tags = ["learned" if f is None else "fraction_" + str(f).replace(".", "p") for f in fraction_values]
@@ -554,7 +576,8 @@ def train_campaign(
         run_fits(rows, jobs, validation=zval, epochs=epochs, seed=seed, device=device,
                  initialization=initialization, workers=workers, io_workers=io_workers, torch_threads=torch_threads,
                  total=total, started=started, settings=settings, normalization_tests=tests, source_ids=source_ids,
-                 background_correction=background_correction, truth_labels_used=truth_labels_used)
+                 background_correction=background_correction, truth_labels_used=truth_labels_used,
+                 allow_device_change=allow_device_change)
     else:
         for job in jobs:
             train_member(rows, zval, output, relative=job["relative"], index=job["index"],
@@ -563,6 +586,7 @@ def train_campaign(
                          label=f"RIDDLE fit {job['fit']}/{total}", normalization_tests=tests,
                          member_split_indices=job["member_split_indices"], source_ids=source_ids,
                          truth_labels_used=truth_labels_used,
+                         allow_device_change=allow_device_change,
                          **({"background_reference": background_reference} if background_reference is not None else {}),
                          **({"background_correction": background_correction} if background_correction is not None else {}))
     configs, failures = [], []
@@ -763,7 +787,8 @@ def train_campaign(
         scoring_mapping = (mapping_identity if mapping_identity is not None else {
             "training_latents_sha256": digest(ztrain), "validation_latents_sha256": digest(zval)
         })
-        prepare_reference(output, chosen["accepted_members"], zval, device, settings, scoring_mapping)
+        prepare_reference(output, chosen["accepted_members"], zval, device, settings, scoring_mapping,
+                          allow_device_change=allow_device_change)
         write_root_provenance(
             output, chosen["members"], chosen["accepted_members"], settings, scoring_mapping
         )
