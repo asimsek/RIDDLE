@@ -75,6 +75,8 @@ def parser():
                       help="Shared BG/signal percentages and independent validation reserves")
     prep.add_argument("--variant", choices=["default", "shifted", "deltaR"], default="default")
     prep.add_argument("--io-workers", type=positive, default=4)
+    prep.add_argument("--verify-workers", type=positive, default=8,
+                      help="Maximum checksum threads per process (default: 8)")
     prep.add_argument("--resume", action="store_true")
     prep.add_argument("--verbose", type=int, choices=[0, 1, 2], default=1)
     prep_scan = subs.add_parser("prepare-scan", parents=[deepcopy(prep)], add_help=False,
@@ -101,6 +103,8 @@ def parser():
         )
         run.add_argument("--io-workers", type=positive, default=2,
                          help="Filesystem/host I/O concurrency; independent of PyTorch compute threads")
+        run.add_argument("--verify-workers", type=positive, default=8,
+                         help="Maximum checksum threads per process, independent of I/O and training workers (default: 8)")
         run.add_argument("--scan-bg-workers", type=positive, default=1,
                          help="Concurrent native background preparations: strengths within each retraining scan seed, or seeds in run mode")
         run.add_argument("--torch-threads", type=positive, default=2,
@@ -163,6 +167,9 @@ def campaign_runs(args):
 
 
 def run_campaign(args, *, cancel_event=None):
+    from .storage import configure_verification
+
+    configure_verification(getattr(args, "verify_workers", 8))
     resume_policy(args)
     if len(args.methods) != len(set(args.methods)) or len(args.scenarios) != len(set(args.scenarios)):
         raise ValueError("Duplicate methods/scenarios")
@@ -297,7 +304,9 @@ def run_campaign(args, *, cancel_event=None):
                            "--sources", str(args.ranode_sources), "--data", options["data"],
                            "--output", str(output), "--config", str(args.ranode_config),
                            "--scenario", scenario, "--seed", str(seed), "--device", options["device"],
-                           "--io-workers", str(args.io_workers), "--torch-threads", str(args.torch_threads),
+                           "--io-workers", str(args.io_workers),
+                           "--verify-workers", str(getattr(args, "verify_workers", 8)),
+                           "--torch-threads", str(args.torch_threads),
                            "--workers", str(args.workers), "--mps", args.mps]
                 for key, value in fit_overrides.items():
                     if value is not None:
@@ -323,11 +332,15 @@ def run_campaign(args, *, cancel_event=None):
             else:
                 command = [sys.executable, "-m", "riddle.worker", json.dumps(options, default=str)]
             with locked(output / ".resume/command.lock"):
+                label = f"{method} | {scenario} | seed {seed} | {args.data.name}"
+                variant = manifest.get("variant", "default")
+                if variant != "default" and variant.lower() not in args.data.name.lower():
+                    label += f" | {variant}"
                 monitor_worker(
                     command,
                     env,
                     output / "training.log",
-                    f"{method} | {scenario} | seed {seed} | {args.data.name}",
+                    label,
                     resume=args.resume,
                     cancel_event=cancel_event,
                 )
@@ -336,6 +349,9 @@ def run_campaign(args, *, cancel_event=None):
 def main(argv=None):
     p = parser()
     args = p.parse_args(argv)
+    from .storage import configure_verification
+
+    configure_verification(getattr(args, "verify_workers", 8))
     if args.command in ("run", "scan"):
         try:
             resume_policy(args)

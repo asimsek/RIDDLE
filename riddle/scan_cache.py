@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 
 from .resume import check_contract
-from .storage import file_digest, fingerprint_files, write_json, read_json, load_array, open_npz
+from .storage import file_digest, verify_artifacts, write_json, read_json, load_array, open_npz
 from .worker_progress import emit_message
 
 _BACKGROUND_POPULATIONS = {}
@@ -292,11 +292,7 @@ def reuse_completed(output, contract, candidates=(), *, resume=False, allow_code
         artifacts = original.get("artifacts_sha256", {})
         if not artifacts or any(Path(name).is_absolute() or ".." in Path(name).parts for name in artifacts):
             raise ValueError("Invalid reusable result artifact inventory")
-        paths = [source / name for name in artifacts]
-        if any(not path.resolve().is_relative_to(source) or not path.is_file() for path in paths):
-            raise ValueError("Missing or invalid reusable scan artifact")
-        if fingerprint_files(source, paths, io_workers) != artifacts:
-            raise ValueError("Reusable scan artifact checksum mismatch")
+        verify_artifacts(source, artifacts, "Verify reusable scan artifacts")
         from .production import validate_result_scores
         validate_result_scores(source, contract["method"])
         if contract["method"] == "ranode":

@@ -1,4 +1,3 @@
-import hashlib
 import subprocess
 from pathlib import Path
 
@@ -7,8 +6,9 @@ REPOSITORY = "https://github.com/rd804/R-ANODE.git"
 
 
 def digest(path):
-    with Path(path).open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
+    from riddle.storage import file_digest
+
+    return file_digest(path, durable=False)
 
 
 def verify(root):

@@ -6,9 +6,9 @@ import subprocess
 import sys
 from types import SimpleNamespace
 
-from .storage import code_hashes, environment, file_digest, write_json, verify_artifacts, fingerprint_files, read_json
+from .storage import code_hashes, environment, file_digest, write_json, verify_artifacts, fingerprint_files, read_json, configure_verification
 from .data import validate
-from .worker_progress import emit_message
+from .worker_progress import emit_message, emit_runtime
 from .resume import inspect_resume, record_transition, resume_policy
 from .integrity import SCIENTIFIC_VERSION, RIDDLE_BENCHMARK_LABELS, RIDDLE_BENCHMARK_SCIENTIFIC_VERSION
 from .production import validate_result_scores, NumericalFitError
@@ -41,6 +41,7 @@ def runtime_code(method, root=None):
         "storage.py",
         "worker_progress.py",
         "progress.py",
+        "console.py",
         "resume.py",
         "mps.py",
         "gpu_identity.py",
@@ -54,6 +55,7 @@ def runtime_code(method, root=None):
 
 def main():
     args = SimpleNamespace(**json.loads(sys.argv[1]))
+    configure_verification(getattr(args, "verify_workers", 8))
     policy = resume_policy(args)
     for name in ("output", "data", "sources"):
         setattr(args, name, Path(getattr(args, name)))
@@ -166,6 +168,7 @@ def main():
         "code": code,
         "settings": settings,
     }
+    emit_runtime(contract["environment"].get("gpu") or "CPU")
     if getattr(args, "background_benchmark", None):
         contract["background_benchmark"] = args.background_benchmark
     if native_method:

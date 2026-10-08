@@ -24,7 +24,9 @@ _NO_DIGEST = object()
 class ConsoleMessages:
     io_report_seconds = 30
     slow_io_seconds = 5
-    fit_pattern = re.compile(r"RIDDLE fit (\d+)/(\d+): (\d+)/(\d+) epoch;")
+    fit_pattern = re.compile(r"(?:RIDDLE fit|Classifier fit) (\d+)/(\d+): (\d+)/(\d+) epoch;")
+    runtime_seen = set()
+    runtime_guard = threading.Lock()
 
     def __init__(self, label, *, status=None, get_verbosity=None):
         self.label = label
@@ -49,6 +51,16 @@ class ConsoleMessages:
                 for field in task.split("; "):
                     if field.split("=", 1)[0] in {"method", "seed", "scenario", "signal_events"}:
                         text = text.replace("; " + field, "", 1)
+        if text.startswith(("BG stages START", "Runtime; ")):
+            fields = dict(part.split("=", 1) for part in text.split("; ") if "=" in part)
+            runtime = tuple(fields.get(key, "unknown") for key in ("gpu", "node", "host"))
+            with self.runtime_guard:
+                announce = runtime not in self.runtime_seen
+                self.runtime_seen.add(runtime)
+            if announce:
+                self.status(f"Runtime | GPU {runtime[0]} | node {runtime[1]}", label=self.label, level=1)
+            if text.startswith("Runtime; "):
+                return
         io_match = re.search(r"\bI/O (START|END); (.*)", text)
         if io_match:
             fields = dict(part.split("=", 1) for part in io_match[2].split("; ") if "=" in part)
@@ -70,6 +82,7 @@ class ConsoleMessages:
                     return
             self.fit_updates[fit] = epoch, now
             text = text.replace("RIDDLE fit", "Fit", 1)
+            text = text.replace("Classifier fit", "Fit", 1)
             if "; operation=Epoch complete" in text:
                 text = re.sub(r"; minibatch=0/\d+", "", text.replace("; operation=Epoch complete", ""))
         if event.get("kind") in {"WARNING", "ERROR"} or text.startswith("BG stages END"):
@@ -213,6 +226,13 @@ def emit_message(message, *, kind="INFO", level=1, durable=False, console=False)
     if durable:
         event["durable"] = True
     _emit_event(event, console=console)
+
+
+def emit_runtime(gpu):
+    host = os.uname().nodename
+    node = os.environ.get("RIDDLE_NODE_NAME") or ("unavailable" if os.environ.get("KUBERNETES_SERVICE_HOST") else host)
+    emit_message(f"Runtime; gpu={gpu}; node={node}; host={host}; job={os.environ.get('RIDDLE_JOB_NAME', 'local')}",
+                 level=1, durable=True)
 
 
 def _emit_event(event, *, console=False):

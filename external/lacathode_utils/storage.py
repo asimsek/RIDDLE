@@ -46,8 +46,9 @@ def save_array(path, array):
 
 
 def file_digest(path):
-    with Path(path).open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
+    from riddle.storage import file_digest as shared_digest
+
+    return shared_digest(path, durable=False)
 
 
 def fingerprint_files(root, paths, workers=1):
@@ -92,16 +93,18 @@ def locked(path):
             fcntl.flock(stream, fcntl.LOCK_UN)
 
 
-def verify_artifacts(root, files, label="Verify saved artifacts"):
-    from .worker_progress import ProgressStage
+def verify_artifacts(root, files, label="Verify saved artifacts", *, workers=None):
+    from riddle.storage import verify_artifacts as shared_verify
+    from riddle.worker_progress import _LOCAL_SINK as shared_sink
+    from .worker_progress import _LOCAL_SINK, ProgressStage
 
-    root = Path(root).resolve()
-    with ProgressStage("verify_" + label, label, len(files), "file") as progress:
-        for name, checksum in files.items():
-            path = (root / name).resolve()
-            if not path.is_relative_to(root) or not path.is_file():
-                raise ValueError("Missing or invalid artifact")
-            progress.digest(path, expected=checksum)
+    sink = _LOCAL_SINK.get()
+    token = shared_sink.set(sink) if sink is not None else None
+    try:
+        return shared_verify(root, files, label, workers=workers, progress_class=ProgressStage)
+    finally:
+        if token is not None:
+            shared_sink.reset(token)
 
 
 def rng_state():

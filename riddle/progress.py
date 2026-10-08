@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Iterator
+from .console import status_lines
 
 try:
     from tqdm.auto import tqdm as _tqdm
@@ -70,12 +71,10 @@ def verbosity() -> int:
 
 def _colored_line(message: str, *, kind: str, label: str | None) -> str:
     normalized = kind.upper()
-    prefix = f"[{normalized}]"
-    if label:
-        prefix += f" [{label}]"
     color = "" if os.environ.get("NO_COLOR") is not None else _ANSI.get(normalized, _ANSI["INFO"])
     reset = "" if not color else _ANSI_RESET
-    return f"{color}{prefix}{reset} {message}"
+    return "\n".join(f"{color}{prefix}{reset} {row}" for prefix, row in
+                     status_lines(message, kind=kind, label=label, verbose=_VERBOSITY))
 
 
 def colored_status(message: str, *, kind: str = "INFO", label: str | None = None, level: int = 0) -> None:

@@ -22,7 +22,7 @@ from .resume import check_contract, policy, transition_history
 from .source import COMMIT, REPOSITORY, digest, verify
 from .stability import stability_contract
 from riddle.worker_progress import (
-    EVENT_PREFIX, ProgressStage, emit_message, emit_progress, BufferedLog,
+    EVENT_PREFIX, ProgressStage, emit_message, emit_progress, emit_runtime, BufferedLog,
     durable_progress_line, _emit_event, _OUTPUT_LOCK,
 )
 from riddle.production import NumericalFitError
@@ -216,15 +216,9 @@ def runtime():
 def check_files(root, hashes):
     if not hashes:
         raise ValueError("Empty R-ANODE artifact receipt")
-    for name, expected in hashes.items():
-        path = Path(root) / name
-        if (
-            Path(name).is_absolute()
-            or ".." in Path(name).parts
-            or path.is_symlink()
-            or digest(path) != expected
-        ):
-            raise ValueError("R-ANODE artifact changed: " + name)
+    from riddle.storage import verify_artifacts
+
+    verify_artifacts(root, hashes, "Verify R-ANODE artifacts")
 
 
 def fingerprint(root):
@@ -645,6 +639,9 @@ def run_signal_fits(args, config, background):
 
 
 def run(args):
+    from riddle.storage import configure_verification
+
+    configure_verification(getattr(args, "verify_workers", 8))
     resume_options = policy(args)
     if type(getattr(args, "workers", 1)) is not int or getattr(args, "workers", 1) < 1:
         raise ValueError("R-ANODE workers must be a positive integer")
@@ -689,6 +686,7 @@ def run(args):
             "R-ANODE runtime is incomplete; install requirements.txt locally or use the updated riddle-runtime image"
         ) from error
     checks.update(3, force=True)
+    emit_runtime(environment.get("gpu") or "CPU")
     emit_message(
         f"R-ANODE on {args.device}: shared background {config['background_epochs']} epochs; "
         f"{config['runs']} signal fits × {config['signal_epochs']} epochs; "
@@ -751,7 +749,8 @@ def run(args):
                 "R-ANODE artifacts exist without their result contract; use a new output"
             )
         if saved:
-            resume_progress = ProgressStage("ranode_resume", "Verify resume contract and saved artifacts")
+            resume_started = time.monotonic()
+            emit_message("Verify resume contract and saved artifacts")
             if not args.resume:
                 raise FileExistsError(
                     "R-ANODE result exists; use --resume or a new output"
@@ -781,7 +780,7 @@ def run(args):
                 ))
                 emit_message("Approved R-ANODE resume changes: "
                              + ", ".join(change["field"] for change in changes), kind="WARNING", level=0)
-            resume_progress.update(1, force=True)
+            emit_message(f"Resume verification complete; elapsed_seconds={time.monotonic() - resume_started:.3f}", kind="PASS")
             if saved["completed"]:
                 emit_message("Reuse verified completed R-ANODE result", kind="PASS")
                 return
@@ -970,6 +969,8 @@ def main(argv=None):
     parser.add_argument("--workers", type=int, default=1, help="Concurrent signal fits after the shared background stage")
     parser.add_argument("--mps", choices=("auto", "on", "off"), default="auto")
     parser.add_argument("--io-workers", type=int, default=2)
+    parser.add_argument("--verify-workers", type=int, default=8,
+                        help="Maximum checksum threads per process, independent of I/O and training workers")
     parser.add_argument("--torch-threads", type=int, default=2)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--scan-background-reuse-policy", help=argparse.SUPPRESS)
@@ -990,8 +991,8 @@ def main(argv=None):
         help="With --resume, permit recorded CUDA GPU changes; software and precision stay strict",
     )
     args = parser.parse_args(argv)
-    if args.workers < 1 or args.io_workers < 1 or args.torch_threads < 1:
-        parser.error("Positive workers/I/O workers/PyTorch threads and a nonnegative 32-bit seed are required")
+    if min(args.workers, args.io_workers, args.verify_workers, args.torch_threads) < 1:
+        parser.error("Positive workers/I/O workers/verification workers/PyTorch threads and a nonnegative 32-bit seed are required")
 
     def terminate(signum, frame):
         raise SystemExit(128 + signum)

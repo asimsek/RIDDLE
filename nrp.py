@@ -87,6 +87,8 @@ def job(args):
         str(getattr(args, "scan_bg_workers", 1)),
         "--io-workers",
         str(args.io_workers),
+        "--verify-workers",
+        str(getattr(args, "verify_workers", 8)),
         "--torch-threads",
         str(args.torch_threads),
         "--mps",
@@ -329,6 +331,8 @@ def main(argv=None):
                    help="Concurrent native background preparations across scan strengths or main-workflow seeds")
     p.add_argument("--io-workers", type=positive, default=4,
                    help="Filesystem/host I/O concurrency")
+    p.add_argument("--verify-workers", type=positive, default=8,
+                   help="Maximum checksum threads per process, independent of I/O and training workers")
     p.add_argument("--torch-threads", type=positive, default=2,
                    help="Intra-op CPU threads per training process (default: 2)")
     p.add_argument("--mps", choices=("auto", "on", "off"), default="auto",
