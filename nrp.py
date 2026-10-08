@@ -178,7 +178,9 @@ def job(args):
                                     "MPLCONFIGDIR": f"/shared/work/RIDDLE/.cache/{args.name}/matplotlib",
                                     "XDG_CACHE_HOME": f"/shared/work/RIDDLE/.cache/{args.name}",
                                 }.items()
-                            ],
+                            ] + [{"name": "RIDDLE_NODE_NAME", "valueFrom": {
+                                "fieldRef": {"fieldPath": "spec.nodeName"},
+                            }}],
                             "resources": {"requests": resource, "limits": resource},
                             "volumeMounts": [
                                 {"name": "shared", "mountPath": "/shared"},

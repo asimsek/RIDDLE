@@ -1,7 +1,10 @@
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from copy import deepcopy
+from datetime import datetime, timezone
 import os
 from pathlib import Path
+import socket
 import threading
 import time
 
@@ -9,6 +12,41 @@ from .storage import write_json
 
 NATIVE_METHODS = ("riddle", "iad", "supervised")
 BARRIER_POLL_SECONDS = 0.5
+
+
+@contextmanager
+def log_background_preparation(args, contract):
+    from .worker_progress import emit_message
+
+    host = socket.gethostname()
+    node = os.environ.get("RIDDLE_NODE_NAME") or (
+        "unavailable" if os.environ.get("KUBERNETES_SERVICE_HOST") else host
+    )
+    gpu = "CPU" if str(args.device) == "cpu" else contract.get("environment", {}).get("gpu") or "unavailable"
+    injection = (contract.get("inputs", {}).get("injection_scan") or {}).get("signal_events")
+    identity = (f"method={args.method}; seed={args.seed}; scenario={args.scenario}; "
+                f"signal_events={injection if injection is not None else 'nominal'}; "
+                f"gpu={gpu}; node={node}; host={host}; "
+                f"bg_workers={getattr(args, 'background_concurrency', 1)}; "
+                f"resume_requested={bool(getattr(args, 'resume', False))}")
+    started_utc = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    started = time.monotonic()
+    emit_message(f"BG stages START; start_utc={started_utc}; {identity}", level=0, durable=True)
+    status, error_type = "completed", "none"
+    try:
+        yield
+    except BaseException as error:
+        status = "interrupted" if isinstance(error, (KeyboardInterrupt, SystemExit)) else "failed"
+        error_type = type(error).__name__
+        raise
+    finally:
+        elapsed = time.monotonic() - started
+        ended_utc = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        emit_message(
+            f"BG stages END; start_utc={started_utc}; end_utc={ended_utc}; "
+            f"elapsed_seconds={elapsed:.3f}; status={status}; error_type={error_type}; {identity}",
+            kind="INFO" if status == "completed" else "WARNING", level=0, durable=True,
+        )
 
 
 def record_timing(output, name, seconds, **values):
@@ -28,6 +66,13 @@ def barrier_paths(output):
     return root / "background_stage.ready", root / "background_stage.release"
 
 
+def task_output(task):
+    if any(len(getattr(task, name)) != 1 for name in ("methods", "scenarios", "seeds")):
+        raise ValueError("Background tasks require one method, scenario and seed")
+    return (Path(task.output).resolve() / task.methods[0] / task.scenarios[0]
+            / f"seed_{task.seeds[0]:03d}")
+
+
 def clear_stage_checkpoint(output):
     root = Path(output) / ".resume"
     for path in (root / "background_stage.json", root / "background_stage.pt"):
@@ -40,12 +85,16 @@ def clear_barrier(output):
 
 
 def wait_for_stage_release(output):
+    from .worker_progress import emit_message
+
     ready, release = barrier_paths(output)
     ready.parent.mkdir(parents=True, exist_ok=True)
     write_json(ready, {"pid": os.getpid(), "ready": True})
+    emit_message("Background preparation complete; waiting for fitting slot", level=0)
     while not release.exists():
         time.sleep(BARRIER_POLL_SECONDS)
     clear_barrier(output)
+    emit_message("Background fitting slot released; continuing to fits", level=0)
 
 
 def release_device_cache(device):
@@ -66,9 +115,12 @@ def run_staged(tasks, workers, run_one, *, background_only=False):
     cancel = threading.Event()
     concurrency = min(workers, len(tasks))
     semaphore = threading.Semaphore(concurrency)
-    paths = [barrier_paths(Path(task.output).resolve()) for task in tasks]
-    for task in tasks:
-        clear_barrier(Path(task.output).resolve())
+    outputs = [task_output(task) for task in tasks]
+    if len(set(outputs)) != len(outputs):
+        raise ValueError("Background tasks must have distinct result directories")
+    paths = [barrier_paths(output) for output in outputs]
+    for output in outputs:
+        clear_barrier(output)
 
     if background_only:
         pool = ThreadPoolExecutor(max_workers=concurrency)
@@ -88,16 +140,21 @@ def run_staged(tasks, workers, run_one, *, background_only=False):
             raise
         finally:
             pool.shutdown(wait=True, cancel_futures=True)
-            for task in tasks:
-                clear_barrier(Path(task.output).resolve())
+            for output in outputs:
+                clear_barrier(output)
         return
 
     def execute(task):
         options = deepcopy(task)
         options.background_phase = "staged"
         options.background_concurrency = concurrency
-        semaphore.acquire()
-        ready_path, _ = barrier_paths(Path(options.output).resolve())
+        while not semaphore.acquire(timeout=BARRIER_POLL_SECONDS):
+            if cancel.is_set():
+                return
+        if cancel.is_set():
+            semaphore.release()
+            return
+        ready_path, _ = barrier_paths(task_output(options))
         finished = threading.Event()
         released = threading.Event()
 
@@ -126,6 +183,9 @@ def run_staged(tasks, workers, run_one, *, background_only=False):
         pending = set(range(len(tasks)))
         skipped = set()
         while pending:
+            for future in futures:
+                if future.done():
+                    future.result()
             for index in tuple(pending):
                 future = futures[index]
                 if future.done() and not paths[index][0].exists():
@@ -155,8 +215,8 @@ def run_staged(tasks, workers, run_one, *, background_only=False):
         raise
     finally:
         pool.shutdown(wait=True, cancel_futures=True)
-        for task in tasks:
-            clear_barrier(Path(task.output).resolve())
+        for output in outputs:
+            clear_barrier(output)
 
 
 def run_seed_backgrounds(args, run_one):

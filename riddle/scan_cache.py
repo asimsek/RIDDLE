@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 
 from .resume import check_contract
-from .storage import file_digest, fingerprint_files, write_json
+from .storage import file_digest, fingerprint_files, write_json, read_json, load_array, open_npz
 from .worker_progress import emit_message
 
 _BACKGROUND_POPULATIONS = {}
@@ -15,7 +15,7 @@ def background_population(directory, manifest=None):
 
     directory = Path(directory).resolve()
     if manifest is None:
-        manifest = json.loads((directory / "inputs.json").read_text())
+        manifest = read_json(directory / "inputs.json")
     names = [f"{region}data_{part}.npy" for region in ("inner", "outer") for part in ("train", "val", "test")]
     names += [f"innerdata_extrabkg_{part}.npy" for part in ("train", "val", "test")]
     expected = {name: manifest.get("files", {}).get(name) for name in names}
@@ -33,9 +33,9 @@ def background_population(directory, manifest=None):
         if file_digest(directory / name) != checksum:
             raise ValueError(f"Background population artifact changed: {directory / name}")
     result = {}
-    with np.load(directory / "event_ids.npz", allow_pickle=False) as archive:
+    with open_npz(directory / "event_ids.npz", allow_pickle=False) as archive:
         for name in names:
-            rows = np.load(directory / name, mmap_mode="r", allow_pickle=False)
+            rows = load_array(directory / name, mmap_mode="r", allow_pickle=False)
             ids = archive[name]
             if ids.shape != (len(rows), 2) or ids.dtype != np.uint64:
                 raise ValueError(f"Invalid background event identities: {directory / name}")
@@ -152,7 +152,7 @@ def resolve_reference(root, report):
     if not source.is_absolute() or source.resolve() == Path(root).resolve():
         raise ValueError("Invalid scan reference source")
     path = source / "result.json"
-    original = json.loads(path.read_text())
+    original = read_json(path)
     if original.get("completed") is not True or original.get("scan_reuse") is not None:
         raise ValueError("Scan references require an original completed result")
     if reference_content(report) != reference_content(original):
@@ -208,11 +208,11 @@ def configure_background_reuse(args, contract):
     for candidate in candidates:
         source = Path(candidate).resolve()
         try:
-            report = json.loads((source / "result.json").read_text())
+            report = read_json(source / "result.json")
             source, report = resolve_reference(source, report)
             if getattr(args, "lacathode_replica", False):
                 source = source / "runs" / f"run_{args.run_index:03d}"
-                report = json.loads((source / "result.json").read_text())
+                report = read_json(source / "result.json")
             previous = report["contract"]
             if (report.get("completed") is not True or previous.get("method") != contract["method"]
                     or report.get("seed") != args.seed or report.get("scenario") != "signal_injection"
@@ -223,7 +223,7 @@ def configure_background_reuse(args, contract):
                            allow_code_change=getattr(args, "resume_across_code_change", False),
                            allow_device_change=getattr(args, "resume_across_device_change", False))
             nominal_data = Path(args.scan_background_data)
-            nominal_inputs = json.loads((nominal_data / "inputs.json").read_text())
+            nominal_inputs = read_json(nominal_data / "inputs.json")
             if comparison_contract({"inputs": previous["inputs"]}) != comparison_contract({"inputs": nominal_inputs}):
                 raise ValueError("Nominal prepared data differ from the background model's original inputs")
             require_background_population(background_population(nominal_data, nominal_inputs),
@@ -262,7 +262,7 @@ def reuse_completed(output, contract, candidates=(), *, resume=False, allow_code
         return False
     output = Path(output)
     destination = output / "result.json"
-    existing = json.loads(destination.read_text()) if destination.exists() else None
+    existing = read_json(destination) if destination.exists() else None
     if existing is not None and existing.get("scan_reuse") is None:
         return False
     if existing is not None:
@@ -278,7 +278,7 @@ def reuse_completed(output, contract, candidates=(), *, resume=False, allow_code
         if source == output.resolve():
             continue
         try:
-            original = json.loads((source / "result.json").read_text())
+            original = read_json(source / "result.json")
             source, original = resolve_reference(source, original)
             if original.get("completed") is not True:
                 continue

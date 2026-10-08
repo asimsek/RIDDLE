@@ -4,7 +4,7 @@ from copy import deepcopy
 import numpy as np
 import torch
 
-from riddle.storage import seed_start, save_array, write_json
+from riddle.storage import seed_start, save_array, write_json, read_json, load_array, load_checkpoint
 from riddle.epoch_hook import install_epoch_recovery
 from riddle.acceleration import install_validation_counts
 from riddle.worker_progress import ProgressStage
@@ -28,7 +28,7 @@ def require_common_mapping(selection):
 
 
 def flow_selection(output):
-    losses = np.load(output / "riddle_model_val_losses.npy")
+    losses = load_array(output / "riddle_model_val_losses.npy")
     if losses.dtype != np.float32 or not np.isfinite(losses).all() or len(losses) <= 10:
         raise ValueError("Invalid initial-plus-trained flow validation loss array")
     mapping = ordered_epochs(losses, 10, initial_entry=True)
@@ -66,7 +66,7 @@ def prepare(data, output, seed, device, recovery, *, settings=None):
     data, output = Path(data), Path(output)
     settings = deepcopy(DEFAULTS["background"] if settings is None else settings)
     configuration = settings["configuration"]
-    configuration["num_inputs"] = np.load(data / "outerdata_train.npy", mmap_mode="r").shape[1] - 2
+    configuration["num_inputs"] = load_array(data / "outerdata_train.npy", mmap_mode="r").shape[1] - 2
     write_json(output / "background_settings.json", settings)
     install_validation_counts(flow_training, output / "validation_diagnostics.json")
     install_epoch_recovery(flow_training, "train_ANODE", "flow", recovery)
@@ -146,15 +146,15 @@ class Mapper:
     def __init__(self, data, output, epoch, device):
         import json
 
-        selection = json.loads((Path(output) / "flow_selection.json").read_text())
+        selection = read_json(Path(output) / "flow_selection.json")
         require_common_mapping(selection)
         if epoch != selection["inference_mapping_epoch"]:
             raise ValueError("Requested inference checkpoint differs from the verified flow selection")
         self.device = device
-        self.reference = load_dataset(np.load(Path(data) / "outerdata_train.npy").astype("float32"))
-        settings = json.loads((Path(output) / "background_settings.json").read_text())
+        self.reference = load_dataset(load_array(Path(data) / "outerdata_train.npy").astype("float32"))
+        settings = read_json(Path(output) / "background_settings.json")
         self.model = DensityEstimator(settings["configuration"], eval_mode=True).model
-        weights = torch.load(
+        weights = load_checkpoint(
             Path(output) / f"riddle_model_epoch_{epoch}.par", map_location="cpu", weights_only=True
         )
         self.model.load_state_dict(weights)
@@ -179,7 +179,7 @@ class Mapper:
         """Reproduce development_rows membership/order, replacing z with x and log p_B."""
         real = []
         for suffix in ("train", "val"):
-            original = np.load(Path(data) / f"innerdata_{suffix}.npy").astype(np.float32)
+            original = load_array(Path(data) / f"innerdata_{suffix}.npy").astype(np.float32)
             features, mask = self.physical(original)
             real.append(np.column_stack((original[mask, 0], features, np.ones(mask.sum()),
                                          original[mask, -1])).astype(np.float32))

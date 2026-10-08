@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from .enhancements import Rosenblatt, save_torch, load_torch, clip_gradients
 from .integrity import SCIENTIFIC_VERSION, RIDDLE_BENCHMARK_SCIENTIFIC_VERSION, require_finite, train_flow_epoch
 from .preprocessing import load_dataset
-from .storage import digest, file_digest, write_json, save_array, seed_start, rng_state, restore_rng, atomic_write, save_npz, persist_boundary
+from .storage import digest, file_digest, write_json, save_array, seed_start, rng_state, restore_rng, atomic_write, save_npz, persist_boundary, read_json, load_array, open_npz, load_checkpoint, copy_file
 from .worker_progress import emit_message
 
 PREPROCESS_KEYS = ("min", "max", "mean2", "std2", "std2_logit_fix")
@@ -93,7 +93,7 @@ def _map_roles_by_source(mapper, sources, roles):
 def split_roles(data, seed, *, calibration):
     """Source-row partitions are saved and never depend on MC labels."""
     data = Path(data)
-    sources = {name: np.load(data / (name+".npy")).astype(np.float32)
+    sources = {name: load_array(data / (name+".npy")).astype(np.float32)
                for name in ("outerdata_train", "outerdata_val", "innerdata_train", "innerdata_val")}
     for name, rows in sources.items():
         require_finite(rows[:, :-1], name)
@@ -130,16 +130,16 @@ class Mapper:
     """Reloadable frozen map, with preprocessing fitted on map-training rows only."""
     def __init__(self, output, device="cpu"):
         self.output, self.device = Path(output), device
-        self.selection = json.loads((self.output / "flow_selection.json").read_text())
-        metadata = json.loads((self.output / "mapping_settings.json").read_text())
+        self.selection = read_json(self.output / "flow_selection.json")
+        metadata = read_json(self.output / "mapping_settings.json")
         self.options = metadata["options"]
-        runtime_background = (json.loads((self.output / "background_settings.json").read_text())
+        runtime_background = (read_json(self.output / "background_settings.json")
                               if (self.output / "background_settings.json").exists() else metadata["background"])
         self.inference_batch_size = int(runtime_background.get("mapping_inference_batch_size", 65536))
         self.reference = load_torch(self.output / "preprocessing.pt")
         self.mass_mean, self.mass_std = metadata["mass_parameters"]
         self.model = build_mapping(metadata["configuration"], self.options, metadata["features"], metadata["seed"], device)
-        self.model.load_state_dict(torch.load(self.output / "model.pt", map_location=device, weights_only=True))
+        self.model.load_state_dict(load_checkpoint(self.output / "model.pt", map_location=device, weights_only=True))
         self.model.eval().requires_grad_(False)
         self.last_inference_batch_size = None
 
@@ -177,7 +177,7 @@ def _frozen_sideband_roles(data, roles, production_contract):
     if not path.is_file() or file_digest(path) != frozen["artifacts_sha256"].get(name):
         raise ValueError("Nominal sideband role identities are missing or failed verification")
     result = {name: dict(role) for name, role in roles.items()}
-    with np.load(path, allow_pickle=False) as original, np.load(Path(data) / "event_ids.npz", allow_pickle=False) as current:
+    with open_npz(path, allow_pickle=False) as original, open_npz(Path(data) / "event_ids.npz", allow_pickle=False) as current:
         for name, role in result.items():
             if not role["source"].startswith("outerdata_"):
                 continue
@@ -207,7 +207,7 @@ def _mapping_reuse_candidate(candidate, current_contract, seed, source_signature
     if not report_path.is_file():
         return None
     try:
-        report = json.loads(report_path.read_text())
+        report = read_json(report_path)
     except json.JSONDecodeError:
         return None
     method = str(report.get("method", ""))
@@ -245,8 +245,8 @@ def _mapping_reuse_candidate(candidate, current_contract, seed, source_signature
             return None
         verified[str(relative)] = path
     try:
-        metadata = json.loads(verified["background/mapping_settings.json"].read_text())
-        selection = json.loads(verified["background/flow_selection.json"].read_text())
+        metadata = read_json(verified["background/mapping_settings.json"])
+        selection = read_json(verified["background/flow_selection.json"])
     except json.JSONDecodeError:
         return None
     previous_signature, target_signature = _reuse_signature(metadata), _reuse_signature(current_contract)
@@ -272,7 +272,7 @@ def _activate_mapping_reuse(output, candidates, current_contract, seed, source_s
     frozen = (production_contract or {}).get("scan_background")
     policy = "nominal_background_v1" if frozen else "exact_mapping_inputs_v1"
     if manifest_path.exists():
-        manifest = json.loads(manifest_path.read_text())
+        manifest = read_json(manifest_path)
         if manifest.get("policy") != policy:
             raise ValueError("Unrecognized mapping reuse policy")
         if manifest.get("target_seed") != seed or manifest.get("target_signature") != _reuse_signature(current_contract):
@@ -312,7 +312,7 @@ def _activate_mapping_reuse(output, candidates, current_contract, seed, source_s
     for relative, source_path in {**verified, **optional}.items():
         target_name = Path(relative).name
         target = output / target_name
-        shutil.copy2(source_path, target)
+        copy_file(source_path, target)
         copied[target_name] = file_digest(target)
     manifest = {
         "schema": 1,
@@ -378,7 +378,7 @@ def prepare(data, output, seed, device, *, background, options, data_policy=None
     if manifest_path.is_file():
         try:
             from .data import benchmark_source_signature
-            source_signature = benchmark_source_signature(json.loads(manifest_path.read_text()))
+            source_signature = benchmark_source_signature(read_json(manifest_path))
         except (OSError, ValueError, json.JSONDecodeError):
             source_signature = None
     mapping_reuse = None if experiment is not None else _activate_mapping_reuse(
@@ -394,7 +394,7 @@ def prepare(data, output, seed, device, *, background, options, data_policy=None
     if mapping_reuse is None:
         if settings_path.exists():
             from .resume import check_derived_contract
-            saved_contract = json.loads(settings_path.read_text())
+            saved_contract = read_json(settings_path)
             check_derived_contract(saved_contract, contract,
                                    allow_device_change=allow_device_change,
                                    device_paths={("device",)},
@@ -479,7 +479,7 @@ def prepare(data, output, seed, device, *, background, options, data_policy=None
                          truth_labels_used=False)
         write_json(output / "flow_selection.json", selection)
     else:
-        selection = json.loads((output / "flow_selection.json").read_text())
+        selection = read_json(output / "flow_selection.json")
     mapper = Mapper(output, device)
     mapped, inference_batch_used = _map_roles_by_source(mapper, sources, roles)
     if inference_batch_used is None:

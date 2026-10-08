@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 import re
 
+from .storage import read_json
+
 
 def add_resume_options(parser, *, always_resume=False):
     parser.add_argument(
@@ -120,7 +122,7 @@ def record_transition(path, previous, current, changes, *, action):
     from .storage import write_json
 
     path = Path(path)
-    history = json.loads(path.read_text()) if path.exists() else {"schema": 1, "transitions": []}
+    history = read_json(path) if path.exists() else {"schema": 1, "transitions": []}
     if history.get("schema") != 1 or not isinstance(history.get("transitions"), list):
         raise ValueError("Invalid resume history; refusing to overwrite it")
     history["transitions"].append({
@@ -165,7 +167,7 @@ def inspect_resume(output, contract, *, resume=False, **policy):
     """Preflight both result and stage contracts before updating either manifest."""
     output = Path(output)
     result_path = output / "result.json"
-    saved = json.loads(result_path.read_text()) if result_path.exists() else None
+    saved = read_json(result_path) if result_path.exists() else None
     changes = []
     if saved is not None:
         if not resume:
@@ -181,5 +183,5 @@ def inspect_resume(output, contract, *, resume=False, **policy):
     if stage_path.exists():
         if not resume:
             raise FileExistsError("Training recovery exists; use --resume or a new output")
-        check_contract(json.loads(stage_path.read_text()), contract, **policy)
+        check_contract(read_json(stage_path), contract, **policy)
     return saved, changes

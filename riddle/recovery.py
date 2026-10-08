@@ -13,6 +13,7 @@ from .storage import (
     verify_artifacts,
     persist_boundary,
     save_array,
+    read_json, load_checkpoint,
 )
 from .worker_progress import emit_progress
 from .resume import check_contract, record_transition
@@ -43,13 +44,13 @@ class EpochRecovery:
         if self.manifest.exists():
             if not resume:
                 raise FileExistsError("Work already started; use --resume")
-            previous = json.loads(self.manifest.read_text())
+            previous = read_json(self.manifest)
             changes = check_contract(
                 previous, contract, allow_code_change=allow_code_change,
                 allow_device_change=allow_device_change,
             )
             if self.path.exists():
-                self.state = torch.load(self.path, map_location="cpu", weights_only=False)
+                self.state = load_checkpoint(self.path, map_location="cpu", weights_only=False)
                 self.done = self.state["done"][:]
                 self.files = dict(self.state["files"])
                 verify_artifacts(self.root, self.files, "Verify training recovery")

@@ -3,7 +3,7 @@ import time
 from pathlib import Path
 import numpy as np
 
-from riddle.storage import atomic_write, save_npz, write_json, digest, file_digest
+from riddle.storage import atomic_write, save_npz, write_json, digest, file_digest, read_json, load_array, open_npz
 from riddle.recovery import EpochRecovery
 from riddle.acceleration import install_tensor_batches, execution_report
 from .latent import prepare, Mapper
@@ -54,10 +54,10 @@ def _prepare_oracle_roles(args, mapper, training, validation, development):
     from .model import with_mass_context
 
     data = Path(args.data)
-    with np.load(data / "event_ids.npz", allow_pickle=False) as archive:
+    with open_npz(data / "event_ids.npz", allow_pickle=False) as archive:
         ids = {name: archive[name] for name in archive.files}
-    background_train = np.load(data / "innerdata_extrabkg_train.npy", allow_pickle=False)
-    background_val = np.load(data / "innerdata_extrabkg_val.npy", allow_pickle=False)
+    background_train = load_array(data / "innerdata_extrabkg_train.npy", allow_pickle=False)
+    background_val = load_array(data / "innerdata_extrabkg_val.npy", allow_pickle=False)
     population = prepared_config(data)
     selector = {}
     if population is None:
@@ -83,8 +83,8 @@ def _prepare_oracle_roles(args, mapper, training, validation, development):
         p_train_ids = development["residual_train"].get("ids") if development is not None else ids["innerdata_train.npy"]
         p_validation_ids = development["evidence"].get("ids") if development is not None else ids["innerdata_val.npy"]
     elif args.method == "supervised":
-        signal_train = np.load(data / "innerdata_extrasig_train.npy", allow_pickle=False)
-        signal_val = np.load(data / "innerdata_extrasig_val.npy", allow_pickle=False)
+        signal_train = load_array(data / "innerdata_extrasig_train.npy", allow_pickle=False)
+        signal_val = load_array(data / "innerdata_extrasig_val.npy", allow_pickle=False)
         ptrain, _, _ = _map_oracle_rows(mapper, signal_train, 1)
         pvalidation, pval_z, pval_mass = _map_oracle_rows(mapper, signal_val, 1)
         member_splits = None
@@ -148,6 +148,13 @@ def _prepare_oracle_roles(args, mapper, training, validation, development):
 
 
 def prepare_background(args, contract):
+    from .background_stage import log_background_preparation
+
+    with log_background_preparation(args, contract):
+        return _prepare_background(args, contract)
+
+
+def _prepare_background(args, contract):
     output = args.output
     latent_root = output / "background"
     recovery = EpochRecovery(latent_root, contract, args.resume, **resume_policy(args))
@@ -189,7 +196,7 @@ def prepare_background(args, contract):
     else:
         selection = prepare(args.data, latent_root, args.seed, args.device, recovery, settings=settings["background"])
     training, validation = ordered_map(
-        np.load,
+        load_array,
         [latent_root / name for name in ("training_latents.npy", "validation_latents.npy")],
         args.io_workers,
     )
@@ -200,7 +207,7 @@ def prepare_background(args, contract):
         "validation_latents_sha256": digest(validation),
         "selection": selection,
     }
-    selection_validation = np.load(latent_root / "mixture_validation_latents.npy") if enhanced else None
+    selection_validation = load_array(latent_root / "mixture_validation_latents.npy") if enhanced else None
     if shared_scoring:
         # Reserve this mixture for score selection only.
         selection_validation = None
@@ -290,7 +297,7 @@ def prepare_background(args, contract):
     evaluation_ids = {}
     ids_path = args.data / "event_ids.npz"
     if ids_path.exists():
-        with np.load(ids_path, allow_pickle=False) as archive:
+        with open_npz(ids_path, allow_pickle=False) as archive:
             source_event_ids = {k: archive[k] for k in archive.files}
     else:
         source_event_ids = None
@@ -305,7 +312,7 @@ def prepare_background(args, contract):
                                           ("innerdata_val.npy", "outerdata_val.npy"))
         else:
             rows, region = evaluation_rows(
-                ordered_map(np.load, [args.data / name for name in names], args.io_workers), names)
+                ordered_map(load_array, [args.data / name for name in names], args.io_workers), names)
         if source_event_ids is not None:
             evaluation_ids[partition] = (np.concatenate([development[k]["source_ids"] for k in ("evidence", "closure")])
                 if enhanced and partition == "validation" else np.concatenate([source_event_ids[n] for n in names]))
@@ -563,7 +570,7 @@ def finish(args, contract, *, acceleration,
         write_json(output / "score_comparison.json", paired_score_metrics(
             exports["signal_region"], settings["riddle"]["stein"]["scoring"]["auto_switch"]["efficiencies"]))
     write_json(output / "mapping_acceptance.json", acceptance)
-    stein_scoring = (json.loads((output / "density/stein_scoring_calibration.json").read_text())
+    stein_scoring = (read_json(output / "density/stein_scoring_calibration.json")
                      if core == "stein_witness" else None)
     scoring_cfg = effective_scoring
     if shared_scoring:

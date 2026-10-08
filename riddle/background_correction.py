@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from .integrity import SCIENTIFIC_VERSION, RIDDLE_BENCHMARK_SCIENTIFIC_VERSION, require_finite
 from .model import build_signal_flow, match_background
 from .storage import (atomic_torch_save, digest, file_digest, rng_state, restore_rng,
-                      write_json, persist_boundary)
+                      read_json, load_checkpoint, copy_file, write_json, persist_boundary)
 from .worker_progress import emit_message
 from .options import feature_options
 from .settings import sr_closure_mode
@@ -555,14 +555,14 @@ def train(directory, train_z, train_mass, val_z, val_mass, *, settings, seed, de
                          closure_z, closure_mass)
     contract_path = directory / "contract.json"
     if contract_path.exists():
-        previous = json.loads(contract_path.read_text())
+        previous = read_json(contract_path)
         changes = _check_mapped_contract(previous, contract, allow_device_change,
                                          directory / ".resume/device_history.json")
         if changes and (directory / "model.pt").is_file() and (directory / "selection.json").is_file():
-            state = torch.load(directory / "model.pt", map_location="cpu", weights_only=False)
+            state = load_checkpoint(directory / "model.pt", map_location="cpu", weights_only=False)
             if state.get("contract") != previous:
                 raise ValueError("Completed background-correction contract changed")
-            decision = json.loads((directory / "selection.json").read_text())
+            decision = read_json(directory / "selection.json")
             active = decision.get("status") == "activated" and bool(decision.get("active"))
             emit_message("Reuse completed background correction after approved GPU migration", level=0)
             return dict(requested_mode=MODE, active=active,
@@ -591,7 +591,7 @@ def train(directory, train_z, train_mass, val_z, val_mass, *, settings, seed, de
     best_eligible, best_eligible_epoch, best_eligible_model = float("inf"), None, None
     latest = directory / ".resume/latest.pt"
     if latest.exists():
-        state = torch.load(latest, map_location=device, weights_only=False)
+        state = load_checkpoint(latest, map_location=device, weights_only=False)
         _check_mapped_contract(state.get("contract"), contract, allow_device_change)
         model.load_state_dict(state["model"])
         optimizer.load_state_dict(state["optimizer"])
@@ -830,7 +830,7 @@ def _activate_oracle_reuse(directory, candidates, contract, current_code, allow_
         if not result_path.is_file():
             continue
         try:
-            report = json.loads(result_path.read_text())
+            report = read_json(result_path)
         except (OSError, json.JSONDecodeError):
             continue
         if report.get("completed") is not True or report.get("method") not in ("iad", "supervised"):
@@ -858,19 +858,19 @@ def _activate_oracle_reuse(directory, candidates, contract, current_code, allow_
         if not valid:
             continue
         try:
-            source_contract = json.loads(verified["contract.json"].read_text())
+            source_contract = read_json(verified["contract.json"])
         except (OSError, json.JSONDecodeError):
             continue
         if source_contract != contract:
             continue
         directory.mkdir(parents=True, exist_ok=True)
         for name, path in verified.items():
-            shutil.copy2(path, directory / name)
+            copy_file(path, directory / name)
         history = base / "history.json"
         relative = "density/background_correction/history.json"
         expected = report.get("artifacts_sha256", {}).get(relative)
         if expected is not None and history.is_file() and file_digest(history) == expected:
-            shutil.copy2(history, directory / "history.json")
+            copy_file(history, directory / "history.json")
         reuse = {
             "policy": "shared_oracle_sr_background_v1",
             "source_result": str(source),
@@ -911,14 +911,14 @@ def train_oracle(directory, train_z, train_mass, val_z, val_mass, closure_z, clo
         _activate_oracle_reuse(directory, reuse_candidates, contract, current_code, allow_code_change,
                               production_contract, allow_device_change)
     if contract_path.exists():
-        _check_mapped_contract(json.loads(contract_path.read_text()), contract, allow_device_change,
+        _check_mapped_contract(read_json(contract_path), contract, allow_device_change,
                                directory / ".resume/device_history.json")
     if (directory / "model.pt").is_file() and (directory / "selection.json").is_file():
-        selection = json.loads((directory / "selection.json").read_text())
+        selection = read_json(directory / "selection.json")
         active = selection.get("status") == "activated" and bool(selection.get("active"))
         if not active:
             raise ValueError("Oracle background q_phi failed Gaussian validation; refusing a Gaussian denominator fallback")
-        return {"requested_mode": MODE, "active": active, "descriptor": descriptor(directory), "selection": selection, "reuse": json.loads((directory / "reuse.json").read_text()) if (directory / "reuse.json").is_file() else None}
+        return {"requested_mode": MODE, "active": active, "descriptor": descriptor(directory), "selection": selection, "reuse": read_json(directory / "reuse.json") if (directory / "reuse.json").is_file() else None}
     write_json(contract_path, contract)
     torch.manual_seed(int(seed))
     np.random.seed(int(seed) % 2**32)
@@ -929,7 +929,7 @@ def train_oracle(directory, train_z, train_mass, val_z, val_mass, closure_z, clo
     best_eligible, best_eligible_epoch, best_eligible_model = float("inf"), None, None
     latest = directory / ".resume/latest.pt"
     if latest.exists():
-        state = torch.load(latest, map_location=device, weights_only=False)
+        state = load_checkpoint(latest, map_location=device, weights_only=False)
         _check_mapped_contract(state.get("contract"), contract, allow_device_change)
         model.load_state_dict(state["model"])
         optimizer.load_state_dict(state["optimizer"])
@@ -1027,7 +1027,7 @@ def train_oracle(directory, train_z, train_mass, val_z, val_mass, closure_z, clo
         emit_message("Oracle background correction failed Gaussian validation gate; refusing Gaussian denominator fallback", level=0)
         raise ValueError("Oracle background q_phi failed Gaussian validation; refusing a Gaussian denominator fallback")
     emit_message("Oracle background correction activated", level=0)
-    return {"requested_mode": MODE, "active": True, "descriptor": descriptor(directory), "selection": decision, "reuse": json.loads((directory / "reuse.json").read_text()) if (directory / "reuse.json").is_file() else None}
+    return {"requested_mode": MODE, "active": True, "descriptor": descriptor(directory), "selection": decision, "reuse": read_json(directory / "reuse.json") if (directory / "reuse.json").is_file() else None}
 
 
 def reuse(directory, source_result, *, expected_contract, frozen=False, allow_device_change=False):
@@ -1039,14 +1039,14 @@ def reuse(directory, source_result, *, expected_contract, frozen=False, allow_de
     expected_signature = expected_contract
     policy = "nominal_background_v1" if frozen else "exact_background_correction_inputs_v1"
     if manifest_path.exists():
-        manifest = json.loads(manifest_path.read_text())
+        manifest = read_json(manifest_path)
         if manifest.get("policy") != policy or manifest.get("target_signature") != expected_signature:
             raise ValueError("Background-correction reuse settings changed; use a new output")
         for name, expected in manifest.get("local_artifacts_sha256", {}).items():
             path = directory / name
             if not path.is_file() or file_digest(path) != expected:
                 raise ValueError("Reused background-correction artifact changed or is missing")
-        selection = json.loads((directory / "selection.json").read_text())
+        selection = read_json(directory / "selection.json")
         active = selection.get("status") == "activated" and bool(selection.get("active"))
         return dict(requested_mode=MODE, active=active, descriptor=descriptor(directory) if active else None,
                     selection=selection, reuse=manifest)
@@ -1057,7 +1057,7 @@ def reuse(directory, source_result, *, expected_contract, frozen=False, allow_de
     if not report_path.is_file():
         return None
     try:
-        report = json.loads(report_path.read_text())
+        report = read_json(report_path)
     except json.JSONDecodeError:
         return None
     native = str(report.get("method", "")).startswith("riddle") or (frozen and report.get("method") in ("iad", "supervised"))
@@ -1073,7 +1073,7 @@ def reuse(directory, source_result, *, expected_contract, frozen=False, allow_de
         if expected is None or not path.is_file() or file_digest(path) != expected:
             return None
         source_paths[name] = path
-    source_contract = json.loads(source_paths["contract.json"].read_text())
+    source_contract = read_json(source_paths["contract.json"])
     previous, current = dict(source_contract), dict(expected_signature)
     if frozen:
         previous.pop("hashes", None)
@@ -1091,9 +1091,9 @@ def reuse(directory, source_result, *, expected_contract, frozen=False, allow_de
     copied = {}
     for name, source_path in source_paths.items():
         target = directory / name
-        shutil.copy2(source_path, target)
+        copy_file(source_path, target)
         copied[name] = file_digest(target)
-    selection = json.loads((directory / "selection.json").read_text())
+    selection = read_json(directory / "selection.json")
     active = selection.get("status") == "activated" and bool(selection.get("active"))
     manifest = {
         "schema": 1,
@@ -1131,12 +1131,12 @@ def independent_closure_diagnostic(model, latent, mass, device, *, selected_deno
 
 def descriptor(directory):
     directory = Path(directory)
-    state = torch.load(directory / "model.pt", map_location="cpu", weights_only=False)
+    state = load_checkpoint(directory / "model.pt", map_location="cpu", weights_only=False)
     contract = state["contract"]
     protocol = contract.get("protocol", PROTOCOL)
     if contract.get("mode") != MODE or protocol not in READABLE_PROTOCOLS or type(contract.get("epochs")) is not int or contract["epochs"] < 10:
         raise ValueError("Invalid RIDDLE background model")
-    selection = json.loads((directory / "selection.json").read_text())
+    selection = read_json(directory / "selection.json")
     if selection.get("status") != "activated" or not selection.get("active"):
         raise ValueError("Inactive background correction cannot be used as the RIDDLE denominator")
     return dict(mode=MODE, protocol=protocol, epochs=int(contract["epochs"]),
@@ -1153,7 +1153,7 @@ def load(description, settings, features, device):
     path = Path(description["model_path"])
     if not path.is_file() or file_digest(path) != description.get("model_sha256"):
         raise ValueError("Shared background-correction artifact changed or is missing")
-    state = torch.load(path, map_location=device, weights_only=False)
+    state = load_checkpoint(path, map_location=device, weights_only=False)
     if state.get("contract") != description.get("contract"):
         raise ValueError("Shared background-correction contract changed")
     model = _model(settings, features, device)
@@ -1170,7 +1170,7 @@ def save_local(directory, model, description):
                "selected_epoch": description["selected_epoch"],
                "contract": description["contract"]}
     if path.exists():
-        saved = torch.load(path, map_location="cpu", weights_only=False)
+        saved = load_checkpoint(path, map_location="cpu", weights_only=False)
         if saved.get("mode") != MODE or saved.get("source_sha256") != description["model_sha256"] or saved.get("contract") != description["contract"]:
             raise ValueError("Persisted fit background correction changed")
     else:
@@ -1182,7 +1182,7 @@ def load_local(directory, settings, features, device):
     path = Path(directory) / "background_correction.pt"
     if not path.exists():
         return None
-    saved = torch.load(path, map_location=device, weights_only=False)
+    saved = load_checkpoint(path, map_location=device, weights_only=False)
     if saved.get("mode") != MODE or saved.get("protocol") not in READABLE_PROTOCOLS:
         raise ValueError("Invalid fit-local background correction")
     model = _model(settings, features, device)

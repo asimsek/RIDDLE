@@ -354,7 +354,7 @@ for SEED in 40 41 42 43 44; do
     --workflow scan --name "riddle-injection-scan-seed${SEED}" --methods riddle --seed "$SEED" \
     --config config/settings.yaml --data data/injection_scan --results results_injection_scan \
     --reuse-results results --resume-across-code-change \
-    --fits 20 --epochs 100 --workers 5 --scan-bg-workers 4 --io-workers 2 --torch-threads 2 --mps on \
+    --fits 20 --epochs 100 --workers 5 --scan-bg-workers 7 --io-workers 2 --torch-threads 2 --mps on \
     | kubectl apply -n cua-asimsek -f - || break
 done
 ```
@@ -368,7 +368,7 @@ for SEED in 40 41 42 43 44; do
     --workflow scan --name "iad-injection-scan-seed${SEED}" --methods iad --seed "$SEED" \
     --config config/settings.yaml --data data/injection_scan --results results_injection_scan \
     --reuse-results results --resume-across-code-change \
-    --fits 20 --epochs 100 --workers 5 --scan-bg-workers 4 --io-workers 2 --torch-threads 2 --mps on \
+    --fits 20 --epochs 100 --workers 5 --scan-bg-workers 7 --io-workers 2 --torch-threads 2 --mps on \
     | kubectl apply -n cua-asimsek -f - || break
 done
 ```
@@ -382,7 +382,7 @@ for SEED in 40 41 42 43 44; do
     --workflow scan --name "supervised-injection-scan-seed${SEED}" --methods supervised --seed "$SEED" \
     --config config/settings.yaml --data data/injection_scan --results results_injection_scan \
     --reuse-results results --resume-across-code-change \
-    --fits 20 --epochs 100 --workers 5 --scan-bg-workers 4 --io-workers 2 --torch-threads 2 --mps on \
+    --fits 20 --epochs 100 --workers 5 --scan-bg-workers 7 --io-workers 2 --torch-threads 2 --mps on \
     | kubectl apply -n cua-asimsek -f - || break
 done
 ```

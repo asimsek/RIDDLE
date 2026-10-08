@@ -6,7 +6,7 @@ import subprocess
 import sys
 from types import SimpleNamespace
 
-from .storage import code_hashes, environment, file_digest, write_json, verify_artifacts, fingerprint_files
+from .storage import code_hashes, environment, file_digest, write_json, verify_artifacts, fingerprint_files, read_json
 from .data import validate
 from .worker_progress import emit_message
 from .resume import inspect_resume, record_transition, resume_policy
@@ -224,7 +224,7 @@ def main():
     if completed:
         if oracle_method:
             history_path = args.output / ".resume" / "resume_history.json"
-            saved["resume_history"] = json.loads(history_path.read_text()) if history_path.is_file() else {"schema": 1, "transitions": []}
+            saved["resume_history"] = read_json(history_path) if history_path.is_file() else {"schema": 1, "transitions": []}
             write_json(path, saved)
         emit_message("Reuse verified completed result; original provenance retained", kind="PASS")
         return
@@ -274,7 +274,7 @@ def main():
         if oracle_method:
             protocol_path = args.output / "protocol.json"
             if protocol_path.is_file():
-                protocol = json.loads(protocol_path.read_text())
+                protocol = read_json(protocol_path)
                 report.update(oracle_benchmark=protocol.get("oracle_benchmark"),
                               score_scope=protocol.get("score_scope"),
                               objective=protocol.get("objective"),
@@ -299,7 +299,7 @@ def main():
     ]
     history_path = args.output / ".resume" / "resume_history.json"
     if oracle_method:
-        report["resume_history"] = json.loads(history_path.read_text()) if history_path.is_file() else {"schema": 1, "transitions": []}
+        report["resume_history"] = read_json(history_path) if history_path.is_file() else {"schema": 1, "transitions": []}
     report.update(completed=True, artifacts_sha256=fingerprint_files(args.output, artifacts, args.io_workers))
     write_json(path, report)
     if native_method:

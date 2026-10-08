@@ -12,7 +12,7 @@ from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from pathlib import Path
 from .progress import colored_status, training_progress, verbosity, _duration, _short_value
-from .storage import IO_PERSIST_EVERY, WORKER_LOG_FLUSH_SECONDS
+from .storage import IO_PERSIST_EVERY, WORKER_LOG_FLUSH_SECONDS, timed_io
 
 EVENT_PREFIX = "[RIDDLE_WORKER_PROGRESS] "
 _LOCAL_SINK = ContextVar("riddle_progress_sink", default=None)
@@ -45,6 +45,8 @@ class BufferedLog:
 
 
 def durable_progress_event(event):
+    if event.get("durable") is True:
+        return True
     if event.get("unit") != "epoch" or event.get("completed") is None:
         return False
     completed = int(event["completed"]); total = int(event.get("total", 0) or 0)
@@ -81,16 +83,21 @@ def emit_progress(
     _emit_event(event)
 
 
-def emit_message(message, *, kind="INFO", level=1):
-    _emit_event({"message": message, "kind": kind, "level": level})
+def emit_message(message, *, kind="INFO", level=1, durable=False, console=False):
+    event = {"message": message, "kind": kind, "level": level}
+    if durable:
+        event["durable"] = True
+    _emit_event(event, console=console)
 
 
-def _emit_event(event):
+def _emit_event(event, *, console=False):
     sink = _LOCAL_SINK.get()
     if sink is not None:
         sink(event)
     elif os.environ.get("RIDDLE_WORKER_PROGRESS") == "1":
         print(EVENT_PREFIX + json.dumps(event), flush=True)
+    elif console:
+        colored_status(event["message"], kind=event.get("kind", "INFO"), level=event.get("level", 1))
 
 
 class ProgressStage:
@@ -140,6 +147,10 @@ class ProgressStage:
         )
 
     def digest(self, path, *, expected=_NO_DIGEST, mismatch=None):
+        with timed_io("Verify checksum", path):
+            return self._digest(path, expected=expected, mismatch=mismatch)
+
+    def _digest(self, path, *, expected=_NO_DIGEST, mismatch=None):
         path = Path(path)
         size, read, started = (path.stat().st_size, 0, time.monotonic())
         self.update(force=True, file=str(path), file_bytes=f"0/{size}", file_eta="unknown")

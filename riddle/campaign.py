@@ -5,7 +5,7 @@ import numpy as np
 import torch
 from copy import deepcopy
 from .settings import DEFAULTS, validate_residual
-from riddle.storage import verify_artifacts
+from riddle.storage import verify_artifacts, read_json, open_npz, load_array, load_checkpoint, copy_file
 from riddle.worker_progress import emit_message
 from riddle.storage import atomic_write, write_json
 from riddle.storage import digest, file_digest
@@ -82,7 +82,7 @@ def _activate_supervised_ensemble_reuse(output, candidates, identity, contract, 
         if not result_path.is_file():
             continue
         try:
-            report = json.loads(result_path.read_text())
+            report = read_json(result_path)
         except (OSError, json.JSONDecodeError):
             continue
         if report.get("completed") is not True or report.get("method") != "supervised":
@@ -104,7 +104,7 @@ def _activate_supervised_ensemble_reuse(output, candidates, identity, contract, 
         if expected_identity is None or not source_identity_path.is_file() or file_digest(source_identity_path) != expected_identity:
             continue
         try:
-            source_identity = json.loads(source_identity_path.read_text())
+            source_identity = read_json(source_identity_path)
         except (OSError, json.JSONDecodeError):
             continue
         if source_identity != identity:
@@ -127,7 +127,7 @@ def _activate_supervised_ensemble_reuse(output, candidates, identity, contract, 
             for relative, source_path in selected:
                 target = output / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(source_path, target)
+                copy_file(source_path, target)
                 copied.append(target)
         except Exception:
             for target in reversed(copied):
@@ -162,7 +162,7 @@ def reject_scoring_member(output, member, error):
     output = Path(output)
     root = (output / member["directory"]).parents[1]
     with locked(root / ".resume/fit.lock"):
-        state = json.loads((root / "attempts.json").read_text())
+        state = read_json(root / "attempts.json")
         attempt = state["attempts"][member["attempt"]]
         if attempt["status"] != "completed" or attempt["directory"] != member["directory"]:
             raise ValueError("Cannot revoke an unrecognized accepted fit")
@@ -172,7 +172,7 @@ def reject_scoring_member(output, member, error):
         write_json(root / "attempts.json", state)
 
         (root / "fit.json").unlink(missing_ok=True)
-    selection = json.loads((output / "ensemble_selection.json").read_text())
+    selection = read_json(output / "ensemble_selection.json")
     selection["status"] = "incomplete"
     write_json(output / "ensemble_selection.json", selection)
     for name in ("stein_scoring_ensemble_reference.json", "stein_scoring_ensemble_reference.npz",
@@ -213,7 +213,7 @@ def assess_fit(directory, epochs, fractions, validation, device, *, sigma, norma
     """Validate selected checkpoints before any physical/test score is exported."""
     from .production import validate_density_ratio, validation_improvement
 
-    correction_inputs = json.loads((Path(directory) / "residual_training_inputs.json").read_text())
+    correction_inputs = read_json(Path(directory) / "residual_training_inputs.json")
     correction = correction_inputs.get("background_correction")
     core = correction_inputs.get("core", correction_inputs.get("settings", {}).get("core", "residual"))
     if background_reference is not None:
@@ -368,7 +368,7 @@ def train_member(rows, validation, output, *, relative, index, fraction, epochs,
     state_path = root / "attempts.json"
     with locked(root / ".resume/fit.lock"):
         if state_path.exists():
-            state = json.loads(state_path.read_text())
+            state = read_json(state_path)
             if not _compatible_identity(state["identity"], identity,
                                         allow_device_change=allow_device_change,
                                         history_path=root / ".resume/device_history.json"):
@@ -388,7 +388,7 @@ def train_member(rows, validation, output, *, relative, index, fraction, epochs,
             write_json(state_path, state)
         split_path = root / "split.npz"
         if split_path.exists():
-            with np.load(split_path, allow_pickle=False) as saved:
+            with open_npz(split_path, allow_pickle=False) as saved:
                 if not np.array_equal(saved["training"], a) or not np.array_equal(saved["validation"], b):
                     raise ValueError("Saved residual split changed")
         else:
@@ -405,7 +405,7 @@ def train_member(rows, validation, output, *, relative, index, fraction, epochs,
             if attempt.get("artifacts_sha256") is not None:
                 verify_artifacts(directory, attempt["artifacts_sha256"], f"{label} | Verify attempt")
         if terminal.exists():
-            saved = json.loads(terminal.read_text())
+            saved = read_json(terminal)
             accepted = next((a for a in state["attempts"] if a["status"] == "completed"), None)
             expected = ({**accepted, "fit_index": index, "attempts": state["attempts"]}
                         if accepted else dict(status="excluded", fit_index=index, directory=str(relative),
@@ -430,7 +430,7 @@ def train_member(rows, validation, output, *, relative, index, fraction, epochs,
             directory.mkdir(parents=True, exist_ok=True)
             emit_message(f"{label} | Attempt {number + 1}/{len(seeds)}; seed={training_seed}", kind="WORK")
             checkpoint_path = directory / ".resume/latest.pt"
-            checkpoint = (torch.load(checkpoint_path, map_location=device, weights_only=False)
+            checkpoint = (load_checkpoint(checkpoint_path, map_location=device, weights_only=False)
                           if checkpoint_path.exists() else None)
             if checkpoint is not None:
                 verify_artifacts(directory, checkpoint["files"], f"{label} | Verify epoch checkpoints")
@@ -559,7 +559,7 @@ def train_campaign(
     )
     identity_path = output / "ensemble_inputs.json"
     if identity_path.exists() and not _compatible_identity(
-            json.loads(identity_path.read_text()), identity, allow_new_mapping_identity=True,
+            read_json(identity_path), identity, allow_new_mapping_identity=True,
             allow_device_change=allow_device_change,
             history_path=output / ".resume/device_history.json"):
         raise ValueError("Residual ensemble training inputs/settings changed; use a new output")
@@ -594,7 +594,7 @@ def train_campaign(
                          **({"background_correction": background_correction} if background_correction is not None else {}))
     configs, failures = [], []
     for tag in tags:
-        receipts = [json.loads((output / tag / f"run_{i:03d}" / "fit.json").read_text()) for i in range(runs)]
+        receipts = [read_json(output / tag / f"run_{i:03d}" / "fit.json") for i in range(runs)]
         accepted_members = [m for m in receipts if m["status"] == "completed"]
         excluded = [m for m in receipts if m["status"] == "excluded"]
         failures.extend(dict(configuration=tag, fit_index=m["fit_index"], **attempt)
@@ -619,7 +619,7 @@ def train_campaign(
             if background_correction is not None:
                 recorded = []
                 for member in accepted_members:
-                    inputs = json.loads((output / member["directory"] / "residual_training_inputs.json").read_text())
+                    inputs = read_json(output / member["directory"] / "residual_training_inputs.json")
                     info = inputs.get("background_correction")
                     if info is None:
                         raise ValueError("Accepted corrected-background member is missing its denominator identity")
@@ -627,7 +627,7 @@ def train_campaign(
                 if set(recorded) != {background_correction["model_sha256"]}:
                     raise ValueError("Accepted RIDDLE members do not share one coherent q_phi denominator")
             if settings.get("core", "residual") == "stein_witness":
-                witnesses = [np.load(output / m["directory"] / "validation_witness_scores.npy") for m in members]
+                witnesses = [load_array(output / m["directory"] / "validation_witness_scores.npy") for m in members]
                 combined = np.mean(np.stack(witnesses), axis=0)
                 contexts = np.random.default_rng(73407).choice(zval[:, -1], 8192, replace=True).astype(np.float32)
                 reference = residual_background_sample(
@@ -640,7 +640,7 @@ def train_campaign(
                 ]), axis=0)
                 from .production import validation_witness_improvement
                 member_normalizations = [
-                    json.loads((output / member["directory"] / "fit_health.json").read_text())["normalization"]
+                    read_json(output / member["directory"] / "fit_health.json")["normalization"]
                     for member in members
                 ]
                 normalization_status = (
@@ -660,7 +660,7 @@ def train_campaign(
                 )
                 config["health"].update(fit_acceptance(config["health"]))
                 config["selection_nll"] = -float(config["health"]["quality"]["mean_witness_gain"])
-                histories = [json.loads((output / m["directory"] / "residual_losses.json").read_text())["history"]
+                histories = [read_json(output / m["directory"] / "residual_losses.json")["history"]
                              for m in members]
                 config["history"] = [dict(
                     epoch=e,
@@ -671,7 +671,7 @@ def train_campaign(
                 ) for e in range(max(map(len, histories)))]
                 configs.append(config)
                 continue
-            mixtures = [np.load(output / m["directory"] / "validation_log_mixture_ratio.npy") for m in members]
+            mixtures = [load_array(output / m["directory"] / "validation_log_mixture_ratio.npy") for m in members]
             combined = np.logaddexp.reduce(mixtures, axis=0) - np.log(len(members))
             selection_gain = None
             if zselection is not None:
@@ -735,7 +735,7 @@ def train_campaign(
                 output / members[0]["directory"], selection_rows, device)
             config["selection_nll"] = -float(np.mean(
                 selected_background + (selection_gain if selection_gain is not None else combined)))
-            histories = [json.loads((output / m["directory"] / "residual_losses.json").read_text())["history"]
+            histories = [read_json(output / m["directory"] / "residual_losses.json")["history"]
                          for m in members]
             config["history"] = [dict(epoch=e, **{key: float(np.mean([h[e][key] for h in histories if e < len(h)]))
                 for key in ("train_nll", "validation_nll", "signal_fraction")},
@@ -809,14 +809,14 @@ def validate_normalization(output, features, device):
     from .production import validate_density_ratio
 
     root = Path(output)
-    selection = json.loads((root / "ensemble_selection.json").read_text())
+    selection = read_json(root / "ensemble_selection.json")
     require_complete_ensemble(selection)
     if selection["production_policy"] in (PRODUCTION_POLICY, EVIDENCE_GATED_POLICY):
         members = []
         for member in selection["members"]:
             directory = root / member["directory"]
             verify_artifacts(directory, member["artifacts_sha256"], "Verify accepted RIDDLE density")
-            health = json.loads((directory / "fit_health.json").read_text())
+            health = read_json(directory / "fit_health.json")
             expected = dict(quality=member["quality"], normalization=member["normalization"])
             if selection["production_policy"] == PRODUCTION_POLICY:
                 expected.update(fit_acceptance(expected))
@@ -856,17 +856,17 @@ def validate_normalization(output, features, device):
 def ensemble_predict(output, z, device, *, return_members=False, return_accepted_members=False,
                      return_raw=False, stein_mode=None, scoring_settings=None):
     root = Path(output)
-    selection = json.loads((root / "ensemble_selection.json").read_text())
+    selection = read_json(root / "ensemble_selection.json")
     require_complete_ensemble(selection)
     selected = selection["members"]
     accepted = selection.get("accepted_members", selected)
     selected_directories = {member["directory"] for member in selected}
-    first_inputs = json.loads((root / selected[0]["directory"] / "residual_training_inputs.json").read_text())
+    first_inputs = read_json(root / selected[0]["directory"] / "residual_training_inputs.json")
     core = first_inputs.get("core", first_inputs.get("settings", {}).get("core", "residual"))
     explicit_stein_mode = stein_mode
     if core == "stein_witness":
         if scoring_settings is None:
-            ensemble_inputs = json.loads((root / "ensemble_inputs.json").read_text())
+            ensemble_inputs = read_json(root / "ensemble_inputs.json")
             scoring_settings = ensemble_inputs.get("settings", first_inputs["settings"])
         scoring_settings = validate_residual(scoring_settings)
         if stein_mode is None:
@@ -913,7 +913,7 @@ def ensemble_predict(output, z, device, *, return_members=False, return_accepted
         scores, raw, final_metadata = final_transform(
             root, selected, ensemble_raw, z, device, scoring_settings
         )
-        identity = json.loads((root / "ensemble_inputs.json").read_text())
+        identity = read_json(root / "ensemble_inputs.json")
         mapping_identity = identity.get("mapping_identity", {
             "training_latents_sha256": identity["training_sha256"],
             "validation_latents_sha256": identity["selection_sha256"],

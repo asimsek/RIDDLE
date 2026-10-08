@@ -1,5 +1,9 @@
 from contextlib import contextmanager
+from contextvars import ContextVar
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from functools import wraps
+from itertools import count
 import fcntl
 import hashlib
 import json
@@ -7,16 +11,92 @@ import os
 from pathlib import Path
 import platform
 import random
+import shutil
 import tempfile
+import time
 
 IO_PERSIST_EVERY = 10
 WORKER_LOG_FLUSH_SECONDS = 30.0
 
 _DIGEST_CACHE = {}
+_IO_DEPTH = ContextVar("riddle_io_depth", default=0)
+_IO_SEQUENCE = count(1)
 
 import numpy as np
 
 
+@contextmanager
+def timed_io(operation, path):
+    if _IO_DEPTH.get():
+        yield
+        return
+    from .worker_progress import emit_message
+
+    identity = f"operation={operation}; path={path}; io_id={os.getpid()}:{next(_IO_SEQUENCE)}"
+    started_utc = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    started = time.monotonic()
+    emit_message(f"I/O START; start_utc={started_utc}; {identity}", level=0, durable=True, console=True)
+    token = _IO_DEPTH.set(1)
+    status, error_type = "completed", "none"
+    try:
+        yield
+    except BaseException as error:
+        status = "interrupted" if isinstance(error, (KeyboardInterrupt, SystemExit)) else "failed"
+        error_type = type(error).__name__
+        raise
+    finally:
+        _IO_DEPTH.reset(token)
+        elapsed = time.monotonic() - started
+        ended_utc = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        emit_message(
+            f"I/O END; start_utc={started_utc}; end_utc={ended_utc}; elapsed_seconds={elapsed:.3f}; "
+            f"status={status}; error_type={error_type}; {identity}",
+            kind="INFO" if status == "completed" else "WARNING", level=0, durable=True, console=True,
+        )
+
+
+def _timed_file_operation(operation):
+    def decorate(function):
+        @wraps(function)
+        def wrapped(*args, **kwargs):
+            path = args[0] if args else kwargs[function.__code__.co_varnames[0]]
+            with timed_io(operation, path):
+                return function(*args, **kwargs)
+        return wrapped
+    return decorate
+
+
+def load_array(path, *args, **kwargs):
+    operation = "Open memory-mapped array" if kwargs.get("mmap_mode") else "Read NumPy array"
+    with timed_io(operation, path):
+        return np.load(path, *args, **kwargs)
+
+
+@contextmanager
+def open_npz(path, **kwargs):
+    with timed_io("Read NumPy archive", path):
+        with np.load(path, **kwargs) as archive:
+            yield archive
+
+
+@_timed_file_operation("Read checkpoint")
+def load_checkpoint(path, *args, **kwargs):
+    import torch
+
+    return torch.load(path, *args, **kwargs)
+
+
+@_timed_file_operation("Read JSON")
+def read_json(path):
+    return json.loads(Path(path).read_text())
+
+
+def copy_file(source, destination, **kwargs):
+    with timed_io("Copy file", f"{source} -> {destination}"):
+        return shutil.copy2(source, destination, **kwargs)
+
+
+@_timed_file_operation("Write artifact")
 def atomic_write(path, writer):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -69,6 +149,7 @@ class _HashingWriter:
         return True
 
 
+@_timed_file_operation("Write checkpoint")
 def atomic_torch_save(path, value):
     """Atomically torch.save and compute SHA256 during the same write pass."""
     import torch
@@ -98,11 +179,13 @@ def write_json(path, value):
     _cache_digest(path, hashlib.sha256(payload).hexdigest())
 
 
+@_timed_file_operation("Write NumPy archive")
 def save_npz(path, **arrays):
     with Path(path).open("wb") as stream:
         np.savez(stream, **arrays)
 
 
+@_timed_file_operation("Write NumPy array")
 def save_array(path, array):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -128,8 +211,9 @@ def file_digest(path):
     cached = _DIGEST_CACHE.get(str(path.resolve()))
     if cached is not None and cached[:4] == (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns):
         return cached[4]
-    with path.open("rb") as stream:
-        value = hashlib.file_digest(stream, "sha256").hexdigest()
+    with timed_io("Checksum file", path):
+        with path.open("rb") as stream:
+            value = hashlib.file_digest(stream, "sha256").hexdigest()
     return _cache_digest(path, value)
 
 
@@ -233,6 +317,7 @@ def environment():
     }
 
 
+@_timed_file_operation("Fingerprint framework")
 def code_hashes(root):
     root = Path(root)
     return {

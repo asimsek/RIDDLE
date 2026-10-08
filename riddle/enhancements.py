@@ -12,7 +12,7 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from .integrity import require_finite
-from .storage import atomic_torch_save, digest, write_json, rng_state, restore_rng, seed_start, persist_boundary
+from .storage import atomic_torch_save, digest, write_json, rng_state, restore_rng, seed_start, persist_boundary, load_checkpoint
 from .worker_progress import emit_message
 
 
@@ -22,7 +22,7 @@ def save_torch(path, value):
 
 def load_torch(path, device="cpu"):
     # Recovery files include optimizer and RNG state.
-    return torch.load(path, map_location=device, weights_only=False)
+    return load_checkpoint(path, map_location=device, weights_only=False)
 
 
 def chunks(function, *arrays, device="cpu", size=4096):

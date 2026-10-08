@@ -8,7 +8,7 @@ import torch
 from copy import deepcopy
 from .settings import DEFAULTS, validate_residual
 from riddle.worker_progress import ProgressStage
-from riddle.storage import atomic_torch_save, write_json, digest, file_digest, rng_state, restore_rng, persist_boundary, seed_start
+from riddle.storage import atomic_torch_save, write_json, digest, file_digest, rng_state, restore_rng, persist_boundary, seed_start, read_json, load_checkpoint
 from .model import (
     build_signal_flow,
     initial_fraction_logit,
@@ -506,7 +506,7 @@ def train_residual(
         inputs = Path(output) / "residual_training_inputs.json"
         if (
             inputs.is_file()
-            and json.loads(inputs.read_text()).get("initialization", "random") != initialization
+            and read_json(inputs).get("initialization", "random") != initialization
         ):
             raise ValueError("Residual initialization changed; use a new output or the saved initialization")
     start = checkpoint["epoch"] + 1 if checkpoint is not None else 0
@@ -817,7 +817,7 @@ def train_residual(
                 "training_evidence": "latent residual responsibilities only",
                 "final_score_uses_fraction": False,
                 "selected_states": [
-                    torch.load(output / f"residual_epoch_{epoch}.pt", map_location="cpu", weights_only=True).get("mass_fraction_state")
+                    load_checkpoint(output / f"residual_epoch_{epoch}.pt", map_location="cpu", weights_only=True).get("mass_fraction_state")
                     for epoch in order
                 ],
             } if mass_fraction_active else {"enabled": False}),
@@ -827,7 +827,7 @@ def train_residual(
     )
     if mass_fraction_active:
         from .mass_fraction import probabilities as mass_fraction_probabilities
-        selected = json.loads((output / "residual_selection.json").read_text())["mass_fraction"]["selected_states"]
+        selected = read_json(output / "residual_selection.json")["mass_fraction"]["selected_states"]
         context_grid = np.linspace(-1.0, 1.0, 101, dtype=np.float64)
         curves = np.stack([mass_fraction_probabilities(state, context_grid, settings) for state in selected])
         ensemble_curve = np.average(curves, axis=0, weights=checkpoint_weights)
@@ -852,7 +852,7 @@ def residual_scores(output, order, z, device, *, normalization_checks=None, norm
                     stein_mode=None, stein_scoring_root=None, stein_scoring_settings=None):
     if not len(order):
         raise ValueError("Residual scoring requires at least one checkpoint")
-    inputs = json.loads((output / "residual_training_inputs.json").read_text())
+    inputs = read_json(output / "residual_training_inputs.json")
     if inputs.get("scientific_version") != SCIENTIFIC_VERSION:
         raise ValueError("Legacy residual inputs; use saved legacy scores or retrain")
     if inputs.get("core", inputs.get("settings", {}).get("core", "residual")) == "stein_witness":
@@ -867,7 +867,7 @@ def residual_scores(output, order, z, device, *, normalization_checks=None, norm
     model = build_signal_flow(device, features=z.shape[1], settings=inputs["settings"]).eval()
     selection_path = output / "residual_selection.json"
     if selection_path.exists():
-        selection = json.loads(selection_path.read_text())
+        selection = read_json(selection_path)
         saved_epochs = list(selection.get("epochs", []))
         saved_weights = np.asarray(selection.get("checkpoint_weights", []), dtype=np.float64)
         if saved_weights.shape == (len(saved_epochs),) and all(epoch in saved_epochs for epoch in order):
@@ -924,7 +924,7 @@ def residual_scores(output, order, z, device, *, normalization_checks=None, norm
     ) as progress:
         with torch.no_grad():
             for i, epoch in enumerate(order):
-                checkpoint = torch.load(
+                checkpoint = load_checkpoint(
                     output / f"residual_epoch_{epoch}.pt", map_location=device, weights_only=True
                 )
                 if checkpoint.get("scientific_version") != SCIENTIFIC_VERSION:
@@ -965,14 +965,14 @@ def residual_fraction_probabilities(output, order, z, *, return_checkpoints=Fals
     z = np.asarray(z, dtype=np.float32)
     if z.ndim != 2 or not len(z) or not np.isfinite(z).all():
         raise ValueError("Mass-fraction evaluation requires finite residual inputs")
-    inputs = json.loads((output / "residual_training_inputs.json").read_text())
+    inputs = read_json(output / "residual_training_inputs.json")
     settings = inputs["settings"]
     if inputs.get("core", settings.get("core", "residual")) == "stein_witness":
         raise ValueError("stein_witness has no mixture-fraction probabilities")
     selection_path = output / "residual_selection.json"
     checkpoint_weights = np.full(len(order), 1.0 / len(order), dtype=np.float64)
     if selection_path.exists():
-        selection = json.loads(selection_path.read_text())
+        selection = read_json(selection_path)
         saved_epochs = list(selection.get("epochs", []))
         saved_weights = np.asarray(selection.get("checkpoint_weights", []), dtype=np.float64)
         if saved_weights.shape == (len(saved_epochs),) and all(epoch in saved_epochs for epoch in order):
@@ -980,7 +980,7 @@ def residual_fraction_probabilities(output, order, z, *, return_checkpoints=Fals
             checkpoint_weights /= checkpoint_weights.sum()
     curves = []
     for epoch in order:
-        checkpoint = torch.load(output / f"residual_epoch_{epoch}.pt", map_location="cpu", weights_only=True)
+        checkpoint = load_checkpoint(output / f"residual_epoch_{epoch}.pt", map_location="cpu", weights_only=True)
         if checkpoint.get("scientific_version") != SCIENTIFIC_VERSION or checkpoint.get("epoch") != epoch:
             raise ValueError("Mass-fraction checkpoint identity differs from selection")
         state = checkpoint.get("mass_fraction_state")
@@ -1006,7 +1006,7 @@ def residual_fraction_probabilities(output, order, z, *, return_checkpoints=Fals
 def residual_background_log_prob(output, z, device):
     """Return the exact denominator log density recorded for a residual fit."""
     output = Path(output)
-    inputs = json.loads((output / "residual_training_inputs.json").read_text())
+    inputs = read_json(output / "residual_training_inputs.json")
     z = np.asarray(z, dtype=np.float32)
     if inputs["features"] != z.shape[1]:
         raise ValueError("Background scoring feature count differs from training")
@@ -1031,7 +1031,7 @@ def residual_background_log_prob(output, z, device):
 def residual_background_sample(output, contexts, count, seed, device, batch_size=None):
     """Draw full residual inputs from the recorded denominator at supplied contexts."""
     output = Path(output)
-    inputs = json.loads((output / "residual_training_inputs.json").read_text())
+    inputs = read_json(output / "residual_training_inputs.json")
     info = inputs.get("background_correction")
     contexts = np.asarray(contexts, dtype=np.float32)
     if contexts.shape != (count,):

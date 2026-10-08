@@ -11,7 +11,7 @@ import numpy as np
 from .data_spec import DatasetSpec
 from .features import FEATURES, canonicalize_event_columns, build_dataset_roles, partition_row_order, partition_labels
 from .datasets import load_dataset_catalog, materialize_dataset_files
-from .storage import locked, write_json, save_array, file_digest, verify_artifacts, digest, atomic_write, save_npz
+from .storage import locked, write_json, save_array, file_digest, verify_artifacts, digest, atomic_write, save_npz, read_json, load_array, open_npz
 from .progress import operation_progress, ProgressReporter
 from . import controls
 
@@ -353,19 +353,19 @@ def validate_independent_signal(directory, manifest, identities, remaining, rese
         if not np.isin(identities[name][:, 0], signal_sources).all():
             raise ValueError("Supervised training/validation signal must come from independent sources")
     if sum(sizes):
-        extra = np.concatenate([np.load(directory / name, allow_pickle=False)[:, :-1] for name in names])
+        extra = np.concatenate([load_array(directory / name, allow_pickle=False)[:, :-1] for name in names])
         extra_keys = physical_event_keys(extra)
         if len(np.unique(extra_keys)) != len(extra_keys):
             raise ValueError("Duplicate physical Supervised signal events")
         for name in CORE_DATA_FILES:
-            values = np.load(directory / name, allow_pickle=False)[:, :-1]
+            values = load_array(directory / name, allow_pickle=False)[:, :-1]
             if np.intersect1d(extra_keys, physical_event_keys(values)).size:
                 raise ValueError("Supervised signal overlaps existing physical training/evaluation events")
 
 
 def validate(directory, *, require_event_ids=False, require_oracle=False, require_supervised=False):
     directory = Path(directory)
-    manifest = json.loads((directory / "inputs.json").read_text())
+    manifest = read_json(directory / "inputs.json")
     variant = manifest.get("variant", "default")
     expected_columns = controls.columns(variant)
     if manifest.get("columns", expected_columns) != expected_columns:
@@ -396,7 +396,7 @@ def validate(directory, *, require_event_ids=False, require_oracle=False, requir
     sr_counts = np.zeros(2, dtype=np.int64)
     lengths = {}
     for name in expected_files:
-        array = np.load(directory / name, mmap_mode="r", allow_pickle=False)
+        array = load_array(directory / name, mmap_mode="r", allow_pickle=False)
         lengths[name] = len(array)
         if (array.ndim != 2 or array.shape[1] != len(expected_columns) or array.dtype != np.float64
                 or not np.isfinite(array).all() or not np.isin(array[:, -1], (0, 1)).all()):
@@ -423,7 +423,7 @@ def validate(directory, *, require_event_ids=False, require_oracle=False, requir
             expected_id_keys.add(EVALUATION_KEY)
         if schema == 6:
             expected_id_keys.add(REMAINING_SIGNAL_KEY)
-        with np.load(id_path, allow_pickle=False) as ids:
+        with open_npz(id_path, allow_pickle=False) as ids:
             if set(ids.files) != expected_id_keys:
                 raise ValueError("Missing event identity arrays")
             if schema in (5, 6):
@@ -509,7 +509,7 @@ def validate(directory, *, require_event_ids=False, require_oracle=False, requir
                 core_names = CORE_DATA_FILES[:6]
                 core_signal_ids = []
                 for name in core_names:
-                    rows = np.load(directory / name, mmap_mode="r", allow_pickle=False)
+                    rows = load_array(directory / name, mmap_mode="r", allow_pickle=False)
                     selected = rows[:, -1] == 1
                     if np.any(selected):
                         core_signal_ids.append(saved_ids[name][selected])
