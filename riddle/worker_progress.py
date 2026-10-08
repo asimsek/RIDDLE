@@ -1,9 +1,10 @@
 from __future__ import annotations
-from collections import deque
+from collections import Counter, deque
 import hashlib
 import json
 import os
 import queue
+import re
 import signal
 import subprocess
 import threading
@@ -18,6 +19,129 @@ EVENT_PREFIX = "[RIDDLE_WORKER_PROGRESS] "
 _LOCAL_SINK = ContextVar("riddle_progress_sink", default=None)
 _OUTPUT_LOCK = threading.RLock()
 _NO_DIGEST = object()
+
+
+class ConsoleMessages:
+    io_report_seconds = 30
+    slow_io_seconds = 5
+    fit_pattern = re.compile(r"RIDDLE fit (\d+)/(\d+): (\d+)/(\d+) epoch;")
+
+    def __init__(self, label, *, status=None, get_verbosity=None):
+        self.label = label
+        self.status = status or colored_status
+        self.verbosity = get_verbosity or verbosity
+        self.active_io, self.fit_updates = {}, {}
+        self.io_counts = Counter()
+        self.io_seconds = 0.0
+        self.io_started = self.io_start_utc = self.io_end_utc = None
+        self.last_io = 0.0
+
+    def event(self, event):
+        text = event["message"]
+        if self.verbosity() >= 2:
+            self.status(text, kind=event.get("kind", "INFO"), label=self.label,
+                        level=event.get("level", 1))
+            return
+        task = event.get("task")
+        if task and self.label:
+            text = text.replace(f"{task}; pid={event.get('pid')} | ", "", 1)
+            if text.startswith("BG stages "):
+                for field in task.split("; "):
+                    if field.split("=", 1)[0] in {"method", "seed", "scenario", "signal_events"}:
+                        text = text.replace("; " + field, "", 1)
+        io_match = re.search(r"\bI/O (START|END); (.*)", text)
+        if io_match:
+            fields = dict(part.split("=", 1) for part in io_match[2].split("; ") if "=" in part)
+            if all(key in fields for key in ("io_id", "operation", "path", "start_utc")):
+                try:
+                    self.io_event(io_match[1], fields, event)
+                    return
+                except (TypeError, ValueError):
+                    pass
+        match = self.fit_pattern.search(text) if event.get("kind") == "PROGRESS" else None
+        if match:
+            fit, _, epoch, total = map(int, match.groups())
+            now = time.monotonic()
+            previous, last = self.fit_updates.get(fit, (0, 0.0))
+            if fit in self.fit_updates:
+                if epoch == previous:
+                    return
+                if epoch > previous and epoch < total and epoch // 5 == previous // 5 and now - last < 60:
+                    return
+            self.fit_updates[fit] = epoch, now
+            text = text.replace("RIDDLE fit", "Fit", 1)
+            if "; operation=Epoch complete" in text:
+                text = re.sub(r"; minibatch=0/\d+", "", text.replace("; operation=Epoch complete", ""))
+        if event.get("kind") in {"WARNING", "ERROR"} or text.startswith("BG stages END"):
+            self.flush()
+        self.status(text, kind=event.get("kind", "INFO"), label=self.label,
+                    level=event.get("level", 1))
+
+    def io_event(self, state, fields, event):
+        now = time.monotonic()
+        elapsed = float(fields.get("elapsed_seconds", 0))
+        if self.io_started is None:
+            self.io_started = now if state == "START" else self.active_io.get(fields["io_id"], (now - elapsed,))[0]
+            self.io_start_utc = fields["start_utc"]
+            if state == "START":
+                self.status(f"I/O START; start_utc={fields['start_utc']}; operation={fields['operation']}",
+                            label=self.label, level=event.get("level", 0))
+        self.last_io = now
+        self.io_start_utc = min(self.io_start_utc, fields["start_utc"])
+        if state == "START":
+            self.active_io[fields["io_id"]] = (now, fields, now + self.slow_io_seconds)
+        else:
+            self.active_io.pop(fields["io_id"], None)
+            self.io_counts[fields["operation"]] += 1
+            self.io_seconds += elapsed
+            end_utc = fields.get("end_utc", fields["start_utc"])
+            self.io_end_utc = max(self.io_end_utc or end_utc, end_utc)
+            failed = fields.get("status", "completed") != "completed" or event.get("kind") in {"WARNING", "ERROR"}
+            if failed or elapsed >= self.slow_io_seconds:
+                self.status(
+                    f"I/O END; operation={fields['operation']}; path={fields['path']}; "
+                    f"start_utc={fields['start_utc']}; end_utc={end_utc}; "
+                    f"elapsed_seconds={elapsed:.3f}; status={fields.get('status', 'completed')}; "
+                    f"io_id={fields['io_id']}"
+                    + (f"; error_type={fields['error_type']}" if fields.get("error_type", "none") != "none" else ""),
+                    kind=event.get("kind", "INFO"), label=self.label, level=event.get("level", 0),
+                )
+        self.tick()
+
+    def tick(self):
+        if self.verbosity() >= 2:
+            return
+        now = time.monotonic()
+        for identity, (started, fields, next_report) in tuple(self.active_io.items()):
+            if now >= next_report:
+                self.status(
+                    f"I/O RUNNING; operation={fields['operation']}; path={fields['path']}; "
+                    f"start_utc={fields['start_utc']}; elapsed_seconds={now - started:.1f}; io_id={identity}",
+                    kind="WORK", label=self.label, level=0,
+                )
+                self.active_io[identity] = started, fields, now + self.io_report_seconds
+        if self.io_started is not None and self.io_counts and (
+            now - self.io_started >= self.io_report_seconds or (not self.active_io and now - self.last_io >= 1)
+        ):
+            self.flush()
+
+    def flush(self):
+        if not self.io_counts:
+            return
+        operations = ", ".join(f"{operation}={count}" for operation, count in self.io_counts.items())
+        self.status(
+            f"I/O SUMMARY; start_utc={self.io_start_utc}; end_utc={self.io_end_utc}; "
+            f"elapsed_seconds={self.last_io - self.io_started:.3f}; "
+            f"operations={sum(self.io_counts.values())}; summed_io_seconds={self.io_seconds:.3f}; "
+            f"pending={len(self.active_io)}; {operations}",
+            label=self.label, level=0,
+        )
+        self.io_counts.clear()
+        self.io_seconds = 0.0
+        self.io_started = self.io_start_utc = self.io_end_utc = None
+
+
+_CONSOLE_MESSAGES = ConsoleMessages("Framework")
 
 
 class BufferedLog:
@@ -106,7 +230,8 @@ def _emit_event(event, *, console=False):
         with _OUTPUT_LOCK:
             print(line, flush=True)
     elif console:
-        colored_status(event["message"], kind=event.get("kind", "INFO"), level=event.get("level", 1))
+        with _OUTPUT_LOCK:
+            _CONSOLE_MESSAGES.event(event)
 
 
 class ProgressStage:
@@ -207,6 +332,8 @@ def local_progress(label, *, display=None):
         finally:
             stop.set()
             thread.join(timeout=2)
+            if isinstance(display, WorkerDisplays):
+                display.flush()
             _LOCAL_SINK.reset(token)
 
 
@@ -244,11 +371,20 @@ class WorkerDisplays:
     def tick(self):
         for display in self.displays.values():
             display.tick()
+        with _OUTPUT_LOCK:
+            _CONSOLE_MESSAGES.tick()
+
+    def flush(self):
+        for display in self.displays.values():
+            display.messages.flush()
+        with _OUTPUT_LOCK:
+            _CONSOLE_MESSAGES.flush()
 
 
 class WorkerDisplay:
     def __init__(self, stack, label, *, heartbeat_seconds=30, startup=True):
         self.stack, self.label = (stack, label)
+        self.messages = ConsoleMessages(label)
         self.phase = None
         self.activity = None
         self.completed = 0
@@ -264,12 +400,7 @@ class WorkerDisplay:
 
     def event(self, event):
         if "message" in event:
-            colored_status(
-                event["message"],
-                kind=event.get("kind", "INFO"),
-                label=self.label,
-                level=event.get("level", 1),
-            )
+            self.messages.event(event)
             return
         phase = event["phase"]
         raw_metrics = event.get("metrics", {})
@@ -291,6 +422,7 @@ class WorkerDisplay:
             and event.get("completed") == event.get("initial")
         )
         if new_phase:
+            self.messages.flush()
             if self.phase == "startup" and (not self.finished):
                 self.activity.update(self.activity.total - self.completed)
                 self.completed = self.activity.total
@@ -330,7 +462,7 @@ class WorkerDisplay:
         # Heartbeats must not advance durable epoch counters.
 
         if self.activity.unit == "epoch":
-            self.activity.report_every = 1
+            self.activity.report_every = 1 if verbosity() >= 2 else 5
         elif "report_every" in event:
             self.activity.report_every = event["report_every"]
         if "file_bytes" in raw_metrics and self._file_bytes != raw_metrics["file_bytes"]:
@@ -358,6 +490,7 @@ class WorkerDisplay:
             colored_status(self.snapshot(), kind="WORK", label=self.label, level=1)
 
     def finish(self):
+        self.messages.flush()
         self.finished = True
         elapsed = _duration(time.monotonic() - self.started)
         if self.activity.unit != "epoch" or self.completed == self.activity.initial:
@@ -365,7 +498,7 @@ class WorkerDisplay:
                 f"{self.phase_label}: {self.completed}/{self.activity.total} {self.activity.unit}; elapsed={elapsed}",
                 kind="WORK",
                 label=self.label,
-                level=1,
+                level=2,
             )
         self.stack.close()
 
@@ -401,6 +534,7 @@ class WorkerDisplay:
             colored_status(text, label=self.label, level=2)
 
     def tick(self):
+        self.messages.tick()
         if self.activity is None or self.finished:
             return
         now = time.monotonic()
@@ -447,6 +581,7 @@ def monitor_worker(command, env, log, label, *, resume=False, cancel_event=None)
         try:
             with ExitStack() as phases:
                 display = WorkerDisplays(phases, label)
+                phases.callback(display.flush)
                 while True:
                     if cancel_event is not None and cancel_event.is_set():
                         raise RuntimeError("Background preparation cancelled after another worker failed")

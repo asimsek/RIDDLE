@@ -10,7 +10,7 @@ from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from pathlib import Path
 from .progress import colored_status, training_progress, verbosity, _duration, _short_value
-from riddle.worker_progress import BufferedLog, durable_progress_line, _emit_event as emit_worker_event
+from riddle.worker_progress import BufferedLog, ConsoleMessages, durable_progress_line, _emit_event as emit_worker_event
 
 EVENT_PREFIX = "[RIDDLE_WORKER_PROGRESS] "
 _LOCAL_SINK = ContextVar("riddle_progress_sink", default=None)
@@ -141,6 +141,7 @@ def local_progress(label):
         finally:
             stop.set()
             thread.join(timeout=2)
+            display.messages.flush()
             _LOCAL_SINK.reset(token)
 
 
@@ -157,6 +158,7 @@ def progress_items(items, label, *, unit="file"):
 class WorkerDisplay:
     def __init__(self, stack, label, *, heartbeat_seconds=30, startup=True):
         self.stack, self.label = (stack, label)
+        self.messages = ConsoleMessages(label, status=colored_status, get_verbosity=verbosity)
         self.phase = None
         self.activity = None
         self.completed = 0
@@ -172,12 +174,7 @@ class WorkerDisplay:
 
     def event(self, event):
         if "message" in event:
-            colored_status(
-                event["message"],
-                kind=event.get("kind", "INFO"),
-                label=self.label,
-                level=event.get("level", 1),
-            )
+            self.messages.event(event)
             return
         phase = event["phase"]
         raw_metrics = event.get("metrics", {})
@@ -193,6 +190,7 @@ class WorkerDisplay:
             (key in metrics and self.metrics.get(key) != metrics[key] for key in ("operation", "array"))
         )
         if new_phase:
+            self.messages.flush()
             if self.phase == "startup" and (not self.finished):
                 self.activity.update(self.activity.total - self.completed)
                 self.completed = self.activity.total
@@ -214,9 +212,12 @@ class WorkerDisplay:
                 )
             )
             self.completed = initial
-            self.activity.report_every = event.get("report_every")
             if self.activity.bar is not None:
                 self.activity.bar.set_description_str(f"  {self.phase_label}", refresh=False)
+        if self.activity.unit == "epoch":
+            self.activity.report_every = 1 if verbosity() >= 2 else 5
+        elif "report_every" in event:
+            self.activity.report_every = event["report_every"]
         if "file_bytes" in raw_metrics and self._file_bytes != raw_metrics["file_bytes"]:
             self._file_bytes = raw_metrics["file_bytes"]
             self.last_advance = time.monotonic()
@@ -241,13 +242,14 @@ class WorkerDisplay:
             colored_status(self.snapshot(), kind="WORK", label=self.label, level=1)
 
     def finish(self):
+        self.messages.flush()
         self.finished = True
         elapsed = _duration(time.monotonic() - self.started)
         colored_status(
             f"{self.phase_label}: {self.completed}/{self.activity.total} {self.activity.unit}; elapsed={elapsed}",
             kind="WORK",
             label=self.label,
-            level=1,
+            level=2,
         )
         self.stack.close()
 
@@ -283,6 +285,7 @@ class WorkerDisplay:
             colored_status(text, label=self.label, level=2)
 
     def tick(self):
+        self.messages.tick()
         if self.activity is None or self.finished:
             return
         now = time.monotonic()
@@ -297,6 +300,7 @@ class WorkerDisplay:
 
 def monitor_worker(command, env, log, label, *, resume=False):
     messages = queue.Queue()
+    display = None
     with (
         log.open("a" if resume else "w") as raw_stream,
         subprocess.Popen(
@@ -357,3 +361,5 @@ def monitor_worker(command, env, log, label, *, resume=False):
         finally:
             stream.force_flush()
             reader.join(timeout=2)
+            if display is not None:
+                display.messages.flush()

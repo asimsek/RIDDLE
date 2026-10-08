@@ -190,7 +190,7 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   | kubectl apply -n cua-asimsek -f -
 ```
 
-**Idealized AD:**
+**Idealized:**
 
 ```bash
 kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
@@ -201,7 +201,7 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   | kubectl apply -n cua-asimsek -f -
 ```
 
-**Supervised AD:**
+**Supervised:**
 
 ```bash
 kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
@@ -353,13 +353,20 @@ for SEED in 40 41 42 43 44; do
     python /shared/work/RIDDLE/nrp.py \
     --workflow scan --name "riddle-injection-scan-seed${SEED}" --methods riddle --seed "$SEED" \
     --config config/settings.yaml --data data/injection_scan --results results_injection_scan \
-    --reuse-results results --resume-across-code-change \
+    --reuse-results results --resume-across-code-change --resume-across-device-change \
     --fits 20 --epochs 100 --workers 5 --scan-bg-workers 7 --io-workers 2 --torch-threads 2 --mps on \
     | kubectl apply -n cua-asimsek -f - || break
 done
 ```
 
-**Idealized AD:**
+Check the job logs (change the seed number from the job name):
+
+```bash
+kubectl logs -n cua-asimsek -f job/riddle-injection-scan-seed40 -c campaign
+```
+
+
+**Idealized:**
 
 ```bash
 for SEED in 40 41 42 43 44; do
@@ -367,13 +374,20 @@ for SEED in 40 41 42 43 44; do
     python /shared/work/RIDDLE/nrp.py \
     --workflow scan --name "iad-injection-scan-seed${SEED}" --methods iad --seed "$SEED" \
     --config config/settings.yaml --data data/injection_scan --results results_injection_scan \
-    --reuse-results results --resume-across-code-change \
+    --reuse-results results --resume-across-code-change --resume-across-device-change \
     --fits 20 --epochs 100 --workers 5 --scan-bg-workers 7 --io-workers 2 --torch-threads 2 --mps on \
     | kubectl apply -n cua-asimsek -f - || break
 done
 ```
 
-**Supervised AD:**
+
+Check the job logs (change the seed number from the job name):
+
+```bash
+kubectl logs -n cua-asimsek -f job/iad-injection-scan-seed40 -c campaign
+```
+
+**Supervised:**
 
 ```bash
 for SEED in 40 41 42 43 44; do
@@ -381,10 +395,16 @@ for SEED in 40 41 42 43 44; do
     python /shared/work/RIDDLE/nrp.py \
     --workflow scan --name "supervised-injection-scan-seed${SEED}" --methods supervised --seed "$SEED" \
     --config config/settings.yaml --data data/injection_scan --results results_injection_scan \
-    --reuse-results results --resume-across-code-change \
+    --reuse-results results --resume-across-code-change --resume-across-device-change \
     --fits 20 --epochs 100 --workers 5 --scan-bg-workers 7 --io-workers 2 --torch-threads 2 --mps on \
     | kubectl apply -n cua-asimsek -f - || break
 done
+```
+
+Check the job logs (change the seed number from the job name):
+
+```bash
+kubectl logs -n cua-asimsek -f job/supervised-injection-scan-seed40 -c campaign
 ```
 
 **LaCathode:**
@@ -395,11 +415,17 @@ for SEED in 40 41 42 43 44; do
     python /shared/work/RIDDLE/nrp.py \
     --workflow scan --name "lacathode-injection-scan-seed${SEED}" --methods lacathode --seed "$SEED" \
     --config config/settings.yaml --data data/injection_scan --results results_injection_scan \
-    --reuse-results results --resume-across-code-change \
+    --reuse-results results --resume-across-code-change --resume-across-device-change \
     --epochs 100 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
     --lacathode-background independent \
     | kubectl apply -n cua-asimsek -f - || break
 done
+```
+
+Check the job logs (change the seed number from the job name):
+
+```bash
+kubectl logs -n cua-asimsek -f job/lacathode-injection-scan-seed40 -c campaign
 ```
 
 **R-ANODE:**
@@ -410,10 +436,16 @@ for SEED in 40 41 42 43 44; do
     python /shared/work/RIDDLE/nrp.py \
     --workflow scan --name "ranode-injection-scan-seed${SEED}" --methods ranode --seed "$SEED" \
     --config config/settings.yaml --data data/injection_scan --results results_injection_scan \
-    --reuse-results results --resume-across-code-change \
+    --reuse-results results --resume-across-code-change --resume-across-device-change \
     --fits 20 --epochs 300 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
     | kubectl apply -n cua-asimsek -f - || break
 done
+```
+
+Check the job logs (change the seed number from the job name):
+
+```bash
+kubectl logs -n cua-asimsek -f job/ranode-injection-scan-seed40 -c campaign
 ```
 
 

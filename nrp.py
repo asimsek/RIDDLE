@@ -93,7 +93,7 @@ def job(args):
         args.mps,
         "--resume",
         "--verbose",
-        "1",
+        str(getattr(args, "verbose", 1)),
     ]
     if getattr(args, "workflow", "run") == "scan":
         if getattr(args, "seeds", None) is not None:
@@ -333,6 +333,8 @@ def main(argv=None):
                    help="Intra-op CPU threads per training process (default: 2)")
     p.add_argument("--mps", choices=("auto", "on", "off"), default="auto",
                    help="CUDA MPS policy forwarded to the training framework")
+    p.add_argument("--verbose", type=int, choices=(0, 1, 2), default=1,
+                   help="Console detail: 1 concise (default), 2 full diagnostics")
     p.add_argument(
         "--gpu", type=str.lower, choices=GPU_TYPES, default="a100",
         help="Request one GPU of this type (case-insensitive; default: a100); namespace access is still required",
