@@ -6,6 +6,7 @@ import json
 import shutil
 import math
 import multiprocessing as mp
+import time
 
 import numpy as np
 import torch
@@ -608,7 +609,9 @@ def train(directory, train_z, train_mass, val_z, val_mass, *, settings, seed, de
     zv = torch.from_numpy(val_z).to(device)
     mv = torch.from_numpy(((val_mass - 3.5) / 0.2).astype(np.float32)).to(device)
     dataset = TensorDataset(zt, mt)
+    epoch_seconds = []
     for epoch in range(start, epochs):
+        epoch_started = time.monotonic()
         generator = torch.Generator().manual_seed(int(seed) + 11000 + epoch)
         balanced = _balanced_indices(train_mass, mass_bins, int(seed) + 11500 + epoch)
         epoch_dataset = dataset if balanced is None else TensorDataset(zt[balanced], mt[balanced])
@@ -657,6 +660,7 @@ def train(directory, train_z, train_mass, val_z, val_mass, *, settings, seed, de
             best_eligible = balanced_validation_nll
             best_eligible_epoch = epoch
             best_eligible_model = deepcopy(model.state_dict())
+        epoch_seconds.append(time.monotonic() - epoch_started)
         if persist_boundary(epoch, epochs):
             state = dict(
                 contract=contract, epoch=epoch, model=model.state_dict(), optimizer=optimizer.state_dict(),
@@ -673,6 +677,8 @@ def train(directory, train_z, train_mass, val_z, val_mass, *, settings, seed, de
             f"natural validation NLL={validation_nll:.6g}; natural gate={epoch_gate['status']}"
         )
 
+    from .background_stage import record_timing
+    record_timing(directory, "epochs", sum(epoch_seconds), epoch_seconds=epoch_seconds)
     use_eligible = best_eligible_model is not None
     best = best_eligible if use_eligible else best_any
     best_epoch = best_eligible_epoch if use_eligible else best_any_epoch
@@ -689,11 +695,13 @@ def train(directory, train_z, train_mass, val_z, val_mass, *, settings, seed, de
     sides_compatible = all(v.get("gaussian_compatible", False) for v in validation_sides.values())
     validation_passed = overall_compatible and sides_compatible
 
+    closure_started = time.monotonic()
     closure = _pseudo_sr_closure(
         train_z, train_mass, val_z, val_mass,
         settings=settings, seed=(int(seed)+40000) % 2**32, device=device,
     ) if policy == "auto" else dict(status="not_evaluated", reason="forced_on_by_configuration")
 
+    record_timing(directory, "closure", time.monotonic() - closure_started)
     active = policy == "on" or (validation_passed and closure.get("status") == "passed")
     reasons = []
     if not overall_compatible:
@@ -813,7 +821,8 @@ def _oracle_contract(settings, train_z, train_mass, val_z, val_mass, closure_z, 
     }
 
 
-def _activate_oracle_reuse(directory, candidates, contract, current_code, allow_code_change):
+def _activate_oracle_reuse(directory, candidates, contract, current_code, allow_code_change,
+                           production_contract=None, allow_device_change=False):
     directory = Path(directory)
     for candidate in candidates or ():
         source = Path(candidate).resolve()
@@ -825,6 +834,10 @@ def _activate_oracle_reuse(directory, candidates, contract, current_code, allow_
         except (OSError, json.JSONDecodeError):
             continue
         if report.get("completed") is not True or report.get("method") not in ("iad", "supervised"):
+            continue
+        from .scan_cache import runtime_compatible
+        if not runtime_compatible(report.get("contract", {}), production_contract,
+                                  allow_code_change=allow_code_change, allow_device_change=allow_device_change):
             continue
         source_code = report.get("contract", {}).get("code", {})
         changed_code = sorted(name for name in set(source_code) | set(current_code) if source_code.get(name) != current_code.get(name))
@@ -872,7 +885,7 @@ def _activate_oracle_reuse(directory, candidates, contract, current_code, allow_
     return None
 
 
-def train_oracle(directory, train_z, train_mass, val_z, val_mass, closure_z, closure_mass, *, settings, seed, device, reuse_candidates=None, current_code=None, allow_code_change=False, allow_device_change=False):
+def train_oracle(directory, train_z, train_mass, val_z, val_mass, closure_z, closure_mass, *, settings, seed, device, reuse_candidates=None, current_code=None, allow_code_change=False, allow_device_change=False, production_contract=None):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     arrays = [np.ascontiguousarray(value, dtype=np.float32) for value in (train_z, train_mass, val_z, val_mass, closure_z, closure_mass)]
@@ -886,10 +899,17 @@ def train_oracle(directory, train_z, train_mass, val_z, val_mass, closure_z, clo
             raise ValueError("Oracle background requires pure signal-region background events")
     epochs, mass_bins = _qphi_options(settings)
     contract = _oracle_contract(settings, train_z, train_mass, val_z, val_mass, closure_z, closure_mass, seed, device)
+    if (production_contract or {}).get("scan_background"):
+        decision = reuse(directory, production_contract["scan_background"]["source_result"],
+                         expected_contract=contract, frozen=True, allow_device_change=allow_device_change)
+        if decision is None or not decision["active"]:
+            raise ValueError("Nominal oracle background is incompatible, inactive, or failed artifact verification")
+        return decision
     current_code = {} if current_code is None else dict(current_code)
     contract_path = directory / "contract.json"
     if not contract_path.exists() and not (directory / ".resume/latest.pt").exists() and not (directory / "model.pt").exists():
-        _activate_oracle_reuse(directory, reuse_candidates, contract, current_code, allow_code_change)
+        _activate_oracle_reuse(directory, reuse_candidates, contract, current_code, allow_code_change,
+                              production_contract, allow_device_change)
     if contract_path.exists():
         _check_mapped_contract(json.loads(contract_path.read_text()), contract, allow_device_change,
                                directory / ".resume/device_history.json")
@@ -922,7 +942,9 @@ def train_oracle(directory, train_z, train_mass, val_z, val_mass, closure_z, clo
     zv = torch.from_numpy(val_z).to(device)
     mv = torch.from_numpy(((val_mass - 3.5) / 0.2).astype(np.float32)).to(device)
     dataset = TensorDataset(zt, mt)
+    epoch_seconds = []
     for epoch in range(start, epochs):
+        epoch_started = time.monotonic()
         generator = torch.Generator().manual_seed(int(seed) + 11000 + epoch)
         balanced = _oracle_balanced_indices(train_mass, mass_bins, int(seed) + 11500 + epoch)
         epoch_dataset = dataset if balanced is None else TensorDataset(zt[balanced], mt[balanced])
@@ -959,11 +981,14 @@ def train_oracle(directory, train_z, train_mass, val_z, val_mass, closure_z, clo
             best_any, best_any_epoch, best_any_model = selection_nll, epoch, deepcopy(model.state_dict())
         if epoch_gate["gaussian_compatible"] and (selection_nll, epoch) < (best_eligible, best_eligible_epoch if best_eligible_epoch is not None else math.inf):
             best_eligible, best_eligible_epoch, best_eligible_model = selection_nll, epoch, deepcopy(model.state_dict())
+        epoch_seconds.append(time.monotonic() - epoch_started)
         if persist_boundary(epoch, epochs):
             latest.parent.mkdir(parents=True, exist_ok=True)
             atomic_torch_save(latest, {"contract": contract, "epoch": epoch, "model": model.state_dict(), "optimizer": optimizer.state_dict(), "history": history, "best_any": best_any, "best_any_epoch": best_any_epoch, "best_any_model": best_any_model, "best_eligible": best_eligible, "best_eligible_epoch": best_eligible_epoch, "best_eligible_model": best_eligible_model, "rng": rng_state()})
             write_json(directory / "history.json", history)
         emit_message(f"Oracle background {epoch+1}/{epochs}: validation NLL={validation_nll:.6g}; selection NLL={selection_nll:.6g}; Gaussian gate={epoch_gate['status']}")
+    from .background_stage import record_timing
+    record_timing(directory, "epochs", sum(epoch_seconds), epoch_seconds=epoch_seconds)
     use_eligible = best_eligible_model is not None
     best = best_eligible if use_eligible else best_any
     best_epoch = best_eligible_epoch if use_eligible else best_any_epoch
@@ -1005,31 +1030,17 @@ def train_oracle(directory, train_z, train_mass, val_z, val_mass, closure_z, clo
     return {"requested_mode": MODE, "active": True, "descriptor": descriptor(directory), "selection": decision, "reuse": json.loads((directory / "reuse.json").read_text()) if (directory / "reuse.json").is_file() else None}
 
 
-def _reuse_signature(settings):
-    epochs, mass_bins = _qphi_options(settings)
-    return {
-        "schema": 9,
-        "scientific_version": SCIENTIFIC_VERSION,
-        "protocol": PROTOCOL,
-        "mode": MODE,
-        "activation_policy": sr_closure_mode(settings.get("sr_closure", "auto")),
-        "epochs": epochs,
-        "mass_bins": mass_bins,
-        "flow": _qphi_flow(settings),
-        "learning_rate": settings["training"]["learning_rate"],
-    }
-
-
-def reuse(directory, source_result, *, settings, seed, device):
-    if sr_closure_mode(settings.get("sr_closure", "auto")) == "off":
+def reuse(directory, source_result, *, expected_contract, frozen=False, allow_device_change=False):
+    if expected_contract.get("activation_policy") == "off":
         return None
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     manifest_path = directory / "reuse.json"
-    expected_signature = _reuse_signature(settings)
+    expected_signature = expected_contract
+    policy = "nominal_background_v1" if frozen else "exact_background_correction_inputs_v1"
     if manifest_path.exists():
         manifest = json.loads(manifest_path.read_text())
-        if manifest.get("policy") != "shared_fixed_background_v1" or manifest.get("target_signature") != expected_signature:
+        if manifest.get("policy") != policy or manifest.get("target_signature") != expected_signature:
             raise ValueError("Background-correction reuse settings changed; use a new output")
         for name, expected in manifest.get("local_artifacts_sha256", {}).items():
             path = directory / name
@@ -1049,7 +1060,8 @@ def reuse(directory, source_result, *, settings, seed, device):
         report = json.loads(report_path.read_text())
     except json.JSONDecodeError:
         return None
-    if report.get("completed") is not True or not str(report.get("method", "")).startswith("riddle"):
+    native = str(report.get("method", "")).startswith("riddle") or (frozen and report.get("method") in ("iad", "supervised"))
+    if report.get("completed") is not True or not native:
         return None
     base = source / "density" / "background_correction"
     relative_names = ("contract.json", "model.pt", "selection.json")
@@ -1062,9 +1074,15 @@ def reuse(directory, source_result, *, settings, seed, device):
             return None
         source_paths[name] = path
     source_contract = json.loads(source_paths["contract.json"].read_text())
-    for key, value in expected_signature.items():
-        if source_contract.get(key) != value:
-            return None
+    previous, current = dict(source_contract), dict(expected_signature)
+    if frozen:
+        previous.pop("hashes", None)
+        current.pop("hashes", None)
+        if allow_device_change:
+            previous.pop("device", None)
+            current.pop("device", None)
+    if previous != current:
+        return None
     optional = base / "history.json"
     optional_relative = "density/background_correction/history.json"
     optional_expected = report.get("artifacts_sha256", {}).get(optional_relative)
@@ -1079,17 +1097,17 @@ def reuse(directory, source_result, *, settings, seed, device):
     active = selection.get("status") == "activated" and bool(selection.get("active"))
     manifest = {
         "schema": 1,
-        "policy": "shared_fixed_background_v1",
+        "policy": policy,
         "source_result": str(source),
         "source_result_sha256": file_digest(report_path),
         "source_model_sha256": file_digest(source_paths["model.pt"]),
         "target_signature": expected_signature,
         "local_artifacts_sha256": copied,
         "training_reused": True,
-        "truth_labels_used": False,
+        "truth_labels_used": source_contract.get("truth_role_selection") == "pure_background",
     }
     write_json(manifest_path, manifest)
-    emit_message(f"Reuse frozen RIDDLE background correction from {source}", kind="PASS", level=0)
+    emit_message(f"Reuse matching RIDDLE background correction from {source}", kind="PASS", level=0)
     return dict(requested_mode=MODE, active=active, descriptor=descriptor(directory) if active else None,
                 selection=selection, reuse=manifest)
 

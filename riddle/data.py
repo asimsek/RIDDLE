@@ -135,7 +135,7 @@ def export_roles(roles, output, spec, source, *, smoke=False, variant="default",
                 "signal_region_boundary": "strict",
                 "synthetic_smoke_fixture": smoke,
                 "event_ids_sha256": file_digest(directory / "event_ids.npz"),
-                "partition_policy": ("independent_class_permutations" if scan else
+                "partition_policy": ("independent_class_permutations" if scan and scan.get("schema", 1) == 1 else
                                      "shared_percentages_fixed_order_v1" if population is not None else "fixed_upstream_partition"),
                 "injection_scan": scan,
                 "injection_reservoir": {
@@ -229,18 +229,30 @@ def supervised_sources(by_source, provenance):
 
 
 def validate_source_configuration(manifest, catalog):
-    if manifest.get("schema") == 6:
+    if manifest.get("schema") in (5, 6):
         expected = [asdict(source) for source in load_dataset_catalog(catalog).select("lhco").files]
         if [source.get("configuration") for source in manifest["source"]] != expected:
             raise ValueError("Prepared source configuration differs; use a new output directory")
 
 
+def preparation_spec(population, settings, *, signal_events=None):
+    from .populations import percentage_counts
+
+    return replace(
+        DatasetSpec(),
+        injection_reservoir_rows=max(population["injected_signal_events"], max(settings["injection_scan"]["signal_events"])),
+        injected_signal_rows=population["injected_signal_events"] if signal_events is None else signal_events,
+        preparation_seed=population["preparation_seed"],
+        sculpting_test_rows=percentage_counts(DatasetSpec().background_rows, population["splits"]["background"])[2],
+    )
+
+
 def prepare(args):
-    from .populations import load_config, percentage_counts
+    from .populations import load_config
     from .settings import load_settings
     population = load_config(getattr(args, "population_config", None))
     settings = load_settings(getattr(args, "config", None) or load_settings.__defaults__[0])
-    reservoir_rows = max(population["injected_signal_events"], max(settings["injection_scan"]["signal_events"]))
+    spec = preparation_spec(population, settings)
     root = args.output.resolve()
     variant = getattr(args, "variant", "default")
     controls.columns(variant)
@@ -254,7 +266,7 @@ def prepare(args):
             validate_source_configuration(manifest, args.catalog)
             if manifest.get("shared_population", {}).get("configuration") != population:
                 raise ValueError("Prepared populations differ; use a new output directory")
-            if manifest["preparation"]["injection_reservoir_rows"] != reservoir_rows:
+            if manifest["preparation"]["injection_reservoir_rows"] != spec.injection_reservoir_rows:
                 raise ValueError("Prepared injection reservoir differs; use a new output directory")
             if manifest.get("variant", "default") != variant:
                 raise ValueError("Prepared variant differs; use a separate output directory")
@@ -262,10 +274,6 @@ def prepare(args):
     root.parent.mkdir(parents=True, exist_ok=True)
     with locked(root.parent / ("." + root.name + ".prepare.lock")):
         primary, extra, by_source, provenance = read_sources(args, root, variant)
-        spec = replace(DatasetSpec(), injection_reservoir_rows=reservoir_rows,
-                       injected_signal_rows=population["injected_signal_events"],
-                       preparation_seed=population["preparation_seed"],
-                       sculpting_test_rows=percentage_counts(DatasetSpec().background_rows, population["splits"]["background"])[2])
         with operation_progress("Construct deterministic LHCO partitions"):
             roles = build_dataset_roles(
                 primary, spec, sic_background_arrays=extra, enforce_expected_counts=True, population=population,
@@ -551,8 +559,14 @@ def validate(directory, *, require_event_ids=False, require_oracle=False, requir
                 raise ValueError("Prepared data does not match the legacy LHCO protocol")
         scan = manifest.get("injection_scan")
         if scan is not None:
-            if manifest.get("partition_policy") != "independent_class_permutations" or schema not in (2, 3, 4, 5, 6):
-                raise ValueError("Scan requires traceable independently permuted partitions")
+            scan_schema = scan.get("schema", 1)
+            if scan_schema == 2:
+                if (schema not in (5, 6) or set(scan) != {"schema", "signal_events", "preparation_seed"}
+                        or manifest.get("partition_policy") != "shared_percentages_fixed_order_v1"
+                        or spec.preparation_seed != population["preparation_seed"]):
+                    raise ValueError("Scan must use the ordinary shared population preparation")
+            elif scan_schema != 1 or manifest.get("partition_policy") != "independent_class_permutations" or schema not in (2, 3, 4, 5, 6):
+                raise ValueError("Invalid injection-scan partition contract")
             if type(scan.get("signal_events")) is not int or not 3 <= scan["signal_events"] < spec.signal_rows:
                 raise ValueError("Invalid scan signal count")
             if type(scan.get("preparation_seed")) is not int or not 0 <= scan["preparation_seed"] < 2**32:

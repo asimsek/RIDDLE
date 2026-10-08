@@ -29,6 +29,7 @@ def runtime_code(method, root=None):
         "production.py",
         "metrics.py",
         "scan.py",
+        "scan_cache.py",
         "cli.py",
         "worker.py",
         "data.py",
@@ -66,6 +67,8 @@ def main():
     workers = getattr(args, "workers", 1)
     if native_method:
         workers = min(workers, int(args.runs))
+        if getattr(args, "background_phase", None) == "prepare":
+            workers = int(getattr(args, "background_concurrency", 1))
     if args.method == "lacathode" and not getattr(args, "lacathode_replica", False):
         from external.lacathode_utils.pipeline import run_settings
 
@@ -163,6 +166,8 @@ def main():
         "code": code,
         "settings": settings,
     }
+    if getattr(args, "background_benchmark", None):
+        contract["background_benchmark"] = args.background_benchmark
     if native_method:
         from .production import PRODUCTION_POLICY
 
@@ -191,6 +196,12 @@ def main():
         if getattr(args, "lacathode_replica", False):
             contract["settings"].update(campaign_seed=args.campaign_seed, run_index=args.run_index)
     path = args.output / "result.json"
+    if (inputs.get("injection_scan") or {}).get("schema") == 2:
+        from .scan_cache import configure_background_reuse, reuse_completed
+        configure_background_reuse(args, contract)
+        if reuse_completed(args.output, contract, getattr(args, "scan_result_candidates", ()),
+                           resume=args.resume, io_workers=args.io_workers, **policy):
+            return
     saved, changes = inspect_resume(args.output, contract, resume=args.resume, **policy)
     completed = saved is not None and saved["completed"]
     if completed:
@@ -255,6 +266,11 @@ def main():
             from external.lacathode_utils.pipeline import run
     try:
         run(args, contract)
+        if getattr(args, "background_phase", None) == "prepare":
+            report["background_prepared"] = True
+            write_json(path, report)
+            emit_message("Background preparation complete; signal fitting remains pending", kind="PASS")
+            return
         if oracle_method:
             protocol_path = args.output / "protocol.json"
             if protocol_path.is_file():
@@ -286,6 +302,9 @@ def main():
         report["resume_history"] = json.loads(history_path.read_text()) if history_path.is_file() else {"schema": 1, "transitions": []}
     report.update(completed=True, artifacts_sha256=fingerprint_files(args.output, artifacts, args.io_workers))
     write_json(path, report)
+    if native_method:
+        from .background_stage import stage_paths
+        stage_paths(args.output)[1].unlink(missing_ok=True)
     emit_message("Verified result saved", kind="PASS")
 
 

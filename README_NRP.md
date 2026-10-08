@@ -115,9 +115,9 @@ python run.py setup --methods ranode
 ```bash
 python run.py prepare --dataset lhco --catalog config/datasets.yaml --output data/lhco --io-workers 16 --verbose 1
 
-python run.py prepare --dataset lhco --catalog config/datasets.yaml --variant shifted --output data/lhco_shifted --io-workers 16 --verbose 1
-
 python run.py prepare --dataset lhco --catalog config/datasets.yaml --variant deltaR --output data/lhco_deltaR --io-workers 16 --verbose 1
+
+python run.py prepare --dataset lhco --catalog config/datasets.yaml --variant shifted --output data/lhco_shifted --io-workers 16 --verbose 1
 ```
 
 
@@ -331,16 +331,16 @@ Add `--overwrite` to regenerate matching plots and tables.
 
 ## Optional injection scan
 
-In the Jupyter terminal, prepare the configured strengths and replicas once; scan seeds come from those replicas.
+Prepare each strength once with the same population settings as the normal runs; all methods use seeds 40–44.
 
 ```bash
 cd /shared/work/RIDDLE
 
 python run.py prepare-scan --config config/settings.yaml --output data/injection_scan --io-workers 16 --resume
 
-python run.py prepare-scan --config config/settings.yaml --variant shifted --output data/injection_scan_shifted --io-workers 16 --resume
-
 python run.py prepare-scan --config config/settings.yaml --variant deltaR --output data/injection_scan_deltaR --io-workers 16 --resume
+
+python run.py prepare-scan --config config/settings.yaml --variant shifted --output data/injection_scan_shifted --io-workers 16 --resume
 ```
 
 After preparation is complete, submit the jobs below from your local terminal.
@@ -348,70 +348,84 @@ After preparation is complete, submit the jobs below from your local terminal.
 **RIDDLE:**
 
 ```bash
-kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
-  python /shared/work/RIDDLE/nrp.py \
-  --workflow scan --name "riddle-injection-scan" --methods riddle --replicas 0-4 \
-  --config config/settings.yaml --data data/injection_scan --results results_injection_scan \
-  --fits 20 --epochs 100 --workers 5 --io-workers 2 --torch-threads 2 --mps on --resume --resume-across-code-change \
-  | kubectl apply -n cua-asimsek -f -
-```
-
-**LaCathode:**
-
-```bash
-kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
-  python /shared/work/RIDDLE/nrp.py \
-  --workflow scan --name "lacathode-injection-scan" --methods lacathode --replicas 0-4 \
-  --config config/settings.yaml --data data/injection_scan --results results_injection_scan \
-  --epochs 100 --workers 5 --io-workers 2 --torch-threads 2 --mps on --resume --resume-across-code-change \
-  --lacathode-background independent \
-  | kubectl apply -n cua-asimsek -f -
-```
-
-LaCathode scan points only reuse a compatible background from the same seed.
-
-**R-ANODE:**
-
-```bash
-kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
-  python /shared/work/RIDDLE/nrp.py \
-  --workflow scan --name "ranode-injection-scan" --methods ranode --replicas 0-4 \
-  --data data/injection_scan --results results_injection_scan --resume --resume-across-code-change \
-  --fits 20 --epochs 300 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
-  | kubectl apply -n cua-asimsek -f -
+for SEED in 40 41 42 43 44; do
+  kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
+    python /shared/work/RIDDLE/nrp.py \
+    --workflow scan --name "riddle-injection-scan-seed${SEED}" --methods riddle --seed "$SEED" \
+    --config config/settings.yaml --data data/injection_scan --results results_injection_scan \
+    --reuse-results results --resume-across-code-change \
+    --fits 20 --epochs 100 --workers 5 --scan-bg-workers 4 --io-workers 2 --torch-threads 2 --mps on \
+    | kubectl apply -n cua-asimsek -f - || break
+done
 ```
 
 **Idealized AD:**
 
 ```bash
-kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
-  python /shared/work/RIDDLE/nrp.py \
-  --workflow scan --name "iad-injection-scan" --methods iad --replicas 0-9 \
-  --config config/settings.yaml --data data/injection_scan --results results_injection_scan \
-  --fits 20 --epochs 100 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
-  | kubectl apply -n cua-asimsek -f -
+for SEED in 40 41 42 43 44; do
+  kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
+    python /shared/work/RIDDLE/nrp.py \
+    --workflow scan --name "iad-injection-scan-seed${SEED}" --methods iad --seed "$SEED" \
+    --config config/settings.yaml --data data/injection_scan --results results_injection_scan \
+    --reuse-results results --resume-across-code-change \
+    --fits 20 --epochs 100 --workers 5 --scan-bg-workers 4 --io-workers 2 --torch-threads 2 --mps on \
+    | kubectl apply -n cua-asimsek -f - || break
+done
 ```
 
 **Supervised AD:**
 
 ```bash
-kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
-  python /shared/work/RIDDLE/nrp.py \
-  --workflow scan --name "supervised-injection-scan" --methods supervised --replicas 0-9 \
-  --config config/settings.yaml --data data/injection_scan --results results_injection_scan \
-  --fits 20 --epochs 100 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
-  | kubectl apply -n cua-asimsek -f -
+for SEED in 40 41 42 43 44; do
+  kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
+    python /shared/work/RIDDLE/nrp.py \
+    --workflow scan --name "supervised-injection-scan-seed${SEED}" --methods supervised --seed "$SEED" \
+    --config config/settings.yaml --data data/injection_scan --results results_injection_scan \
+    --reuse-results results --resume-across-code-change \
+    --fits 20 --epochs 100 --workers 5 --scan-bg-workers 4 --io-workers 2 --torch-threads 2 --mps on \
+    | kubectl apply -n cua-asimsek -f - || break
+done
 ```
+
+**LaCathode:**
+
+```bash
+for SEED in 40 41 42 43 44; do
+  kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
+    python /shared/work/RIDDLE/nrp.py \
+    --workflow scan --name "lacathode-injection-scan-seed${SEED}" --methods lacathode --seed "$SEED" \
+    --config config/settings.yaml --data data/injection_scan --results results_injection_scan \
+    --reuse-results results --resume-across-code-change \
+    --epochs 100 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
+    --lacathode-background independent \
+    | kubectl apply -n cua-asimsek -f - || break
+done
+```
+
+**R-ANODE:**
+
+```bash
+for SEED in 40 41 42 43 44; do
+  kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
+    python /shared/work/RIDDLE/nrp.py \
+    --workflow scan --name "ranode-injection-scan-seed${SEED}" --methods ranode --seed "$SEED" \
+    --config config/settings.yaml --data data/injection_scan --results results_injection_scan \
+    --reuse-results results --resume-across-code-change \
+    --fits 20 --epochs 300 --workers 5 --io-workers 2 --torch-threads 2 --mps on \
+    | kubectl apply -n cua-asimsek -f - || break
+done
+```
+
 
 In Jupyter, plot completed scan results:
 
 ```bash
 python plot.py --results results_injection_scan --output plots_injection_scan --verbose 1  --io-workers 16 --overwrite
 
-python paper_plot.py --scan-data data/injection_scan --scan-results results/injection_scan \
+python paper_plot.py --scan-data data/injection_scan --scan-results results_injection_scan \
   --config config/settings.yaml --output paper_plots \
   --methods riddle lacathode ranode iad supervised --variants default deltaR shifted \
-  --plot-formats png --file-formats csv --overwrite --verbose 1
+  --plot-formats png --file-formats csv --io-workers 16 --overwrite --verbose 1
 ```
 
 

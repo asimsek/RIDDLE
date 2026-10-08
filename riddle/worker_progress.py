@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import queue
+import signal
 import subprocess
 import threading
 import time
@@ -394,7 +395,7 @@ class WorkerDisplay:
             self.last_heartbeat = now
 
 
-def monitor_worker(command, env, log, label, *, resume=False):
+def monitor_worker(command, env, log, label, *, resume=False, cancel_event=None):
     messages = queue.Queue()
     recent_output = deque(maxlen=30)
     with (
@@ -407,6 +408,7 @@ def monitor_worker(command, env, log, label, *, resume=False):
             text=True,
             bufsize=1,
             errors="replace",
+            start_new_session=cancel_event is not None and os.name == "posix",
         ) as process,
     ):
         stream = BufferedLog(raw_stream)
@@ -426,6 +428,8 @@ def monitor_worker(command, env, log, label, *, resume=False):
             with ExitStack() as phases:
                 display = WorkerDisplays(phases, label)
                 while True:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise RuntimeError("Background preparation cancelled after another worker failed")
                     try:
                         line = messages.get(timeout=1)
                     except queue.Empty:
@@ -453,12 +457,20 @@ def monitor_worker(command, env, log, label, *, resume=False):
         except BaseException:
             stream.force_flush()
             if process.poll() is None:
-                process.terminate()
+                if cancel_event is not None and os.name == "posix":
+                    os.killpg(process.pid, signal.SIGTERM)
+                else:
+                    process.terminate()
                 try:
                     process.wait(timeout=10)
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait()
+            if cancel_event is not None and os.name == "posix":
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
             raise
         finally:
             stream.force_flush()

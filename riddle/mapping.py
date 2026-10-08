@@ -3,6 +3,7 @@ from copy import deepcopy
 import json
 from pathlib import Path
 import shutil
+import time
 
 import numpy as np
 import torch
@@ -163,8 +164,32 @@ class Mapper:
 
 def _reuse_signature(contract):
     keys = ("schema", "implementation", "preprocessing", "configuration", "options", "background",
-            "features", "data_policy", "residual_batch_size")
+            "features", "data_policy", "residual_batch_size", "seed", "hashes", "mass_parameters")
     return {key: contract.get(key) for key in keys if key in contract}
+
+
+def _frozen_sideband_roles(data, roles, production_contract):
+    frozen = (production_contract or {}).get("scan_background")
+    if not frozen:
+        return roles
+    name = "background/event_roles.npz"
+    path = Path(frozen["source_result"]) / name
+    if not path.is_file() or file_digest(path) != frozen["artifacts_sha256"].get(name):
+        raise ValueError("Nominal sideband role identities are missing or failed verification")
+    result = {name: dict(role) for name, role in roles.items()}
+    with np.load(path, allow_pickle=False) as original, np.load(Path(data) / "event_ids.npz", allow_pickle=False) as current:
+        for name, role in result.items():
+            if not role["source"].startswith("outerdata_"):
+                continue
+            nominal_ids = original[name + "__source_ids"]
+            target_ids = current[role["source"] + ".npy"]
+            nominal_keys = np.ascontiguousarray(nominal_ids, dtype=np.uint64).view("V16").ravel()
+            target_keys = np.ascontiguousarray(target_ids, dtype=np.uint64).view("V16").ravel()
+            _, original_indices, target_indices = np.intersect1d(nominal_keys, target_keys, return_indices=True)
+            role["indices"] = target_indices[np.argsort(original_indices)]
+            if len(role["indices"]) < 2:
+                raise ValueError(f"Too few nominal events remain for sideband role {name}")
+    return result
 
 
 def _verified_source_artifact(source, report, relative):
@@ -175,7 +200,8 @@ def _verified_source_artifact(source, report, relative):
     return path
 
 
-def _mapping_reuse_candidate(candidate, current_contract, seed, source_signature):
+def _mapping_reuse_candidate(candidate, current_contract, seed, source_signature, production_contract=None,
+                             allow_code_change=False, allow_device_change=False):
     source = Path(candidate).resolve()
     report_path = source / "result.json"
     if not report_path.is_file():
@@ -191,6 +217,11 @@ def _mapping_reuse_candidate(candidate, current_contract, seed, source_signature
     if scientific_version not in (SCIENTIFIC_VERSION, RIDDLE_BENCHMARK_SCIENTIFIC_VERSION):
         return None
     if report.get("scenario") != "signal_injection":
+        return None
+    from .scan_cache import runtime_compatible
+    if report.get("seed") != seed or not runtime_compatible(
+            report.get("contract", {}), production_contract,
+            allow_code_change=allow_code_change, allow_device_change=allow_device_change):
         return None
     if source_signature is None:
         return None
@@ -218,7 +249,12 @@ def _mapping_reuse_candidate(candidate, current_contract, seed, source_signature
         selection = json.loads(verified["background/flow_selection.json"].read_text())
     except json.JSONDecodeError:
         return None
-    if _reuse_signature(metadata) != _reuse_signature(current_contract):
+    previous_signature, target_signature = _reuse_signature(metadata), _reuse_signature(current_contract)
+    if (production_contract or {}).get("scan_background"):
+        for value in (previous_signature, target_signature):
+            value.pop("hashes", None)
+            value.pop("mass_parameters", None)
+    if previous_signature != target_signature:
         return None
     if selection.get("implementation") != current_contract["implementation"]:
         return None
@@ -230,11 +266,14 @@ def _mapping_reuse_candidate(candidate, current_contract, seed, source_signature
     return source, report, metadata, selection, verified, optional
 
 
-def _activate_mapping_reuse(output, candidates, current_contract, seed, source_signature):
+def _activate_mapping_reuse(output, candidates, current_contract, seed, source_signature,
+                            production_contract=None, allow_code_change=False, allow_device_change=False):
     manifest_path = output / "mapping_reuse.json"
+    frozen = (production_contract or {}).get("scan_background")
+    policy = "nominal_background_v1" if frozen else "exact_mapping_inputs_v1"
     if manifest_path.exists():
         manifest = json.loads(manifest_path.read_text())
-        if manifest.get("policy") not in ("same_replica_fixed_background_v1", "shared_fixed_background_v1"):
+        if manifest.get("policy") != policy:
             raise ValueError("Unrecognized mapping reuse policy")
         if manifest.get("target_seed") != seed or manifest.get("target_signature") != _reuse_signature(current_contract):
             raise ValueError("Mapping reuse target settings changed; use a new output")
@@ -247,15 +286,20 @@ def _activate_mapping_reuse(output, candidates, current_contract, seed, source_s
         return manifest
     found = None
     for candidate in candidates or ():
-        candidate_result = _mapping_reuse_candidate(candidate, current_contract, seed, source_signature)
+        candidate_result = _mapping_reuse_candidate(candidate, current_contract, seed, source_signature,
+                                                   production_contract, allow_code_change, allow_device_change)
         if candidate_result is not None:
             found = candidate_result
             break
     if found is None:
+        if frozen:
+            raise ValueError("Nominal background mapping is incompatible or its artifacts failed verification")
         return None
     downstream = output.parent / "density"
     local_training = (output / "mapping_settings.json").exists() or (output / ".resume/latest.pt").exists()
     if local_training and downstream.exists() and any(path.is_file() for path in downstream.rglob("*")):
+        if frozen:
+            raise ValueError("Cannot replace an existing trained background; use a new scan output")
         return None
     if local_training:
         for name in ("model.pt", "preprocessing.pt", "flow_selection.json", "mapping_settings.json", "history.json", "mapping_runtime.json"):
@@ -272,7 +316,7 @@ def _activate_mapping_reuse(output, candidates, current_contract, seed, source_s
         copied[target_name] = file_digest(target)
     manifest = {
         "schema": 1,
-        "policy": "shared_fixed_background_v1",
+        "policy": policy,
         "source_result": str(source),
         "source_result_sha256": file_digest(source / "result.json"),
         "source_seed": report.get("seed"),
@@ -289,16 +333,18 @@ def _activate_mapping_reuse(output, candidates, current_contract, seed, source_s
         "truth_labels_used": False,
     }
     write_json(manifest_path, manifest)
-    emit_message(f"Reuse frozen RIDDLE background map from {source}", kind="PASS", level=0)
+    emit_message(f"Reuse matching RIDDLE background map from {source}", kind="PASS", level=0)
     return manifest
 
 def prepare(data, output, seed, device, *, background, options, data_policy=None, residual_batch_size=256,
-            experiment=None, reuse_candidates=None, allow_device_change=False):
+            experiment=None, reuse_candidates=None, allow_device_change=False,
+            production_contract=None, allow_code_change=False):
     output = Path(output); output.mkdir(parents=True, exist_ok=True)
     sources, roles = split_roles(data, seed, calibration=options["score_flow"])
     from .roles import DEFAULT_POLICY, override_roles, attach_source_ids, finalize_mapped
     data_policy = DEFAULT_POLICY if data_policy is None else data_policy
     roles = override_roles(sources, roles, seed, data_policy, residual_batch_size)
+    roles = _frozen_sideband_roles(data, roles, production_contract)
     experiment_reference = None
     if experiment is not None:
         if not options["rosenblatt"]:
@@ -336,7 +382,8 @@ def prepare(data, output, seed, device, *, background, options, data_policy=None
         except (OSError, ValueError, json.JSONDecodeError):
             source_signature = None
     mapping_reuse = None if experiment is not None else _activate_mapping_reuse(
-        output, reuse_candidates, contract, seed, source_signature
+        output, reuse_candidates, contract, seed, source_signature,
+        production_contract, allow_code_change, allow_device_change
     )
     settings_path = output / "mapping_settings.json"
     write_json(output / "background_settings.json", background)
@@ -381,7 +428,9 @@ def prepare(data, output, seed, device, *, background, options, data_policy=None
         validation_batch_used = (min(int(background["mapping_validation_batch_size"]), 8192)
                                  if torch.device(device).type == "cpu"
                                  else int(background["mapping_validation_batch_size"]))
+        epoch_seconds = []
         for epoch in range(start, background["epochs"]):
+            epoch_started = time.monotonic()
             model.train()
             if options["rosenblatt"]:
                 total = 0.
@@ -409,12 +458,15 @@ def prepare(data, output, seed, device, *, background, options, data_policy=None
             if experiment is not None:
                 from .mapping_experiment import observe_epoch
                 observe_epoch(experiment, output, model, epoch, clean, sources, fit, mass_parameters, device, loss)
+            epoch_seconds.append(time.monotonic() - epoch_started)
             if persist_boundary(epoch, background["epochs"]):
                 save_torch(latest, dict(contract=contract, next_epoch=epoch+1, model=model.state_dict(),
                            optimizer=optimizer.state_dict(), rng=rng_state(), history=history,
                            best=best, best_model=best_model, best_epoch=best_epoch))
                 write_json(output / "history.json", history)
             emit_message(f"Background map {epoch+1}/{background['epochs']}: validation NLL={loss:.6g}")
+        from .background_stage import record_timing
+        record_timing(output, "epochs", sum(epoch_seconds), epoch_seconds=epoch_seconds)
         save_torch(output / "model.pt", best_model)
         _save_preprocessing(output / "preprocessing.pt", {k: fit[k].cpu() for k in PREPROCESS_KEYS},
                             allow_device_change)

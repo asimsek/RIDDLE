@@ -48,7 +48,8 @@ class SeedList(argparse.Action):
 def add_seed_argument(parser, default=(42,)):
     parser.add_argument("--seed", "--seeds", dest="seeds", nargs="+", type=seeds,
                         action=SeedList, default=None if default is None else list(default),
-                        help="Explicit seeds; one complete run per seed (default: 42)")
+                        help="Explicit seeds; one complete run per seed"
+                             + (" (scan default: settings.yaml; run default: 42)" if default is None else " (default: 42)"))
 
 
 def positive(value):
@@ -77,10 +78,9 @@ def parser():
     prep.add_argument("--resume", action="store_true")
     prep.add_argument("--verbose", type=int, choices=[0, 1, 2], default=1)
     prep_scan = subs.add_parser("prepare-scan", parents=[deepcopy(prep)], add_help=False,
-                                help="Prepare independently partitioned injection strengths")
+                                help="Prepare injection strengths with the ordinary shared populations")
     prep_scan.set_defaults(output=Path("data/injection_scan"))
     prep_scan.add_argument("--signal-events", type=seeds, help="Subset of configured total signal counts")
-    prep_scan.add_argument("--replicas", type=seeds, help="Zero-based replica indices, e.g. 0-9")
     for command in ("run", "scan"):
         run = subs.add_parser(command, allow_abbrev=False,
                               help="Run independent methods" if command == "run" else "Run the optional injection scan")
@@ -101,6 +101,8 @@ def parser():
         )
         run.add_argument("--io-workers", type=positive, default=2,
                          help="Filesystem/host I/O concurrency; independent of PyTorch compute threads")
+        run.add_argument("--scan-bg-workers", type=positive, default=1,
+                         help="Concurrent native background preparations: strengths within each retraining scan seed, or seeds in run mode")
         run.add_argument("--torch-threads", type=positive, default=2,
                          help="Intra-op CPU threads per training process (default: 2)")
         run.add_argument("--mps", choices=["auto", "on", "off"], default="auto")
@@ -129,7 +131,10 @@ def parser():
         else:
             run.set_defaults(data=Path("data/injection_scan"), output=Path("results/injection_scan"))
             run.add_argument("--signal-events", type=seeds, help="Subset of configured total signal counts")
-            run.add_argument("--replicas", type=seeds, help="Zero-based replica indices, e.g. 0-9")
+            add_seed_argument(run, default=None)
+            run.add_argument("--population-config", type=Path, default=default_config_path("populations.yaml"))
+            run.add_argument("--scan-reuse", action=argparse.BooleanOptionalAction, default=True)
+            run.add_argument("--reuse-results", nargs="+", type=Path, help="Search these result roots for compatible completed work")
     return p
 
 
@@ -157,7 +162,17 @@ def campaign_runs(args):
     return requests
 
 
-def run_campaign(args):
+def run_campaign(args, *, cancel_event=None):
+    resume_policy(args)
+    if len(args.methods) != len(set(args.methods)) or len(args.scenarios) != len(set(args.scenarios)):
+        raise ValueError("Duplicate methods/scenarios")
+    campaign_runs(args)
+    if cancel_event is not None and cancel_event.is_set():
+        raise RuntimeError("Background preparation cancelled")
+    if (getattr(args, "scan_bg_workers", 1) > 1 and not getattr(args, "background_phase", None)
+            and getattr(args, "command", "run") != "scan"):
+        from .background_stage import run_seed_backgrounds
+        return run_seed_backgrounds(args, run_campaign)
     resume_policy(args)
     run_overrides = {"runs": 1, "epochs": getattr(args, "epochs", None)}
     fit_overrides = dict(runs=getattr(args, "fits", None), epochs=getattr(args, "epochs", None))
@@ -261,6 +276,8 @@ def run_campaign(args):
                 RIDDLE_WORKER_PROGRESS="1",
                 PYTHONPATH=os.pathsep.join(filter(None, (str(ROOT), env.get("PYTHONPATH")))),
             )
+            if getattr(args, "background_benchmark", None):
+                env["RIDDLE_BG_BENCHMARK"] = "1"
             for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
                 env[key] = str(args.torch_threads)
             if method == "ranode":
@@ -280,6 +297,12 @@ def run_campaign(args):
                     command.extend(["--scan-background-reuse-policy", reuse_policy])
                 for candidate in getattr(args, "ranode_background_reuse_candidates", None) or ():
                     command.extend(["--background-reuse-candidate", str(candidate)])
+                for candidate in getattr(args, "scan_result_candidates", None) or ():
+                    command.extend(["--scan-result-candidate", str(candidate)])
+                for key in ("scan_background_mode", "scan_background_baseline", "scan_background_data"):
+                    value = getattr(args, key, None)
+                    if value is not None:
+                        command.extend(["--" + key.replace("_", "-"), str(value)])
                 if args.resume:
                     command.append("--resume")
                 for key in ("resume_across_code_change", "resume_across_device_change"):
@@ -292,8 +315,9 @@ def run_campaign(args):
                     command,
                     env,
                     output / "training.log",
-                    f"{method} | {scenario}",
+                    f"{method} | {scenario} | seed {seed} | {args.data.name}",
                     resume=args.resume,
+                    cancel_event=cancel_event,
                 )
 
 

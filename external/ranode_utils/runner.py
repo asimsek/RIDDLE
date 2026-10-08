@@ -373,6 +373,8 @@ def _select_background_reuse(args):
 def _activate_background_reuse(args):
     selected = _select_background_reuse(args)
     if selected is None:
+        if getattr(args, "production_contract", {}).get("scan_background"):
+            raise ValueError("Nominal R-ANODE background is incompatible or its artifacts failed verification")
         return None
     source, report, receipt, source_attempt, signature = selected
     attempts = args.output / "upstream_runs" / "background"
@@ -706,6 +708,7 @@ def run(args):
         "code": {**{p.name: digest(p) for p in sorted(Path(__file__).parent.glob("*.py"))},
                  "framework/production.py": digest(ROOT / "riddle/production.py"),
                  "framework/resume.py": digest(ROOT / "riddle/resume.py"),
+                 "framework/scan_cache.py": digest(ROOT / "riddle/scan_cache.py"),
                  "framework/acceleration.py": digest(ROOT / "riddle/acceleration.py")},
     }
     if not guarded:
@@ -719,6 +722,12 @@ def run(args):
     args.output.mkdir(parents=True, exist_ok=True)
     with lock(args.output / ".ranode.lock"):
         manifest = args.output / "result.json"
+        from riddle.scan_cache import configure_background_reuse, reuse_completed
+        args.scan_result_candidates = getattr(args, "scan_result_candidate", ()) or ()
+        configure_background_reuse(args, contract)
+        if reuse_completed(args.output, contract, getattr(args, "scan_result_candidate", ()) or (),
+                           resume=args.resume, io_workers=args.io_workers, **resume_options):
+            return
         saved = json.loads(manifest.read_text()) if manifest.exists() else None
         if saved is None and any(
             (args.output / name).exists()
@@ -956,6 +965,10 @@ def main(argv=None):
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--scan-background-reuse-policy", help=argparse.SUPPRESS)
     parser.add_argument("--background-reuse-candidate", action="append", help=argparse.SUPPRESS)
+    parser.add_argument("--scan-result-candidate", action="append", help=argparse.SUPPRESS)
+    parser.add_argument("--scan-background-mode", choices=("reuse", "retrain"), help=argparse.SUPPRESS)
+    parser.add_argument("--scan-background-baseline", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--scan-background-data", help=argparse.SUPPRESS)
     parser.add_argument("--pilot-no-safeguards", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--pilot-rng-source", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--pilot-latent-inputs", type=Path, help=argparse.SUPPRESS)

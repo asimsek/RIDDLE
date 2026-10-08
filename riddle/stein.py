@@ -1,6 +1,7 @@
 import json
 import math
 import random
+import time
 from copy import deepcopy
 from pathlib import Path
 
@@ -599,8 +600,10 @@ def train_stein_witness(train, validation, output, *, epochs, seed, device, chec
     if stopped:
         start = epochs
     durable_history = list(history)
+    epoch_seconds = []
     try:
         for epoch in range(start, epochs):
+            epoch_started = time.monotonic()
             flow_lr = optimizer.param_groups[0]["lr"]
             progress.substep("Train", 0, len(train_loader))
             train_loss, diagnostics = _epoch(
@@ -633,6 +636,7 @@ def train_stein_witness(train, validation, output, *, epochs, seed, device, chec
                            and epoch + 1 >= control.get("minimum_epochs", 1)
                            and stale >= control["early_stopping_patience"])
             _offer(candidates, options["selected_checkpoints"], epoch, validation_loss, model)
+            epoch_seconds.append(time.monotonic() - epoch_started)
             durable = persist_boundary(epoch, epochs) or stopped
             if durable:
                 progress.update(force=True, operation="Persist 10-epoch recovery boundary", minibatch="-")
@@ -666,6 +670,8 @@ def train_stein_witness(train, validation, output, *, epochs, seed, device, chec
         write_json(output / "residual_losses.json", {"history": durable_history})
         raise
     write_json(output / "residual_losses.json", {"history": history})
+    from .background_stage import record_timing
+    record_timing(output, "epochs", sum(epoch_seconds), epoch_seconds=epoch_seconds)
     order = ordered_epochs([row["validation_nll"] for row in history], options["selected_checkpoints"])
     if [candidate["epoch"] for candidate in candidates] != order:
         raise ValueError("Buffered Stein Top-N checkpoint inventory disagrees with final selection")

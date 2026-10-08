@@ -43,6 +43,18 @@ def _active_pipe_directory() -> Path | None:
 
 
 def configure_mps(mode: str, device: str, workers: int) -> MPSStatus:
+    if mode != "off" and workers > 1 and str(device).startswith("cuda") and os.name == "posix":
+        import fcntl
+
+        root = _runtime_directories()[0].parent
+        root.mkdir(parents=True, exist_ok=True, mode=448)
+        with (root / "startup.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            return _configure_mps(mode, device, workers)
+    return _configure_mps(mode, device, workers)
+
+
+def _configure_mps(mode: str, device: str, workers: int) -> MPSStatus:
     if mode not in {"auto", "on", "off"}:
         raise ValueError("MPS mode must be auto, on, or off")
     requested = mode != "off" and workers > 1 and (not str(device).lower().startswith("cpu"))

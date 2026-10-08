@@ -145,10 +145,23 @@ python run.py prepare-scan --config config/settings.yaml --output data/injection
 ```
 
 ```bash
-python run.py scan --methods lacathode riddle ranode --config config/settings.yaml \
+python run.py scan --methods riddle iad supervised lacathode --seed 40 41 42 43 44 --config config/settings.yaml \
   --data data/injection_scan --output results_injection_scan \
+  --reuse-results results --resume-across-code-change \
   --fits 20 --epochs 100 \
-  --device cuda:0 --workers 2 --io-workers 8 --mps auto --resume
+  --device cuda:0 --workers 5 --io-workers 2 --torch-threads 2 --mps on --resume
+```
+
+Request single method directly with `--methods lacathode`, `--methods riddle`, `--methods ranode`, `--methods iad`, or `--methods supervised`.<br>
+
+R-ANODE method uses 300 epochs. It should be produced seperately:
+
+```bash
+python run.py scan --methods ranode --seed 40 41 42 43 44 --config config/settings.yaml \
+  --data data/injection_scan --output results_injection_scan \
+  --reuse-results results --resume-across-code-change \
+  --fits 20 --epochs 300 \
+  --device cuda:0 --workers 5 --io-workers 2 --torch-threads 2 --mps on --resume
 ```
 
 ```bash

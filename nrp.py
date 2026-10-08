@@ -83,6 +83,8 @@ def job(args):
         str(getattr(args, "config", "config/settings.yaml")),
         "--workers",
         str(args.workers),
+        "--scan-bg-workers",
+        str(getattr(args, "scan_bg_workers", 1)),
         "--io-workers",
         str(args.io_workers),
         "--torch-threads",
@@ -95,10 +97,14 @@ def job(args):
     ]
     if getattr(args, "workflow", "run") == "scan":
         if getattr(args, "seeds", None) is not None:
-            raise ValueError("Scan training seeds come from its configuration; --seed applies to --workflow run")
-        for key in ("replicas", "signal_events"):
-            if getattr(args, key, None) is not None:
-                command.extend(["--" + key.replace("_", "-"), ",".join(map(str, getattr(args, key)))])
+            command.extend(["--seed", *map(str, args.seeds)])
+        if getattr(args, "signal_events", None) is not None:
+            command.extend(["--signal-events", ",".join(map(str, args.signal_events))])
+        command.extend(["--population-config", args.population_config])
+        if not args.scan_reuse:
+            command.append("--no-scan-reuse")
+        if args.reuse_results:
+            command.extend(["--reuse-results", *args.reuse_results])
     else:
         command.extend(["--scenarios", *args.scenarios, "--seed", *map(str, args.seeds or [42])])
     for option in ("resume_across_code_change", "resume_across_device_change"):
@@ -295,11 +301,13 @@ def main(argv=None):
     action.add_argument("--pin-image", help="Save a built image digest in config/nrp/jupyter.yaml")
     p.add_argument("--methods", nargs="+", type=method_name, choices=METHODS, default=list(DEFAULT_METHODS))
     p.add_argument("--workflow", choices=("run", "scan"), default="run")
-    p.add_argument("--replicas", type=seeds, help="Scan replica indices, e.g. 0-9")
     p.add_argument("--signal-events", type=seeds, help="Scan total signal counts, e.g. 1000,667")
     p.add_argument("--scenarios", nargs="+", choices=SCENARIOS, default=["signal_injection"])
     add_seed_argument(p, default=None)
     p.add_argument("--config", default="config/settings.yaml", help="Settings path inside the job")
+    p.add_argument("--population-config", default="config/populations.yaml", help="Shared population settings for scans")
+    p.add_argument("--scan-reuse", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--reuse-results", nargs="+", help="Result roots containing compatible completed work")
     p.add_argument("--ranode-config", default="external/ranode_utils/ranode.yaml", help="Independent upstream R-ANODE settings")
     p.add_argument("--data", help="Prepared dataset path; defaults to data/lhco or data/injection_scan for scans")
     p.add_argument("--results", help="Result directory; defaults to results or results/injection_scan for scans")
@@ -314,6 +322,8 @@ def main(argv=None):
                    help="Retrain each LaCathode background flow (default), or share one flow across classifier fits")
     p.add_argument("--epochs", type=positive, help="Override RIDDLE/Idealized-RIDDLE/Supervised-RIDDLE/R-ANODE fit epochs and LaCathode classifier epochs; background stages are unchanged")
     p.add_argument("--workers", type=positive, default=2)
+    p.add_argument("--scan-bg-workers", type=positive, default=1,
+                   help="Concurrent native background preparations across scan strengths or main-workflow seeds")
     p.add_argument("--io-workers", type=positive, default=4,
                    help="Filesystem/host I/O concurrency")
     p.add_argument("--torch-threads", type=positive, default=2,

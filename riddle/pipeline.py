@@ -1,4 +1,5 @@
 import json
+import time
 from pathlib import Path
 import numpy as np
 
@@ -146,9 +147,7 @@ def _prepare_oracle_roles(args, mapper, training, validation, development):
     }
 
 
-def run(args, contract):
-    fraction_values = fractions(args.fractions)
-    acceleration = install_tensor_batches(args.device)
+def prepare_background(args, contract):
     output = args.output
     latent_root = output / "background"
     recovery = EpochRecovery(latent_root, contract, args.resume, **resume_policy(args))
@@ -184,6 +183,8 @@ def run(args, contract):
                 residual_batch_size=settings["riddle"]["training"]["batch_size"],
                 reuse_candidates=getattr(args, "riddle_background_reuse_candidates", None),
                 allow_device_change=allow_device_change,
+                production_contract=contract,
+                allow_code_change=resume_policy(args)["allow_code_change"],
             )
     else:
         selection = prepare(args.data, latent_root, args.seed, args.device, recovery, settings=settings["background"])
@@ -247,6 +248,7 @@ def run(args, contract):
             settings=settings["riddle"], seed=(int(args.seed)+91000) % 2**32, device=args.device,
             reuse_candidates=getattr(args, "oracle_background_reuse_candidates", None),
             current_code=contract.get("code", {}),
+            production_contract=contract,
             allow_code_change=resume_policy(args)["allow_code_change"],
             allow_device_change=allow_device_change,
         )
@@ -257,13 +259,24 @@ def run(args, contract):
         for role in ("correction_train", "correction_val", "closure"):
             if role not in development:
                 raise ValueError(f"Missing reserved {role} role required by bgcorr_40_reguide")
-        from .background_correction import train as train_background_correction, reuse as reuse_background_correction
+        from .background_correction import train as train_background_correction, reuse as reuse_background_correction, _contract as correction_contract
         background_correction_decision = None
         if mapping_reuse is not None:
+            correction_inputs = [np.ascontiguousarray(development[role][field], dtype=np.float32)
+                                 for role in ("correction_train", "correction_val", "closure")
+                                 for field in ("z", "mass")]
+            expected_correction = correction_contract(
+                settings["riddle"], *correction_inputs[:4], (int(args.seed)+91000) % 2**32,
+                args.device, *correction_inputs[4:])
             background_correction_decision = reuse_background_correction(
                 output / "density" / "background_correction", mapping_reuse["source_result"],
-                settings=settings["riddle"], seed=(int(args.seed)+91000) % 2**32, device=args.device,
+                expected_contract=expected_correction,
+                frozen=bool(contract.get("scan_background")),
+                allow_device_change=allow_device_change,
             )
+            if (contract.get("scan_background") and background_correction_decision is None
+                    and expected_correction["activation_policy"] != "off"):
+                raise ValueError("Nominal background correction is incompatible or its artifacts failed verification")
         if background_correction_decision is None:
             background_correction_decision = train_background_correction(
                 output / "density" / "background_correction",
@@ -310,7 +323,70 @@ def run(args, contract):
             z = (np.column_stack((with_mass_context(z[:, :-1], rows[mask, 0]), z[:, -1])).astype(np.float32)
                  if physical_inputs else with_mass_context(z, rows[mask, 0]))
         mapped[partition] = (rows, region, z, mask, preprocessing_mask, score_domain_mask)
+    return {
+        "training": training,
+        "validation": validation,
+        "selection_validation": selection_validation,
+        "member_splits": member_splits,
+        "source_ids": source_ids,
+        "oracle_roles": oracle_roles,
+        "mapping_identity": mapping_identity,
+        "background_reference": background_reference,
+        "dimensions": dimensions,
+        "background_correction": background_correction,
+        "background_correction_decision": background_correction_decision,
+        "mapped": mapped,
+        "evaluation_ids": evaluation_ids,
+        "development": development,
+        "mapping_reuse": mapping_reuse,
+        "selection": selection,
+    }
+
+
+def run(args, contract):
+    from .background_stage import load_stage, save_stage
+    from .worker_progress import emit_message
+
+    acceleration = install_tensor_batches(args.device)
+    started = time.monotonic()
+    state = load_stage(args, contract)
+    if state is None:
+        if getattr(args, "background_phase", None) == "finish":
+            raise ValueError("Missing verified background preparation; rerun the background stage")
+        state = prepare_background(args, contract)
+        if getattr(args, "background_phase", None) == "prepare":
+            save_stage(args, contract, state, time.monotonic() - started)
+    else:
+        emit_message("Reuse verified background preparation and mapped arrays", kind="PASS")
+    if getattr(args, "background_phase", None) == "prepare":
+        return
+    finish_started = time.monotonic()
+    finish(args, contract, acceleration=acceleration, **state)
+    from .background_stage import record_timing
+    record_timing(args.output, "finish", time.monotonic() - finish_started)
+
+
+def finish(args, contract, *, acceleration,
+           training, validation, selection_validation, member_splits, source_ids, oracle_roles,
+           mapping_identity, background_reference, dimensions, background_correction, background_correction_decision,
+           mapped, evaluation_ids, development, mapping_reuse, selection):
+    fraction_values = fractions(args.fractions)
+    output = args.output
+    settings = args.settings
+    allow_device_change = resume_policy(args)["allow_device_change"] and str(args.device).startswith("cuda")
+    oracle_method = args.method in RIDDLE_BENCHMARK_LABELS
+    active = effective_features(settings["riddle"])
+    core = settings["riddle"].get("core", "residual")
+    from .score_selection import validate_population_contract
+    shared_scoring = validate_population_contract(settings["riddle"], contract["inputs"], args.method)
+    enhanced = any(active.values()) or settings["riddle"].get("background_correction") == "bgcorr_40_reguide"
+    mass_conditioning = settings["riddle"].get("mass_conditioning", False)
+    physical_inputs = settings["riddle"].get("input_space") == "physical"
+    score_scope = "signal_region" if mass_conditioning else "full_region"
+    acceptance = {}
+    fits_seconds = 0.0
     while True:
+        fits_started = time.monotonic()
         result = train_campaign(
             training,
             validation,
@@ -339,6 +415,9 @@ def run(args, contract):
                 "allow_ensemble_reuse_code_change": resume_policy(args)["allow_code_change"],
             } if args.method == "supervised" else {}),
         )
+        fits_seconds += time.monotonic() - fits_started
+        from .background_stage import record_timing
+        record_timing(output, "fits", fits_seconds)
         validate_normalization(output / "density", dimensions + int(mass_conditioning) + int(physical_inputs), args.device)
         exports = {}
         calibration_raw = {}

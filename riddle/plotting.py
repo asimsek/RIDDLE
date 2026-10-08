@@ -396,13 +396,15 @@ def discover(root, requested=None, *, scan=False):
         method = method_family(stored_method)
         if (requested is not None and method not in requested) or not report.get("completed"):
             continue
-        if method == "lacathode" and "run_index" in report and path.parent != root:
+        if method == "lacathode" and "run_index" in report and path.parent != root and not report.get("scan_reuse"):
             continue
         point = report.get("contract", {}).get("inputs", {}).get("injection_scan")
         if bool(point) != scan:
             continue
+        from .scan_cache import resolve_reference
+        artifact_root, report = resolve_reference(path.parent, report)
         if method in RIDDLE_NATIVE_METHODS and "protocol.json" in report.get("artifacts_sha256", {}):
-            protocol = read_metadata(path.parent, report, "protocol.json")
+            protocol = read_metadata(artifact_root, report, "protocol.json")
             report = {**report, "protocol": protocol,
                       "score_scope": riddle_score_scope({**report, "protocol": protocol})}
         spec = register_method(report)
@@ -414,13 +416,13 @@ def discover(root, requested=None, *, scan=False):
         scenario, seed = report["scenario"], report["seed"]
         if scenario not in f.SCENARIOS or type(seed) is not int:
             raise ValueError("Invalid result identity")
-        identity = ((point["signal_events"], point["replica"], report.get("run_index", 0), variant)
+        identity = ((point["signal_events"], point.get("replica", seed), report.get("run_index", 0), variant)
                     if scan else (scenario, seed, variant))
         group = groups.setdefault(identity, {})
         if method in group:
             old_root, old_report = group[method]
             if method in RIDDLE_NATIVE_METHODS and scientific_protocol(old_report) != scientific_protocol(report):
-                preferred = (path.parent, report) if protocol_rank(report) > protocol_rank(old_report) else (old_root, old_report)
+                preferred = (artifact_root, report) if protocol_rank(report) > protocol_rank(old_report) else (old_root, old_report)
                 discarded = old_report if preferred[1] is report else report
                 group[method] = preferred
                 colored_status(
@@ -432,7 +434,7 @@ def discover(root, requested=None, *, scan=False):
             raise ValueError(
                 f"Duplicate {METHOD_SPECS[method].label}/scenario/seed/variant results; choose a narrower input directory"
             )
-        group[method] = (path.parent, report)
+        group[method] = (artifact_root, report)
     return groups
 
 
@@ -1368,6 +1370,14 @@ def render_injection_scan(groups, output, args, score_loader=None):
     if len(variants) > 1:
         raise ValueError("Render each injection-scan dataset variant separately")
     variant = next(iter(variants), "default")
+    schemas = {report["contract"]["inputs"]["injection_scan"].get("schema", 1)
+               for group in groups.values() for _, report in group.values()}
+    if len(schemas) != 1:
+        raise ValueError("Do not combine legacy replica scans with shared-population seed scans")
+    shared_population = schemas == {2}
+    from .scan_cache import require_scan_compatibility
+    for method in {method for group in groups.values() for method in group}:
+        require_scan_compatibility(method, [group[method] for group in groups.values() if method in group])
     for identity, group in sorted(groups.items()):
         count, replica = identity[:2]
         reference = None
@@ -1392,8 +1402,8 @@ def render_injection_scan(groups, output, args, score_loader=None):
             point = inputs["injection_scan"]
             from .cli import independent_run_seeds
             run_index = report.get("run_index", 0)
-            expected_seed = independent_run_seeds(point["training_seed"], run_index + 1)[-1]
-            if report["seed"] != expected_seed:
+            expected_seed = replica if shared_population else independent_run_seeds(point["training_seed"], run_index + 1)[-1]
+            if report["seed"] != expected_seed or (shared_population and run_index != 0):
                 raise ValueError("Scan result has an incompatible training seed")
             if reference is not None and inputs != reference:
                 raise ValueError("Scan methods must share identical prepared data at each point")
@@ -1407,15 +1417,17 @@ def render_injection_scan(groups, output, args, score_loader=None):
                               for score in fit_scores(data)]
                 classifier_fits.append(dict(method=method, signal_events=count, replica=replica,
                                             training_seed=report["seed"], fits=fit_values))
-                for field in ("conditional_auc", "conditional_max_sic", "full_pipeline_max_sic"):
-                    finite = [v[field] for v in fit_values if v[field] is not None and np.isfinite(v[field])]
-                    values[field] = float(np.median(finite)) if finite else None
+                if not shared_population:
+                    for field in ("conditional_auc", "conditional_max_sic", "full_pipeline_max_sic"):
+                        finite = [v[field] for v in fit_values if v[field] is not None and np.isfinite(v[field])]
+                        values[field] = float(np.median(finite)) if finite else None
             initial = inputs["uncut_signal_region"]
             b0, s0 = initial["background"], initial["signal"]
             if b0 <= 0 or s0 <= 0:
                 raise ValueError("Positive realized SR background and signal counts required for a scan")
             maximum = values["full_pipeline_max_sic"]
-            fixed = [sic_at_background(data, score, 1e-3, args.min_background) for score in fit_scores(data)]
+            fixed = [sic_at_background(data, score, 1e-3, args.min_background)
+                     for score in ([data["scores"]] if shared_population else fit_scores(data))]
             fixed_sic = float(np.median(fixed)) if all(v is not None for v in fixed) else None
             row = dict(method=method, variant=variant, signal_events=count, replica=replica, run_index=run_index,
                        training_seed=report["seed"], preparation_seed=point["preparation_seed"],
@@ -1435,8 +1447,9 @@ def render_injection_scan(groups, output, args, score_loader=None):
     audit = dict(
         variant=variant,
         metric="Oracle maximum on truth-labelled SR test sample; mapping failures never pass",
-        nominal_significance="Per replica: SIC times realized uncut SR S/sqrt(B), then aggregate",
-        uncertainty="16/50/84 percentiles across independently seeded partitions and training; finite source pool is reused, not independent collision datasets",
+        nominal_significance="Per seed: SIC times realized uncut SR S/sqrt(B), then aggregate",
+        uncertainty=("Mean and min-max across explicit training seeds on fixed prepared data" if shared_population else
+                     "16/50/84 percentiles across independently seeded partitions and training; finite source pool is reused, not independent collision datasets"),
         minimum_background_count=args.min_background, minimum_background_efficiency=1e-4,
         fixed_efficiency="SIC at physical background efficiency 0.001; linear ROC interpolation within supported points only",
         significance_caveat="Nominal S/sqrt(B); no systematics, background fit, Poisson calibration or trials correction",
@@ -1468,7 +1481,9 @@ def render_injection_scan(groups, output, args, score_loader=None):
                     if not finite:
                         continue
                     x = float(np.median([r[x_field] for r in finite]))
-                    low, median, high = np.quantile([r[field] for r in finite], [.16, .5, .84])
+                    observations = [r[field] for r in finite]
+                    low, median, high = ((np.min(observations), np.mean(observations), np.max(observations))
+                                         if shared_population else np.quantile(observations, [.16, .5, .84]))
                     values.append((x, low, median, high, len(finite), count))
                 if not values:
                     continue
@@ -1481,9 +1496,10 @@ def render_injection_scan(groups, output, args, score_loader=None):
                 if supported.any():
                     ax.fill_between(x, low, high, where=supported, color=color, alpha=.18, linewidth=0)
                 if not supported.all():
-                    colored_status(f"{name}: scan band unavailable at single-replica points", kind="WARNING")
-                plotted[method] = [dict(x=float(a), low=float(l), median=float(m), high=float(h),
-                                       replicas=int(n), signal_events=int(c))
+                    colored_status(f"{name}: scan band unavailable at points with one completed seed", kind="WARNING")
+                plotted[method] = [dict(x=float(a), low=float(l), high=float(h), signal_events=int(c),
+                                       **({"mean": float(m), "seeds": int(n)} if shared_population else
+                                          {"median": float(m), "replicas": int(n)}))
                                    for a, l, m, h, n, c in values]
                 any_drawn = True
             if not any_drawn:
@@ -1514,7 +1530,8 @@ def render_injection_scan(groups, output, args, score_loader=None):
     audit["points"] = rows
     if classifier_fits:
         audit["lacathode_classifier_fits"] = classifier_fits
-        audit["lacathode_aggregation"] = "Median of per-fit metrics within each replica; bands remain across replicas, not shared-flow fits"
+        audit["lacathode_aggregation"] = ("Saved ensemble metric per seed; mean and min-max across seeds" if shared_population else
+                                          "Median of per-fit metrics within each replica; bands remain across replicas, not shared-flow fits")
     write_json(output / "injection_scan.json", json_safe(audit))
     return audit
 

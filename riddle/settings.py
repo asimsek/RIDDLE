@@ -466,7 +466,9 @@ def load_settings(path=DEFAULT_PATH):
     for name, default in background_defaults.items():
         b.setdefault(name, default)
     keys(b, "configuration epochs batch_size reference_samples mapping_validation_batch_size mapping_inference_batch_size", "background")
-    integer(b["epochs"], "background epochs", 11)
+    from .options import effective_features
+    enhanced = any(effective_features(value["riddle"]).values()) or value["riddle"].get("background_correction") == "bgcorr_40_reguide"
+    integer(b["epochs"], "background epochs", 10 if enhanced else 11)
     integer(b["batch_size"], "background batch_size", 2)
     integer(b["reference_samples"], "reference_samples", 2)
     integer(b["mapping_validation_batch_size"], "mapping_validation_batch_size", 1)
@@ -486,7 +488,10 @@ def load_settings(path=DEFAULT_PATH):
     if b["configuration"]["num_inputs"] != 4:
         raise ValueError("Keep num_inputs=4; the DeltaR control automatically selects five dimensions")
     scan = value["injection_scan"]
-    keys(scan, "signal_events replicas preparation_seed training_seed", "injection scan")
+    scan.setdefault("background_mode", "reuse")
+    keys(scan, "signal_events seeds background_mode", "injection scan")
+    if scan["background_mode"] not in ("reuse", "retrain"):
+        raise ValueError("injection_scan.background_mode must be reuse or retrain")
     if not isinstance(scan["signal_events"], list) or not scan["signal_events"]:
         raise ValueError("Provide injection strengths as positive total signal counts")
     from .data_spec import DatasetSpec
@@ -496,11 +501,14 @@ def load_settings(path=DEFAULT_PATH):
             raise ValueError("Reserve uninjected signal for independent evaluation")
     if len(set(scan["signal_events"])) != len(scan["signal_events"]):
         raise ValueError("Duplicate injection strengths")
-    integer(scan["replicas"], "scan replicas")
-    for key in ("preparation_seed", "training_seed"):
-        integer(scan[key], key, 0)
-        if scan[key] + scan["replicas"] >= 2**32:
+    if not isinstance(scan["seeds"], list) or not scan["seeds"]:
+        raise ValueError("Provide explicit injection-scan training seeds")
+    for seed in scan["seeds"]:
+        integer(seed, "scan seed", 0)
+        if seed >= 2**32:
             raise ValueError("Scan seeds exceed the NumPy seed range")
+    if len(set(scan["seeds"])) != len(scan["seeds"]):
+        raise ValueError("Duplicate injection-scan seeds")
     return value
 
 

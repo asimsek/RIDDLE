@@ -726,6 +726,10 @@ def _select_background_reuse(args, contract, flow_epochs, config_file):
             continue
         if any(not (source / name).is_file() for name in relative):
             continue
+        from riddle.storage import file_digest
+        outer = data / "outerdata_train.npy"
+        if not outer.is_file() or file_digest(outer) != source_contract.get("inputs", {}).get("files", {}).get(outer.name):
+            raise ValueError("Nominal LaCathode preprocessing data are missing or differ from the background training data")
         return {"source": source, "data": data, "report": report, "files": relative, "signature": expected}
     return None
 
@@ -881,6 +885,8 @@ def run_single(args, contract):
     root = args.output / "training"
     background_request = _select_background_reuse(args, contract, background_epochs, config_file)
     background_request = _prepare_reuse_root(root, background_request)
+    if contract.get("scan_background") and background_request is None:
+        raise ValueError("Nominal LaCathode background is incompatible, missing, or conflicts with existing training")
     recovery = EpochRecovery(root, contract, args.resume, **resume_policy(args))
     background_reuse, creation_reference, evaluation_reference = _activate_background_reuse(
         root, background_request, data_handler, torch.device(args.device)

@@ -154,7 +154,6 @@ background:
   mapping_validation_batch_size: 65536
   mapping_inference_batch_size: 65536
 injection_scan:
+  background_mode: retrain
   signal_events: [1000, 667, 500, 333, 250, 167, 83]
-  replicas: 10
-  preparation_seed: 1001
-  training_seed: 42
+  seeds: [40, 41, 42, 43, 44]

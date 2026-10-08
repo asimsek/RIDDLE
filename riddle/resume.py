@@ -74,7 +74,9 @@ def check_contract(previous, current, *, allow_code_change=False, allow_device_c
     changes, protected, required = [], [], set()
     for path, values in _differences(previous, current):
         field = ".".join(path)
-        if len(path) == 2 and path[0] == "code" and path[1].endswith(".py"):
+        if path[:2] == ("settings", "injection_scan"):
+            kind, allowed = "scan_configuration", True
+        elif len(path) == 2 and path[0] == "code" and path[1].endswith(".py"):
             kind, allowed = "code", allow_code_change
         elif path == ("environment", "platform") and (
             _linux_runtime(values["previous"]) is not None

@@ -356,6 +356,8 @@ def discover_paper_results(root, requested=None, *, scan=False):
         return groups
     for path in result_paths(root, requested=("lacathode",)):
         report = json.loads(path.read_text())
+        if report.get("scan_reuse"):
+            continue
         if report.get("method") != "lacathode" or not report.get("completed") or "run_index" not in report:
             continue
         parent_path = path.parent.parent.parent / "result.json"
@@ -403,25 +405,8 @@ def group_protocol_key(method, report):
 
 
 def aggregation_protocol_signature(method, report):
-    contract = report.get("contract", {})
-    settings = contract.get("settings", {})
-    if method in ("riddle", "iad", "supervised"):
-        payload = {
-            "scientific_version": contract.get("scientific_version"),
-            "riddle": settings.get("riddle"),
-            "background": settings.get("background"),
-            "inputs": settings.get("inputs"),
-            "oracle_benchmark": contract.get("oracle_benchmark") if method in ("iad", "supervised") else None,
-            "score_scope": score_scope(method, report),
-        }
-    else:
-        volatile = {"seed", "scenario", "device", "run_index", "campaign_seed"}
-        payload = {
-            "scientific_version": contract.get("scientific_version"),
-            "settings": {key: value for key, value in settings.items() if key not in volatile},
-            "score_scope": score_scope(method, report),
-        }
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    from riddle.scan_cache import aggregation_signature
+    return aggregation_signature(method, report)
 
 
 def require_riddle_benchmark_alignment(group):
@@ -1945,11 +1930,11 @@ def export_tables(groups, cache, loader, output, file_formats, data_root, verbos
     write_table_rows(tables / "table_03_performance_summary", performance, file_formats)
 
 
-def scan_identity_data(scan_groups, methods):
+def scan_identity_data(scan_groups, methods, variant="default"):
     result = defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
     for identity, group in scan_groups.items():
-        signal_events, replica, run_index, variant = identity
-        if variant != "default":
+        signal_events, replica, run_index, source_variant = identity
+        if source_variant != variant:
             continue
         for method, source in group.items():
             family = canonical_method(method)
@@ -1976,10 +1961,10 @@ def scan_realized_counts(report):
     return None
 
 
-def scan_method_run_indices(method_data, configured, replicas):
+def scan_method_run_indices(method_data, configured, cohort):
     indices = set()
     for level in configured:
-        for replica in range(replicas):
+        for replica in cohort:
             indices.update(method_data.get(level, {}).get(replica, {}))
     return sorted(indices)
 
@@ -2010,16 +1995,33 @@ def aggregate_scan_replica(run_rows):
     }
 
 
-def process_injection_scan(scan_groups, methods, loader, settings, output, formats, file_formats, overwrite, min_background, allow_partial, verbose, require_compatible_populations=False):
+def process_injection_scan(scan_groups, methods, loader, settings, output, formats, file_formats, overwrite, min_background, allow_partial, verbose, require_compatible_populations=False, variant="default"):
     configured = [int(value) for value in settings.get("injection_scan", {}).get("signal_events", [])]
-    replicas = int(settings.get("injection_scan", {}).get("replicas", 0))
-    if not configured or replicas < 1:
-        say("[SKIP] Injection scan: configuration is missing signal_events or replicas", verbose)
+    config = settings.get("injection_scan", {})
+    cohort = config.get("seeds", list(range(int(config.get("replicas", 0)))))
+    if not configured or not cohort:
+        say("[SKIP] Injection scan: configuration is missing signal_events or seeds", verbose)
         return
     if not scan_groups:
         say("[SKIP] Injection scan: no completed scan results were discovered", verbose)
         return
-    data = scan_identity_data(scan_groups, methods)
+    scan_groups = {identity: group for identity, group in scan_groups.items() if identity[3] == variant}
+    if not scan_groups:
+        return
+    schemas = {report["contract"]["inputs"]["injection_scan"].get("schema", 1)
+               for group in scan_groups.values() for _, report in group.values()}
+    if len(schemas) != 1 or (schemas == {2}) != ("seeds" in config):
+        raise ValueError("Injection-scan results and configuration must use the same seed or legacy replica protocol")
+    if schemas == {2}:
+        prepared = defaultdict(set)
+        for (level, seed, run_index, _), group in scan_groups.items():
+            for _, report in group.values():
+                if report["seed"] != seed or run_index != 0:
+                    raise ValueError("Shared-population scans require one result per explicit seed")
+                prepared[level].add(json.dumps(report["contract"]["inputs"], sort_keys=True))
+        if any(len(values) != 1 for values in prepared.values()):
+            raise ValueError("Scan methods and seeds must share identical prepared data at each injection strength")
+    data = scan_identity_data(scan_groups, methods, variant)
     if allow_partial:
         requested_methods = [method for method in methods if method in data]
     else:
@@ -2028,12 +2030,16 @@ def process_injection_scan(scan_groups, methods, loader, settings, output, forma
             labels = ", ".join(METHOD_LABELS.get(method, method) for method in missing_methods)
             raise ValueError(f"Strict injection-scan comparison is missing requested methods: {labels}")
         requested_methods = list(methods)
-    expected_runs = {method: scan_method_run_indices(data[method], configured, replicas) for method in requested_methods}
+    expected_runs = {method: scan_method_run_indices(data[method], configured, cohort) for method in requested_methods}
+    from riddle.scan_cache import require_scan_compatibility
+    for method in requested_methods:
+        records = [record for level in configured for seed in cohort
+                   for record in data[method].get(level, {}).get(seed, {}).values()]
+        require_scan_compatibility(method, records)
     if not allow_partial and len(requested_methods) > 1:
         cohorts = {tuple(expected_runs[method]) for method in requested_methods}
         if len(cohorts) != 1:
             raise ValueError("Injection-scan methods do not share the same independent run-index cohort")
-    method_reports = defaultdict(list)
     invalid = defaultdict(list)
     loaded = defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
     point_records = defaultdict(dict)
@@ -2044,14 +2050,13 @@ def process_injection_scan(scan_groups, methods, loader, settings, output, forma
             invalid[method].append("no independent runs discovered")
             continue
         for level in configured:
-            for replica in range(replicas):
+            for replica in cohort:
                 runs = data[method].get(level, {}).get(replica, {})
                 if set(runs) != set(runs_expected):
                     missing = sorted(set(runs_expected) - set(runs))
                     extra = sorted(set(runs) - set(runs_expected))
-                    invalid[method].append(f"N_inj={level} replica={replica} missing_runs={missing} extra_runs={extra}")
+                    invalid[method].append(f"N_inj={level} seed={replica} missing_runs={missing} extra_runs={extra}")
                 for run_index, (root, report) in sorted(runs.items()):
-                    method_reports[method].append(report)
                     try:
                         record = loader(root, report, "signal_region")
                         metrics = central_metrics(record, min_background)
@@ -2069,14 +2074,10 @@ def process_injection_scan(scan_groups, methods, loader, settings, output, forma
                         point_records[(level, replica, run_index)][method] = record
                         point_counts[(level, replica)].add(counts)
                     except Exception as error:
-                        invalid[method].append(f"N_inj={level} replica={replica} run={run_index}: {type(error).__name__}: {error}")
-    for method, reports in method_reports.items():
-        signatures = {aggregation_protocol_signature(method, report) for report in reports}
-        if len(signatures) > 1:
-            invalid[method].append("incompatible scientific protocols across scan points/runs")
+                        invalid[method].append(f"N_inj={level} seed={replica} run={run_index}: {type(error).__name__}: {error}")
     for identity, group in scan_groups.items():
-        level, replica, run_index, variant = identity
-        if variant != "default" or level not in configured or replica not in range(replicas):
+        level, replica, run_index, source_variant = identity
+        if source_variant != variant or level not in configured or replica not in cohort:
             continue
         normalized = {canonical_method(method): source for method, source in group.items() if canonical_method(method) in requested_methods}
         if len(normalized) > 1:
@@ -2087,10 +2088,10 @@ def process_injection_scan(scan_groups, methods, loader, settings, output, forma
                 try:
                     require_population_compatibility(records)
                 except ValueError as error:
-                    raise ValueError(f"Incompatible injection-scan evaluation population for N_inj={level}, replica={replica}, run={run_index}") from error
+                    raise ValueError(f"Incompatible injection-scan evaluation population for N_inj={level}, seed={replica}, run={run_index}") from error
     for (level, replica), counts in point_counts.items():
         if len(counts) > 1:
-            raise ValueError(f"Injection-scan methods disagree on uncut physical counts for N_inj={level}, replica={replica}")
+            raise ValueError(f"Injection-scan methods disagree on uncut physical counts for N_inj={level}, seed={replica}")
     summaries = {}
     if not allow_partial:
         failures = [f"{METHOD_LABELS.get(method, method)}: " + "; ".join(invalid[method]) for method in requested_methods if invalid[method]]
@@ -2102,14 +2103,14 @@ def process_injection_scan(scan_groups, methods, loader, settings, output, forma
         levels = []
         for level in configured:
             replicas_data = []
-            for replica in range(replicas):
+            for replica in cohort:
                 run_rows = list(loaded[method].get(level, {}).get(replica, {}).values())
                 if not run_rows:
                     continue
                 replicas_data.append(aggregate_scan_replica(run_rows))
             if replicas_data:
                 levels.append((level, replicas_data))
-        if levels and (allow_partial or (len(levels) == len(configured) and all(len(rows) == replicas for _, rows in levels))):
+        if levels and (allow_partial or (len(levels) == len(configured) and all(len(rows) == len(cohort) for _, rows in levels))):
             summaries[method] = levels
     if not allow_partial and set(summaries) != set(requested_methods):
         missing = [method for method in requested_methods if method not in summaries]
@@ -2117,7 +2118,7 @@ def process_injection_scan(scan_groups, methods, loader, settings, output, forma
         raise ValueError(f"Strict injection-scan comparison could not build complete summaries for: {labels}")
     if not summaries:
         return
-    destination = output / "06_injection_scan" / "Default"
+    destination = output / "06_injection_scan" / VARIANT_LABELS.get(variant, variant)
     figure_specs = [("max_sic", "Maximum significance improvement", "maximum_sic_vs_s_over_b"), ("nominal_selected", "Maximum nominal significance after anomaly selection", "maximum_nominal_significance_vs_s_over_b"), ("auc", "AUC", "auc_vs_s_over_b")]
     for wp in PLOT_WORKING_POINTS[::-1]:
         figure_specs.append((f"wp_{wp}", r"Signal efficiency, $\epsilon_S$", f"epsS_{WORKING_POINT_LABELS[wp].replace('%','pct').replace('.','p')}_vs_s_over_b"))
@@ -2174,7 +2175,7 @@ def process_injection_scan(scan_groups, methods, loader, settings, output, forma
                 top.set_xticks([item[1] for item in ordered_axis])
                 top.set_xticklabels([f"{item[2]:.2g}" for item in ordered_axis])
             top.set_xlabel(r"Uncut $S/\sqrt{B}$")
-            legend = inside_legend(ax, title="Default")
+            legend = inside_legend(ax, title=VARIANT_LABELS.get(variant, variant))
             save_figure(fig, ax, destination / stem, formats, overwrite, legend)
         else:
             plt.close(fig)
@@ -2183,8 +2184,8 @@ def process_injection_scan(scan_groups, methods, loader, settings, output, forma
         for level, replicas_data in summaries["riddle"]:
             metrics = [metrics for row in replicas_data for metrics in row["run_metrics"]]
             rows.append({"N_inj": int(level), **performance_summary(metrics)})
-        if rows and (allow_partial or (len(rows) == len(configured) and all(len(replicas_data) == replicas for _, replicas_data in summaries["riddle"]))):
-            write_table_rows(output / "07_tables" / "table_04_default_signal_injection_dependence", rows, file_formats)
+        if rows and (allow_partial or (len(rows) == len(configured) and all(len(replicas_data) == len(cohort) for _, replicas_data in summaries["riddle"]))):
+            write_table_rows(output / "07_tables" / f"table_04_{variant}_signal_injection_dependence", rows, file_formats)
 
 
 def load_settings_file(path):
@@ -2277,7 +2278,8 @@ def run(args):
     say("[STAGE] Render training histories", args.verbose)
     plot_training(groups, args.output, args.plot_formats, args.overwrite)
     say("[STAGE] Render signal-injection dependence", args.verbose)
-    process_injection_scan(scan_all, methods, loader, settings, args.output, args.plot_formats, args.file_formats, args.overwrite, args.min_background, args.allow_partial_injection_scan, args.verbose, args.require_compatible_populations)
+    for variant in variants:
+        process_injection_scan(scan_all, methods, loader, settings, args.output, args.plot_formats, args.file_formats, args.overwrite, args.min_background, args.allow_partial_injection_scan, args.verbose, args.require_compatible_populations, variant=variant)
     say("[STAGE] Export publication tables", args.verbose)
     export_tables(groups, cache, loader, args.output, args.file_formats, args.data, args.verbose)
     say(f"[DONE] Publication outputs written to {args.output}", args.verbose)

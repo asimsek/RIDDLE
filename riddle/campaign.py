@@ -90,6 +90,9 @@ def _activate_supervised_ensemble_reuse(output, candidates, identity, contract, 
         source_contract = report.get("contract", {})
         if source_contract.get("scientific_version") != current_version:
             continue
+        from .scan_cache import runtime_compatible
+        if not runtime_compatible(source_contract, contract, allow_code_change=allow_code_change):
+            continue
         source_code = source_contract.get("code", {})
         changed_code = sorted(name for name in set(source_code) | set(current_code) if source_code.get(name) != current_code.get(name))
         if changed_code and not allow_code_change:
@@ -104,7 +107,7 @@ def _activate_supervised_ensemble_reuse(output, candidates, identity, contract, 
             source_identity = json.loads(source_identity_path.read_text())
         except (OSError, json.JSONDecodeError):
             continue
-        if not _compatible_identity(source_identity, identity):
+        if source_identity != identity:
             continue
         selected = []
         valid = True
@@ -132,7 +135,7 @@ def _activate_supervised_ensemble_reuse(output, candidates, identity, contract, 
             raise
         reuse = {
             "schema": 1,
-            "policy": "same_replica_supervised_oracle_ensemble_v1",
+            "policy": "exact_supervised_ensemble_inputs_v1",
             "source_result": str(source),
             "source_result_sha256": file_digest(result_path),
             "source_ensemble_inputs_sha256": expected_identity,
