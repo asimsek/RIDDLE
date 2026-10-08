@@ -17,6 +17,12 @@ def record_timing(output, name, seconds, **values):
                    {"seconds": seconds, **values})
 
 
+def record_background_stage(output, preparation_seconds):
+    if os.environ.get("RIDDLE_BG_BENCHMARK") == "1":
+        write_json(Path(output) / ".resume" / "background_stage.json",
+                   {"preparation_seconds": preparation_seconds, "checkpoint_seconds": 0.0})
+
+
 def barrier_paths(output):
     root = Path(output) / ".resume"
     return root / "background_stage.ready", root / "background_stage.release"

@@ -354,7 +354,10 @@ def run(args, contract):
         release_device_cache(args.device)
         wait_for_stage_release(args.output)
     elif phase == "prepare":
+        preparation_started = time.monotonic()
         prepare_background(args, contract)
+        from .background_stage import record_background_stage
+        record_background_stage(args.output, time.monotonic() - preparation_started)
         return
     elif phase == "finish":
         raise ValueError("Standalone background finish is no longer supported; resume the full workflow")
