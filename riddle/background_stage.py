@@ -1,15 +1,14 @@
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
-import json
 import os
 from pathlib import Path
 import threading
 import time
 
-from .resume import check_contract, resume_policy
-from .storage import atomic_torch_save, file_digest, fingerprint_files, rng_state, restore_rng, write_json
+from .storage import write_json
 
 NATIVE_METHODS = ("riddle", "iad", "supervised")
+BARRIER_POLL_SECONDS = 0.5
 
 
 def record_timing(output, name, seconds, **values):
@@ -18,50 +17,40 @@ def record_timing(output, name, seconds, **values):
                    {"seconds": seconds, **values})
 
 
-def stage_paths(output):
+def barrier_paths(output):
     root = Path(output) / ".resume"
-    return root / "background_stage.json", root / "background_stage.pt"
+    return root / "background_stage.ready", root / "background_stage.release"
 
 
-def save_stage(args, contract, state, elapsed):
-    receipt_path, state_path = stage_paths(args.output)
-    started = time.monotonic()
-    checksum = atomic_torch_save(state_path, {"state": state, "rng": rng_state()})
-    artifacts = [p for directory in (args.output / "background", args.output / "density/background_correction")
-                 if directory.exists() for p in directory.rglob("*")
-                 if p.is_file() and ".resume" not in p.relative_to(args.output).parts]
-    oracle = args.output / "oracle_roles.json"
-    if oracle.is_file():
-        artifacts.append(oracle)
-    write_json(receipt_path, {
-        "schema": 1, "completed": True, "contract": contract,
-        "state_sha256": checksum,
-        "artifacts_sha256": fingerprint_files(args.output, artifacts, args.io_workers),
-        "preparation_seconds": elapsed, "checkpoint_seconds": time.monotonic() - started,
-    })
+def clear_stage_checkpoint(output):
+    root = Path(output) / ".resume"
+    for path in (root / "background_stage.json", root / "background_stage.pt"):
+        path.unlink(missing_ok=True)
 
 
-def load_stage(args, contract):
+def clear_barrier(output):
+    for path in barrier_paths(output):
+        path.unlink(missing_ok=True)
+
+
+def wait_for_stage_release(output):
+    ready, release = barrier_paths(output)
+    ready.parent.mkdir(parents=True, exist_ok=True)
+    write_json(ready, {"pid": os.getpid(), "ready": True})
+    while not release.exists():
+        time.sleep(BARRIER_POLL_SECONDS)
+    clear_barrier(output)
+
+
+def release_device_cache(device):
+    import gc
     import torch
 
-    receipt_path, state_path = stage_paths(args.output)
-    if not receipt_path.is_file():
-        return None
-    if not args.resume:
-        raise FileExistsError("Background preparation exists; use --resume")
-    receipt = json.loads(receipt_path.read_text())
-    if receipt.get("schema") != 1 or receipt.get("completed") is not True:
-        raise ValueError("Invalid background-stage checkpoint")
-    check_contract(receipt["contract"], contract, **resume_policy(args))
-    for name, checksum in receipt["artifacts_sha256"].items():
-        path = (args.output / name).resolve()
-        if not path.is_relative_to(args.output.resolve()) or file_digest(path) != checksum:
-            raise ValueError(f"Background-stage artifact changed: {name}")
-    if file_digest(state_path) != receipt["state_sha256"]:
-        raise ValueError("Background-stage state checksum mismatch")
-    payload = torch.load(state_path, map_location="cpu", weights_only=False)
-    restore_rng(payload["rng"])
-    return payload["state"]
+    if str(device).startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    gc.collect()
+    if str(device).startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def run_staged(tasks, workers, run_one, *, background_only=False):
@@ -69,18 +58,89 @@ def run_staged(tasks, workers, run_one, *, background_only=False):
     if not tasks:
         return
     cancel = threading.Event()
+    concurrency = min(workers, len(tasks))
+    semaphore = threading.Semaphore(concurrency)
+    paths = [barrier_paths(Path(task.output).resolve()) for task in tasks]
+    for task in tasks:
+        clear_barrier(Path(task.output).resolve())
 
-    def prepare(task):
+    if background_only:
+        pool = ThreadPoolExecutor(max_workers=concurrency)
+        futures = []
+        try:
+            for task in tasks:
+                options = deepcopy(task)
+                options.background_phase = "prepare"
+                options.background_concurrency = concurrency
+                futures.append(pool.submit(run_one, options, cancel_event=cancel))
+            for future in futures:
+                future.result()
+        except BaseException:
+            cancel.set()
+            for future in futures:
+                future.cancel()
+            raise
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
+            for task in tasks:
+                clear_barrier(Path(task.output).resolve())
+        return
+
+    def execute(task):
         options = deepcopy(task)
-        options.background_phase = "prepare"
-        options.background_concurrency = min(workers, len(tasks))
-        run_one(options, cancel_event=cancel)
+        options.background_phase = "staged"
+        options.background_concurrency = concurrency
+        semaphore.acquire()
+        ready_path, _ = barrier_paths(Path(options.output).resolve())
+        finished = threading.Event()
+        released = threading.Event()
 
-    pool = ThreadPoolExecutor(max_workers=min(workers, len(tasks)))
+        def release_slot():
+            while not finished.is_set():
+                if ready_path.exists():
+                    semaphore.release()
+                    released.set()
+                    return
+                finished.wait(BARRIER_POLL_SECONDS)
+            if not released.is_set():
+                semaphore.release()
+
+        watcher = threading.Thread(target=release_slot, daemon=True)
+        watcher.start()
+        try:
+            run_one(options, cancel_event=cancel)
+        finally:
+            finished.set()
+            watcher.join()
+
+    pool = ThreadPoolExecutor(max_workers=len(tasks))
     futures = []
     try:
-        futures = [pool.submit(prepare, task) for task in tasks]
-        for future in as_completed(futures):
+        futures = [pool.submit(execute, task) for task in tasks]
+        pending = set(range(len(tasks)))
+        skipped = set()
+        while pending:
+            for index in tuple(pending):
+                future = futures[index]
+                if future.done() and not paths[index][0].exists():
+                    future.result()
+                    skipped.add(index)
+                    pending.remove(index)
+                elif paths[index][0].is_file():
+                    pending.remove(index)
+            if pending:
+                time.sleep(BARRIER_POLL_SECONDS)
+        for index, future in enumerate(futures):
+            if index in skipped:
+                continue
+            paths[index][1].parent.mkdir(parents=True, exist_ok=True)
+            paths[index][1].touch()
+            while not future.done():
+                for later in range(index + 1, len(futures)):
+                    if later not in skipped and futures[later].done():
+                        futures[later].result()
+                        raise RuntimeError("Background worker exited before its in-memory stage was released")
+                time.sleep(BARRIER_POLL_SECONDS)
             future.result()
     except BaseException:
         cancel.set()
@@ -89,12 +149,8 @@ def run_staged(tasks, workers, run_one, *, background_only=False):
         raise
     finally:
         pool.shutdown(wait=True, cancel_futures=True)
-    if not background_only:
         for task in tasks:
-            options = deepcopy(task)
-            options.background_phase = "finish"
-            options.resume = True
-            run_one(options)
+            clear_barrier(Path(task.output).resolve())
 
 
 def run_seed_backgrounds(args, run_one):

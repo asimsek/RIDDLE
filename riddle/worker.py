@@ -67,7 +67,7 @@ def main():
     workers = getattr(args, "workers", 1)
     if native_method:
         workers = min(workers, int(args.runs))
-        if getattr(args, "background_phase", None) == "prepare":
+        if getattr(args, "background_phase", None) in ("prepare", "staged"):
             workers = int(getattr(args, "background_concurrency", 1))
     if args.method == "lacathode" and not getattr(args, "lacathode_replica", False):
         from external.lacathode_utils.pipeline import run_settings
@@ -303,8 +303,8 @@ def main():
     report.update(completed=True, artifacts_sha256=fingerprint_files(args.output, artifacts, args.io_workers))
     write_json(path, report)
     if native_method:
-        from .background_stage import stage_paths
-        stage_paths(args.output)[1].unlink(missing_ok=True)
+        from .background_stage import clear_stage_checkpoint
+        clear_stage_checkpoint(args.output)
     emit_message("Verified result saved", kind="PASS")
 
 

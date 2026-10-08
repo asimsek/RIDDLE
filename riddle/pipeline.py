@@ -344,22 +344,22 @@ def prepare_background(args, contract):
 
 
 def run(args, contract):
-    from .background_stage import load_stage, save_stage
-    from .worker_progress import emit_message
+    from .background_stage import clear_stage_checkpoint, release_device_cache, wait_for_stage_release
 
     acceleration = install_tensor_batches(args.device)
-    started = time.monotonic()
-    state = load_stage(args, contract)
-    if state is None:
-        if getattr(args, "background_phase", None) == "finish":
-            raise ValueError("Missing verified background preparation; rerun the background stage")
+    phase = getattr(args, "background_phase", None)
+    if phase == "staged":
+        clear_stage_checkpoint(args.output)
         state = prepare_background(args, contract)
-        if getattr(args, "background_phase", None) == "prepare":
-            save_stage(args, contract, state, time.monotonic() - started)
-    else:
-        emit_message("Reuse verified background preparation and mapped arrays", kind="PASS")
-    if getattr(args, "background_phase", None) == "prepare":
+        release_device_cache(args.device)
+        wait_for_stage_release(args.output)
+    elif phase == "prepare":
+        prepare_background(args, contract)
         return
+    elif phase == "finish":
+        raise ValueError("Standalone background finish is no longer supported; resume the full workflow")
+    else:
+        state = prepare_background(args, contract)
     finish_started = time.monotonic()
     finish(args, contract, acceleration=acceleration, **state)
     from .background_stage import record_timing
