@@ -10,7 +10,7 @@ from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from pathlib import Path
 from .progress import colored_status, training_progress, verbosity, _duration, _short_value
-from riddle.worker_progress import BufferedLog, durable_progress_line
+from riddle.worker_progress import BufferedLog, durable_progress_line, _emit_event as emit_worker_event
 
 EVENT_PREFIX = "[RIDDLE_WORKER_PROGRESS] "
 _LOCAL_SINK = ContextVar("riddle_progress_sink", default=None)
@@ -44,7 +44,7 @@ def _emit_event(event):
     if sink is not None:
         sink(event)
     elif os.environ.get("RIDDLE_WORKER_PROGRESS") == "1":
-        print(EVENT_PREFIX + json.dumps(event), flush=True)
+        emit_worker_event(event)
 
 
 class ProgressStage:

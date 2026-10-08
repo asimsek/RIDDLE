@@ -21,7 +21,10 @@ from .ensemble import combine_fits, selected_epochs, mass_normalization_check, v
 from .resume import check_contract, policy, transition_history
 from .source import COMMIT, REPOSITORY, digest, verify
 from .stability import stability_contract
-from riddle.worker_progress import EVENT_PREFIX, ProgressStage, emit_message, emit_progress, BufferedLog
+from riddle.worker_progress import (
+    EVENT_PREFIX, ProgressStage, emit_message, emit_progress, BufferedLog,
+    durable_progress_line, _emit_event, _OUTPUT_LOCK,
+)
 from riddle.production import NumericalFitError
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -93,6 +96,9 @@ class StageReporter:
         text = line.strip()
         if text.startswith(EVENT_PREFIX):
             event = json.loads(text[len(EVENT_PREFIX):])
+            if "message" in event:
+                _emit_event({**event, "stream": self.stream}, console=True)
+                return
             self.phase(event["phase"], event["label"],
                        total=event.get("total", 1), unit=event.get("unit", "step"))
             if event.get("completed") is not None:
@@ -101,7 +107,8 @@ class StageReporter:
         prefix = "" if self.options["stage"] == "background" else f"[R-ANODE fit {self.options['fit_index']}] "
         if text:
             if os.environ.get("RIDDLE_WORKER_PROGRESS") == "1":
-                print(prefix + line.rstrip(), flush=True)
+                with _OUTPUT_LOCK:
+                    print(prefix + line.rstrip(), flush=True)
             else:
                 from riddle.progress import colored_status
 
@@ -290,6 +297,8 @@ def execute(options, env):
         try:
             for line in process.stdout:
                 stream.write(line)
+                if durable_progress_line(line):
+                    stream.force_flush()
                 reporter.line(line)
             if process.wait() != 0:
                 failure = stage_failure(options)

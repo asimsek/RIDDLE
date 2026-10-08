@@ -79,7 +79,7 @@ def numerical_run_failure(options):
 
 def launch_run(options, index, count):
     from .worker_progress import EVENT_PREFIX
-    from riddle.worker_progress import BufferedLog, durable_progress_event
+    from riddle.worker_progress import BufferedLog, durable_progress_event, _OUTPUT_LOCK
 
     output = Path(options["output"])
     command, env = run_command(options)
@@ -100,7 +100,8 @@ def launch_run(options, index, count):
                         if durable_progress_event(event):
                             log.force_flush()
                         line = EVENT_PREFIX + json.dumps(event) + "\n"
-                    print(line, end="", flush=True)
+                    with _OUTPUT_LOCK:
+                        print(line, end="", flush=True)
                 log.force_flush()
                 if process.wait() and not numerical_run_failure(options):
                     raise RuntimeError(f"LaCathode run {index} failed; inspect {output / 'training.log'}")
@@ -118,6 +119,7 @@ def launch_run(options, index, count):
 
 def concurrent_log(state, count, *, final=False):
     from .worker_progress import EVENT_PREFIX, _emit_event
+    from riddle.worker_progress import _OUTPUT_LOCK
 
     text = state["pending_log"] + state["reader"].read()
     state["pending_log"] = ""
@@ -130,7 +132,8 @@ def concurrent_log(state, count, *, final=False):
             event["stream"] = f"Run {state['index'] + 1}/{count}"
             _emit_event(event)
         elif line.strip():
-            print(f"[LaCathode run {state['index']:03d}] {line.rstrip()}", flush=True)
+            with _OUTPUT_LOCK:
+                print(f"[LaCathode run {state['index']:03d}] {line.rstrip()}", flush=True)
 
 
 def stop_runs(active):

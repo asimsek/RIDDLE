@@ -199,6 +199,7 @@ def run_campaign(args, *, cancel_event=None):
         raise ValueError("Keep data and results in separate directories")
     native_requested = any(method in args.methods for method in ("riddle", "iad", "supervised"))
     oracle_requested = any(method in args.methods for method in ("iad", "supervised"))
+    manifests = {}
     for scenario in args.scenarios:
         if args.methods == ["ranode"]:
             from external.ranode_utils.data import validate as validate_ranode
@@ -207,6 +208,7 @@ def run_campaign(args, *, cancel_event=None):
             from .data import validate
             manifest = validate(args.data / scenario, require_event_ids=native_requested, require_oracle=oracle_requested,
                                 require_supervised="supervised" in args.methods)
+        manifests[scenario] = manifest
         if native_requested:
             input_features(args.settings, manifest)
             from .score_selection import validate_population_contract
@@ -256,6 +258,16 @@ def run_campaign(args, *, cancel_event=None):
             elif method in ("iad", "supervised"):
                 options["runs"] = args.fits
             env = os.environ.copy()
+            manifest = manifests[scenario]
+            injection = (manifest.get("injection_scan") or {}).get(
+                "signal_events", manifest.get("preparation", {}).get("injected_signal_rows", "nominal"))
+            if scenario == "background_only":
+                injection = 0
+            task = (f"method={method}; seed={seed}; scenario={scenario}; "
+                    f"signal_events={injection}; variant={manifest.get('variant', 'default')}")
+            if env.get("RIDDLE_JOB_NAME"):
+                task = f"job={env['RIDDLE_JOB_NAME']}; {task}"
+            env["RIDDLE_LOG_TASK"] = task
             if args.device == "cpu":
                 env["CUDA_VISIBLE_DEVICES"] = ""
             else:

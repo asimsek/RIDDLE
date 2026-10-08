@@ -175,6 +175,7 @@ def job(args):
                                     "PYTHONUNBUFFERED": "1",
                                     "PYTHONDONTWRITEBYTECODE": "1",
                                     "PYTHONNOUSERSITE": "1",
+                                    "RIDDLE_JOB_NAME": args.name,
                                     "MPLCONFIGDIR": f"/shared/work/RIDDLE/.cache/{args.name}/matplotlib",
                                     "XDG_CACHE_HOME": f"/shared/work/RIDDLE/.cache/{args.name}",
                                 }.items()

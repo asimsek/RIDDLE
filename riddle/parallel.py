@@ -8,7 +8,7 @@ import signal
 import time
 import traceback
 from riddle.progress import _duration, _short_value
-from riddle.worker_progress import _LOCAL_SINK, emit_message, BufferedLog, durable_progress_event
+from riddle.worker_progress import _LOCAL_SINK, emit_message, BufferedLog, durable_progress_event, _emit_event
 
 
 def _fit_worker(events, job, rows, validation, options):
@@ -183,7 +183,7 @@ def run_fits(
                 )
             elif kind == "progress" and fit in active:
                 if "message" in event:
-                    emit_message(event["message"], kind=event.get("kind", "INFO"), level=event.get("level", 1))
+                    _emit_event({**event, "stream": f"Fit {fit:03d}"})
                 state = active[fit]
                 if event.get("unit") == "epoch":
                     if state.get("attempt_label") != event.get("label"):
