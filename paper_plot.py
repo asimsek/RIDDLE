@@ -2,11 +2,17 @@ import argparse
 import csv
 import json
 import math
+import multiprocessing
+import os
+import pickle
 import re
 import shutil
 import sys
+import time
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 
 import matplotlib
@@ -22,10 +28,11 @@ import yaml
 from scipy.special import ndtri
 from sklearn.metrics import roc_curve
 from threadpoolctl import threadpool_limits
+from tqdm import tqdm
 
 from riddle.evaluation import common_acceptance_auc, riddle_score_scope
 from riddle.metrics import efficiency_curve, oracle_metrics
-from riddle.plotting import ScoreLoader, discover, event_size_rows, exact_background_selection, method_family, read_metadata, result_paths, result_variant, scientific_protocol, settings_rows, verify_plot_input
+from riddle.plotting import ScoreLoader, discover, event_size_rows, exact_background_selection, method_family, read_discovery_result, read_metadata, result_paths, result_variant, scientific_protocol, settings_rows, verify_plot_input
 from riddle.figures import equal_occupancy, shape_chi2
 from riddle.stein_scoring import conditional_gaussianize
 from riddle.storage import file_digest
@@ -50,11 +57,19 @@ FEATURE_NAMES = {"default": ("m1", "delta_m", "tau21_j1", "tau21_j2"), "shifted"
 SINGLE_COLUMN_IN = 8.6 / 2.54
 DOUBLE_COLUMN_IN = 17.6 / 2.54
 STYLE = {"font.family": "sans-serif", "font.sans-serif": ["DejaVu Sans"], "mathtext.fontset": "dejavusans", "text.usetex": False, "font.size": 8.2, "axes.labelsize": 8.8, "axes.linewidth": 0.8, "xtick.labelsize": 7.7, "ytick.labelsize": 7.7, "legend.fontsize": 7.3, "legend.title_fontsize": 7.3, "lines.linewidth": 1.0, "lines.markersize": 3.2, "xtick.direction": "in", "ytick.direction": "in", "xtick.top": True, "ytick.right": True, "xtick.minor.visible": True, "ytick.minor.visible": True, "pdf.fonttype": 42, "ps.fonttype": 42, "savefig.dpi": 600, "savefig.facecolor": "white", "savefig.edgecolor": "white", "figure.facecolor": "white", "axes.facecolor": "white"}
+_FIGURE_RENDERER = ContextVar("paper_figure_renderer", default=None)
 
 
 def say(message, verbose=1, level=1):
     if verbose >= level:
         print(message, flush=True)
+
+
+def incomplete_scan_error(message):
+    hint = "For preliminary plots using available completed results, add --allow-partial-injection-scan."
+    if sys.stderr.isatty() and "NO_COLOR" not in os.environ:
+        hint = f"\x1b[1;91m{hint}\x1b[0m"
+    return ValueError(f"{message}\n{hint}")
 
 
 def canonical_method(value):
@@ -157,6 +172,15 @@ def legend_overlap_score(ax, legend):
 
 
 def inside_legend(ax, title=None, ncol=None, fontsize=None, borderaxespad=0.5, allow_headroom=True):
+    options = dict(title=title, ncol=ncol, fontsize=fontsize, borderaxespad=borderaxespad,
+                   allow_headroom=allow_headroom)
+    renderer = _FIGURE_RENDERER.get()
+    if renderer is not None and renderer.pool is not None:
+        return {"deferred_legend": options}
+    return _inside_legend(ax, **options)
+
+
+def _inside_legend(ax, title=None, ncol=None, fontsize=None, borderaxespad=0.5, allow_headroom=True):
     handles, labels = ax.get_legend_handles_labels()
     pairs = []
     seen = set()
@@ -186,8 +210,8 @@ def inside_legend(ax, title=None, ncol=None, fontsize=None, borderaxespad=0.5, a
         legend.remove()
     score, location = best
     if score >= 1000 and columns > 1:
-        return inside_legend(ax, title=title, ncol=columns - 1, fontsize=font,
-                             borderaxespad=borderaxespad, allow_headroom=allow_headroom)
+        return _inside_legend(ax, title=title, ncol=columns - 1, fontsize=font,
+                              borderaxespad=borderaxespad, allow_headroom=allow_headroom)
     if score > 2.5 and allow_headroom:
         add_y_headroom(ax, 0.12)
     legend = ax.legend(handles, labels, loc=location, frameon=True, framealpha=0.93, borderpad=0.42, labelspacing=0.32, handlelength=1.9, columnspacing=0.8, ncol=columns, title=title, fontsize=max(6.7, font - 0.2 if score > 3.5 else font), borderaxespad=borderaxespad)
@@ -204,6 +228,52 @@ def add_y_headroom(ax, fraction=0.15):
             ax.set_ylim(ymin, ymax * (ymax / ymin) ** fraction)
     else:
         ax.set_ylim(ymin, ymax + fraction * (ymax - ymin))
+
+
+def _scan_legend_overlap(ax, legend):
+    renderer = ax.figure.canvas.get_renderer()
+    box = legend.get_window_extent(renderer=renderer).padded(2)
+    intersections = sum(line.get_path().transformed(line.get_transform()).intersects_bbox(box, filled=False)
+                        for line in ax.lines if line.get_visible())
+    intersections += sum(any(path.transformed(collection.get_transform()).intersects_bbox(box, filled=True)
+                             for path in collection.get_paths())
+                         for collection in ax.collections if collection.get_visible())
+    return intersections
+
+
+def _scan_legend(ax, title=None):
+    options = dict(title=title, frameon=True, framealpha=0.93, borderpad=0.42,
+                   labelspacing=0.32, handlelength=1.5, fontsize=STYLE["legend.fontsize"] - 0.3)
+    for location in ("upper right", "upper left", "lower right", "lower left", "center right",
+                     "center left", "upper center", "lower center"):
+        legend = ax.legend(loc=location, **options)
+        ax.figure.canvas.draw()
+        renderer = ax.figure.canvas.get_renderer()
+        box = legend.get_window_extent(renderer=renderer)
+        axes_box = ax.get_window_extent(renderer=renderer)
+        if (box.x0 >= axes_box.x0 and box.x1 <= axes_box.x1
+                and box.y0 >= axes_box.y0 and box.y1 <= axes_box.y1
+                and _scan_legend_overlap(ax, legend) == 0):
+            return legend
+        legend.remove()
+    legend = ax.legend(loc="upper right", **options)
+    for _ in range(3):
+        ax.figure.canvas.draw()
+        renderer = ax.figure.canvas.get_renderer()
+        box = legend.get_window_extent(renderer=renderer)
+        axes_box = ax.get_window_extent(renderer=renderer)
+        available = (box.y0 - 6 - axes_box.y0) / axes_box.height
+        if available <= 0:
+            raise RuntimeError("Injection-scan legend leaves no space for the curves")
+        ymin, ymax = ax.get_ylim()
+        peak = ax.dataLim.ymax
+        required = ymin + (peak - ymin) / available
+        if not np.isfinite(required) or required <= ymax:
+            if _scan_legend_overlap(ax, legend):
+                raise RuntimeError("Injection-scan legend overlaps the curves")
+            return legend
+        ax.set_ylim(ymin, required * (1 + 1e-12))
+    raise RuntimeError("Injection-scan legend could not be separated from the curves")
 
 
 def probability_contour_levels(histogram, fractions=(0.95, 0.68, 0.50)):
@@ -288,11 +358,27 @@ def audit_layout(fig, ax, legend=None):
 
 
 def save_figure(fig, ax, stem, formats, overwrite, legend=None):
+    try:
+        renderer = _FIGURE_RENDERER.get()
+        if renderer is not None:
+            renderer.save(fig, ax, stem, formats, overwrite, legend)
+        else:
+            _save_figure(fig, ax, stem, formats, overwrite, legend)
+    finally:
+        plt.close(fig)
+
+
+def _save_figure(fig, ax, stem, formats, overwrite, legend=None):
+    scan_legend = legend if isinstance(legend, dict) and "scan_legend" in legend else None
+    if isinstance(legend, dict) and "deferred_legend" in legend:
+        legend = _inside_legend(ax, **legend["deferred_legend"])
     stem.parent.mkdir(parents=True, exist_ok=True)
     try:
         fig.tight_layout(pad=0.45)
     except Exception:
         pass
+    if scan_legend is not None:
+        legend = _scan_legend(ax, **scan_legend["scan_legend"])
     audit_layout(fig, ax, legend)
     for extension in formats:
         path = stem.with_suffix("." + extension)
@@ -302,7 +388,130 @@ def save_figure(fig, ax, stem, formats, overwrite, legend=None):
         if extension == "png":
             kwargs["dpi"] = 600
         fig.savefig(path, **kwargs)
-    plt.close(fig)
+
+
+def _render_worker_init():
+    torch.set_num_threads(1)
+    threadpool_limits(limits=1)
+
+
+def _render_figure(payload, stem, formats, overwrite, style):
+    started = time.monotonic()
+    with matplotlib.rc_context(style):
+        fig, ax, legend = pickle.loads(payload)
+        try:
+            _save_figure(fig, ax, stem, formats, overwrite, legend)
+        finally:
+            plt.close(fig)
+    return time.monotonic() - started, os.getpid()
+
+
+class PaperFigureRenderer:
+    def __init__(self, workers, verbose):
+        if workers < 1:
+            raise ValueError("Plot workers must be positive")
+        self.pool = (ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn"),
+                                         initializer=_render_worker_init) if workers > 1 else None)
+        self.pending = {}
+        self.destinations = {}
+        self.pending_bytes = 0
+        self.max_pending = 2 * workers
+        self.max_bytes = 128 * 1024**2
+        self.verbose = verbose
+        self.submitted = 0
+        self.completed = 0
+        self.started = time.monotonic()
+        self.last_update = self.started
+        say(f"[RENDER] workers={workers}", verbose)
+
+    def report(self, force=False):
+        now = time.monotonic()
+        if force or now - self.last_update >= 10:
+            say(f"[RENDER] {self.completed}/{self.submitted} figures saved; elapsed {now - self.started:.1f}s", self.verbose)
+            self.last_update = now
+
+    def finish(self, futures):
+        for future in sorted(futures, key=lambda value: self.pending[value][3]):
+            stem, paths, size, index = self.pending.pop(future)
+            self.pending_bytes -= size
+            for path in paths:
+                if self.destinations.get(path) is future:
+                    del self.destinations[path]
+            try:
+                elapsed, pid = future.result()
+            except Exception as error:
+                raise RuntimeError(f"Figure rendering failed for {stem}: {error}") from error
+            self.completed += 1
+            say(f"[RENDER {index}] {stem}; {elapsed:.1f}s; pid={pid}", self.verbose, 2)
+        self.report()
+
+    def wait_one(self):
+        done, _ = wait(self.pending, timeout=5, return_when=FIRST_COMPLETED)
+        self.finish(done)
+
+    def save(self, fig, ax, stem, formats, overwrite, legend):
+        if self.pool is None:
+            _save_figure(fig, ax, stem, formats, overwrite, legend)
+            self.submitted += 1
+            self.completed += 1
+            self.report()
+            return
+        self.finish({future for future in self.pending if future.done()})
+        paths = tuple(str(stem.with_suffix("." + extension).resolve()) for extension in formats)
+        dependencies = {self.destinations[path] for path in paths if path in self.destinations}
+        while dependencies:
+            done, _ = wait(dependencies, timeout=5, return_when=FIRST_COMPLETED)
+            self.finish(done)
+            dependencies -= done
+        if not overwrite:
+            for path in paths:
+                if Path(path).exists():
+                    raise FileExistsError(f"Output exists: {path}")
+        try:
+            payload = pickle.dumps((fig, ax, legend), protocol=pickle.HIGHEST_PROTOCOL)
+        except (pickle.PicklingError, AttributeError, TypeError):
+            say(f"[RENDER] Serial fallback for {stem}", self.verbose, 2)
+            _save_figure(fig, ax, stem, formats, overwrite, legend)
+            self.submitted += 1
+            self.completed += 1
+            self.report()
+            return
+        while self.pending and (len(self.pending) >= self.max_pending
+                                or self.pending_bytes + len(payload) > self.max_bytes):
+            self.wait_one()
+        future = self.pool.submit(_render_figure, payload, stem, tuple(formats), overwrite, dict(matplotlib.rcParams))
+        self.submitted += 1
+        self.pending[future] = (stem, paths, len(payload), self.submitted)
+        self.pending_bytes += len(payload)
+        self.destinations.update({path: future for path in paths})
+
+    def flush(self):
+        while self.pending:
+            self.wait_one()
+        self.report(force=True)
+
+    def close(self):
+        if self.pool is not None:
+            self.pool.shutdown(wait=True, cancel_futures=True)
+
+
+@contextmanager
+def render_resources(workers, verbose):
+    previous_threads = torch.get_num_threads()
+    renderer = PaperFigureRenderer(workers, verbose)
+    token = _FIGURE_RENDERER.set(renderer)
+    try:
+        if workers > 1:
+            torch.set_num_threads(1)
+        with threadpool_limits(limits=1 if workers > 1 else None):
+            yield renderer
+            renderer.flush()
+    finally:
+        _FIGURE_RENDERER.reset(token)
+        try:
+            renderer.close()
+        finally:
+            torch.set_num_threads(previous_threads)
 
 
 def verify_requested_artifact(root, report, relative):
@@ -313,7 +522,7 @@ def verify_requested_artifact(root, report, relative):
     return verify_plot_input(root, report, relative)
 
 
-def select_requested_methods(all_groups, requested):
+def select_requested_methods(all_groups, requested, *, allow_missing=False, injection_scan=False):
     available = set()
     for group in all_groups.values():
         available.update(canonical_method(method) for method in group)
@@ -326,9 +535,12 @@ def select_requested_methods(all_groups, requested):
             if method not in normalized:
                 normalized.append(method)
         missing = [method for method in normalized if method not in available]
-        if missing:
+        if missing and not allow_missing:
             labels = ", ".join(METHOD_LABELS.get(method, method) for method in missing)
-            raise ValueError(f"Explicitly requested publication methods were not discovered: {labels}")
+            message = f"Explicitly requested publication methods were not discovered: {labels}"
+            if injection_scan and available:
+                raise incomplete_scan_error(message)
+            raise ValueError(message)
         return normalized
     return [item for item in ("riddle", "iad", "supervised") if item in available]
 
@@ -349,28 +561,26 @@ def filter_groups(groups, methods, variants, scenarios, excluded_seeds):
     return selected
 
 
-def discover_paper_results(root, requested=None, *, scan=False):
+def discover_paper_results(root, requested=None, *, scan=False, workers=1, verbose=0):
+    root = Path(root)
     requested = None if requested is None else {canonical_method(method) for method in requested}
-    groups = discover(root, requested=requested, scan=scan)
-    if requested is not None and "lacathode" not in requested:
-        return groups
-    for path in result_paths(root, requested=("lacathode",)):
-        report = json.loads(path.read_text())
-        if report.get("scan_reuse"):
-            continue
-        if report.get("method") != "lacathode" or not report.get("completed") or "run_index" not in report:
-            continue
-        parent_path = path.parent.parent.parent / "result.json"
-        if parent_path.is_file() and json.loads(parent_path.read_text()).get("completed"):
-            continue
-        for identity, group in discover(path.parent, requested=("lacathode",), scan=scan).items():
-            target = groups.setdefault(identity, {})
-            if "lacathode" in target:
-                if target["lacathode"][0].resolve() == path.parent.resolve():
-                    continue
-                raise ValueError("Duplicate independent LaCATHODE run")
-            target.update(group)
-    return groups
+    last_update = 0.0
+
+    def progress(directories, reports, elapsed, finished):
+        nonlocal last_update
+        if finished or elapsed - last_update >= 10:
+            state = "Finished" if finished else "Searching"
+            say(f"[DISCOVER] {state}: {directories} folders, {reports} reports; {elapsed:.1f}s", verbose)
+            last_update = elapsed
+
+    paths = list(result_paths(root, requested, workers=workers, progress=progress))
+
+    def read(path):
+        say(f"[REPORTS] {path}", verbose, 2)
+        return read_discovery_result(path, root, requested, scan=scan, independent_lacathode=True)
+
+    reports = parallel_plot_tasks(read, paths, workers, "REPORTS", verbose)
+    return discover(root, requested=requested, scan=scan, reports=reports)
 
 
 def independent_records(record, seed):
@@ -558,35 +768,130 @@ def aggregate_metric_runs(run_rows, curve_kind):
     return grid, *run_summary(curves)
 
 
+def parallel_plot_tasks(function, tasks, workers, stage, verbose, describe=None):
+    if not tasks:
+        return []
+    started = time.monotonic()
+    completed = 0
+    values = [None] * len(tasks)
+    worker_count = min(workers, len(tasks))
+    compact_progress = stage in ("LOAD", "SCAN LOAD", "METRICS", "SCAN METRICS") and verbose == 1
+    live = compact_progress and sys.stdout.isatty()
+
+    def progress_status():
+        elapsed = time.monotonic() - started
+        filled = 16 * completed // len(tasks)
+        bar = "#" * filled + "-" * (16 - filled)
+        remaining = tqdm.format_interval(elapsed * (len(tasks) - completed) / completed) if completed else "?"
+        say(f"[{stage}] |{bar}| {completed}/{len(tasks)} "
+            f"[{tqdm.format_interval(elapsed)}<{remaining}; workers={worker_count}]", verbose)
+
+    if compact_progress:
+        if not live:
+            progress_status()
+    else:
+        say(f"[{stage}] 0/{len(tasks)}; workers={worker_count}", verbose)
+
+    def timed(task):
+        task_started = time.monotonic()
+        return function(task), time.monotonic() - task_started
+
+    with tqdm(total=len(tasks), desc=f"[{stage}]", file=sys.stdout, ascii=True,
+              bar_format="{desc} |{bar:16}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}{postfix}]",
+              postfix={"workers": worker_count}, mininterval=0.2, miniters=1, disable=not live) as progress, \
+            threadpool_limits(limits=1), ThreadPoolExecutor(max_workers=worker_count) as executor:
+        pending = {executor.submit(timed, task): i for i, task in enumerate(tasks)}
+        last_update = started
+        try:
+            while pending:
+                done, _ = wait(pending, timeout=5, return_when=FIRST_COMPLETED)
+                for future in sorted(done, key=lambda item: pending[item]):
+                    index = pending.pop(future)
+                    values[index], elapsed = future.result()
+                    completed += 1
+                    now = time.monotonic()
+                    detail = values[index][0] if stage == "LOAD" else None
+                    if compact_progress:
+                        if live:
+                            progress.update(1)
+                            last_update = now
+                        elif now - last_update >= 10:
+                            progress_status()
+                            last_update = now
+                    elif describe is not None:
+                        say(f"[{stage} {completed}/{len(tasks)}] {describe(tasks[index], values[index])}; {elapsed:.1f}s", verbose)
+                        last_update = now
+                    elif detail is not None:
+                        method, scenario, variant, region, seed = detail
+                        name = f"{METHOD_LABELS.get(method, method)} s{seed} {variant}"
+                        scenario_name = "signal" if scenario == "signal_injection" else "BG"
+                        say(f"[{stage} {completed}/{len(tasks)}] {name} {scenario_name}; {elapsed:.1f}s", verbose)
+                        last_update = now
+                    elif now - last_update >= 5:
+                        say(f"[{stage}] {completed}/{len(tasks)}; elapsed {now - started:.1f}s", verbose)
+                        last_update = now
+                now = time.monotonic()
+                if pending and now - last_update >= 10:
+                    if compact_progress:
+                        if live:
+                            progress.refresh()
+                        else:
+                            progress_status()
+                    else:
+                        say(f"[{stage}] {completed}/{len(tasks)}; elapsed {now - started:.1f}s; loading in progress" if stage.endswith("LOAD")
+                            else f"[{stage}] {completed}/{len(tasks)}; elapsed {now - started:.1f}s", verbose)
+                    last_update = now
+        except BaseException:
+            progress.close()
+            for future in pending:
+                future.cancel()
+            if compact_progress:
+                say(f"[{stage}] Failed at {completed}/{len(tasks)}; total {time.monotonic() - started:.1f}s", verbose)
+            raise
+    if compact_progress:
+        if not live:
+            progress_status()
+    else:
+        say(f"[{stage}] Finished {completed}/{len(tasks)}; total {time.monotonic() - started:.1f}s", verbose)
+    return values
+
+
 def metric_cache(groups, loader, regions, min_background, verbose, require_compatible_populations=False, io_workers=1):
     cache = {}
     records = {}
     protocol_groups = defaultdict(set)
     populations = {}
-    total = sum(len(group) * len(regions) for group in groups.values())
-    index = 0
+    tasks = []
     for (scenario, seed, variant), group in sorted(groups.items()):
         require_riddle_benchmark_alignment(group)
         for method, (root, report) in group.items():
             for region in regions:
-                index += 1
-                say(f"[{index}/{total}] {METHOD_LABELS.get(method, method)} {scenario} {variant} seed {seed} {region}", verbose, 2)
-                record = load_record(loader, method, root, report, region)
-                if record is None:
-                    if method == "riddle" and region == "full_region":
-                        say("[SKIP] RIDDLE Full Region plots: saved scores are Signal Region only", verbose)
-                    continue
                 cohort = (method, scenario, variant, region)
-                protocol_groups[cohort].add(aggregation_protocol_signature(method, report))
-                for run_seed, run in independent_records(record, seed):
-                    key = (*cohort, run_seed)
-                    if key in records:
-                        raise ValueError(f"Duplicate independent run: {key}")
-                    if cohort in populations:
-                        require_population_compatibility({"first": populations[cohort], "current": run})
-                    else:
-                        populations[cohort] = run
-                    records[key] = run
+                tasks.append(((*cohort, seed), root, report))
+
+    def load(task):
+        key, root, report = task
+        method, scenario, variant, region, seed = key
+        say(f"[LOAD] {METHOD_LABELS.get(method, method)} s{seed} {variant} {scenario}: {root}", verbose, 2)
+        return key, load_record(loader, method, root, report, region), report
+
+    for source, record, report in parallel_plot_tasks(load, tasks, io_workers, "LOAD", verbose):
+        method, scenario, variant, region, seed = source
+        if record is None:
+            if method == "riddle" and region == "full_region":
+                say("[SKIP] RIDDLE Full Region plots: saved scores are Signal Region only", verbose)
+            continue
+        cohort = (method, scenario, variant, region)
+        protocol_groups[cohort].add(aggregation_protocol_signature(method, report))
+        for run_seed, run in independent_records(record, seed):
+            key = (*cohort, run_seed)
+            if key in records:
+                raise ValueError(f"Duplicate independent run: {key}")
+            if cohort in populations:
+                require_population_compatibility({"first": populations[cohort], "current": run})
+            else:
+                populations[cohort] = run
+            records[key] = run
     for (method, scenario, variant, region), signatures in protocol_groups.items():
         if len(signatures) != 1:
             raise ValueError(f"Incompatible scientific protocols across independent runs for {METHOD_LABELS.get(method, method)}, {scenario}, {variant}, {region}")
@@ -611,8 +916,7 @@ def metric_cache(groups, loader, regions, min_background, verbose, require_compa
         return key, {"auc": None, "max_sic": None, "working_points": {}, "acceptance": {
             "background": {"total": int(bg.sum()), "mapped": int((bg & mask).sum()),
                            "acceptance": float(mask[bg].mean()) if bg.any() else None}}}
-    with ThreadPoolExecutor(max_workers=io_workers) as executor:
-        cache.update(executor.map(compute, records.items()))
+    cache.update(parallel_plot_tasks(compute, list(records.items()), io_workers, "METRICS", verbose))
     for method, scenario, variant, region in sorted(populations):
         count = len(compatible_run_rows(cache, method, scenario, variant, region))
         say(f"[SEEDS] {METHOD_LABELS.get(method, method)} {scenario} {variant} {region}: {count} completed seeds", verbose)
@@ -1995,17 +2299,22 @@ def aggregate_scan_replica(run_rows):
     }
 
 
-def process_injection_scan(scan_groups, methods, loader, settings, output, formats, file_formats, overwrite, min_background, allow_partial, verbose, require_compatible_populations=False, variant="default"):
+def process_injection_scan(scan_groups, methods, loader, settings, output, formats, file_formats, overwrite, min_background, allow_partial, verbose, require_compatible_populations=False, variant="default", io_workers=1, excluded_seeds=()):
     configured = [int(value) for value in settings.get("injection_scan", {}).get("signal_events", [])]
     config = settings.get("injection_scan", {})
     cohort = config.get("seeds", list(range(int(config.get("replicas", 0)))))
     if not configured or not cohort:
         say("[SKIP] Injection scan: configuration is missing signal_events or seeds", verbose)
         return
+    cohort = [seed for seed in cohort if seed not in excluded_seeds]
+    if not cohort:
+        say("[SKIP] Injection scan: all configured seeds were excluded", verbose)
+        return
     if not scan_groups:
         say("[SKIP] Injection scan: no completed scan results were discovered", verbose)
         return
-    scan_groups = {identity: group for identity, group in scan_groups.items() if identity[3] == variant}
+    scan_groups = {identity: group for identity, group in scan_groups.items()
+                   if identity[3] == variant and identity[1] not in excluded_seeds}
     if not scan_groups:
         return
     schemas = {report["contract"]["inputs"]["injection_scan"].get("schema", 1)
@@ -2028,7 +2337,7 @@ def process_injection_scan(scan_groups, methods, loader, settings, output, forma
         missing_methods = [method for method in methods if method not in data]
         if missing_methods:
             labels = ", ".join(METHOD_LABELS.get(method, method) for method in missing_methods)
-            raise ValueError(f"Strict injection-scan comparison is missing requested methods: {labels}")
+            raise incomplete_scan_error(f"Strict injection-scan comparison is missing requested methods: {labels}")
         requested_methods = list(methods)
     expected_runs = {method: scan_method_run_indices(data[method], configured, cohort) for method in requested_methods}
     from riddle.scan_cache import require_scan_compatibility
@@ -2039,11 +2348,12 @@ def process_injection_scan(scan_groups, methods, loader, settings, output, forma
     if not allow_partial and len(requested_methods) > 1:
         cohorts = {tuple(expected_runs[method]) for method in requested_methods}
         if len(cohorts) != 1:
-            raise ValueError("Injection-scan methods do not share the same independent run-index cohort")
+            raise incomplete_scan_error("Injection-scan methods do not share the same independent run-index cohort")
     invalid = defaultdict(list)
     loaded = defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
     point_records = defaultdict(dict)
     point_counts = defaultdict(set)
+    tasks = []
     for method in requested_methods:
         runs_expected = expected_runs[method]
         if not runs_expected:
@@ -2057,24 +2367,51 @@ def process_injection_scan(scan_groups, methods, loader, settings, output, forma
                     extra = sorted(set(runs) - set(runs_expected))
                     invalid[method].append(f"N_inj={level} seed={replica} missing_runs={missing} extra_runs={extra}")
                 for run_index, (root, report) in sorted(runs.items()):
-                    try:
-                        record = loader(root, report, "signal_region")
-                        metrics = central_metrics(record, min_background)
-                        if metrics is None:
-                            raise ValueError("signal metrics are unavailable")
-                        counts = scan_realized_counts(report)
-                        if counts is None:
-                            raise ValueError("uncut_signal_region provenance is missing")
-                        background, signal = counts
-                        loaded[method][level][replica][run_index] = {
-                            "metrics": metrics,
-                            "background": background,
-                            "signal": signal,
-                        }
-                        point_records[(level, replica, run_index)][method] = record
-                        point_counts[(level, replica)].add(counts)
-                    except Exception as error:
-                        invalid[method].append(f"N_inj={level} seed={replica} run={run_index}: {type(error).__name__}: {error}")
+                    tasks.append(((method, level, replica, run_index), root, report))
+
+    def load(task):
+        key, root, report = task
+        say(f"[SCAN LOAD] {key}: {root}", verbose, 2)
+        try:
+            return key, loader(root, report, "signal_region"), report, None
+        except Exception as error:
+            return key, None, report, f"{type(error).__name__}: {error}"
+
+    def describe(task, result):
+        method, level, replica, _ = task[0]
+        status = "; failed" if result[3] else ""
+        return f"{METHOD_LABELS.get(method, method)} s{replica} N={level} {variant}{status}"
+
+    loaded_tasks = parallel_plot_tasks(load, tasks, io_workers, "SCAN LOAD", verbose, describe)
+
+    def compute(task):
+        key, record, report, error = task
+        if error is not None:
+            return key, record, None, None, error
+        try:
+            metrics = central_metrics(record, min_background)
+            if metrics is None:
+                raise ValueError("signal metrics are unavailable")
+            counts = scan_realized_counts(report)
+            if counts is None:
+                raise ValueError("uncut_signal_region provenance is missing")
+            return key, record, metrics, counts, None
+        except Exception as error:
+            return key, record, None, None, f"{type(error).__name__}: {error}"
+
+    for key, record, metrics, counts, error in parallel_plot_tasks(compute, loaded_tasks, io_workers, "SCAN METRICS", verbose):
+        method, level, replica, run_index = key
+        if error is not None:
+            invalid[method].append(f"N_inj={level} seed={replica} run={run_index}: {error}")
+            continue
+        background, signal = counts
+        loaded[method][level][replica][run_index] = {
+            "metrics": metrics,
+            "background": background,
+            "signal": signal,
+        }
+        point_records[(level, replica, run_index)][method] = record
+        point_counts[(level, replica)].add(counts)
     for identity, group in scan_groups.items():
         level, replica, run_index, source_variant = identity
         if source_variant != variant or level not in configured or replica not in cohort:
@@ -2096,7 +2433,7 @@ def process_injection_scan(scan_groups, methods, loader, settings, output, forma
     if not allow_partial:
         failures = [f"{METHOD_LABELS.get(method, method)}: " + "; ".join(invalid[method]) for method in requested_methods if invalid[method]]
         if failures:
-            raise ValueError("Strict injection-scan comparison is incomplete: " + " | ".join(failures))
+            raise incomplete_scan_error("Strict injection-scan comparison is incomplete: " + " | ".join(failures))
     for method in requested_methods:
         if invalid[method] and allow_partial:
             say("[WARN] Partial injection scan: " + METHOD_LABELS.get(method, method) + ": " + "; ".join(invalid[method]), verbose)
@@ -2115,27 +2452,34 @@ def process_injection_scan(scan_groups, methods, loader, settings, output, forma
     if not allow_partial and set(summaries) != set(requested_methods):
         missing = [method for method in requested_methods if method not in summaries]
         labels = ", ".join(METHOD_LABELS.get(method, method) for method in missing)
-        raise ValueError(f"Strict injection-scan comparison could not build complete summaries for: {labels}")
+        raise incomplete_scan_error(f"Strict injection-scan comparison could not build complete summaries for: {labels}")
     if not summaries:
         return
     destination = output / "06_injection_scan" / VARIANT_LABELS.get(variant, variant)
-    figure_specs = [("max_sic", "Maximum significance improvement", "maximum_sic_vs_s_over_b"), ("nominal_selected", "Maximum nominal significance after anomaly selection", "maximum_nominal_significance_vs_s_over_b"), ("auc", "AUC", "auc_vs_s_over_b")]
+    figure_specs = [("max_sic", "Maximum significance improvement", "maximum_sic_vs_s_over_b"), ("nominal_selected", "Maximum achieved significance", "maximum_nominal_significance_vs_s_over_b"), ("auc", "AUC", "auc_vs_s_over_b")]
     for wp in PLOT_WORKING_POINTS[::-1]:
         figure_specs.append((f"wp_{wp}", r"Signal efficiency, $\epsilon_S$", f"epsS_{WORKING_POINT_LABELS[wp].replace('%','pct').replace('.','p')}_vs_s_over_b"))
     reference_axis = None
+    reference_counts = None
     for method, levels in summaries.items():
         axis = []
+        counts = []
         for level, replicas_data in levels:
             sob = [row["s_over_b"] for row in replicas_data if row["s_over_b"] is not None]
             nominal = [row["nominal"] for row in replicas_data if row["nominal"] is not None]
             if sob and nominal:
                 axis.append((level, 100 * float(np.mean(sob)), float(np.mean(nominal))))
+                counts.append({(row["background"], row["signal"]) for row in replicas_data})
         if reference_axis is None:
             reference_axis = axis
-        elif axis != reference_axis:
+            reference_counts = counts
+        elif ([item[0] for item in axis] != [item[0] for item in reference_axis]
+              or counts != reference_counts
+              or not np.allclose([item[1:] for item in axis], [item[1:] for item in reference_axis],
+                                 rtol=1e-14, atol=0.0)):
             raise ValueError("Injection-scan methods do not share the same realized S/B and S/sqrt(B) axis")
     for field, ylabel, stem in figure_specs:
-        fig, ax = new_figure("Injected SR S/B (%)", ylabel)
+        fig, ax = new_figure("S/B (%)", ylabel)
         drawn = 0
         for method, levels in summaries.items():
             x, y, low, high = [], [], [], []
@@ -2164,28 +2508,43 @@ def process_injection_scan(scan_groups, methods, loader, settings, output, forma
             if x:
                 order = np.argsort(x)
                 x, y, low, high = [np.asarray(values)[order] for values in (x, y, low, high)]
-                ax.plot(x, y, color=METHOD_COLORS.get(method), ls="-", label=METHOD_LABELS.get(method, method))
+                ax.plot(x, y, color=METHOD_COLORS.get(method), ls="-", marker="x",
+                        label=METHOD_LABELS.get(method, method))
                 ax.fill_between(x, low, high, where=np.isfinite(low) & np.isfinite(high), color=METHOD_COLORS.get(method), alpha=0.2, linewidth=0)
                 drawn += 1
         if drawn:
+            if field == "nominal_selected":
+                for significance in (3, 5):
+                    ax.axhline(significance, color="0.5", ls=":", lw=0.7, label="_nolegend_")
+            ax.invert_xaxis()
             top = ax.twiny()
             top.set_xlim(ax.get_xlim())
             if reference_axis:
                 ordered_axis = sorted(reference_axis, key=lambda item: item[1])
                 top.set_xticks([item[1] for item in ordered_axis])
                 top.set_xticklabels([f"{item[2]:.2g}" for item in ordered_axis])
-            top.set_xlabel(r"Uncut $S/\sqrt{B}$")
-            legend = inside_legend(ax, title=VARIANT_LABELS.get(variant, variant))
+            top.set_xlabel(r"$S/\sqrt{B}$")
+            top.tick_params(axis="x", labelsize=6.7)
+            legend = {"scan_legend": {"title": VARIANT_LABELS.get(variant, variant)}}
             save_figure(fig, ax, destination / stem, formats, overwrite, legend)
         else:
             plt.close(fig)
-    if "riddle" in summaries:
-        rows = []
-        for level, replicas_data in summaries["riddle"]:
+    rows = []
+    for method, levels in summaries.items():
+        for level, replicas_data in levels:
             metrics = [metrics for row in replicas_data for metrics in row["run_metrics"]]
-            rows.append({"N_inj": int(level), **performance_summary(metrics)})
-        if rows and (allow_partial or (len(rows) == len(configured) and all(len(replicas_data) == len(cohort) for _, replicas_data in summaries["riddle"]))):
-            write_table_rows(output / "07_tables" / f"table_04_{variant}_signal_injection_dependence", rows, file_formats)
+            significance = [metric["max_sic"] * row["nominal"] for row in replicas_data
+                            for metric in row["run_metrics"]
+                            if metric["max_sic"] is not None and row["nominal"] is not None]
+            significance = np.asarray(significance, float)
+            significance = significance[np.isfinite(significance)]
+            rows.append({"Method": METHOD_LABELS.get(method, method), "N_inj": int(level),
+                         **performance_summary(metrics),
+                         "Max. achieved significance": float(significance.mean()) if len(significance) else None,
+                         "Max. achieved significance min": float(significance.min()) if len(significance) else None,
+                         "Max. achieved significance max": float(significance.max()) if len(significance) else None})
+    if rows:
+        write_table_rows(output / "07_tables" / f"table_04_{variant}_signal_injection_dependence", rows, file_formats)
 
 
 def load_settings_file(path):
@@ -2198,10 +2557,11 @@ def load_settings_file(path):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Physical Review D publication plotting for completed RIDDLE-compatible results")
-    parser.add_argument("--results", type=Path, default=Path("results"))
-    parser.add_argument("--scan-results", type=Path, default=Path("results/injection_scan"))
-    parser.add_argument("--data", type=Path, default=Path("data/lhco"))
-    parser.add_argument("--scan-data", type=Path, default=Path("data/injection_scan"))
+    parser.add_argument("--workflow", choices=("normal", "scan"), help="Defaults to scan when --scan-data or --scan-results is supplied")
+    parser.add_argument("--results", type=Path)
+    parser.add_argument("--scan-results", type=Path)
+    parser.add_argument("--data", type=Path)
+    parser.add_argument("--scan-data", type=Path)
     parser.add_argument("--config", type=Path, default=Path("config/settings.yaml"))
     parser.add_argument("--output", type=Path, default=Path("paper_plots"))
     parser.add_argument("--methods", nargs="+")
@@ -2212,14 +2572,28 @@ def parse_args(argv=None):
     parser.add_argument("--file-formats", nargs="+", choices=("csv", "json", "yaml"), default=("csv",))
     parser.add_argument("--exclude-seeds", nargs="*", type=int, default=())
     parser.add_argument("--min-background", type=int, default=10)
-    parser.add_argument("--io-workers", type=int, default=2, help="Parallel metric workers and CPU numerical threads")
+    parser.add_argument("--io-workers", type=int, default=2, help="Parallel discovery, result loading and metric workers")
+    parser.add_argument("--plot-workers", type=int, default=min(8, max(1, (os.cpu_count() or 1) // 2)),
+                        help="CPU processes for legend layout and image rendering; 1 runs serially")
     parser.add_argument("--allow-partial-injection-scan", action="store_true")
     parser.add_argument("--require-compatible-populations", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--verbose", type=int, choices=(0, 1, 2), default=1)
     args = parser.parse_args(argv)
-    if args.io_workers < 1 or args.min_background < 1:
-        parser.error("--io-workers and --min-background must be positive")
+    if args.io_workers < 1 or args.plot_workers < 1 or args.min_background < 1:
+        parser.error("--io-workers, --plot-workers and --min-background must be positive")
+    normal_requested = args.data is not None or args.results is not None
+    scan_requested = args.scan_data is not None or args.scan_results is not None
+    if normal_requested and scan_requested:
+        parser.error("Use --data/--results for normal plots or --scan-data/--scan-results for injection plots in separate commands")
+    if ((args.workflow == "normal" and scan_requested)
+            or (args.workflow == "scan" and normal_requested)):
+        parser.error("The input arguments must match --workflow")
+    args.workflow = args.workflow or ("scan" if scan_requested else "normal")
+    args.results = args.results if args.results is not None else Path("results")
+    args.data = args.data if args.data is not None else Path("data/lhco")
+    args.scan_results = args.scan_results if args.scan_results is not None else Path("results_injection_scan")
+    args.scan_data = args.scan_data if args.scan_data is not None else Path("data/injection_scan")
     return args
 
 
@@ -2236,30 +2610,61 @@ def main(argv=None):
 
 def run(args):
     configure_style()
-    if args.overwrite:
+    if args.overwrite and args.workflow == "normal":
         cleanup_legacy_summary_folders(args.output)
     settings = load_settings_file(args.config)
-    say("[STAGE] Discover completed results", args.verbose)
+    scan = args.workflow == "scan"
+    source = args.scan_results if scan else args.results
+    say(f"[STAGE] Discover completed {'injection-scan' if scan else 'normal'} results", args.verbose)
     requested = None if args.methods and "all" in args.methods else tuple(
         canonical_method(method) for method in (args.methods or ("riddle", "iad", "supervised"))
     )
-    groups_all = discover_paper_results(args.results, requested=requested) if args.results.exists() else {}
-    scan_all = discover_paper_results(args.scan_results, requested=requested, scan=True) if args.scan_results.exists() else {}
-    methods = select_requested_methods(groups_all, args.methods)
+    groups_all = discover_paper_results(source, requested=requested, scan=scan,
+                                        workers=args.io_workers, verbose=args.verbose) if source.exists() else {}
+    methods = select_requested_methods(groups_all, args.methods,
+                                       allow_missing=scan and args.allow_partial_injection_scan,
+                                       injection_scan=scan)
     if not methods:
         raise SystemExit("No requested publication methods were discovered")
-    discovered_variants = sorted({identity[2] for identity in groups_all}, key=lambda value: VARIANT_ORDER.index(value) if value in VARIANT_ORDER else 99)
+    discovered_variants = sorted({identity[3 if scan else 2] for identity in groups_all}, key=lambda value: VARIANT_ORDER.index(value) if value in VARIANT_ORDER else 99)
     variants = list(args.variants) if args.variants else discovered_variants
+    loader = ScoreLoader(safeguard_filtering=True, ensemble_fit_selection=True, io_workers=args.io_workers,
+                         device="cpu", eager_partitions=False)
+    if scan:
+        groups = {identity: {canonical_method(method): value for method, value in group.items()
+                             if canonical_method(method) in methods and (not args.scenarios or value[1]["scenario"] in args.scenarios)}
+                  for identity, group in groups_all.items()
+                  if identity[3] in variants and identity[1] not in args.exclude_seeds}
+        groups = {identity: group for identity, group in groups.items() if group}
+        if not groups:
+            raise SystemExit("No completed injection-scan results remain after applying filters")
+        say("[SUMMARY] Mean across completed seeds; bands show the min–max range across seeds", args.verbose)
+        with render_resources(args.plot_workers, args.verbose):
+            for variant in variants:
+                say(f"[STAGE] Build and render {variant} signal-injection dependence", args.verbose)
+                process_injection_scan(groups, methods, loader, settings, args.output, args.plot_formats,
+                                       args.file_formats, args.overwrite, args.min_background,
+                                       args.allow_partial_injection_scan, args.verbose,
+                                       args.require_compatible_populations, variant=variant,
+                                       io_workers=args.io_workers, excluded_seeds=args.exclude_seeds)
+        say(f"[DONE] Injection-scan outputs written to {args.output}", args.verbose)
+        return 0
     scenarios = list(args.scenarios) if args.scenarios else sorted({identity[0] for identity in groups_all}, key=lambda value: ("signal_injection", "background_only").index(value))
     regions = ["signal_region"]
     groups = filter_groups(groups_all, methods, variants, scenarios, set(args.exclude_seeds))
     if not groups:
         raise SystemExit("No completed results remain after applying method, variant, scenario, and seed filters")
     say("[STAGE] Validate result provenance", args.verbose)
-    loader = ScoreLoader(safeguard_filtering=True, ensemble_fit_selection=True, io_workers=args.io_workers, device="cpu")
     say("[STAGE] Build publication metric cache", args.verbose)
     cache, records = metric_cache(groups, loader, regions, args.min_background, args.verbose, args.require_compatible_populations, args.io_workers)
     say("[SUMMARY] Mean across completed seeds; bands show the min–max range across seeds", args.verbose)
+    with render_resources(args.plot_workers, args.verbose):
+        render_publication_outputs(args, groups, cache, records, loader, scenarios, variants, regions)
+    say(f"[DONE] Publication outputs written to {args.output}", args.verbose)
+    return 0
+
+
+def render_publication_outputs(args, groups, cache, records, loader, scenarios, variants, regions):
     say("[STAGE] Render comparison performance plots", args.verbose)
     plot_performance(cache, args.output, args.plot_formats, args.overwrite, scenarios, variants, regions)
     plot_score_distributions(groups, records, args.output, args.plot_formats, args.overwrite)
@@ -2277,13 +2682,8 @@ def run(args):
     plot_stein(groups, records, args.output, args.plot_formats, args.overwrite)
     say("[STAGE] Render training histories", args.verbose)
     plot_training(groups, args.output, args.plot_formats, args.overwrite)
-    say("[STAGE] Render signal-injection dependence", args.verbose)
-    for variant in variants:
-        process_injection_scan(scan_all, methods, loader, settings, args.output, args.plot_formats, args.file_formats, args.overwrite, args.min_background, args.allow_partial_injection_scan, args.verbose, args.require_compatible_populations, variant=variant)
     say("[STAGE] Export publication tables", args.verbose)
     export_tables(groups, cache, loader, args.output, args.file_formats, args.data, args.verbose)
-    say(f"[DONE] Publication outputs written to {args.output}", args.verbose)
-    return 0
 
 
 if __name__ == "__main__":

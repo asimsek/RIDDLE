@@ -315,13 +315,11 @@ kubectl exec -n cua-asimsek \
 
 ```bash
 cd /shared/work/RIDDLE
-python scripts/nrp_runtime.py
-python plot.py --results results --output plots --verbose 1 --io-workers 16 --overwrite
 
 python paper_plot.py --data data/lhco --results results \
   --config config/settings.yaml --output paper_plots \
-  --methods riddle lacathode ranode iad supervised --variants default deltaR shifted \
-  --plot-formats png --file-formats csv --io-workers 16 --overwrite --verbose 1
+  --methods riddle iad supervised --variants default deltaR shifted \
+  --plot-formats png --file-formats csv --io-workers 16 --plot-workers 16 --overwrite --verbose 1
 ```
 
 All completed methods are discovered automatically.<br>
@@ -452,13 +450,16 @@ kubectl logs -n cua-asimsek -f job/ranode-injection-scan-seed40 -c campaign
 In Jupyter, plot completed scan results:
 
 ```bash
-python plot.py --results results_injection_scan --output plots_injection_scan --verbose 1  --io-workers 16 --overwrite
+cd /shared/work/RIDDLE
 
 python paper_plot.py --scan-data data/injection_scan --scan-results results_injection_scan \
   --config config/settings.yaml --output paper_plots \
-  --methods riddle lacathode ranode iad supervised --variants default deltaR shifted \
-  --plot-formats png --file-formats csv --io-workers 16 --overwrite --verbose 1
+  --methods riddle iad supervised --variants default deltaR shifted \
+  --plot-formats png --file-formats csv --io-workers 16 --plot-workers 16 --overwrite --verbose 1
 ```
+
+For preliminary plots using only available completed results, add `--allow-partial-injection-scan`.<br>
+`--variants` accepts `default`, `deltaR`, and `shifted`, individually or together (e.g. `--variants default deltaR shifted`).
 
 
 ## Troubleshooting

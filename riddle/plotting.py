@@ -1,4 +1,6 @@
 import argparse
+from collections import deque
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from dataclasses import dataclass
 import csv
@@ -376,37 +378,99 @@ def methods(keys, *, view=None):
         f.METHODS, f.VIEWS, f.POPULATIONS, f.DISPLAY_TRANSFORMS = previous
 
 
-def result_paths(root, requested=None):
-    paths = [root / "result.json"] if (root / "result.json").is_file() else sorted(root.rglob("result.json"))
+def result_directory_method(path):
+    return next((method_family(parent.parent.name) for parent in (path, *path.parents)
+                 if parent.name in f.SCENARIOS), None)
+
+
+def result_paths(root, requested=None, *, workers=1, progress=None):
+    if workers < 1:
+        raise ValueError("Discovery workers must be positive")
+    root = Path(root)
     requested = None if requested is None else {method_family(method) for method in requested}
-    for path in paths:
-        directory_method = next((method_family(parent.parent.name) for parent in path.parents
-                                 if parent.name in f.SCENARIOS), None)
+    direct = root / "result.json"
+    if direct.is_file():
+        directory_method = result_directory_method(root)
         if requested is not None and directory_method is not None and directory_method not in requested:
-            continue
-        yield path
+            return
+        yield direct
+        return
+
+    def scan_directory(directory):
+        method = result_directory_method(directory)
+        if requested is not None and method is not None and method not in requested:
+            return [], []
+        try:
+            with os.scandir(directory) as stream:
+                entries = list(stream)
+        except FileNotFoundError:
+            return [], []
+        found = [Path(entry.path) for entry in entries if entry.name == "result.json"]
+        seed_directory = (re.fullmatch(r"seed_\d+", directory.name) is not None
+                          and directory.parent.name in f.SCENARIOS)
+        run_directory = directory.name.startswith("run_") and directory.parent.name == "runs"
+        if ((seed_directory and method in (*RIDDLE_NATIVE_METHODS, "ranode"))
+                or (run_directory and method == "lacathode")):
+            return found, []
+        directories = [Path(entry.path) for entry in entries if entry.is_dir(follow_symlinks=False)
+                       and (not seed_directory or method != "lacathode" or entry.name == "runs")]
+        return found, directories
+
+    paths = []
+    directories = deque([root])
+    checked = 0
+    started = time.monotonic()
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        pending = set()
+        while directories or pending:
+            while directories and len(pending) < 2 * workers:
+                pending.add(executor.submit(scan_directory, directories.popleft()))
+            done, _ = wait(pending, timeout=5, return_when=FIRST_COMPLETED)
+            for future in done:
+                found, children = future.result()
+                paths.extend(found)
+                directories.extend(children)
+                checked += 1
+            pending -= done
+            if progress is not None:
+                progress(checked, len(paths), time.monotonic() - started, not directories and not pending)
+    yield from sorted(paths)
 
 
-def discover(root, requested=None, *, scan=False):
+def read_discovery_result(path, root, requested=None, *, scan=False, independent_lacathode=False):
+    path, root = Path(path), Path(root)
+    requested = None if requested is None else {method_family(method) for method in requested}
+    report = json.loads(path.read_text())
+    method = method_family(report.get("method"))
+    if (requested is not None and method not in requested) or not report.get("completed"):
+        return None
+    if method == "lacathode" and "run_index" in report and path.parent != root and not report.get("scan_reuse"):
+        if not independent_lacathode:
+            return None
+        parent_path = path.parent.parent.parent / "result.json"
+        if parent_path.is_file() and json.loads(parent_path.read_text()).get("completed"):
+            return None
+    point = report.get("contract", {}).get("inputs", {}).get("injection_scan")
+    if bool(point) != scan:
+        return None
+    from .scan_cache import resolve_reference
+    artifact_root, report = resolve_reference(path.parent, report)
+    if method in RIDDLE_NATIVE_METHODS and "protocol.json" in report.get("artifacts_sha256", {}):
+        protocol = read_metadata(artifact_root, report, "protocol.json")
+        report = {**report, "protocol": protocol,
+                  "score_scope": riddle_score_scope({**report, "protocol": protocol})}
+    return path, artifact_root, report, point, method
+
+
+def discover(root, requested=None, *, scan=False, reports=None):
     requested = None if requested is None else {method_family(method) for method in requested}
     groups = {}
-    for path in result_paths(root, requested):
-        report = json.loads(path.read_text())
-        stored_method = report.get("method")
-        method = method_family(stored_method)
-        if (requested is not None and method not in requested) or not report.get("completed"):
+    if reports is None:
+        reports = (read_discovery_result(path, root, requested, scan=scan) for path in result_paths(root, requested))
+    for result in reports:
+        if result is None:
             continue
-        if method == "lacathode" and "run_index" in report and path.parent != root and not report.get("scan_reuse"):
-            continue
-        point = report.get("contract", {}).get("inputs", {}).get("injection_scan")
-        if bool(point) != scan:
-            continue
-        from .scan_cache import resolve_reference
-        artifact_root, report = resolve_reference(path.parent, report)
-        if method in RIDDLE_NATIVE_METHODS and "protocol.json" in report.get("artifacts_sha256", {}):
-            protocol = read_metadata(artifact_root, report, "protocol.json")
-            report = {**report, "protocol": protocol,
-                      "score_scope": riddle_score_scope({**report, "protocol": protocol})}
+        path, artifact_root, report, point, method = result
         spec = register_method(report)
         METHOD_SPECS[method] = spec
         KEYS.setdefault(method, "method_" + method)
@@ -493,7 +557,7 @@ def load_scores(root, report, name, *, attempt=None, for_rebuild=False):
 
             if "is_signal_region" not in archive:
                 raise ValueError(f"{BUILTINS[method].label} SR membership is missing; regenerate its score artifacts")
-            data["is_signal_region"] = validate_region(archive["is_signal_region"], len(data["mass"]))
+            data["is_signal_region"] = validate_region(data["is_signal_region"], len(data["mass"]))
             if name == "signal_region" and not data["is_signal_region"].all():
                 raise ValueError(f"{BUILTINS[method].label} signal-region evaluation contains non-SR events")
             expected_scope = riddle_score_scope(report)
@@ -1049,7 +1113,8 @@ def apply_riddle_ensemble_fit_selection(root, report, records, audit, *, enabled
 class ScoreLoader:
     """Load saved method predictions once; ensemble members are not repeat runs."""
 
-    def __init__(self, *, safeguard_filtering=True, ensemble_fit_selection=True, io_workers=2, device="cpu"):
+    def __init__(self, *, safeguard_filtering=True, ensemble_fit_selection=True, io_workers=2, device="cpu",
+                 eager_partitions=True):
         self.cache = {}
         self.validated = set()
         self.fit_audit = {}
@@ -1057,17 +1122,28 @@ class ScoreLoader:
         self.ensemble_fit_selection = ensemble_fit_selection
         self.io_workers = io_workers
         self.device = plot_device_argument(device)
+        self.eager_partitions = eager_partitions
+        self._load_locks = {}
+        self._load_guard = threading.Lock()
+        self._inference_lock = threading.Lock()
 
     def __call__(self, root, report, partition):
         identity = str(root.resolve())
+        with self._load_guard:
+            lock = self._load_locks.setdefault(identity, threading.Lock())
+        with lock:
+            return self._load(root, report, partition, identity)
+
+    def _load(self, root, report, partition, identity):
+        method = method_family(report["method"])
+        legacy_riddle = method == "riddle" and report.get("contract", {}).get("scientific_version", 1) < 3
         if identity not in self.validated:
-            method = method_family(report["method"])
-            legacy_riddle = method == "riddle" and report.get("contract", {}).get("scientific_version", 1) < 3
             if method in ("riddle", "iad", "supervised", "ranode") and (not self.safeguard_filtering or legacy_riddle or method == "ranode"):
                 if not self.safeguard_filtering:
                     records, audit = unfiltered_plot_ensemble(root, report)
                 elif legacy_riddle:
-                    records, audit = riddle_plot_ensemble(root, report, io_workers=self.io_workers, device=self.device)
+                    with self._inference_lock:
+                        records, audit = riddle_plot_ensemble(root, report, io_workers=self.io_workers, device=self.device)
                 else:
                     records, audit = ranode_plot_ensemble(root, report)
                 self.fit_audit[identity] = audit
@@ -1104,7 +1180,8 @@ class ScoreLoader:
                     raise ValueError(f"{root}: failed density normalization check")
             if method in ("riddle", "iad", "supervised") and not legacy_riddle:
                 records = {}
-                for name in ("validation", "test", "signal_region"):
+                names = ("validation", "test", "signal_region") if self.eager_partitions else (partition,)
+                for name in names:
                     key = (identity, name)
                     records[name] = self.cache.get(key) if key in self.cache else load_scores(root, report, name)
                 records, audit = apply_riddle_ensemble_fit_selection(
@@ -1119,9 +1196,16 @@ class ScoreLoader:
                     kind="INFO", level=0
                 )
             self.validated.add(identity)
-        key = (str(root.resolve()), partition)
+        key = (identity, partition)
         if key not in self.cache:
-            self.cache[key] = load_scores(root, report, partition)
+            record = load_scores(root, report, partition)
+            if method in RIDDLE_NATIVE_METHODS and not legacy_riddle:
+                selected, audit = apply_riddle_ensemble_fit_selection(
+                    root, report, {partition: record}, self.fit_audit[identity], enabled=self.ensemble_fit_selection
+                )
+                record = selected[partition]
+                self.fit_audit[identity] = audit
+            self.cache[key] = record
         if identity in self.fit_audit:
             self.cache[key]["plot_ensemble"] = self.fit_audit[identity]
         return self.cache[key]
