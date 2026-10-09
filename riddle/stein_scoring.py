@@ -597,7 +597,7 @@ def _calibration(output, order, device, cfg, scoring_root):
 
 
 def member_scores(output, order, z, device, *, mode=None, scoring_root=None, normalization_checks=None,
-                  scoring_settings=None):
+                  scoring_settings=None, background_scores=None, calibration_arrays=None, strict_batch_size=False):
     from .stein import build_potential, _checkpoint_weights
 
     output = Path(output)
@@ -622,21 +622,37 @@ def member_scores(output, order, z, device, *, mode=None, scoring_root=None, nor
     if mode != "potential_raw":
         if scoring_root is None:
             raise ValueError("q-normalized Stein scoring requires the shared scoring reference")
-        _, calibration_path = _calibration(output, order, device, cfg, scoring_root)
-        calibration = np.load(calibration_path, allow_pickle=False)
+        if calibration_arrays is None:
+            _, calibration_path = _calibration(output, order, device, cfg, scoring_root)
+            calibration = np.load(calibration_path, allow_pickle=False)
+        else:
+            calibration = calibration_arrays
+            keys = {"mass"} | {f"{field}_{int(epoch)}" for field in ("p", "h", "w", "e") for epoch in order}
+            if (set(calibration) != keys or np.asarray(calibration["mass"]).ndim != 1
+                    or any(np.asarray(calibration[key]).shape != np.asarray(calibration["mass"]).shape
+                           or not np.isfinite(calibration[key]).all() for key in keys)):
+                raise ValueError("Invalid preloaded frozen member calibration")
         if need_derivatives:
-            background = _load_background(output, inputs, device)
-            qscore = _qscore(
-                z, background, device, cfg, Path(scoring_root) / ".resume/stein_qscore_cache", background_hash
-            )
+            if background_scores is None:
+                background = _load_background(output, inputs, device)
+                qscore = _qscore(
+                    z, background, device, cfg, Path(scoring_root) / ".resume/stein_qscore_cache", background_hash
+                )
+            else:
+                qscore = np.asarray(background_scores)
+                if (qscore.shape != (len(z), z.shape[1] - 1) or qscore.dtype != np.float32
+                        or not np.isfinite(qscore).all()):
+                    raise ValueError("Invalid precomputed frozen background scores")
     combined = np.zeros(len(z), dtype=np.float64)
     mass = z[:, -1]
     regularization = float(inputs["settings"]["stein"]["witness_regularization"])
     for epoch, weight in zip(order, weights):
         _load_checkpoint(output, model, int(epoch), device)
-        p, h, w, e, _ = _checkpoint_values(
+        p, h, w, e, used = _checkpoint_values(
             model, z, qscore, regularization, device, int(cfg["inference_batch_size"]), need_derivatives
         )
+        if strict_batch_size and used != int(cfg["inference_batch_size"]):
+            raise RuntimeError("Frozen scoring required a smaller inference batch after GPU OOM; reduce --workers and resume")
         if mode == "potential_raw":
             values = p
         else:
@@ -664,7 +680,7 @@ def member_scores(output, order, z, device, *, mode=None, scoring_root=None, nor
                 **score_diagnostics(values, stage=f"RIDDLE {output}, Stein checkpoint {epoch} {mode}"),
             ))
         combined += float(weight) * values
-    if calibration is not None:
+    if calibration is not None and hasattr(calibration, "close"):
         calibration.close()
     if not np.isfinite(combined).all():
         raise FloatingPointError("Nonfinite Stein checkpoint ensemble score")

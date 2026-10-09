@@ -1786,6 +1786,9 @@ def _prepared_data_directory(data_root, report):
     scenario = report.get("scenario")
     variant = result_variant(report)
     candidates = [data_root / scenario, data_root / variant / scenario, data_root]
+    if variant != "default" and not data_root.name.endswith("_" + variant):
+        alternate = data_root.with_name(data_root.name + "_" + variant)
+        candidates.extend((alternate / scenario, alternate))
     seen = set()
     for candidate in candidates:
         manifest = candidate / "inputs.json"

@@ -1028,7 +1028,7 @@ def residual_background_log_prob(output, z, device):
                                physical_inputs=model.physical_inputs).numpy().astype(np.float64)
 
 
-def residual_background_sample(output, contexts, count, seed, device, batch_size=None):
+def residual_background_sample(output, contexts, count, seed, device, batch_size=None, *, strict_batch_size=False):
     """Draw full residual inputs from the recorded denominator at supplied contexts."""
     output = Path(output)
     inputs = read_json(output / "residual_training_inputs.json")
@@ -1045,7 +1045,8 @@ def residual_background_sample(output, contexts, count, seed, device, batch_size
         q, saved = loaded
         if saved.get("source_sha256") != info["source_sha256"]:
             raise ValueError("Corrected-background source identity changed")
-        latent = sample_background(q, torch.from_numpy(contexts), features-1, seed, device, batch_size=batch_size).detach().cpu().numpy()
+        latent = sample_background(q, torch.from_numpy(contexts), features-1, seed, device,
+                                   batch_size=batch_size, strict_batch_size=strict_batch_size).detach().cpu().numpy()
         return np.column_stack((latent, contexts)).astype(np.float32)
     rng = np.random.default_rng(seed)
     latent = rng.standard_normal((count, features-1)).astype(np.float32)

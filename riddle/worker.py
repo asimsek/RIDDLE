@@ -134,6 +134,17 @@ def main():
     oracle_method = args.method in ("iad", "supervised")
     inputs = validate(args.data, require_event_ids=native_method, require_oracle=oracle_method,
                       require_supervised=args.method == "supervised")
+    if getattr(args, "score_sidebands_only", False):
+        if not native_method:
+            raise ValueError("Frozen sideband backfill supports native methods only")
+        from .full_mass import score_sidebands
+        saved_report = read_json(args.output / "result.json")
+        saved_method = saved_report["contract"]["method"]
+        if saved_method != args.method or saved_report["seed"] != args.seed:
+            raise ValueError("Frozen backfill method/seed differs from the saved result")
+        emit_runtime(environment().get("gpu") or "CPU")
+        score_sidebands(args, saved_report)
+        return
     if native_method:
         from .settings import input_features
 
@@ -204,6 +215,9 @@ def main():
         configure_background_reuse(args, contract)
         if reuse_completed(args.output, contract, getattr(args, "scan_result_candidates", ()),
                            resume=args.resume, io_workers=args.io_workers, **policy):
+            if native_method and getattr(args, "sideband_scoring", True):
+                from .full_mass import score_sidebands
+                score_sidebands(args)
             return
     saved, changes = inspect_resume(args.output, contract, resume=args.resume, **policy)
     completed = saved is not None and saved["completed"]
@@ -230,6 +244,9 @@ def main():
             saved["resume_history"] = read_json(history_path) if history_path.is_file() else {"schema": 1, "transitions": []}
             write_json(path, saved)
         emit_message("Reuse verified completed result; original provenance retained", kind="PASS")
+        if native_method and getattr(args, "sideband_scoring", True):
+            from .full_mass import score_sidebands
+            score_sidebands(args, saved)
         return
     report = {
         "schema": 1,
@@ -297,6 +314,7 @@ def main():
         for p in args.output.rglob("*")
         if p.is_file()
         and ".resume" not in p.relative_to(args.output).parts
+        and "full_mass" not in p.relative_to(args.output).parts
         and p != path
         and p.name != "training.log"
     ]
@@ -309,6 +327,9 @@ def main():
         from .background_stage import clear_stage_checkpoint
         clear_stage_checkpoint(args.output)
     emit_message("Verified result saved", kind="PASS")
+    if native_method and getattr(args, "sideband_scoring", True):
+        from .full_mass import score_sidebands
+        score_sidebands(args, report)
 
 
 if __name__ == "__main__":

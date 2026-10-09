@@ -125,7 +125,7 @@ def log_prob(model, latent, context):
     return model.log_prob(latent, context=context.reshape(-1, 1))
 
 
-def sample(model, context, dimensions, seed, device, batch_size=None):
+def sample(model, context, dimensions, seed, device, batch_size=None, *, strict_batch_size=False):
     """Sample q_phi(z|m) at matched mass contexts without perturbing caller RNG."""
     context = torch.as_tensor(context, dtype=torch.float32).reshape(-1, 1)
     target = torch.device(device)
@@ -171,6 +171,8 @@ def sample(model, context, dimensions, seed, device, batch_size=None):
                 parts.append(values.detach().cpu())
                 offset = stop
             except torch.cuda.OutOfMemoryError:
+                if strict_batch_size:
+                    raise
                 if target.type != "cuda" or size <= 256:
                     raise
                 torch.cuda.empty_cache()

@@ -112,6 +112,13 @@ def job(args):
     for option in ("resume_across_code_change", "resume_across_device_change"):
         if getattr(args, option, False):
             command.append("--" + option.replace("_", "-"))
+    if getattr(args, "score_sidebands_only", False):
+        if any(method not in ("riddle", "iad", "supervised") for method in args.methods):
+            raise ValueError("--score-sidebands-only supports RIDDLE, IAD and Supervised")
+        command.append("--score-sidebands-only")
+    if not getattr(args, "sideband_scoring", True):
+        command.append("--no-sideband-scoring")
+    command.extend(["--sideband-reference-events", str(getattr(args, "sideband_reference_events", 65536))])
     for key in ("fits", "epochs"):
         value = getattr(args, key, None)
         if value is not None:
@@ -337,6 +344,10 @@ def main(argv=None):
                    help="Intra-op CPU threads per training process (default: 2)")
     p.add_argument("--mps", choices=("auto", "on", "off"), default="auto",
                    help="CUDA MPS policy forwarded to the training framework")
+    p.add_argument("--score-sidebands-only", action="store_true",
+                   help="Backfill frozen sideband scores from completed native results without training")
+    p.add_argument("--sideband-scoring", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--sideband-reference-events", type=positive, default=65536)
     p.add_argument("--verbose", type=int, choices=(0, 1, 2), default=1,
                    help="Console detail: 1 concise (default), 2 full diagnostics")
     p.add_argument(

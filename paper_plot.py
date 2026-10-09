@@ -86,6 +86,10 @@ def folder_variant(variant):
     return VARIANT_LABELS.get(variant, safe_component(variant))
 
 
+def variant_output(output, variant):
+    return Path(output) / ("nominal" if variant == "default" else variant)
+
+
 def folder_region(region):
     return "Signal-Region" if region == "signal_region" else "Full-Region"
 
@@ -369,6 +373,7 @@ def save_figure(fig, ax, stem, formats, overwrite, legend=None):
 
 
 def _save_figure(fig, ax, stem, formats, overwrite, legend=None):
+    spectrum_legend = legend if isinstance(legend, dict) and "spectrum_legend" in legend else None
     scan_legend = legend if isinstance(legend, dict) and "scan_legend" in legend else None
     if isinstance(legend, dict) and "deferred_legend" in legend:
         legend = _inside_legend(ax, **legend["deferred_legend"])
@@ -379,6 +384,11 @@ def _save_figure(fig, ax, stem, formats, overwrite, legend=None):
         pass
     if scan_legend is not None:
         legend = _scan_legend(ax, **scan_legend["scan_legend"])
+    if spectrum_legend is not None:
+        fig.subplots_adjust(top=0.76)
+        ax.legend(loc="lower center", bbox_to_anchor=(0.5, 1.02), ncol=2, frameon=False,
+                  **spectrum_legend["spectrum_legend"])
+        legend = None
     audit_layout(fig, ax, legend)
     for extension in formats:
         path = stem.with_suffix("." + extension)
@@ -577,10 +587,129 @@ def discover_paper_results(root, requested=None, *, scan=False, workers=1, verbo
 
     def read(path):
         say(f"[REPORTS] {path}", verbose, 2)
-        return read_discovery_result(path, root, requested, scan=scan, independent_lacathode=True)
+        value = read_discovery_result(path, root, requested, scan=scan, independent_lacathode=True)
+        if value is not None:
+            value[2]["_full_mass_root"] = str(path.parent)
+        return value
 
     reports = parallel_plot_tasks(read, paths, workers, "REPORTS", verbose)
     return discover(root, requested=requested, scan=scan, reports=reports)
+
+
+def discover_variant_results(root, requested, variants, *, scan=False, workers=1, verbose=0):
+    root = Path(root)
+    roots = [root]
+    if not any(root.name.endswith("_" + variant) for variant in ("deltaR", "shifted")):
+        roots.extend(root.with_name(root.name + "_" + variant)
+                     for variant in (variants or VARIANT_ORDER) if variant != "default")
+    groups = {}
+    for source in dict.fromkeys(roots):
+        if not source.is_dir():
+            continue
+        found = discover_paper_results(source, requested, scan=scan, workers=workers, verbose=verbose)
+        for identity, group in found.items():
+            current = groups.setdefault(identity, {})
+            for method, value in group.items():
+                if method in current and current[method][0].resolve() != value[0].resolve():
+                    raise ValueError(f"Duplicate {method} result for {identity} in the selected variant folders")
+                current[method] = value
+    return groups
+
+
+def plot_dijet_spectra(groups, args, output, *, scan=False):
+    from riddle.full_mass import load_full_mass
+    from riddle.mass_spectrum import CUTS, mass_edges, mass_ylabel, match_ids, normalization_weights, spectrum_histograms
+
+    tasks = [(identity, method, root, report) for identity, group in sorted(groups.items())
+             for method, (root, report) in sorted(group.items()) if method in ("riddle", "iad", "supervised")]
+
+    def load(task):
+        identity, method, root, report = task
+        derived_root = Path(report.get("_full_mass_root", root))
+        record = load_full_mass(derived_root, report, workers=1)
+        if record is None and derived_root != root:
+            record = load_full_mass(root, report, workers=1)
+        return identity, method, record
+
+    loaded = parallel_plot_tasks(load, tasks, args.io_workers, "SPECTRA LOAD", args.verbose)
+    cohorts = defaultdict(list)
+    populations = {}
+    missing = 0
+    for identity, method, record in loaded:
+        if record is None:
+            missing += 1
+            continue
+        scenario = "signal_injection" if scan else identity[0]
+        level = identity[0] if scan else None
+        population_key = (scenario, level)
+        if population_key in populations:
+            reference = populations[population_key]
+            if len(record["event_ids"]) != len(reference["event_ids"]):
+                raise ValueError("Full-mass method comparisons require identical primary held-out populations")
+            indices = match_ids(record["event_ids"], reference["event_ids"])
+            if (not np.array_equal(record["mass"][indices], reference["mass"])
+                    or not np.array_equal(record["labels"][indices], reference["labels"])):
+                raise ValueError("Full-mass method comparisons require identical primary held-out populations")
+        else:
+            populations[population_key] = record
+        cohorts[(method, scenario, level)].append(record)
+    if missing:
+        say(f"[SPECTRA] {missing} results need --score-sidebands-only before full-mass plotting", args.verbose)
+    for (method, scenario, level), records in cohorts.items():
+        first = records[0]
+        statuses = sorted({record["manifest"]["validation_status"] for record in records})
+        if statuses != ["passed"]:
+            say(f"[SPECTRA] {METHOD_LABELS[method]} {scenario}: closure {', '.join(statuses)}; diagnostic spectra", args.verbose)
+        for record in records[1:]:
+            indices = match_ids(record["event_ids"], first["event_ids"])
+            if (not np.array_equal(record["mass"][indices], first["mass"])
+                    or not np.array_equal(record["labels"][indices], first["labels"])):
+                raise ValueError("Dijet seed bands require identical primary held-out event populations")
+        edges = mass_edges(first["mass"])
+        rows = []
+        units = None
+        for record in records:
+            weights, record_units, _ = normalization_weights(record, getattr(args, "cross_section_weights", None))
+            if units is not None and units != record_units:
+                raise ValueError("Inconsistent mass-spectrum normalization")
+            units = record_units
+            rows.append(spectrum_histograms(record, weights, edges))
+        width = np.diff(edges)
+        destination = output / "04_dijet_spectra" / METHOD_LABELS[method] / SCENARIO_LABELS[scenario]
+        if level is not None:
+            destination = destination / f"N_{int(level):06d}"
+        table = []
+        for cut in CUTS:
+            fig, ax = new_figure("Dijet Mass [TeV]", mass_ylabel(units))
+            ax.set(xlim=(edges[0], edges[-1]), yscale="log")
+            for component, color, label in (("background", "#276a87", "BG"),
+                                             ("signal", "#c65d32", "Signal"),
+                                             ("data", "#276a87", "Data")):
+                uncut = np.asarray([row[None][component] / width for row in rows])
+                selected = np.asarray([row[cut][component] / width for row in rows])
+                if not np.any(uncut > 0):
+                    continue
+                base, mean = uncut.mean(axis=0), selected.mean(axis=0)
+                ax.fill_between(edges, np.r_[base, base[-1]], step="post", color=color, alpha=0.18,
+                                linewidth=0, label=label + " before selection")
+                ax.stairs(np.where(mean > 0, mean, np.nan), edges, color=color, ls="--", lw=1.0,
+                          label=label + f" · {cut * 100:g}% BG cut")
+                if len(records) > 1:
+                    low, high = selected.min(axis=0), selected.max(axis=0)
+                    ax.fill_between(edges, np.r_[low, low[-1]], np.r_[high, high[-1]],
+                                    step="post", color=color, alpha=0.22, linewidth=0)
+                for index in range(len(width)):
+                    table.append(dict(Method=METHOD_LABELS[method], Scenario=SCENARIO_LABELS[scenario],
+                        N_inj=level, background_acceptance=cut, component=component,
+                        bin_low_TeV=float(edges[index]), bin_high_TeV=float(edges[index + 1]),
+                        before_selection=float(base[index]), selected_mean=float(mean[index]),
+                        selected_min=float(selected[:, index].min()), selected_max=float(selected[:, index].max()),
+                        closure_status=" | ".join(statuses),
+                        units="pb/TeV" if units == "pb" else "events/TeV"))
+            legend = {"spectrum_legend": {"title": METHOD_LABELS[method]}}
+            stem = f"dijet_mass_{cut * 100:g}pct".replace("0.5pct", "0p5pct")
+            save_figure(fig, ax, destination / stem, args.plot_formats, args.overwrite, legend)
+        write_table_rows(destination / "dijet_mass_spectra", table, args.file_formats)
 
 
 def independent_records(record, seed):
@@ -2575,6 +2704,8 @@ def parse_args(argv=None):
     parser.add_argument("--io-workers", type=int, default=2, help="Parallel discovery, result loading and metric workers")
     parser.add_argument("--plot-workers", type=int, default=min(8, max(1, (os.cpu_count() or 1) // 2)),
                         help="CPU processes for legend layout and image rendering; 1 runs serially")
+    parser.add_argument("--cross-section-weights", type=Path,
+                        help="NPZ with event_ids and physical weights_pb; otherwise mass spectra show events/TeV")
     parser.add_argument("--allow-partial-injection-scan", action="store_true")
     parser.add_argument("--require-compatible-populations", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
@@ -2619,8 +2750,8 @@ def run(args):
     requested = None if args.methods and "all" in args.methods else tuple(
         canonical_method(method) for method in (args.methods or ("riddle", "iad", "supervised"))
     )
-    groups_all = discover_paper_results(source, requested=requested, scan=scan,
-                                        workers=args.io_workers, verbose=args.verbose) if source.exists() else {}
+    groups_all = discover_variant_results(source, requested, args.variants, scan=scan,
+                                         workers=args.io_workers, verbose=args.verbose)
     methods = select_requested_methods(groups_all, args.methods,
                                        allow_missing=scan and args.allow_partial_injection_scan,
                                        injection_scan=scan)
@@ -2628,6 +2759,9 @@ def run(args):
         raise SystemExit("No requested publication methods were discovered")
     discovered_variants = sorted({identity[3 if scan else 2] for identity in groups_all}, key=lambda value: VARIANT_ORDER.index(value) if value in VARIANT_ORDER else 99)
     variants = list(args.variants) if args.variants else discovered_variants
+    for variant in variants:
+        if variant not in discovered_variants:
+            say(f"[WARN] No completed {variant} results found in the selected result folders", args.verbose)
     loader = ScoreLoader(safeguard_filtering=True, ensemble_fit_selection=True, io_workers=args.io_workers,
                          device="cpu", eager_partitions=False)
     if scan:
@@ -2641,12 +2775,17 @@ def run(args):
         say("[SUMMARY] Mean across completed seeds; bands show the min–max range across seeds", args.verbose)
         with render_resources(args.plot_workers, args.verbose):
             for variant in variants:
+                if variant not in discovered_variants:
+                    continue
                 say(f"[STAGE] Build and render {variant} signal-injection dependence", args.verbose)
-                process_injection_scan(groups, methods, loader, settings, args.output, args.plot_formats,
+                destination = variant_output(args.output, variant)
+                process_injection_scan(groups, methods, loader, settings, destination, args.plot_formats,
                                        args.file_formats, args.overwrite, args.min_background,
                                        args.allow_partial_injection_scan, args.verbose,
                                        args.require_compatible_populations, variant=variant,
                                        io_workers=args.io_workers, excluded_seeds=args.exclude_seeds)
+                plot_dijet_spectra({identity: group for identity, group in groups.items() if identity[3] == variant},
+                                   args, destination, scan=True)
         say(f"[DONE] Injection-scan outputs written to {args.output}", args.verbose)
         return 0
     scenarios = list(args.scenarios) if args.scenarios else sorted({identity[0] for identity in groups_all}, key=lambda value: ("signal_injection", "background_only").index(value))
@@ -2659,18 +2798,31 @@ def run(args):
     cache, records = metric_cache(groups, loader, regions, args.min_background, args.verbose, args.require_compatible_populations, args.io_workers)
     say("[SUMMARY] Mean across completed seeds; bands show the min–max range across seeds", args.verbose)
     with render_resources(args.plot_workers, args.verbose):
-        render_publication_outputs(args, groups, cache, records, loader, scenarios, variants, regions)
+        for variant in variants:
+            selected_groups = {identity: group for identity, group in groups.items() if identity[2] == variant}
+            if not selected_groups:
+                continue
+            selected_cache = {key: value for key, value in cache.items() if key[2] == variant}
+            selected_records = {key: value for key, value in records.items() if key[2] == variant}
+            destination = variant_output(args.output, variant)
+            render_publication_outputs(args, selected_groups, selected_cache, selected_records, loader,
+                                       scenarios, [variant], regions, output=destination)
+            say(f"[STAGE] Render {variant} full-mass dijet spectra", args.verbose)
+            plot_dijet_spectra(selected_groups, args, destination)
+        plot_variant_robustness(cache, variant_output(args.output, "default"), args.plot_formats, args.overwrite, regions)
     say(f"[DONE] Publication outputs written to {args.output}", args.verbose)
     return 0
 
 
-def render_publication_outputs(args, groups, cache, records, loader, scenarios, variants, regions):
+def render_publication_outputs(args, groups, cache, records, loader, scenarios, variants, regions, output=None):
+    from copy import copy
+    args = copy(args)
+    args.output = args.output if output is None else output
     say("[STAGE] Render comparison performance plots", args.verbose)
     plot_performance(cache, args.output, args.plot_formats, args.overwrite, scenarios, variants, regions)
     plot_score_distributions(groups, records, args.output, args.plot_formats, args.overwrite)
     plot_stability(cache, args.output, args.plot_formats, args.overwrite, regions)
     plot_acceptance(cache, args.output, args.plot_formats, args.overwrite)
-    plot_variant_robustness(cache, args.output, args.plot_formats, args.overwrite, regions)
     say("[STAGE] Render mass-sculpting plots", args.verbose)
     plot_mass_sculpting(cache, records, args.output, args.plot_formats, args.overwrite, scenarios, variants, regions, args.verbose)
     say("[STAGE] Render feature diagnostics", args.verbose)

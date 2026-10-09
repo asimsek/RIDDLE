@@ -110,6 +110,12 @@ def parser():
         run.add_argument("--torch-threads", type=positive, default=2,
                          help="Intra-op CPU threads per training process (default: 2)")
         run.add_argument("--mps", choices=["auto", "on", "off"], default="auto")
+        run.add_argument("--score-sidebands-only", action="store_true",
+                         help="Backfill frozen SR + sideband exports from completed native results without training")
+        run.add_argument("--sideband-scoring", action=argparse.BooleanOptionalAction, default=True,
+                         help="Export frozen held-out sideband scores after SR scoring (default: enabled)")
+        run.add_argument("--sideband-reference-events", type=positive, default=65536,
+                         help="Independent background events for frozen full-mass thresholds and assessment")
         run.add_argument("--fits", type=positive,
                          help="Ensemble fits per RIDDLE/Idealized-RIDDLE/Supervised-RIDDLE/R-ANODE run (default: method settings); does not change LaCathode")
         run.add_argument("--lacathode-background", choices=("independent", "fixed"), default="independent",
@@ -176,7 +182,8 @@ def run_campaign(args, *, cancel_event=None):
     campaign_runs(args)
     if cancel_event is not None and cancel_event.is_set():
         raise RuntimeError("Background preparation cancelled")
-    if (getattr(args, "scan_bg_workers", 1) > 1 and not getattr(args, "background_phase", None)
+    if (getattr(args, "scan_bg_workers", 1) > 1 and not getattr(args, "score_sidebands_only", False)
+            and not getattr(args, "background_phase", None)
             and getattr(args, "command", "run") != "scan"):
         from .background_stage import run_seed_backgrounds
         return run_seed_backgrounds(args, run_campaign)
@@ -184,6 +191,12 @@ def run_campaign(args, *, cancel_event=None):
     run_overrides = {"runs": 1, "epochs": getattr(args, "epochs", None)}
     fit_overrides = dict(runs=getattr(args, "fits", None), epochs=getattr(args, "epochs", None))
     requests = campaign_runs(args)
+    if getattr(args, "score_sidebands_only", False):
+        if any(method not in ("riddle", "iad", "supervised") for method in args.methods):
+            raise ValueError("--score-sidebands-only supports RIDDLE, IAD and Supervised")
+        if not getattr(args, "sideband_scoring", True):
+            raise ValueError("--score-sidebands-only conflicts with --no-sideband-scoring")
+        args.resume = True
     if "lacathode" in args.methods:
         from external.lacathode_utils.pipeline import run_settings
 
@@ -243,6 +256,13 @@ def run_campaign(args, *, cancel_event=None):
     for scenario in args.scenarios:
         for method, base_seed, run_index, seed in requests:
             output = args.output / method / scenario / f"seed_{seed:03d}"
+            if getattr(args, "score_sidebands_only", False):
+                from .storage import read_json
+                from .worker_progress import emit_message
+                result_path = output / "result.json"
+                if not result_path.is_file() or not read_json(result_path).get("completed"):
+                    emit_message(f"Skip unfinished sideband backfill: {method} seed {seed} {scenario}", kind="WARNING")
+                    continue
             if output.exists() and not args.resume:
                 raise FileExistsError("Result exists; use --resume or a new output")
             output.mkdir(parents=True, exist_ok=True)

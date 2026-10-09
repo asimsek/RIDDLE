@@ -181,8 +181,9 @@ def run_scan(args):
                 options.oracle_background_reuse_candidates = []
                 options.supervised_ensemble_reuse_candidates = candidates
                 tasks.append(options)
-            if background_mode == "retrain" and method in NATIVE_METHODS and (
-                    workers > 1 or getattr(args, "background_only", False)):
+            if (not getattr(args, "score_sidebands_only", False)
+                    and background_mode == "retrain" and method in NATIVE_METHODS and (
+                    workers > 1 or getattr(args, "background_only", False))):
                 def execute(options, *, cancel_event=None):
                     candidates = reuse_candidates(args, output_root, variant, seed) if getattr(args, "scan_reuse", True) else []
                     options.scan_result_candidates = candidates
