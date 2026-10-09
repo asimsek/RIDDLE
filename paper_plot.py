@@ -904,7 +904,7 @@ def parallel_plot_tasks(function, tasks, workers, stage, verbose, describe=None)
     completed = 0
     values = [None] * len(tasks)
     worker_count = min(workers, len(tasks))
-    compact_progress = stage in ("LOAD", "SCAN LOAD", "METRICS", "SCAN METRICS") and verbose == 1
+    compact_progress = stage in ("LOAD", "SCAN LOAD", "METRICS", "SCAN METRICS", "SCORE STAGES") and verbose == 1
     live = compact_progress and sys.stdout.isatty()
 
     def progress_status():
@@ -2156,6 +2156,208 @@ def performance_summary(metrics):
     return row
 
 
+def saved_score_stages(record, report):
+    settings = report.get("contract", {}).get("settings", {}).get("riddle", {})
+    if settings.get("core") != "stein_witness" or settings.get("enhancements", {}).get("score_flow", False):
+        return []
+    if record.get("plot_ensemble", {}).get("ensemble_rebuilt_for_plot", False):
+        return []
+    scoring = settings["stein"]["scoring"]
+    mode = str(np.asarray(record.get("selected_scoring_mode", scoring["mode"])).item())
+    guard = bool(scoring["support_guard"]["enabled"])
+    transform = scoring["final_transform"]
+    mask, labels = np.asarray(record["mask"]), np.asarray(record["labels"])
+    if mask.dtype != bool or mask.shape != labels.shape or not np.isin(labels, (0, 1)).all():
+        raise ValueError("Invalid score-stage evaluation population")
+    stages = []
+    for name, key, stage_mode, stage_guard, stage_transform in (
+            ("Frozen selection", "scores", mode, guard, transform),
+            ("Fixed PEW", "pew_scores", "tail_focus", guard, transform),
+            ("Fixed potential-qnorm", "potential_qnorm_scores", "potential_qnorm", guard, transform),
+            ("Without final calibration", "raw_scores", mode, guard, "identity")):
+        if key not in record:
+            continue
+        values = np.asarray(record[key])
+        if values.shape != labels.shape or not np.isfinite(values[mask]).all():
+            raise ValueError(f"Invalid saved scores for {name}")
+        stages.append(dict(configuration=name, source=key, mode=stage_mode,
+                           guard=stage_guard, transform=stage_transform, scores=values))
+    fits = np.asarray(record.get("fit_scores", []))
+    kind = str(np.asarray(record.get("fit_score_kind", "")).item())
+    if kind == "stein_" + mode and ("pre_guard_scores" in record or fits.size):
+        if "pre_guard_scores" in record:
+            values = np.asarray(record["pre_guard_scores"])
+            count = record["pre_guard_fit_count"]
+        else:
+            if fits.ndim != 2 or fits.shape[1:] != labels.shape or not np.isfinite(fits[:, mask]).all():
+                raise ValueError("Invalid saved member scores for the pre-guard comparison")
+            values = fits[0].astype(np.float64, copy=True)
+            for fit in fits[1:]:
+                values += fit
+            count = len(fits)
+            values /= count
+        selected = record.get("plot_ensemble", {}).get("used_members", [])
+        if selected and count != len(selected):
+            raise ValueError("Saved member scores differ from the plotted ensemble")
+        if values.shape != labels.shape or not np.isfinite(values[mask]).all():
+            raise ValueError("Invalid reconstructed pre-guard scores")
+        if "raw_scores" in record and guard and np.any(
+                np.asarray(record["raw_scores"])[mask] > values[mask] + 1e-8 * np.maximum(1, np.abs(values[mask]))):
+            raise ValueError("Saved guarded scores exceed the reconstructed pre-guard ensemble")
+        stages.append(dict(configuration="Before guard and final calibration", source="mean(fit_scores)",
+                           mode=mode, guard=False, transform="identity", scores=values))
+    return stages
+
+
+def score_stage_metric_values(record, min_background, cached=None, *, signal_metrics=True):
+    metrics = (cached if cached is not None else central_metrics(record, min_background)) if signal_metrics else None
+    values = {"AUC": None if metrics is None else metrics.get("auc"),
+              "Max. SIC": None if metrics is None else metrics.get("max_sic")}
+    for wp in reversed(WORKING_POINTS):
+        values[f"εS@{WORKING_POINT_LABELS[wp]}"] = (None if metrics is None
+            else metrics.get("working_points", {}).get(wp))
+    sculpting = exact_mass_sculpt_curve(record, WORKING_POINTS)
+    for index, wp in enumerate(WORKING_POINTS):
+        values[f"BG χ²/ndf@{WORKING_POINT_LABELS[wp]}"] = (None if sculpting is None
+            else normalize_scalar(sculpting[index]))
+    for name, label in (("BG", 0), ("Signal", 1)):
+        population = np.asarray(record["labels"]) == label
+        values[name + " acceptance"] = float(np.asarray(record["mask"])[population].mean()) if population.any() else None
+    return values
+
+
+def export_score_stage_comparison(items, output, file_formats, min_background, io_workers, verbose, *, scan=False, variant="default"):
+    from riddle.mass_spectrum import event_keys
+    from riddle.storage import digest
+
+    items = [item for item in items if item["method"] in ("riddle", "iad", "supervised")]
+    tasks, populations, protocols, identities = [], {}, defaultdict(set), set()
+    missing = 0
+    for item in sorted(items, key=lambda item: (item["level"] or 0, item["scenario"], item["method"], item["seed"])):
+        record, report = item["record"], item["report"]
+        if "event_ids" not in record:
+            missing += 1
+            continue
+        event_keys(record["event_ids"])
+        stages = saved_score_stages(record, report)
+        if not stages:
+            missing += 1
+            continue
+        population = (item["scenario"], item["variant"], item["region"], item["level"])
+        if population in populations:
+            require_population_compatibility({"first": populations[population], "current": record})
+        else:
+            populations[population] = record
+        cohort = (*population, item["method"])
+        identity = (*cohort, item["seed"])
+        if identity in identities:
+            raise ValueError("Duplicate seed in the score-stage comparison")
+        identities.add(identity)
+        protocols[cohort].add(aggregation_protocol_signature(item["method"], report))
+        tasks.append((item, stages, digest(record["event_ids"])))
+    if any(len(values) != 1 for values in protocols.values()):
+        raise ValueError("Score-stage summaries require matching scientific configurations across seeds")
+    if missing:
+        say(f"[SCORE STAGES] Skip {missing} results without supported stages or event IDs", verbose)
+    if not tasks:
+        return
+
+    def compute(task):
+        item, stages, ids_sha256 = task
+        record, report = item["record"], item["report"]
+        selector = (read_metadata(item["root"], report, "density/score_selection.json")
+                    if "density/score_selection.json" in report.get("artifacts_sha256", {})
+                    else report.get("protocol", {}).get("score_selection") or {})
+        selected_mode = stages[0]["mode"]
+        if selector and selector.get("selected_mode") != selected_mode:
+            raise ValueError("Frozen selector differs from the saved scoring mode")
+        for stage in stages[1:]:
+            if stage["source"] in ("pew_scores", "potential_qnorm_scores") and stage["mode"] == selected_mode:
+                if not np.array_equal(stage["scores"][record["mask"]], np.asarray(record["scores"])[record["mask"]]):
+                    raise ValueError("The selected candidate differs from the saved final scores")
+        baseline = None
+        rows = []
+        for stage in stages:
+            stage_record = {**record, "scores": stage["scores"], "plot_saved_ensemble": True}
+            cached = item.get("metrics") if stage["configuration"] == "Frozen selection" else None
+            metrics = score_stage_metric_values(stage_record, min_background, cached,
+                                               signal_metrics=item["scenario"] == "signal_injection")
+            if baseline is None:
+                baseline = metrics
+            row = {"Row type": "seed", "Dataset": VARIANT_LABELS.get(item["variant"], item["variant"]),
+                   "Scenario": SCENARIO_LABELS[item["scenario"]], "Region": REGION_LABELS[item["region"]],
+                   "Method": METHOD_LABELS[item["method"]], "N_inj": item["level"],
+                   "Seed": item["seed"], "Seeds": str(item["seed"]), "Completed seeds": 1,
+                   "Available completed seeds": 1, "Configuration": stage["configuration"],
+                   "Scoring mode": stage["mode"], "Frozen selected mode": selected_mode,
+                   "Support guard": stage["guard"], "Final transform": stage["transform"],
+                   "Selector enabled": selector.get("enabled", ""), "Selector reason": selector.get("reason", ""),
+                   "Selector basis": selector.get("selection_basis", ""),
+                   "Score source": stage["source"], "Event IDs SHA256": ids_sha256,
+                   "Score artifact SHA256": report.get("artifacts_sha256", {}).get("signal_region_scores.npz", ""),
+                   "Selector SHA256": str(np.asarray(record.get("score_selection_sha256", "")).item()),
+                   "Result folder": str(item["root"]), "BG events": int((record["labels"] == 0).sum()),
+                   "Signal events": int((record["labels"] == 1).sum()),
+                   "Comparison type": "post-training score-stage diagnostic",
+                   "Causal training ablation": False,
+                   "Threshold basis": "truth-assisted evaluation; selector remains frozen",
+                   "Mass test scope": "saved SR population; not full-mass discovery closure",
+                   "Available configurations": " | ".join(stage["configuration"] for stage in stages)}
+            for name, value in metrics.items():
+                row[name] = normalize_scalar(value)
+                row[name + " min"] = row[name]
+                row[name + " max"] = row[name]
+                if name.startswith("BG χ") or name.endswith("acceptance"):
+                    continue
+                row["Paired final " + name] = normalize_scalar(baseline[name])
+                delta = None if value is None or baseline[name] is None else value - baseline[name]
+                row["Δ " + name] = normalize_scalar(delta)
+                row["Δ " + name + " min"] = row["Δ " + name]
+                row["Δ " + name + " max"] = row["Δ " + name]
+            rows.append(row)
+        return item, rows
+
+    computed = parallel_plot_tasks(compute, tasks, io_workers, "SCORE STAGES", verbose)
+    rows, cohorts = [], defaultdict(lambda: defaultdict(dict))
+    for item, stage_rows in computed:
+        rows.extend(stage_rows)
+        cohort = (item["method"], item["scenario"], item["variant"], item["region"], item["level"])
+        for row in stage_rows:
+            cohorts[cohort][row["Configuration"]][item["seed"]] = row
+    for cohort, configurations in sorted(cohorts.items(), key=lambda pair: str(pair[0])):
+        seeds = sorted(set.intersection(*(set(values) for values in configurations.values())))
+        available = len(set.union(*(set(values) for values in configurations.values())))
+        if not seeds:
+            say(f"[SCORE STAGES] No common seed cohort for {cohort}; per-seed rows saved", verbose)
+            continue
+        if len(seeds) != available:
+            say(f"[SCORE STAGES] Matched summaries use {len(seeds)}/{available} completed seeds for {cohort}", verbose)
+        for configuration, by_seed in configurations.items():
+            samples = [by_seed[seed] for seed in seeds]
+            summary = dict(samples[0])
+            summary.update({"Row type": "summary", "Seed": "", "Seeds": " ".join(map(str, seeds)),
+                            "Completed seeds": len(seeds), "Available completed seeds": available})
+            for name in summary:
+                if name.endswith((" min", " max")):
+                    continue
+                if name in ("BG events", "Signal events", "Event IDs SHA256"):
+                    if len({sample[name] for sample in samples}) != 1:
+                        raise ValueError("Score-stage summary population changed across seeds")
+                elif name in ("Scoring mode", "Frozen selected mode", "Selector enabled", "Selector reason", "Selector basis",
+                              "Score artifact SHA256", "Selector SHA256", "Result folder", "Available configurations"):
+                    summary[name] = " | ".join(sorted({str(sample[name]) for sample in samples}))
+                elif name + " min" in summary or name.startswith("Paired final "):
+                    values = np.asarray([sample[name] for sample in samples], dtype=float)
+                    values = values[np.isfinite(values)]
+                    summary[name] = float(values.mean()) if len(values) else None
+                    if name + " min" in summary:
+                        summary[name + " min"] = float(values.min()) if len(values) else None
+                        summary[name + " max"] = float(values.max()) if len(values) else None
+            rows.append(summary)
+    stem = f"table_05_{variant}_signal_injection_score_stages" if scan else "table_05_score_stage_comparison"
+    write_table_rows(output / "07_tables" / stem, rows, file_formats)
+
+
 def concise_sample_name(value, validation=False):
     text = str(value or "").lower()
     if not text or "not used" in text:
@@ -2428,7 +2630,7 @@ def aggregate_scan_replica(run_rows):
     }
 
 
-def process_injection_scan(scan_groups, methods, loader, settings, output, formats, file_formats, overwrite, min_background, allow_partial, verbose, require_compatible_populations=False, variant="default", io_workers=1, excluded_seeds=()):
+def process_injection_scan(scan_groups, methods, loader, settings, output, formats, file_formats, overwrite, min_background, allow_partial, verbose, require_compatible_populations=False, variant="default", io_workers=1, excluded_seeds=(), score_stage_comparison=True):
     configured = [int(value) for value in settings.get("injection_scan", {}).get("signal_events", [])]
     config = settings.get("injection_scan", {})
     cohort = config.get("seeds", list(range(int(config.get("replicas", 0)))))
@@ -2674,6 +2876,17 @@ def process_injection_scan(scan_groups, methods, loader, settings, output, forma
                          "Max. achieved significance max": float(significance.max()) if len(significance) else None})
     if rows:
         write_table_rows(output / "07_tables" / f"table_04_{variant}_signal_injection_dependence", rows, file_formats)
+    if score_stage_comparison and schemas == {2}:
+        items = []
+        for (level, seed, run_index), records in sorted(point_records.items()):
+            for method, record in sorted(records.items()):
+                root, report = data[method][level][seed][run_index]
+                items.append(dict(method=method, scenario="signal_injection", variant=variant,
+                                  region="signal_region", level=level, seed=report["seed"],
+                                  root=root, report=report, record=record,
+                                  metrics=loaded[method][level][seed][run_index]["metrics"]))
+        export_score_stage_comparison(items, output, file_formats, min_background, io_workers, verbose,
+                                     scan=True, variant=variant)
 
 
 def load_settings_file(path):
@@ -2706,6 +2919,8 @@ def parse_args(argv=None):
                         help="CPU processes for legend layout and image rendering; 1 runs serially")
     parser.add_argument("--cross-section-weights", type=Path,
                         help="NPZ with event_ids and physical weights_pb; otherwise mass spectra show events/TeV")
+    parser.add_argument("--score-stage-comparison", action=argparse.BooleanOptionalAction, default=True,
+                        help="Export a separate detailed saved-score comparison table (default: enabled; no model inference)")
     parser.add_argument("--allow-partial-injection-scan", action="store_true")
     parser.add_argument("--require-compatible-populations", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
@@ -2783,7 +2998,8 @@ def run(args):
                                        args.file_formats, args.overwrite, args.min_background,
                                        args.allow_partial_injection_scan, args.verbose,
                                        args.require_compatible_populations, variant=variant,
-                                       io_workers=args.io_workers, excluded_seeds=args.exclude_seeds)
+                                       io_workers=args.io_workers, excluded_seeds=args.exclude_seeds,
+                                       score_stage_comparison=args.score_stage_comparison)
                 plot_dijet_spectra({identity: group for identity, group in groups.items() if identity[3] == variant},
                                    args, destination, scan=True)
         say(f"[DONE] Injection-scan outputs written to {args.output}", args.verbose)
@@ -2836,6 +3052,17 @@ def render_publication_outputs(args, groups, cache, records, loader, scenarios, 
     plot_training(groups, args.output, args.plot_formats, args.overwrite)
     say("[STAGE] Export publication tables", args.verbose)
     export_tables(groups, cache, loader, args.output, args.file_formats, args.data, args.verbose)
+    if getattr(args, "score_stage_comparison", True):
+        items = []
+        for (method, scenario, variant, region, seed), record in sorted(records.items()):
+            if method not in groups.get((scenario, seed, variant), {}):
+                continue
+            root, report = groups[(scenario, seed, variant)][method]
+            items.append(dict(method=method, scenario=scenario, variant=variant, region=region,
+                              level=None, seed=seed, root=root, report=report, record=record,
+                              metrics=cache.get((method, scenario, variant, region, seed))))
+        export_score_stage_comparison(items, args.output, args.file_formats, args.min_background,
+                                     args.io_workers, args.verbose)
 
 
 if __name__ == "__main__":

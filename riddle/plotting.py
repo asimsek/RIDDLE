@@ -530,7 +530,9 @@ def load_scores(root, report, name, *, attempt=None, for_rebuild=False):
                 data["background_log_density"] = archive["background_log_density"]
         for key in ("raw_scores", "score_kind", "fit_score_kind", "event_ids",
                     "preprocessing_mask", "score_domain_mask", "score_scope",
-                    "accepted_fit_indices", "accepted_fit_seeds"):
+                    "accepted_fit_indices", "accepted_fit_seeds", "fit_indices",
+                    "pew_scores", "potential_qnorm_scores", "selected_scoring_mode",
+                    "auto_switch_enabled", "score_selection_sha256"):
             if key in archive:
                 data[key] = archive[key]
         if "fit_scores" in archive:
@@ -637,6 +639,17 @@ def load_scores(root, report, name, *, attempt=None, for_rebuild=False):
                     or not np.array_equal(data["run_seeds"], [m["seed"] for m in members])
                     or len(set(data["run_seeds"].tolist())) != len(fits)):
                 raise ValueError("Invalid independent LaCathode run identities or latents")
+    if method in RIDDLE_NATIVE_METHODS and "fit_scores" in data:
+        fits = data["fit_scores"]
+        kind = str(np.asarray(data.get("fit_score_kind", "")).item())
+        if kind.startswith("stein_"):
+            if fits.ndim != 2 or fits.shape[1:] != data["scores"].shape or not len(fits) or not np.isfinite(fits[:, data["mask"]]).all():
+                raise ValueError("Invalid saved Stein member scores")
+            combined = fits[0].astype(np.float64, copy=True)
+            for fit in fits[1:]:
+                combined += fit
+            data["pre_guard_scores"] = combined / len(fits)
+            data["pre_guard_fit_count"] = len(fits)
     if method in RIDDLE_NATIVE_METHODS or method == "ranode":
         data.pop("fit_scores", None)
     return data
