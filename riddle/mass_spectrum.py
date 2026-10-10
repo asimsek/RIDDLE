@@ -4,6 +4,8 @@ import numpy as np
 
 
 CUTS = (0.10, 0.05, 0.01, 0.005)
+MASS_CLOSURE_PROTOCOL = "local_poisson_mass_closure_v2"
+MASS_CLOSURE_RANGE = (2.8, 5.0)
 CMS_MASS_BINS_TEV = np.array([
     1, 3, 6, 10, 16, 23, 31, 40, 50, 61, 74, 88, 103, 119, 137, 156, 176, 197, 220,
     244, 270, 296, 325, 354, 386, 419, 453, 489, 526, 565, 606, 649, 693, 740, 788,
@@ -48,6 +50,111 @@ def mass_edges(mass, *, split_sr=False):
     if split_sr:
         edges = np.unique(np.r_[edges, [b for b in (3.3, 3.7) if edges[0] < b < edges[-1]]])
     return edges
+
+
+def background_closure_fit(edges, counts):
+    from scipy.optimize import minimize
+    from scipy.special import logsumexp, xlogy
+    from scipy.stats import chi2
+
+    edges, counts = np.asarray(edges, float), np.asarray(counts, float)
+    if (edges.ndim != 1 or counts.shape != (len(edges) - 1,) or not np.isfinite(edges).all()
+            or not np.isfinite(counts).all() or np.any(np.diff(edges) <= 0)
+            or np.any(counts < 0) or np.any(counts != np.floor(counts))):
+        raise ValueError("Invalid background counts for mass closure")
+    keep = (edges >= MASS_CLOSURE_RANGE[0]) & (edges <= MASS_CLOSURE_RANGE[1])
+    keep &= ~(((edges > 3.25) & (edges < 3.3)) | ((edges > 3.7) & (edges < 3.75)))
+    positions = np.flatnonzero(keep)
+    if len(positions) < 7 or not all(np.any(edges[positions] == b) for b in (3.3, 3.7)):
+        return dict(status="inconclusive", reason="Insufficient mass coverage around the SR")
+    local_edges = edges[positions]
+    cumulative = np.r_[0, np.cumsum(counts)]
+    local_counts = np.diff(cumulative[positions])
+    widths = np.diff(local_edges)
+    sr = (local_edges[:-1] >= 3.3) & (local_edges[1:] <= 3.7)
+    fit_bins = ~sr
+    result = dict(requested_mass_range_TeV=list(MASS_CLOSURE_RANGE),
+                  fitted_mass_range_TeV=[float(local_edges[0]), float(local_edges[-1])],
+                  fitted_bin_edges_TeV=local_edges.tolist(),
+                  sideband_events=int(local_counts[fit_bins].sum()),
+                  observed_SR_background=int(local_counts[sr].sum()),
+                  covariance="Inverse observed Poisson likelihood Hessian; exploratory diagnostic")
+    if (fit_bins.sum() < 5 or min(np.sum(fit_bins & (local_edges[1:] <= 3.3)),
+                                np.sum(fit_bins & (local_edges[:-1] >= 3.7))) < 2
+            or result["sideband_events"] < 50):
+        return dict(result, status="inconclusive", reason="Insufficient sideband statistics")
+    nodes, weights = np.polynomial.legendre.leggauss(8)
+    log_mass = np.log((local_edges[:-1, None] + local_edges[1:, None]) / 2
+                      + widths[:, None] * nodes / 2)
+    raw = np.stack((log_mass, log_mass ** 2), axis=-1)
+    selected = raw[fit_bins].reshape(-1, 2)
+    center = selected.mean(axis=0)
+    _, singular, vectors = np.linalg.svd(selected - center, full_matrices=False)
+    if singular[-1] <= singular[0] * 1e-12:
+        return dict(result, status="inconclusive", reason="Singular mass-fit design")
+    transform = vectors.T * np.sqrt(len(selected)) / singular
+    design = np.concatenate((np.ones((*raw.shape[:-1], 1)), (raw - center) @ transform), axis=-1)
+    log_weights = np.log(widths[:, None] * weights / 2)
+    observed = local_counts[fit_bins]
+
+    def components(parameters, full=False):
+        basis = design if full else design[fit_bins]
+        terms = basis @ parameters + (log_weights if full else log_weights[fit_bins])
+        log_mean = logsumexp(terms, axis=1)
+        mean = np.exp(np.minimum(log_mean, 700))
+        probability = np.exp(terms - log_mean[:, None])
+        first = np.einsum("bn,bnk->bk", probability, basis)
+        second = np.einsum("bn,bnk,bnl->bkl", probability, basis, basis)
+        return log_mean, mean, first, second
+
+    def objective(parameters):
+        log_mean, mean, first, _ = components(parameters)
+        value = np.sum(mean - observed + xlogy(observed, observed) - observed * log_mean)
+        return float(value), np.einsum("b,bk->k", mean - observed, first)
+
+    def hessian(parameters):
+        _, mean, first, second = components(parameters)
+        covariance = second - np.einsum("bk,bl->bkl", first, first)
+        return np.einsum("b,bkl->kl", mean, second) - np.einsum("b,bkl->kl", observed, covariance)
+
+    initial = np.array([np.log(result["sideband_events"] / widths[fit_bins].sum()), 0.0, 0.0])
+    candidates = []
+    for offset in (0.0, 0.25, -0.25):
+        optimized = minimize(lambda x: objective(x)[0], initial + [0, offset, offset],
+                             jac=lambda x: objective(x)[1], hess=hessian, method="trust-exact",
+                             options=dict(gtol=1e-5, maxiter=100))
+        if not np.isfinite(optimized.fun) or not np.isfinite(optimized.x).all():
+            continue
+        gradient = objective(optimized.x)[1]
+        if np.isfinite(gradient).all() and np.linalg.norm(gradient) / result["sideband_events"] < 1e-7:
+            candidates.append(optimized)
+    if not candidates:
+        return dict(result, status="inconclusive", reason="Mass fit did not converge")
+    best = min(candidates, key=lambda fit: fit.fun)
+    curvature = hessian(best.x)
+    if not np.isfinite(curvature).all() or np.linalg.eigvalsh(curvature).min() <= 0:
+        return dict(result, status="inconclusive", reason="Mass-fit covariance is not positive definite")
+    _, expected, first, _ = components(best.x, full=True)
+    if not np.isfinite(expected).all() or np.any(expected <= 0):
+        return dict(result, status="inconclusive", reason="Invalid fitted background expectation")
+    gradient = np.einsum("b,bk->k", expected[sr], first[sr])
+    variance = float(gradient @ np.linalg.solve(curvature, gradient))
+    prediction = float(expected[sr].sum())
+    pull = (result["observed_SR_background"] - prediction) / np.sqrt(prediction + variance)
+    deviance = max(0.0, float(2 * best.fun))
+    degrees = int(fit_bins.sum() - 3)
+    p_value = float(chi2.sf(deviance, degrees))
+    failures = [name for name, failed in (("sideband_shape", p_value <= 0.001),
+                                         ("SR_extrapolation", abs(pull) >= 5)) if failed]
+    coefficients = np.r_[best.x[0] - center @ transform @ best.x[1:], transform @ best.x[1:]]
+    return dict(result, status="failed" if failures else "passed", failed_checks=failures,
+                sideband_deviance=deviance, degrees_of_freedom=degrees,
+                approximate_p_value=p_value, predicted_SR_background=prediction,
+                approximate_fit_variance=variance, approximate_SR_pull=float(pull),
+                coefficients=coefficients.tolist(),
+                minimum_fitted_sideband_count=float(expected[fit_bins].min()),
+                sparse_sideband_bins=int(np.sum(expected[fit_bins] < 5)),
+                scaled_gradient=float(np.linalg.norm(objective(best.x)[1]) / result["sideband_events"]))
 
 
 def normalization_weights(record, path=None):

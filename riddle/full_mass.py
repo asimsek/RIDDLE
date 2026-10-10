@@ -12,7 +12,7 @@ import time
 
 import numpy as np
 
-from .mass_spectrum import CUTS, event_keys, match_ids, mass_edges
+from .mass_spectrum import CUTS, MASS_CLOSURE_PROTOCOL, background_closure_fit, event_keys, match_ids, mass_edges
 from .storage import atomic_write, copy_file, digest, environment, file_digest, fingerprint_files, locked, read_json, save_array, save_npz, seed_start, verify_artifacts, write_json
 from .worker_progress import emit_message
 
@@ -301,19 +301,12 @@ def _predict_members(root, work, frozen, identity, args):
 
 
 def diagnostic_validation(record, assessment_scores, rules):
-    from scipy.optimize import minimize
-    from scipy.special import xlogy
-    from scipy.stats import binomtest, chi2
+    from scipy.stats import binomtest
 
     mass, labels = record["mass"], record["labels"]
     regions = {"signal_region": record["is_signal_region"], "sidebands": ~record["is_signal_region"]}
     edges = mass_edges(mass, split_sr=True)
     widths = np.diff(edges)
-    nodes, quadrature = np.polynomial.legendre.leggauss(8)
-    centers = (edges[:-1] + edges[1:]) / 2
-    log_nodes = np.log(centers[:, None] + widths[:, None] * nodes / 2)
-    design = np.stack([np.ones_like(log_nodes), log_nodes, log_nodes ** 2], axis=-1)
-    bins_sr = (edges[:-1] >= 3.3) & (edges[1:] <= 3.7)
     result = dict(schema=1, thresholds_use_evaluation_labels=False,
                   closure_uses_simulation_background_labels=True, cuts=[], physics_certified=False,
                   calibration_domain="SR; sidebands use the unchanged edge-clamped SR calibration",
@@ -321,7 +314,7 @@ def diagnostic_validation(record, assessment_scores, rules):
                   fit_is_publication_search_model=False)
     if not np.any(labels == 0):
         result.update(status="inconclusive", reason="No labelled held-out background for closure diagnostics")
-        return result
+        return update_mass_closure(result)
     assessment_ids = np.column_stack((np.full(len(assessment_scores), 2**64 - 1, dtype=np.uint64),
                                       np.arange(len(assessment_scores), dtype=np.uint64)))
     assessment_masks = apply_rules(assessment_scores, np.ones(len(assessment_scores), bool),
@@ -353,37 +346,6 @@ def diagnostic_validation(record, assessment_scores, rules):
                                      background=int(total[j]), selected=int(chosen[j]),
                                      acceptance=float(chosen[j] / total[j]) if total[j] else None)
                                    for j in range(len(widths))]
-        fit_bins = (~bins_sr) & (total > 0)
-        fit = None
-        if fit_bins.sum() >= 5 and chosen[fit_bins].sum() >= 50:
-            initial = np.array([np.log(max(1.0, chosen[fit_bins].sum() / widths[fit_bins].sum())), 0, 0])
-
-            def expectation(parameters):
-                density = np.exp(np.clip(design @ parameters, -100, 100))
-                return (density * quadrature).sum(axis=1) * widths / 2
-
-            def loss(parameters):
-                mean = expectation(parameters)[fit_bins]
-                return float(np.sum(mean - xlogy(chosen[fit_bins], mean)))
-
-            optimized = minimize(loss, initial, method="L-BFGS-B", bounds=[(-100, 100)] * 3)
-            expected = expectation(optimized.x)
-            if optimized.success and np.isfinite(expected).all() and np.all(expected > 0):
-                counts, fitted = chosen[fit_bins], expected[fit_bins]
-                deviance = float(2 * np.sum(xlogy(counts, counts / fitted) - counts + fitted))
-                observed_sr, expected_sr = int(chosen[bins_sr].sum()), float(expected[bins_sr].sum())
-                hessian = np.asarray(optimized.hess_inv.todense())
-                gradient = ((np.exp(np.clip(design @ optimized.x, -100, 100)) * quadrature)[..., None]
-                            * design * widths[:, None, None] / 2).sum(axis=1)[bins_sr].sum(axis=0)
-                fit_variance = max(0.0, float(gradient @ hessian @ gradient))
-                z = (observed_sr - expected_sr) / np.sqrt(max(1.0, expected_sr + fit_variance))
-                fit = dict(status="passed" if abs(z) < 5 and chi2.sf(deviance, fit_bins.sum() - 3) > 0.001 else "failed",
-                           sideband_deviance=deviance, degrees_of_freedom=int(fit_bins.sum() - 3),
-                           approximate_p_value=float(chi2.sf(deviance, fit_bins.sum() - 3)),
-                           observed_SR_background=observed_sr, predicted_SR_background=expected_sr,
-                           approximate_fit_variance=fit_variance, approximate_SR_pull=float(z),
-                           covariance="L-BFGS inverse Hessian; exploratory diagnostic")
-        row["background_fit_closure"] = fit or dict(status="inconclusive", reason="Insufficient statistics or fit convergence")
         left = (mass >= 3.2) & (mass < 3.3) & bg
         right = (mass > 3.7) & (mass <= 3.8) & bg
         inner_left = (mass > 3.3) & (mass <= 3.4) & bg
@@ -401,10 +363,187 @@ def diagnostic_validation(record, assessment_scores, rules):
                                             outer_events=int(outer.sum()), outer_selected=a,
                                             inner_events=int(inner.sum()), inner_selected=b))
         result["cuts"].append(row)
-    statuses = [row["background_fit_closure"]["status"] for row in result["cuts"]]
-    statuses.extend(boundary["status"] for row in result["cuts"] for boundary in row["SR_boundaries"])
-    result["status"] = "failed" if "failed" in statuses else "inconclusive" if "inconclusive" in statuses else "passed"
+    return update_mass_closure(result)
+
+
+def update_mass_closure(validation):
+    result = deepcopy(validation)
+    result.update(schema=2, diagnostic_protocol=MASS_CLOSURE_PROTOCOL,
+                  fit_model="diagnostic exp(a+b*log(m)+c*log(m)^2), integrated over mass bins",
+                  fit_is_publication_search_model=False, physics_certified=False,
+                  fit_range_policy="Fixed local SR window; merge narrow bins next to SR boundaries",
+                  p_value_method="Asymptotic Poisson deviance; exploratory diagnostic")
+    cuts = result.get("cuts", [])
+    if not cuts:
+        result.update(status="inconclusive", baseline_status="inconclusive",
+                      mass_fit_status="inconclusive", boundary_status="inconclusive")
+        return result
+    first = cuts[0]["mass_acceptance"]
+    if not first or any(row["high_TeV"] != first[i + 1]["low_TeV"] for i, row in enumerate(first[:-1])):
+        raise ValueError("Invalid saved mass-bin edges")
+    edges = np.array([row["low_TeV"] for row in first] + [first[-1]["high_TeV"]])
+    total = np.array([row["background"] for row in first])
+    baseline = background_closure_fit(edges, total)
+    result["uncut_background_fit"] = baseline
+    result["baseline_status"] = baseline["status"]
+    for cut in cuts:
+        bins = cut["mass_acceptance"]
+        if (len(bins) != len(first) or any(row["low_TeV"] != first[i]["low_TeV"]
+                or row["high_TeV"] != first[i]["high_TeV"] or row["background"] != total[i]
+                for i, row in enumerate(bins))
+                or any(row["selected"] < 0 or row["selected"] > row["background"] for row in bins)):
+            raise ValueError("Inconsistent saved mass-closure histograms")
+        fit = background_closure_fit(edges, [row["selected"] for row in bins])
+        if baseline["status"] != "passed":
+            fit.update(conditional_status=fit["status"], status="inconclusive",
+                       reason="Uncut background does not validate the diagnostic model")
+        cut["background_fit_closure"] = fit
+
+    def combined(statuses):
+        return "failed" if "failed" in statuses else "inconclusive" if not statuses or "inconclusive" in statuses else "passed"
+
+    result["mass_fit_status"] = combined([cut["background_fit_closure"]["status"] for cut in cuts])
+    result["boundary_status"] = combined([boundary["status"] for cut in cuts for boundary in cut["SR_boundaries"]])
+    result["status"] = combined([result["mass_fit_status"], result["boundary_status"]])
+    result["failed_checks"] = [name for name in ("mass_fit", "boundary") if result[name + "_status"] == "failed"]
+    if baseline["status"] != "passed":
+        result["reason"] = "Uncut baseline model is not validated; selected mass-fit closure is inconclusive"
+    else:
+        result.pop("reason", None)
     return result
+
+
+def emit_closure_status(validation):
+    emit_message(f"Full-mass diagnostic: {validation['status']}; uncut model {validation['baseline_status']}",
+                 kind="PASS" if validation["status"] == "passed" else "WARNING")
+    emit_message(f"Mass-fit check {validation['mass_fit_status']}; SR-boundary check {validation['boundary_status']}",
+                 kind="PASS" if validation["status"] == "passed" else "WARNING")
+    for cut in validation.get("cuts", []):
+        fit = cut["background_fit_closure"]
+        if fit["status"] == "failed":
+            checks = ", ".join(fit["failed_checks"])
+            emit_message(f"Mass-fit failure at epsilon_B={100 * cut['background_acceptance']:g}%: {checks}", kind="WARNING")
+
+
+def _diagnostic_json_digest(value):
+    return hashlib.sha256((json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n").encode()).hexdigest()
+
+
+def _diagnostic_code():
+    return {path.name: file_digest(path) for path in (Path(__file__), Path(__file__).with_name("mass_spectrum.py"))}
+
+
+def _recover_mass_diagnostic(root):
+    root = Path(root)
+    journal = root / ".resume/full_mass_diagnostics/pending.json"
+    if not journal.is_file():
+        return
+    state = read_json(journal)
+    if state.get("protocol") != MASS_CLOSURE_PROTOCOL or set(state.get("updates", {})) != {"validation.json", "manifest.json"}:
+        raise ValueError("Invalid pending full-mass diagnostic update")
+    export = root / DERIVED_DIRECTORY
+    for name, update in state["updates"].items():
+        if (update["new_sha256"] != _diagnostic_json_digest(update["value"])
+                or file_digest(export / name) not in (update["old_sha256"], update["new_sha256"])):
+            raise ValueError("Full-mass diagnostic metadata changed during publication")
+    if state["updates"]["manifest.json"]["value"]["artifacts_sha256"]["validation.json"] != state["updates"]["validation.json"]["new_sha256"]:
+        raise ValueError("Pending full-mass diagnostic checksum is inconsistent")
+    for name in ("validation.json", "manifest.json"):
+        update = state["updates"][name]
+        if file_digest(export / name) != update["new_sha256"]:
+            write_json(export / name, update["value"])
+    journal.unlink()
+
+
+def _validate_full_mass_manifest(manifest, report):
+    if not report.get("completed") or manifest.get("protocol") != PROTOCOL or not manifest.get("completed"):
+        raise ValueError("Full-mass score export is incomplete or incompatible")
+    expected = report["contract"]["inputs"]
+    if (manifest["identity"]["inputs"]["files"] != expected["files"]
+            or manifest["identity"]["inputs"]["event_ids_sha256"] != expected.get("event_ids_sha256")
+            or manifest["identity"]["seed"] != report["seed"]):
+        raise ValueError("Full-mass export uses a different prepared population or seed")
+    for name, checksum in manifest["identity"]["frozen"]["artifacts_sha256"].items():
+        if report["artifacts_sha256"].get(name) != checksum:
+            raise ValueError("Full-mass export uses different frozen training artifacts")
+
+
+def refresh_mass_diagnostic(root):
+    root = Path(root)
+    with locked(root / ".resume/command.lock"), locked(root / ".resume/full_mass_diagnostics.lock"):
+        rescore_state = root / ".resume/rescore_in_place.json"
+        if rescore_state.is_file() and read_json(rescore_state).get("phase") != "completed":
+            raise ValueError("Finish the pending in-place re-scoring before refreshing diagnostics")
+        _recover_mass_diagnostic(root)
+        export = root / DERIVED_DIRECTORY
+        manifest = read_json(export / "manifest.json")
+        _validate_full_mass_manifest(manifest, read_json(root / "result.json"))
+        original_sha256 = file_digest(export / "validation.json")
+        if manifest["artifacts_sha256"].get("validation.json") != original_sha256:
+            raise ValueError("Saved full-mass diagnostic checksum mismatch")
+        original = read_json(export / "validation.json")
+        validation = update_mass_closure(original)
+        code = _diagnostic_code()
+        if (validation == original and manifest.get("diagnostic_protocol") == MASS_CLOSURE_PROTOCOL
+                and manifest.get("diagnostic_code_sha256") == code):
+            return validation
+        updated = deepcopy(manifest)
+        updated.update(validation_status=validation["status"], diagnostic_protocol=MASS_CLOSURE_PROTOCOL,
+                       diagnostic_code_sha256=code,
+                       diagnostic_updated_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                       diagnostic_scores_recomputed=False)
+        updated["artifacts_sha256"]["validation.json"] = _diagnostic_json_digest(validation)
+        metadata = root / ".resume/full_mass_diagnostics"
+        backup = metadata / identity_digest(dict(validation=original_sha256, manifest=file_digest(export / "manifest.json")))
+        for name in ("validation.json", "manifest.json"):
+            if not (backup / name).exists():
+                atomic_write(backup / name, lambda path, name=name: copy_file(export / name, path))
+        updates = {name: dict(old_sha256=file_digest(export / name), new_sha256=_diagnostic_json_digest(value), value=value)
+                   for name, value in (("validation.json", validation), ("manifest.json", updated))}
+        write_json(metadata / "pending.json", dict(protocol=MASS_CLOSURE_PROTOCOL, updates=updates))
+        _recover_mass_diagnostic(root)
+        return validation
+
+
+def refresh_mass_diagnostics(args):
+    roots = list(dict.fromkeys(path.resolve() for path in args.results))
+    jobs = []
+    for root in roots:
+        if not root.is_dir():
+            raise ValueError(f"Results folder is missing: {root}")
+        for method in args.methods:
+            for scenario in args.scenarios:
+                for path in sorted((root / method / scenario).glob("seed_*/full_mass/manifest.json")):
+                    seed = int(path.parent.parent.name.removeprefix("seed_"))
+                    if args.seeds is None or seed in args.seeds:
+                        jobs.append(path.parent.parent)
+    jobs = list(dict.fromkeys(jobs))
+    if not jobs:
+        raise ValueError("No completed full-mass exports match the requested methods, scenarios and seeds")
+    from threadpoolctl import threadpool_limits
+    from .progress import colored_status, training_progress
+    from contextvars import copy_context
+
+    started = time.monotonic()
+    statuses = []
+    with threadpool_limits(limits=1), ThreadPoolExecutor(max_workers=min(args.io_workers, len(jobs))) as pool:
+        futures = {pool.submit(copy_context().run, refresh_mass_diagnostic, root): root for root in jobs}
+        with training_progress("Refresh full-mass diagnostics", len(jobs), unit="result") as progress:
+            from concurrent.futures import as_completed
+            for index, future in enumerate(as_completed(futures), 1):
+                root = futures[future]
+                validation = future.result()
+                statuses.append(validation["status"])
+                colored_status(f"{root.parents[2].name}/{root.parent.parent.name} {root.parent.name} {root.name}: {validation['status']}",
+                               kind="PASS" if validation["status"] == "passed" else "WARNING",
+                               level=2 if validation["status"] == "passed" else 0)
+                if validation["status"] != "passed":
+                    colored_status(f"Uncut model {validation['baseline_status']}; mass fit {validation['mass_fit_status']}; boundaries {validation['boundary_status']}", kind="WARNING")
+                progress.update(index)
+    counts = ", ".join(f"{statuses.count(status)} {status}" for status in ("passed", "failed", "inconclusive") if status in statuses)
+    emit_message(f"Refreshed {len(jobs)} diagnostics in {time.monotonic() - started:.1f}s; {counts}",
+                 kind="PASS" if all(status == "passed" for status in statuses) else "WARNING")
+    emit_message("Training, calibration, scores and thresholds unchanged", kind="PASS")
 
 
 def load_full_mass(root, report, *, workers=1):
@@ -412,18 +551,11 @@ def load_full_mass(root, report, *, workers=1):
     path = root / DERIVED_DIRECTORY / "manifest.json"
     if not path.is_file():
         return None
-    manifest = read_json(path)
-    if manifest.get("protocol") != PROTOCOL or not manifest.get("completed"):
-        raise ValueError("Full-mass score export is incomplete or incompatible")
-    expected = report["contract"]["inputs"]
-    if (manifest["identity"]["inputs"]["files"] != expected["files"]
-            or manifest["identity"]["inputs"]["event_ids_sha256"] != expected.get("event_ids_sha256")):
-        raise ValueError("Full-mass export uses a different prepared population")
-    frozen = manifest["identity"]["frozen"]
-    for name, checksum in frozen["artifacts_sha256"].items():
-        if report["artifacts_sha256"].get(name) != checksum:
-            raise ValueError("Full-mass export uses different frozen training artifacts")
-    verify_artifacts(root / DERIVED_DIRECTORY, manifest["artifacts_sha256"], "Verify full-mass scores", workers=workers)
+    with locked(root / ".resume/full_mass_diagnostics.lock"):
+        _recover_mass_diagnostic(root)
+        manifest = read_json(path)
+        _validate_full_mass_manifest(manifest, report)
+        verify_artifacts(root / DERIVED_DIRECTORY, manifest["artifacts_sha256"], "Verify full-mass scores", workers=workers)
     with np.load(root / DERIVED_DIRECTORY / "scores.npz", allow_pickle=False) as archive:
         record = {name: archive[name] for name in archive.files}
     if (record["scores"].shape != record["mass"].shape
@@ -455,6 +587,8 @@ def _export_full_mass(args, report=None):
     report = read_json(destination / "result.json") if report is None else report
     if not report.get("completed"):
         raise ValueError("Sideband backfill requires a completed result; training has not been started")
+    with locked(destination / ".resume/full_mass_diagnostics.lock"):
+        _recover_mass_diagnostic(destination)
     root, source_report = resolve_reference(destination, report)
     data = Path(args.data)
     inputs = report["contract"]["inputs"]
@@ -598,6 +732,7 @@ def _export_full_mass(args, report=None):
     artifacts = {name: file_digest(export / name) for name in
                  ("scores.npz", "sideband_scores.npz", "reference_D.npz", "validation.json")}
     manifest = dict(protocol=PROTOCOL, completed=True, identity=identity, artifacts_sha256=artifacts,
+                    diagnostic_protocol=MASS_CLOSURE_PROTOCOL, diagnostic_code_sha256=_diagnostic_code(),
                     population="primary_held_out_innerdata_test_plus_outerdata_test",
                     population_event_ids_sha256=digest(test_ids), thresholds=rules,
                     thresholds_source="independent_generated_reference_D_threshold_half",
@@ -609,8 +744,7 @@ def _export_full_mass(args, report=None):
                     background_correction_domain="SR only" if report["contract"]["method"] in ("iad", "supervised") else "sidebands",
                     physics_certified=False, elapsed_seconds=time.monotonic() - started)
     write_json(manifest_path, manifest)
-    emit_message(f"Frozen full-mass closure: {validation['status']}; diagnostic export saved",
-                 kind="WARNING" if validation["status"] != "passed" else "PASS")
+    emit_closure_status(validation)
     ended_utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
     emit_message(f"Frozen sideband scoring END; utc={ended_utc}; elapsed={time.monotonic() - started:.1f}s", kind="PASS")
 

@@ -46,7 +46,7 @@ class SeedList(argparse.Action):
 
 
 def add_seed_argument(parser, default=(42,)):
-    parser.add_argument("--seed", "--seeds", dest="seeds", nargs="+", type=seeds,
+    return parser.add_argument("--seed", "--seeds", dest="seeds", nargs="+", type=seeds,
                         action=SeedList, default=None if default is None else list(default),
                         help="Explicit seeds; one complete run per seed"
                              + (" (scan default: settings.yaml; run default: 42)" if default is None else " (default: 42)"))
@@ -83,6 +83,15 @@ def parser():
                                 help="Prepare injection strengths with the ordinary shared populations")
     prep_scan.set_defaults(output=Path("data/injection_scan"))
     prep_scan.add_argument("--signal-events", type=seeds, help="Subset of configured total signal counts")
+    validate = subs.add_parser("validate-full-mass", allow_abbrev=False,
+                               help="Refresh saved full-mass closure diagnostics on CPU without re-scoring")
+    validate.add_argument("--results", nargs="+", type=Path, default=[Path("results")])
+    validate.add_argument("--methods", nargs="+", type=method_name, choices=("riddle", "iad", "supervised"),
+                          default=["riddle", "iad", "supervised"])
+    validate.add_argument("--scenarios", nargs="+", choices=SCENARIOS, default=list(SCENARIOS))
+    add_seed_argument(validate, default=None).help = "Explicit seeds to refresh (default: all available seeds)"
+    validate.add_argument("--io-workers", type=positive, default=4)
+    validate.add_argument("--verbose", type=int, choices=[0, 1, 2], default=1)
     for command in ("run", "scan"):
         run = subs.add_parser(command, allow_abbrev=False,
                               help="Run independent methods" if command == "run" else "Run the optional injection scan")
@@ -430,6 +439,9 @@ def main(argv=None):
             elif args.command == "scan":
                 from .scan import run_scan
                 run_scan(args)
+            elif args.command == "validate-full-mass":
+                from .full_mass import refresh_mass_diagnostics
+                refresh_mass_diagnostics(args)
             else:
                 run_campaign(args)
         colored_status("Completed", kind="PASS")
