@@ -430,15 +430,39 @@ class PaperFigureRenderer:
         self.verbose = verbose
         self.submitted = 0
         self.completed = 0
+        self.saved_plots = set()
+        self.saved_files = set()
         self.started = time.monotonic()
         self.last_update = self.started
+        self.last_report = None
         say(f"[RENDER] workers={workers}", verbose)
+
+    def record_saved(self, paths):
+        self.saved_files.update(paths)
+        self.saved_plots.update(str(Path(path).with_suffix("")) for path in paths)
 
     def report(self, force=False):
         now = time.monotonic()
+        state = (len(self.saved_plots), len(self.saved_files), len(self.pending))
+        if not self.saved_files and not self.pending:
+            return
+        if state == self.last_report and (force or not self.pending):
+            return
         if force or now - self.last_update >= 10:
-            say(f"[RENDER] {self.completed}/{self.submitted} figures saved; elapsed {now - self.started:.1f}s", self.verbose)
+            say(f"[RENDER] {len(self.saved_plots)} unique plots saved; {len(self.pending)} pending; wall {now - self.started:.1f}s", self.verbose)
+            say(f"[RENDER TASKS] {self.completed}/{self.submitted} operations completed", self.verbose, 2)
             self.last_update = now
+            self.last_report = state
+
+    def summary(self, output=None):
+        if output is not None:
+            for variant in VARIANT_ORDER:
+                directory = variant_output(output, variant).resolve()
+                files = {path for path in self.saved_files if Path(path).is_relative_to(directory)}
+                if files:
+                    plots = {str(Path(path).with_suffix("")) for path in files}
+                    say(f"[PLOTS] {directory.name}: {len(plots)} plots; {len(files)} files", self.verbose)
+        say(f"[PLOTS] Total saved: {len(self.saved_plots)} unique plots; {len(self.saved_files)} plot files", self.verbose)
 
     def finish(self, futures):
         for future in sorted(futures, key=lambda value: self.pending[value][3]):
@@ -452,6 +476,7 @@ class PaperFigureRenderer:
             except Exception as error:
                 raise RuntimeError(f"Figure rendering failed for {stem}: {error}") from error
             self.completed += 1
+            self.record_saved(paths)
             say(f"[RENDER {index}] {stem}; {elapsed:.1f}s; pid={pid}", self.verbose, 2)
         self.report()
 
@@ -460,14 +485,15 @@ class PaperFigureRenderer:
         self.finish(done)
 
     def save(self, fig, ax, stem, formats, overwrite, legend):
+        paths = tuple(str(stem.with_suffix("." + extension).resolve()) for extension in formats)
         if self.pool is None:
             _save_figure(fig, ax, stem, formats, overwrite, legend)
             self.submitted += 1
             self.completed += 1
+            self.record_saved(paths)
             self.report()
             return
         self.finish({future for future in self.pending if future.done()})
-        paths = tuple(str(stem.with_suffix("." + extension).resolve()) for extension in formats)
         dependencies = {self.destinations[path] for path in paths if path in self.destinations}
         while dependencies:
             done, _ = wait(dependencies, timeout=5, return_when=FIRST_COMPLETED)
@@ -484,6 +510,7 @@ class PaperFigureRenderer:
             _save_figure(fig, ax, stem, formats, overwrite, legend)
             self.submitted += 1
             self.completed += 1
+            self.record_saved(paths)
             self.report()
             return
         while self.pending and (len(self.pending) >= self.max_pending
@@ -506,7 +533,7 @@ class PaperFigureRenderer:
 
 
 @contextmanager
-def render_resources(workers, verbose):
+def render_resources(workers, verbose, output=None):
     previous_threads = torch.get_num_threads()
     renderer = PaperFigureRenderer(workers, verbose)
     token = _FIGURE_RENDERER.set(renderer)
@@ -516,6 +543,7 @@ def render_resources(workers, verbose):
         with threadpool_limits(limits=1 if workers > 1 else None):
             yield renderer
             renderer.flush()
+            renderer.summary(output)
     finally:
         _FIGURE_RENDERER.reset(token)
         try:
@@ -3041,7 +3069,7 @@ def run(args):
         if not groups:
             raise SystemExit("No completed injection-scan results remain after applying filters")
         say("[SUMMARY] Mean across completed seeds; bands show the min–max range across seeds", args.verbose)
-        with render_resources(args.plot_workers, args.verbose):
+        with render_resources(args.plot_workers, args.verbose, args.output):
             for variant in variants:
                 if variant not in discovered_variants:
                     continue
@@ -3066,7 +3094,7 @@ def run(args):
     say("[STAGE] Build publication metric cache", args.verbose)
     cache, records = metric_cache(groups, loader, regions, args.min_background, args.verbose, args.require_compatible_populations, args.io_workers)
     say("[SUMMARY] Mean across completed seeds; bands show the min–max range across seeds", args.verbose)
-    with render_resources(args.plot_workers, args.verbose):
+    with render_resources(args.plot_workers, args.verbose, args.output):
         for variant in variants:
             selected_groups = {identity: group for identity, group in groups.items() if identity[2] == variant}
             if not selected_groups:
@@ -3074,6 +3102,7 @@ def run(args):
             selected_cache = {key: value for key, value in cache.items() if key[2] == variant}
             selected_records = {key: value for key, value in records.items() if key[2] == variant}
             destination = variant_output(args.output, variant)
+            say(f"[VARIANT] {destination.name}", args.verbose)
             render_publication_outputs(args, selected_groups, selected_cache, selected_records, loader,
                                        scenarios, [variant], regions, output=destination)
             say(f"[STAGE] Render {variant} full-mass dijet spectra", args.verbose)
