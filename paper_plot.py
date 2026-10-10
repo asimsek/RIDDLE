@@ -2273,7 +2273,7 @@ def score_stage_metric_values(record, min_background, cached=None, *, signal_met
     return values
 
 
-def export_score_stage_comparison(items, output, file_formats, min_background, io_workers, verbose, *, scan=False, variant="default"):
+def export_score_stage_comparison(items, output, file_formats, min_background, io_workers, verbose, *, variant="default"):
     from riddle.mass_spectrum import event_keys
     from riddle.storage import digest
 
@@ -2401,7 +2401,7 @@ def export_score_stage_comparison(items, output, file_formats, min_background, i
                         summary[name + " min"] = float(values.min()) if len(values) else None
                         summary[name + " max"] = float(values.max()) if len(values) else None
             rows.append(summary)
-    stem = f"table_05_{variant}_signal_injection_score_stages" if scan else "table_05_score_stage_comparison"
+    stem = f"table_05_{variant}_signal_injection_score_stages"
     write_table_rows(output / "07_tables" / stem, rows, file_formats)
 
 
@@ -2933,7 +2933,7 @@ def process_injection_scan(scan_groups, methods, loader, settings, output, forma
                                   root=root, report=report, record=record,
                                   metrics=loaded[method][level][seed][run_index]["metrics"]))
         export_score_stage_comparison(items, output, file_formats, min_background, io_workers, verbose,
-                                     scan=True, variant=variant)
+                                     variant=variant)
 
 
 def load_settings_file(path):
@@ -2971,7 +2971,7 @@ def parse_args(argv=None):
     parser.add_argument("--cross-section-weights", type=Path,
                         help="NPZ with event_ids and physical weights_pb; otherwise mass spectra show events/TeV")
     parser.add_argument("--score-stage-comparison", action=argparse.BooleanOptionalAction, default=True,
-                        help="Export a separate detailed saved-score comparison table (default: enabled; no model inference)")
+                        help="Export a detailed injection-scan saved-score comparison table (default: enabled; no model inference)")
     parser.add_argument("--allow-partial-injection-scan", action="store_true")
     parser.add_argument("--require-compatible-populations", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
@@ -3107,17 +3107,6 @@ def render_publication_outputs(args, groups, cache, records, loader, scenarios, 
     plot_training(groups, args.output, args.plot_formats, args.overwrite)
     say("[STAGE] Export publication tables", args.verbose)
     export_tables(groups, cache, loader, args.output, args.file_formats, args.data, args.verbose)
-    if getattr(args, "score_stage_comparison", True):
-        items = []
-        for (method, scenario, variant, region, seed), record in sorted(records.items()):
-            if method not in groups.get((scenario, seed, variant), {}):
-                continue
-            root, report = groups[(scenario, seed, variant)][method]
-            items.append(dict(method=method, scenario=scenario, variant=variant, region=region,
-                              level=None, seed=seed, root=root, report=report, record=record,
-                              metrics=cache.get((method, scenario, variant, region, seed))))
-        export_score_stage_comparison(items, args.output, args.file_formats, args.min_background,
-                                     args.io_workers, args.verbose)
 
 
 if __name__ == "__main__":
