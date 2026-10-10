@@ -114,9 +114,9 @@ def parser():
                          help="Backfill frozen SR + sideband exports from completed native results without training")
         rescoring = run.add_mutually_exclusive_group()
         rescoring.add_argument("--rescore", action="store_true",
-                               help="Re-score completed RIDDLE models in --output without training")
+                               help="Re-score completed RIDDLE/IAD/Supervised models in --output without training")
         rescoring.add_argument("--rescore-from", type=Path,
-                               help="Re-score frozen RIDDLE models without training; matching source/output roots update in place")
+                               help="Re-score frozen RIDDLE/IAD/Supervised models without training; matching source/output roots update in place")
         run.add_argument("--sideband-scoring", action=argparse.BooleanOptionalAction, default=True,
                          help="Export frozen held-out sideband scores after SR scoring (default: enabled)")
         run.add_argument("--sideband-reference-events", type=positive, default=65536,
@@ -185,8 +185,8 @@ def configure_rescoring(args):
     if in_place and source is not None:
         raise ValueError("--rescore and --rescore-from are mutually exclusive")
     option = "--rescore" if in_place else "--rescore-from"
-    if args.methods != ["riddle"] or args.command != "run" or getattr(args, "score_sidebands_only", False):
-        raise ValueError(f"{option} requires run mode, --methods riddle and no --score-sidebands-only")
+    if any(method not in ("riddle", "iad", "supervised") for method in args.methods) or args.command != "run" or getattr(args, "score_sidebands_only", False):
+        raise ValueError(f"{option} requires run mode, methods riddle/iad/supervised and no --score-sidebands-only")
     source = Path(args.output if in_place else source).resolve()
     destination = Path(args.output).resolve()
     if destination != source and (destination.is_relative_to(source) or source.is_relative_to(destination)):

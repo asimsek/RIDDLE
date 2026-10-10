@@ -120,8 +120,8 @@ def job(args):
         option = "--rescore" if getattr(args, "rescore", False) else "--rescore-from"
         if getattr(args, "rescore", False) and getattr(args, "rescore_from", None):
             raise ValueError("--rescore and --rescore-from are mutually exclusive")
-        if args.methods != ["riddle"] or getattr(args, "workflow", "run") != "run" or getattr(args, "score_sidebands_only", False):
-            raise ValueError(f"{option} requires run mode, --methods riddle and no --score-sidebands-only")
+        if any(method not in ("riddle", "iad", "supervised") for method in args.methods) or getattr(args, "workflow", "run") != "run" or getattr(args, "score_sidebands_only", False):
+            raise ValueError(f"{option} requires run mode, methods riddle/iad/supervised and no --score-sidebands-only")
         if getattr(args, "rescore", False):
             command.append("--rescore")
         else:
@@ -362,8 +362,8 @@ def main(argv=None):
                    help="Backfill frozen sideband scores from completed native results without training")
     rescoring = p.add_mutually_exclusive_group()
     rescoring.add_argument("--rescore", action="store_true",
-                           help="Re-score completed RIDDLE models in --results without training")
-    rescoring.add_argument("--rescore-from", help="Re-score frozen RIDDLE models without training; matching source/results roots update in place")
+                           help="Re-score completed RIDDLE/IAD/Supervised models in --results without training")
+    rescoring.add_argument("--rescore-from", help="Re-score frozen RIDDLE/IAD/Supervised models without training; matching source/results roots update in place")
     p.add_argument("--sideband-scoring", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--sideband-reference-events", type=positive, default=65536)
     p.add_argument("--verbose", type=int, choices=(0, 1, 2), default=1,

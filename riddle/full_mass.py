@@ -617,6 +617,7 @@ def _export_full_mass(args, report=None):
 
 RESCORE_PROTOCOL = "frozen_riddle_rescoring_v2_deterministic"
 RESCORE_PARTITIONS = ("signal_region", "test", "validation")
+RESCORE_METHODS = ("riddle", "iad", "supervised")
 
 
 def _rescore_link(source, destination):
@@ -652,16 +653,58 @@ def _rescore_stage(source, output, report, workers):
                 _rescore_link(path, output / "density/.resume" / name / path.relative_to(directory))
 
 
+def _oracle_selector_roles(args, source, mapper, saved):
+    from .model import with_mass_context
+    from .pipeline import _map_oracle_rows, _oracle_role_seed
+    from .populations import prepared_config, role_indices
+
+    population = prepared_config(args.data)
+    if population is None:
+        raise ValueError("Frozen oracle re-scoring requires the original shared population configuration")
+    receipt = read_json(source / "oracle_roles.json")
+    if receipt.get("method") != args.method:
+        raise ValueError("Frozen oracle population belongs to another method")
+    with np.load(args.data / "event_ids.npz", allow_pickle=False) as archive:
+        ids = {name: archive[name] for name in archive.files}
+    background = np.load(args.data / "innerdata_extrabkg_val.npy", allow_pickle=False)
+    if len(background) != len(ids["innerdata_extrabkg_val.npy"]):
+        raise ValueError("Frozen oracle background rows and event identities are misaligned")
+    qparts = role_indices(len(background), population["validation_roles"]["oracle_background"],
+                          ("fit", "closure", "selector"), _oracle_role_seed(args.seed, "oracle_background_validation"))
+    _, qz, qm = _map_oracle_rows(mapper, background, 0)
+    selector = dict(q=with_mass_context(qz[qparts["selector"]], qm[qparts["selector"]]),
+                    q_ids=ids["innerdata_extrabkg_val.npy"][qparts["selector"]])
+    if args.method == "supervised":
+        signal = np.load(args.data / "innerdata_extrasig_val.npy", allow_pickle=False)
+        if len(signal) != len(ids["innerdata_extrasig_val.npy"]):
+            raise ValueError("Frozen oracle signal rows and event identities are misaligned")
+        pparts = role_indices(len(signal), population["validation_roles"]["supervised_signal"],
+                              ("assessment", "selector"), _oracle_role_seed(args.seed, "oracle_signal_validation"))
+        _, pz, pm = _map_oracle_rows(mapper, signal, 1)
+        selector.update(p=with_mass_context(pz[pparts["selector"]], pm[pparts["selector"]]),
+                        p_ids=ids["innerdata_extrasig_val.npy"][pparts["selector"]])
+        p_train_ids = ids["innerdata_extrasig_train.npy"]
+        p_validation_ids = ids["innerdata_extrasig_val.npy"][pparts["assessment"]]
+    else:
+        p_train_ids, p_validation_ids = saved["residual_train__ids"], saved["evidence__ids"]
+    for name in ("p", "q"):
+        if name in selector and (len(selector[name]) != receipt["selector_counts"][name]
+                                 or digest(selector[name + "_ids"]) != receipt["selector_reserves"][name + "_ids"]):
+            raise ValueError("Frozen oracle selector event population changed")
+    selector["used_ids"] = np.concatenate([p_train_ids, p_validation_ids, ids["innerdata_extrabkg_train.npy"],
+                                           ids["innerdata_extrabkg_val.npy"][qparts["fit"]],
+                                           ids["innerdata_extrabkg_val.npy"][qparts["closure"]]])
+    return dict(selector=selector)
+
+
 def _selector_data(args, source, report):
     from .mapping import Mapper
-    from .model import with_mass_context
-    from .score_selection import assert_disjoint
+    from .score_selection import selector_populations
 
     roles = read_json(source / "background/data_roles.json")
     with np.load(source / "background/event_roles.npz", allow_pickle=False) as archive:
         saved = {key: archive[key] for key in archive.files}
     mixture = np.load(source / "background/mixture_validation_latents.npy", allow_pickle=False)
-    p = with_mass_context(mixture[:, 1:-2], mixture[:, 0])
     p_ids = saved["mixture_validation__ids"]
     indices = saved["closure__source_indices"]
     if digest(indices) != roles["closure"]["indices_sha256"]:
@@ -671,19 +714,22 @@ def _selector_data(args, source, report):
     z, mask = mapper.map(rows)
     if not np.array_equal(mask, saved["closure__mask"]):
         raise ValueError("Frozen sideband control acceptance changed")
-    control = with_mass_context(z, rows[mask, 0])
-    used = np.unique(np.concatenate([saved[name + "__ids"] for name in roles
-                                    if name not in ("closure", "mixture_validation")]), axis=0)
     with np.load(source / "signal_region_scores.npz", allow_pickle=False) as archive:
         evaluation_ids = archive["event_ids"]
-    empty_ids = np.empty((0, 2), dtype=np.uint64)
-    assert_disjoint(p_ids, saved["closure__ids"], used, evaluation_ids)
-    if len(p) != len(p_ids) or len(control) != len(saved["closure__ids"]):
+    if len(mixture) != len(p_ids) or len(z) != len(saved["closure__ids"]):
         raise ValueError("Frozen selector rows and event identities are misaligned")
-    return dict(p=p, p_ids=p_ids, q=None, q_ids=empty_ids, control=control,
-                control_ids=saved["closure__ids"], used_ids_sha256=digest(used),
-                p_source="reserved_signal_region_mixture_validation",
-                q_source="independent_generated_q_reference_C")
+    development = {name: dict(ids=saved[name + "__ids"]) for name in roles}
+    development["mixture_validation"].update(z=mixture[:, 1:-2], mass=mixture[:, 0])
+    development["closure"].update(z=z, mass=rows[mask, 0])
+    oracle = _oracle_selector_roles(args, source, mapper, saved) if args.method in ("iad", "supervised") else None
+    populations = selector_populations(development, oracle, args.method, evaluation_ids)
+    original = read_json(source / "density/score_selection.json")["identity"]
+    if (digest(populations["p_ids"]) != original["p_event_ids_sha256"]
+            or digest(populations["q_ids"]) != original["q_event_ids_sha256"]
+            or ("background_control" in original and digest(populations["control_ids"])
+                != original["background_control"]["event_ids_sha256"])):
+        raise ValueError("Frozen re-scoring selector event identities changed")
+    return populations
 
 
 class FrozenPredictor:
@@ -752,7 +798,7 @@ def _validate_rescore_source(args, inputs, source_report):
     if original_settings["background"] != args.settings["background"]:
         raise ValueError("Re-scoring must preserve the saved background configuration")
     if "density/score_selection.json" not in source_report["artifacts_sha256"]:
-        raise ValueError("Re-scoring requires a completed shared-population RIDDLE result with a frozen selector")
+        raise ValueError("Re-scoring requires a completed shared-population native result with a frozen selector")
     settings = validate_residual(deepcopy(args.settings["riddle"]))
     original = validate_residual(deepcopy(original_settings["riddle"]))
     if _training_contract(original) != _training_contract(settings):
@@ -777,8 +823,8 @@ def _rescore(args, inputs, *, source=None, source_name=None):
 
     source = (Path(args.rescore_from).resolve() / args.method / args.scenario / f"seed_{args.seed:03d}") if source is None else Path(source)
     output = args.output.resolve()
-    if args.method != "riddle" or source == output or (source_name is None and (output.is_relative_to(source) or source.is_relative_to(output))):
-        raise ValueError("Frozen re-scoring requires RIDDLE and separate source/output directories")
+    if args.method not in RESCORE_METHODS or source == output or (source_name is None and (output.is_relative_to(source) or source.is_relative_to(output))):
+        raise ValueError("Frozen re-scoring requires RIDDLE/IAD/Supervised and separate source/output directories")
     source_report = read_json(source / "result.json")
     settings = _validate_rescore_source(args, inputs, source_report)
     identity = dict(protocol=RESCORE_PROTOCOL, source=str(source if source_name is None else source_name), source_report_sha256=file_digest(source / "result.json"),
@@ -1011,8 +1057,8 @@ def rescore(args, inputs):
     output = Path(args.output).resolve()
     if not source.is_dir():
         raise FileNotFoundError(f"Completed re-scoring source is missing: {source}")
-    if args.method != "riddle" or (source != output and (source.is_relative_to(output) or output.is_relative_to(source))):
-        raise ValueError("Frozen re-scoring requires RIDDLE and matching or nonoverlapping source/output folders")
+    if args.method not in RESCORE_METHODS or (source != output and (source.is_relative_to(output) or output.is_relative_to(source))):
+        raise ValueError("Frozen re-scoring requires RIDDLE/IAD/Supervised and matching or nonoverlapping source/output folders")
     if not getattr(args, "rescore_output_locked", False):
         with locked(output / ".resume/command.lock"):
             from types import SimpleNamespace
