@@ -1,3 +1,4 @@
+import copy
 import functools
 import inspect
 import json
@@ -6,9 +7,158 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .storage import atomic_write, write_json, rng_state, restore_rng, file_digest, verify_artifacts
+from .storage import atomic_write, write_json, rng_state, restore_rng, file_digest, verify_artifacts, save_array
+from riddle.storage import persist_boundary
 from .worker_progress import emit_progress
 from .resume import check_contract, record_transition
+
+
+PROTOCOL = "buffered_all_epoch_selection_v1"
+
+
+def cpu_snapshot(value):
+    if isinstance(value, torch.nn.Module):
+        return copy.deepcopy(value).cpu()
+    result = copy.copy(value)
+    for key, item in value.items():
+        result[key] = item.detach().cpu().clone() if isinstance(item, torch.Tensor) else copy.deepcopy(item)
+    if hasattr(value, "_metadata"):
+        result._metadata = copy.deepcopy(value._metadata)
+    return result
+
+
+def save_checkpoint(path, value):
+    def write(temporary):
+        with temporary.open("wb") as stream:
+            torch.save(value, stream)
+
+    atomic_write(path, write)
+
+
+class CheckpointBuffer:
+    def __init__(self, root, phase, prefix, epochs, state=None):
+        self.root = Path(root).resolve()
+        self.phase, self.prefix, self.epochs = phase, str(prefix), int(epochs)
+        if phase not in ("flow", "classifier") or self.epochs <= 10:
+            raise ValueError("LaCATHODE checkpoint selection requires more than ten epochs")
+        if Path(self.prefix).name != self.prefix or not self.prefix:
+            raise ValueError("Unexpected LaCATHODE checkpoint prefix")
+        self.candidates, self.last, self.validation_losses = {}, None, []
+        self.finished = False
+        if state is not None:
+            saved = state.get("checkpoint_buffer")
+            if saved is None:
+                self.restore_legacy(state)
+            else:
+                expected = (PROTOCOL, phase, self.prefix, self.epochs)
+                if tuple(saved.get(key) for key in ("protocol", "phase", "prefix", "epochs")) != expected:
+                    raise ValueError("LaCATHODE checkpoint buffer contract changed")
+                self.candidates = dict(saved["candidates"])
+                self.last = saved["last"]
+                self.validation_losses = list(saved["validation_losses"])
+                self.finished = saved["finished"]
+            if len(self.validation_losses) != state["next_epoch"]:
+                raise ValueError("LaCATHODE checkpoint buffer epoch differs from recovery")
+
+    def filename(self, epoch):
+        return f"{self.prefix}_epoch_{epoch}.par" if self.phase == "flow" else f"{self.prefix}_ep{epoch}"
+
+    def owns(self, name):
+        if self.phase == "flow":
+            return name.startswith(self.prefix + "_epoch_") and name.endswith(".par")
+        return name.startswith(self.prefix + "_ep")
+
+    def eligible(self, loss):
+        if len(self.validation_losses) < 10 or not np.isfinite(loss):
+            return True
+        threshold = np.sort(self.validation_losses)[9]
+        return np.isnan(threshold) or loss <= threshold
+
+    def offer(self, value, path, epoch, loss):
+        epoch, loss = int(epoch), float(loss)
+        if self.finished or epoch != len(self.validation_losses) or not 0 <= epoch < self.epochs:
+            raise ValueError("LaCATHODE checkpoint epoch is out of sequence")
+        if Path(path).resolve() != self.root / self.filename(epoch):
+            raise ValueError("Unexpected LaCATHODE checkpoint path")
+        eligible = self.eligible(loss)
+        candidate = {"epoch": epoch, "model": cpu_snapshot(value)} if eligible or persist_boundary(epoch, self.epochs) else None
+        if eligible:
+            self.candidates[epoch] = candidate
+        self.last = candidate
+        self.validation_losses.append(loss)
+        if len(self.validation_losses) >= 10:
+            threshold = np.sort(self.validation_losses)[9]
+            if not np.isnan(threshold):
+                self.candidates = {
+                    index: item for index, item in self.candidates.items()
+                    if self.validation_losses[index] <= threshold or not np.isfinite(self.validation_losses[index])
+                }
+
+    def restore_legacy(self, state):
+        count = int(state["next_epoch"])
+        losses = np.asarray(state["losses"][1])
+        self.validation_losses = losses[1:count + 1].tolist() if self.phase == "flow" else losses[:count].tolist()
+        if not 0 < count <= self.epochs or len(self.validation_losses) != count:
+            raise ValueError("Invalid legacy LaCATHODE recovery epoch")
+        threshold = np.sort(self.validation_losses)[min(9, count - 1)]
+        required = {
+            index for index, loss in enumerate(self.validation_losses)
+            if np.isnan(threshold) or loss <= threshold or not np.isfinite(loss)
+        } | {count - 1}
+        for index in sorted(required):
+            name = self.filename(index)
+            if name not in state["files"]:
+                raise ValueError("Legacy LaCATHODE recovery is missing a selection candidate")
+            candidate = {
+                "epoch": index,
+                "model": torch.load(self.root / name, map_location="cpu", weights_only=False),
+                "sha256": state["files"][name],
+            }
+            self.candidates[index] = candidate
+            if index == count - 1:
+                self.last = candidate
+
+    def state(self):
+        return {
+            "protocol": PROTOCOL,
+            "phase": self.phase,
+            "prefix": self.prefix,
+            "epochs": self.epochs,
+            "candidates": self.candidates,
+            "last": self.last,
+            "validation_losses": self.validation_losses,
+            "finished": self.finished,
+        }
+
+    def finish(self, losses):
+        if self.finished:
+            return {}
+        if len(self.validation_losses) != self.epochs or self.last is None:
+            raise ValueError("LaCATHODE checkpoint buffer has incomplete training")
+        losses = np.asarray(losses)
+        trained = losses[1:] if self.phase == "flow" else losses
+        if not np.array_equal(trained, self.validation_losses, equal_nan=True):
+            raise ValueError("LaCATHODE checkpoint selection losses changed")
+        offset = 1 if self.phase == "flow" else 0
+        required = set((np.argpartition(losses, 10)[:10] - offset).tolist()) | {self.epochs - 1}
+        if self.phase == "flow":
+            required.add(int(np.argpartition(losses, 1)[0]) - 1)
+        files = {}
+        for index in sorted(required - {-1}):
+            candidate = self.last if index == self.epochs - 1 else self.candidates.get(index)
+            if candidate is None or candidate["epoch"] != index:
+                raise ValueError("Missing all-epoch LaCATHODE selection candidate")
+            path = self.root / self.filename(index)
+            if candidate.get("sha256") is not None:
+                if file_digest(path) != candidate["sha256"]:
+                    raise ValueError("Legacy LaCATHODE selection candidate changed")
+            else:
+                save_checkpoint(path, candidate["model"])
+            files[path.name] = file_digest(path)
+        self.candidates.clear()
+        self.last = None
+        self.finished = True
+        return files
 
 
 class EpochRecovery:
@@ -24,6 +174,7 @@ class EpochRecovery:
         self.state = None
         self.resume = resume
         self.classifier_run = None
+        self.checkpoint_buffer = None
         if self.manifest.exists():
             if not resume:
                 raise FileExistsError("Work already started; use --resume")
@@ -92,7 +243,7 @@ class EpochRecovery:
                 raise ValueError("Unexpected upstream classifier checkpoint prefix")
             index = int(prefix.name.removeprefix("model_run"))
             path = self.root / ".resume" / f"classifier_run{index}.pt"
-            previous = self.path, self.state, self.next_epochs, self.classifier_run
+            previous = self.path, self.state, self.next_epochs, self.classifier_run, self.checkpoint_buffer
             try:
                 state = None
                 if path.exists():
@@ -117,7 +268,7 @@ class EpochRecovery:
                 self.save("classifier", "complete", losses=losses)
                 return losses
             finally:
-                self.path, self.state, self.next_epochs, self.classifier_run = previous
+                self.path, self.state, self.next_epochs, self.classifier_run, self.checkpoint_buffer = previous
 
         return train
 
@@ -138,12 +289,49 @@ class EpochRecovery:
         )
         return [values[name] for name in names]
 
+    def start_checkpoint_buffer(self, phase, values):
+        prefix = values["model_file_name"] if phase == "flow" else Path(values["save_model"]).name
+        state = self.state if self.next_epoch(phase) else None
+        self.checkpoint_buffer = CheckpointBuffer(self.root, phase, prefix, values["epochs"], state)
+        self.files = {name: checksum for name, checksum in self.files.items() if not self.checkpoint_buffer.owns(name)}
+        if self.checkpoint_buffer.finished:
+            self.files.update({name: checksum for name, checksum in state["files"].items() if self.checkpoint_buffer.owns(name)})
+
+    def buffer_checkpoint(self, value, path, phase, epoch, values):
+        loss = values["val_losses"][epoch + 1] if phase == "flow" else values["val_loss"][epoch]
+        self.checkpoint_buffer.offer(value, path, epoch, loss)
+
+    @staticmethod
+    def save_loss_array(path, losses, epoch, epochs):
+        if persist_boundary(epoch, epochs):
+            save_array(path, losses)
+
+    def finish_checkpoint_buffer(self, phase, values):
+        losses = values["val_losses"] if phase == "flow" else values["val_loss"]
+        self.files.update(self.checkpoint_buffer.finish(losses))
+        self.checkpoint_buffer = None
+
     def save_epoch(self, phase, epoch, values):
-        model, optimizer = values["model"], values["optimizer"]
         losses = [
             values[n]
             for n in (("train_losses", "val_losses") if phase == "flow" else ("train_loss", "val_loss"))
         ]
+        if persist_boundary(epoch, values["epochs"]):
+            if epoch + 1 == values["epochs"]:
+                self.files.update(self.checkpoint_buffer.finish(losses[1]))
+            self.save_epoch_state(phase, epoch, values, losses)
+        emit_progress(
+            *self.progress_identity(phase),
+            total=values["epochs"],
+            completed=epoch + 1,
+            unit="epoch",
+            report_every=1,
+            train_loss=float(losses[0][epoch + 1 if phase == "flow" else epoch]),
+            validation_loss=float(losses[1][epoch + 1 if phase == "flow" else epoch]),
+        )
+
+    def save_epoch_state(self, phase, epoch, values, losses):
+        model, optimizer = values["model"], values["optimizer"]
         loaders = [
             {
                 "verified": getattr(loader, "_runtime_gather_verified", None),
@@ -159,11 +347,6 @@ class EpochRecovery:
             }
             for name, module in model.named_modules()
         }
-        checkpoint = (
-            f"{values['model_file_name']}_epoch_{epoch}.par"
-            if phase == "flow" else f"{Path(values['save_model']).name}_ep{epoch}"
-        )
-        self.files[checkpoint] = file_digest(self.root / checkpoint)
         self.save(
             phase,
             "epoch",
@@ -173,15 +356,7 @@ class EpochRecovery:
             attributes=attributes,
             losses=losses,
             loaders=loaders,
-        )
-        emit_progress(
-            *self.progress_identity(phase),
-            total=values["epochs"],
-            completed=epoch + 1,
-            unit="epoch",
-            report_every=1,
-            train_loss=float(losses[0][epoch + 1 if phase == "flow" else epoch]),
-            validation_loss=float(losses[1][epoch + 1 if phase == "flow" else epoch]),
+            checkpoint_buffer=self.checkpoint_buffer.state(),
         )
 
     def restore_epoch(self, phase, values):

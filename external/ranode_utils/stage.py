@@ -1,3 +1,4 @@
+import copy
 import ast
 import importlib
 import json
@@ -17,8 +18,185 @@ from .source import digest, verify
 from .ensemble import signal_fit_health
 from .variants import background_diagnostics, extend_delta_r, model_config
 from .stability import bounded_background, stability_contract
+from riddle.storage import IO_PERSIST_EVERY, atomic_torch_save, persist_boundary, save_array, write_json
 from riddle.worker_progress import emit_progress as stage_progress
 from riddle.production import NumericalFitError
+
+
+PROTOCOL = "buffered_all_epoch_selection_v1"
+
+
+def cpu_state(state):
+    result = copy.copy(state)
+    for key, value in state.items():
+        result[key] = value.detach().cpu().clone() if isinstance(value, torch.Tensor) else copy.deepcopy(value)
+    if hasattr(state, "_metadata"):
+        result._metadata = copy.deepcopy(state._metadata)
+    return result
+
+
+class CheckpointBuffer:
+    def __init__(self, root, epochs):
+        self.root = Path(root).resolve()
+        self.epochs = int(epochs)
+        if self.epochs < 10:
+            raise ValueError("R-ANODE checkpoint selection requires at least ten epochs")
+        self.candidates = {}
+        self.current = None
+        self.training_losses, self.validation_losses = [], []
+        self.persisted_epochs = []
+        self.protected = set()
+        self.finished = False
+
+    def path(self, value):
+        path = Path(value).resolve()
+        if path.parent != self.root:
+            raise ValueError("Unexpected R-ANODE checkpoint directory")
+        return path
+
+    def eligible(self, loss):
+        if len(self.validation_losses) < 10 or not np.isfinite(loss):
+            return True
+        threshold = np.sort(self.validation_losses)[9]
+        return np.isnan(threshold) or loss <= threshold
+
+    def model(self, state, filename, epoch, loss):
+        epoch, loss = int(epoch), float(loss)
+        path = self.path(filename)
+        if epoch != len(self.validation_losses) or not 0 <= epoch < self.epochs:
+            raise ValueError("R-ANODE checkpoint epoch is out of sequence")
+        if self.current is None:
+            self.current = dict(epoch=epoch, loss=loss, models={}, arrays={})
+        if self.current["epoch"] != epoch:
+            raise ValueError("R-ANODE checkpoint epoch was not completed")
+        if self.eligible(loss) or persist_boundary(epoch, self.epochs):
+            self.current["models"][path.name] = cpu_state(state)
+
+    def array(self, filename, value):
+        path = self.path(filename)
+        if self.current is None:
+            raise ValueError("R-ANODE mixture weight has no model checkpoint")
+        if self.current["models"]:
+            self.current["arrays"][path.name] = np.array(value, copy=True)
+
+    def end_epoch(self, epoch, training_loss, validation_loss):
+        if self.current is None or self.current["epoch"] != int(epoch):
+            raise ValueError("R-ANODE epoch has no checkpoint candidate")
+        loss = float(validation_loss)
+        if loss != self.current["loss"] and not (np.isnan(loss) and np.isnan(self.current["loss"])):
+            raise ValueError("R-ANODE checkpoint validation loss changed")
+        if self.eligible(loss):
+            self.candidates[int(epoch)] = self.current
+        self.training_losses.append(float(training_loss))
+        self.validation_losses.append(loss)
+        if len(self.validation_losses) >= 10:
+            threshold = np.sort(self.validation_losses)[9]
+            if not np.isnan(threshold):
+                self.candidates = {
+                    index: candidate for index, candidate in self.candidates.items()
+                    if candidate["loss"] <= threshold or not np.isfinite(candidate["loss"])
+                }
+        if persist_boundary(epoch, self.epochs):
+            atomic_torch_save(self.root / "checkpoint_buffer.pt", {
+                "protocol": PROTOCOL,
+                "completed_epochs": int(epoch) + 1,
+                "total_epochs": self.epochs,
+                "training_losses": self.training_losses,
+                "validation_losses": self.validation_losses,
+                "candidates": self.candidates,
+                "last": self.current,
+            })
+            self.persisted_epochs.append(int(epoch) + 1)
+        if int(epoch) + 1 < self.epochs:
+            self.current = None
+
+    def finish(self):
+        if len(self.validation_losses) != self.epochs or self.current is None:
+            raise ValueError("R-ANODE checkpoint buffer has incomplete training")
+        losses = np.asarray(self.validation_losses)
+        selected = np.argsort(losses).flatten()[:10].tolist()
+        required = set(selected) | {int(np.argmin(losses)), self.epochs - 1}
+        for epoch in sorted(required):
+            candidate = self.current if epoch == self.epochs - 1 else self.candidates.get(epoch)
+            if candidate is None or not candidate["models"]:
+                raise ValueError("Missing all-epoch R-ANODE selection candidate")
+            for name, state in candidate["models"].items():
+                atomic_torch_save(self.root / name, state)
+                self.protected.add(self.root / name)
+            for name, array in candidate["arrays"].items():
+                save_array(self.root / name, array)
+        write_json(self.root / "checkpoint_storage.json", {
+            "protocol": PROTOCOL,
+            "persist_every": IO_PERSIST_EVERY,
+            "persisted_epochs": self.persisted_epochs,
+            "selected_epochs": selected,
+            "retained_epochs": sorted(required),
+            "last_epoch": self.epochs - 1,
+            "selection": "Original NumPy argsort over validation losses from every epoch",
+            "restart": "Reuse completed stages; interrupted stages retain original initial-RNG restart behavior",
+        })
+        (self.root / "checkpoint_buffer.pt").unlink()
+        self.candidates.clear()
+        self.current = None
+        self.finished = True
+
+    def discard(self, filename):
+        path = self.path(filename)
+        if not self.finished or not path.name.startswith("model_S_") or path.suffix != ".pt":
+            raise ValueError("Unexpected R-ANODE checkpoint cleanup")
+        if path not in self.protected:
+            path.unlink(missing_ok=True)
+
+
+def buffer_checkpoints(tree, stage):
+    if stage not in ("background", "signal"):
+        raise ValueError("Unknown R-ANODE checkpoint stage")
+    loops = [node for node in tree.body if isinstance(node, ast.For)
+             and ast.unparse(node.target) == "epoch" and ast.unparse(node.iter) == "range(args.epochs)"]
+    if len(loops) != 1:
+        raise ValueError("Unrecognized upstream R-ANODE epoch loop")
+    loop = loops[0]
+    loss = "valloss" if stage == "background" else "val_loss"
+    calls = {"torch.save": 0, "np.save": 0, "os.remove": 0}
+
+    class Rewrite(ast.NodeTransformer):
+        def visit_Call(self, node):
+            name = ast.unparse(node.func)
+            if name == "torch.save":
+                if len(node.args) != 2 or node.keywords or "epoch" not in ast.unparse(node.args[1]):
+                    raise ValueError("Unrecognized upstream R-ANODE epoch checkpoint")
+                calls[name] += 1
+                node.func = ast.parse("__checkpoint_buffer.model", mode="eval").body
+                node.args += [ast.Name(id="epoch", ctx=ast.Load()), ast.Name(id=loss, ctx=ast.Load())]
+            elif name == "np.save":
+                if stage != "signal" or len(node.args) != 2 or node.keywords or "w_{epoch}" not in ast.unparse(node.args[0]):
+                    raise ValueError("Unrecognized upstream R-ANODE epoch weight")
+                calls[name] += 1
+                node.func = ast.parse("__checkpoint_buffer.array", mode="eval").body
+            elif name == "os.remove":
+                if stage != "signal" or len(node.args) != 1 or node.keywords:
+                    raise ValueError("Unrecognized upstream R-ANODE checkpoint removal")
+                calls[name] += 1
+                node.func = ast.parse("__checkpoint_buffer.discard", mode="eval").body
+            return self.generic_visit(node)
+
+    rewrite = Rewrite()
+    rewrite.visit(loop)
+    if stage == "signal":
+        cleanup = [node for node in tree.body if isinstance(node, ast.For)
+                   and ast.unparse(node.target) == "file_" and ast.unparse(node.iter) == "file_list"]
+        if len(cleanup) != 1:
+            raise ValueError("Unrecognized upstream R-ANODE checkpoint cleanup")
+        rewrite.visit(cleanup[0])
+    expected = {"torch.save": 1, "np.save": 0, "os.remove": 0} if stage == "background" else {
+        "torch.save": 2, "np.save": 1, "os.remove": 1,
+    }
+    if calls != expected:
+        raise ValueError("Upstream R-ANODE checkpoint calls changed")
+    train = "trainloss" if stage == "background" else "train_loss"
+    loop.body += ast.parse(f"__checkpoint_buffer.end_epoch(epoch, {train}, {loss})").body
+    tree.body[tree.body.index(loop) + 1:tree.body.index(loop) + 1] = ast.parse("__checkpoint_buffer.finish()").body
+    return ast.fix_missing_locations(tree)
 
 
 def nflows_spline_sampling_failure(error):
@@ -133,9 +311,9 @@ def matched_inputs(arrays, stage, *, resample_training=False):
         utils.preprocess_params_transform = original_transform
 
 
-def execute_script(path, *, cpu_background=False, variant="default"):
+def execute_script(path, *, cpu_background=False, variant="default", checkpoints=None):
     sideband_background = path.name == "nflows_CR.py"
-    if not cpu_background and variant != "deltaR" and not sideband_background:
+    if not cpu_background and variant != "deltaR" and not sideband_background and checkpoints is None:
         return runpy.run_path(str(path), run_name="__main__")
     tree = ast.parse(path.read_text(), filename=str(path))
     if sideband_background:
@@ -159,7 +337,11 @@ def execute_script(path, *, cpu_background=False, variant="default"):
         ):
             raise ValueError("Unrecognized upstream background device switch")
         assignments[0].value = ast.copy_location(ast.Constant(False), assignments[0].value)
+    if checkpoints is not None:
+        tree = buffer_checkpoints(tree, "background" if sideband_background else "signal")
     namespace = {"__name__": "__main__", "__file__": str(path)}
+    if checkpoints is not None:
+        namespace["__checkpoint_buffer"] = checkpoints
     exec(compile(ast.fix_missing_locations(tree), str(path), "exec"), namespace)  # noqa: S102
     return namespace
 
@@ -292,6 +474,7 @@ def main():
         namespace = execute_script(
             script, cpu_background=stage == "background" and options["device"] == "cpu",
             variant=variant,
+            checkpoints=CheckpointBuffer(attempt / "results/upstream" / stage / "fit", options["epochs"]),
         )
     stage_progress("losses", "Validate losses and record data partitions")
     output = attempt / "results/upstream" / stage / "fit"
