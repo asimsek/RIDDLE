@@ -378,17 +378,17 @@ def _save_figure(fig, ax, stem, formats, overwrite, legend=None):
     if isinstance(legend, dict) and "deferred_legend" in legend:
         legend = _inside_legend(ax, **legend["deferred_legend"])
     stem.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        fig.tight_layout(pad=0.45)
-    except Exception:
-        pass
+    if not fig.get_constrained_layout() and (spectrum_legend is None or len(fig.axes) == 1):
+        try:
+            fig.tight_layout(pad=0.45)
+        except Exception:
+            pass
     if scan_legend is not None:
         legend = _scan_legend(ax, **scan_legend["scan_legend"])
     if spectrum_legend is not None:
-        fig.subplots_adjust(top=0.76)
-        ax.legend(loc="lower center", bbox_to_anchor=(0.5, 1.02), ncol=2, frameon=False,
-                  **spectrum_legend["spectrum_legend"])
-        legend = None
+        from riddle.mass_spectrum import mass_legend
+
+        legend = mass_legend(ax, **spectrum_legend["spectrum_legend"])
     audit_layout(fig, ax, legend)
     for extension in formats:
         path = stem.with_suffix("." + extension)
@@ -618,7 +618,7 @@ def discover_variant_results(root, requested, variants, *, scan=False, workers=1
 
 def plot_dijet_spectra(groups, args, output, *, scan=False):
     from riddle.full_mass import load_full_mass
-    from riddle.mass_spectrum import CUTS, mass_edges, mass_ylabel, match_ids, normalization_weights, spectrum_histograms
+    from riddle.mass_spectrum import CUTS, mass_edges, match_ids, normalization_weights, residual_limits, spectrum_histograms, spectrum_summary, spectrum_figure, spectrum_cuts_figure
 
     tasks = [(identity, method, root, report) for identity, group in sorted(groups.items())
              for method, (root, report) in sorted(group.items()) if method in ("riddle", "iad", "supervised")]
@@ -674,42 +674,23 @@ def plot_dijet_spectra(groups, args, output, *, scan=False):
                 raise ValueError("Inconsistent mass-spectrum normalization")
             units = record_units
             rows.append(spectrum_histograms(record, weights, edges))
-        width = np.diff(edges)
         destination = output / "04_dijet_spectra" / METHOD_LABELS[method] / SCENARIO_LABELS[scenario]
         if level is not None:
             destination = destination / f"N_{int(level):06d}"
-        table = []
-        for cut in CUTS:
-            fig, ax = new_figure("Dijet Mass [TeV]", mass_ylabel(units))
-            ax.set(xlim=(edges[0], edges[-1]), yscale="log")
-            for component, color, label in (("background", "#276a87", "BG"),
-                                             ("signal", "#c65d32", "Signal"),
-                                             ("data", "#276a87", "Data")):
-                uncut = np.asarray([row[None][component] / width for row in rows])
-                selected = np.asarray([row[cut][component] / width for row in rows])
-                if not np.any(uncut > 0):
-                    continue
-                base, mean = uncut.mean(axis=0), selected.mean(axis=0)
-                ax.fill_between(edges, np.r_[base, base[-1]], step="post", color=color, alpha=0.18,
-                                linewidth=0, label=label + " before selection")
-                ax.stairs(np.where(mean > 0, mean, np.nan), edges, color=color, ls="--", lw=1.0,
-                          label=label + f" · {cut * 100:g}% BG cut")
-                if len(records) > 1:
-                    low, high = selected.min(axis=0), selected.max(axis=0)
-                    ax.fill_between(edges, np.r_[low, low[-1]], np.r_[high, high[-1]],
-                                    step="post", color=color, alpha=0.22, linewidth=0)
-                for index in range(len(width)):
-                    table.append(dict(Method=METHOD_LABELS[method], Scenario=SCENARIO_LABELS[scenario],
-                        N_inj=level, background_acceptance=cut, component=component,
-                        bin_low_TeV=float(edges[index]), bin_high_TeV=float(edges[index + 1]),
-                        before_selection=float(base[index]), selected_mean=float(mean[index]),
-                        selected_min=float(selected[:, index].min()), selected_max=float(selected[:, index].max()),
-                        closure_status=" | ".join(statuses),
-                        units="pb/TeV" if units == "pb" else "events/TeV"))
-            legend = {"spectrum_legend": {"title": METHOD_LABELS[method]}}
-            stem = f"dijet_mass_{cut * 100:g}pct".replace("0.5pct", "0p5pct")
-            save_figure(fig, ax, destination / stem, args.plot_formats, args.overwrite, legend)
-        write_table_rows(destination / "dijet_mass_spectra", table, args.file_formats)
+        summaries = {cut: spectrum_summary(rows, cut) for cut in (None, *CUTS)}
+        shared_limits = residual_limits(summaries)
+        if args.overwrite:
+            for extension in ("csv", "json", "yaml"):
+                (destination / f"dijet_mass_spectra.{extension}").unlink(missing_ok=True)
+        fig, ax = spectrum_cuts_figure(summaries, edges, units)
+        save_figure(fig, ax, destination / "dijet_mass_score_cuts", args.plot_formats,
+                    args.overwrite, {"spectrum_legend": {}})
+        for cut in (None, *CUTS):
+            fig, ax = spectrum_figure(summaries[cut], edges, cut, units,
+                                      residual_ylim=shared_limits if cut is not None else None)
+            stem = "dijet_mass_uncut" if cut is None else f"dijet_mass_{cut * 100:g}pct".replace("0.5pct", "0p5pct")
+            save_figure(fig, ax, destination / stem, args.plot_formats, args.overwrite,
+                        {"spectrum_legend": {}})
 
 
 def independent_records(record, seed):
@@ -904,7 +885,7 @@ def parallel_plot_tasks(function, tasks, workers, stage, verbose, describe=None)
     completed = 0
     values = [None] * len(tasks)
     worker_count = min(workers, len(tasks))
-    compact_progress = stage in ("LOAD", "SCAN LOAD", "METRICS", "SCAN METRICS", "SCORE STAGES") and verbose == 1
+    compact_progress = stage in ("LOAD", "SCAN LOAD", "METRICS", "SCAN METRICS", "SCORE STAGES", "WITNESS FIELDS") and verbose == 1
     live = compact_progress and sys.stdout.isatty()
 
     def progress_status():
@@ -1891,6 +1872,72 @@ def plot_stein(groups, records, output, formats, overwrite):
             hist, xe, ye = np.histogram2d(x[good], y[good], bins=70)
             white_log_density_mesh(ax, xe, ye, hist, "Events / bin")
             save_figure(fig, ax, base / stem, formats, overwrite)
+
+
+def plot_projected_witness(groups, records, args, output):
+    from types import SimpleNamespace
+    from riddle.full_mass import load_full_mass
+    from riddle.mass_spectrum import match_ids
+    from riddle.plotting import _prepared_data_directory
+    from riddle.plotting import evaluate_saved_witness, parse_witness_pairs, witness_population_mask, project_witness_fields, witness_signal_selections, plot_witness_projections
+
+    renderer = _FIGURE_RENDERER.get()
+    if renderer is not None:
+        renderer.flush()
+    tasks = []
+    for identity, group in sorted(groups.items()):
+        scenario, seed, variant = identity
+        for method, (root, report) in sorted(group.items()):
+            key = (method, scenario, variant, "signal_region", seed)
+            if method in ("riddle", "iad", "supervised") and key in records:
+                tasks.append((identity, method, root, report, records[key]))
+
+    def prepare(task):
+        identity, method, root, report, record = task
+        protocol = read_metadata(root, report, "protocol.json")
+        if protocol.get("core") != "stein_witness":
+            return None
+        derived_root = Path(report.get("_full_mass_root", root))
+        full = load_full_mass(derived_root, report, workers=1)
+        if full is None and derived_root != root:
+            full = load_full_mass(root, report, workers=1)
+        if full is not None:
+            indices = match_ids(record["event_ids"], full["event_ids"][full["is_signal_region"]])
+            population = np.zeros(len(record["labels"]), bool)
+            population[indices] = True
+        else:
+            prepared = _prepared_data_directory(args.data, report)
+            if prepared is None:
+                raise ValueError(f"Original prepared event IDs are required for {method}, seed {identity[1]}")
+            population, _ = witness_population_mask(prepared, report, record, "primary")
+        options = SimpleNamespace(field_events=getattr(args, "witness_field_events", 16384),
+                                  grid_size=40, smoothing=1.2, min_cell_events=2.0,
+                                  batch_size=1024, device="cpu", io_workers=1,
+                                  sampling_seed=int(report["seed"]) + 10502,
+                                  plot_formats=args.plot_formats, overwrite=args.overwrite, dpi=600,
+                                  verbose=args.verbose,
+                                  label=f"{METHOD_LABELS[method]} s{identity[1]} {identity[0]} {identity[2]}")
+        fields, metadata = evaluate_saved_witness(root, report, options)
+        pairs = parse_witness_pairs(getattr(args, "witness_pairs", ["1:2"]), metadata["dimensions"])
+        selections = witness_signal_selections(record, full)
+        return identity, method, record, population, fields, selections, pairs, options
+
+    previous_threads = torch.get_num_threads()
+    try:
+        torch.set_num_threads(1 if args.io_workers > 1 and len(tasks) > 1 else previous_threads)
+        prepared = parallel_plot_tasks(prepare, tasks, args.io_workers, "WITNESS FIELDS", args.verbose)
+    finally:
+        torch.set_num_threads(previous_threads)
+    for item in prepared:
+        if item is None:
+            continue
+        identity, method, record, population, fields, selections, pairs, options = item
+        scenario, seed, variant = identity
+        destination = output / "05_stein_witness" / METHOD_LABELS[method] / SCENARIO_LABELS[scenario] / f"seed_{seed:03d}"
+        for pair in pairs:
+            grid = project_witness_fields(fields, pair, options)
+            plot_witness_projections(grid, pair, record, population, destination, options,
+                          selections=selections, save_figure=save_figure, legend_factory=inside_legend)
 
 
 def history_rows(root, report, relative):
@@ -2917,6 +2964,10 @@ def parse_args(argv=None):
     parser.add_argument("--io-workers", type=int, default=2, help="Parallel discovery, result loading and metric workers")
     parser.add_argument("--plot-workers", type=int, default=min(8, max(1, (os.cpu_count() or 1) // 2)),
                         help="CPU processes for legend layout and image rendering; 1 runs serially")
+    parser.add_argument("--witness-field-events", type=int, default=16384,
+                        help="Maximum saved background-reference events for projected Stein diagnostics")
+    parser.add_argument("--witness-pairs", nargs="+", default=["1:2"],
+                        help="One-based latent-coordinate pairs for Stein projections, or all")
     parser.add_argument("--cross-section-weights", type=Path,
                         help="NPZ with event_ids and physical weights_pb; otherwise mass spectra show events/TeV")
     parser.add_argument("--score-stage-comparison", action=argparse.BooleanOptionalAction, default=True,
@@ -2928,6 +2979,8 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.io_workers < 1 or args.plot_workers < 1 or args.min_background < 1:
         parser.error("--io-workers, --plot-workers and --min-background must be positive")
+    if args.witness_field_events < 16:
+        parser.error("--witness-field-events must be at least 16")
     normal_requested = args.data is not None or args.results is not None
     scan_requested = args.scan_data is not None or args.scan_results is not None
     if normal_requested and scan_requested:
@@ -3048,6 +3101,8 @@ def render_publication_outputs(args, groups, cache, records, loader, scenarios, 
     plot_latent_closure(groups, records, args.output, args.plot_formats, args.overwrite, args.verbose)
     say("[STAGE] Render Stein-witness diagnostics", args.verbose)
     plot_stein(groups, records, args.output, args.plot_formats, args.overwrite)
+    say("[STAGE] Build projected Stein-witness diagnostics", args.verbose)
+    plot_projected_witness(groups, records, args, args.output)
     say("[STAGE] Render training histories", args.verbose)
     plot_training(groups, args.output, args.plot_formats, args.overwrite)
     say("[STAGE] Export publication tables", args.verbose)

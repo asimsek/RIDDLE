@@ -15,7 +15,9 @@ import time
 
 import numpy as np
 import yaml
-from matplotlib.colors import is_color_like
+from matplotlib.colors import is_color_like, LinearSegmentedColormap, TwoSlopeNorm
+from matplotlib import patheffects as path_effects
+from scipy.ndimage import gaussian_filter
 from scipy.special import expit
 from sklearn.metrics import roc_curve
 
@@ -26,6 +28,7 @@ from .worker_progress import ProgressStage, local_progress
 from .metrics import acceptance_report, efficiency_curve, oracle_metrics
 from .production import validate_score_record, region_acceptance
 from .evaluation import common_acceptance_auc, population_metadata, riddle_score_scope
+from .mass_spectrum import CUTS as WITNESS_CUTS
 
 
 
@@ -3981,6 +3984,343 @@ def refresh_plot_scopes(output, groups, scan_groups):
     for scope in sorted(scopes, key=lambda p: len(p.parts), reverse=True):
         clean(scope)
     (output / "ranode_comparison.json").unlink(missing_ok=True)
+
+
+_WITNESS_EXCESS = LinearSegmentedColormap.from_list(
+    "riddle_witness", ["#f5f8fa", "#c2e0e5", "#71b6c1", "#f5d18f", "#ed9a56", "#c64732", "#752820"]
+)
+_WITNESS_RESPONSE = LinearSegmentedColormap.from_list(
+    "riddle_response", ["#145b86", "#90bfce", "#faf9f3", "#e9b374", "#c3472d"]
+)
+
+
+def _witness_field_progress(message, args):
+    if getattr(args, "verbose", 1) >= 2:
+        label = getattr(args, "label", "Witness")
+        print(f"[{label}] {message}", flush=True)
+
+
+
+def _witness_sha256(path):
+    h = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _witness_sample_indices(count, limit, seed):
+    if count <= limit:
+        return np.arange(count)
+    return np.sort(np.random.default_rng(seed).choice(count, limit, replace=False))
+
+
+def _witness_identity_rows(ids):
+    ids = np.asarray(ids)
+    if ids.ndim != 2 or ids.shape[1] != 2 or ids.dtype.kind not in "ui":
+        raise ValueError("Expected two-column integer event IDs")
+    ids = np.ascontiguousarray(ids, dtype=np.uint64)
+    return ids.view(np.dtype([("source", "<u8"), ("entry", "<u8")])).reshape(-1)
+
+
+def witness_population_mask(data, report, record, mode):
+    directory = data if (data / "inputs.json").is_file() else data / report["scenario"]
+    inputs = report["contract"]["inputs"]
+    path = directory / "event_ids.npz"
+    if _witness_sha256(path) != inputs.get("event_ids_sha256"):
+        raise ValueError("Prepared event IDs differ from the saved result; supply its original --data directory")
+    with np.load(path, allow_pickle=False) as archive:
+        primary = archive["innerdata_test.npy"]
+        extra_bg = archive["innerdata_extrabkg_test.npy"]
+        extra_signal = archive["innerdata_extrasig.npy"]
+    expected = np.concatenate((primary, extra_bg, extra_signal))
+    if not np.array_equal(expected, record.get("event_ids")):
+        raise ValueError("SR scores do not match the prepared evaluation event IDs and order")
+    chosen = primary if mode == "primary" else np.concatenate((primary, extra_bg)) if mode == "injected" else expected
+    return np.isin(_witness_identity_rows(expected), _witness_identity_rows(chosen)), directory
+
+
+def _witness_model_fields(model, inputs, qscore, device, batch_size):
+    import torch
+    from riddle.stein import _split_inputs
+
+    results = {"potential": [], "direction": [], "operator": []}
+    model.eval().requires_grad_(False)
+    with torch.enable_grad():
+        for start in range(0, len(inputs), batch_size):
+            chunk = torch.as_tensor(inputs[start:start + batch_size], dtype=torch.float32, device=device)
+            latent, context = _split_inputs(chunk, model.mass_conditioning)
+            z = latent.detach().requires_grad_(True)
+            u = model(z, context)
+            grad = torch.autograd.grad(u.sum(), z, create_graph=True)[0]
+            laplacian = torch.zeros_like(u)
+            for j in range(z.shape[1]):
+                if grad[:, j].requires_grad:
+                    second = torch.autograd.grad(grad[:, j].sum(), z, retain_graph=True, allow_unused=True)[0]
+                    if second is not None:
+                        laplacian = laplacian + second[:, j]
+            q = torch.as_tensor(qscore[start:start + batch_size], dtype=z.dtype, device=device)
+            operator = laplacian + (grad * q).sum(dim=1)
+            for key, tensor in (("potential", -u), ("direction", -grad), ("operator", operator)):
+                value = tensor.detach().cpu().numpy().astype(np.float64)
+                if not np.isfinite(value).all():
+                    raise FloatingPointError(f"Nonfinite witness {key}")
+                results[key].append(value)
+    return {k: np.concatenate(v) for k, v in results.items()}
+
+
+def evaluate_saved_witness(root, report, args):
+    import torch
+    from riddle.production import require_complete_ensemble
+    from riddle.stein import PROTOCOL, _background_score_array, _checkpoint_weights, build_potential
+    from riddle.stein_scoring import _background_identity, _load_background, _load_checkpoint, _load_reference_b
+
+    selection = read_metadata(root, report, "density/ensemble_selection.json")
+    require_complete_ensemble(selection)
+    members = selection["members"]
+    if not members:
+        raise ValueError("The saved ensemble contains no selected fits")
+    paths = ["density/stein_scoring_reference.json", "density/stein_scoring_reference.npz"]
+    descriptions = []
+    for member in members:
+        prefix = "density/" + member["directory"] + "/"
+        inputs = read_metadata(root, report, prefix + "residual_training_inputs.json")
+        if inputs.get("core") != "stein_witness" or inputs.get("stein_protocol") != PROTOCOL:
+            raise ValueError("This diagnostic requires the saved Stein-witness core")
+        paths.extend([prefix + "residual_selection.json"])
+        paths.extend(prefix + f"residual_epoch_{int(epoch)}.pt" for epoch in member["epochs"])
+        if inputs.get("background_correction") is not None:
+            paths.append(prefix + "background_correction.pt")
+        descriptions.append(inputs)
+    _witness_field_progress(f"Verify {len(paths)} witness artifacts; workers={args.io_workers}", args)
+    with ThreadPoolExecutor(max_workers=args.io_workers) as pool:
+        list(pool.map(lambda name: verify_plot_input(root, report, name), paths))
+    reference, reference_metadata = _load_reference_b(root / "density")
+    indices = _witness_sample_indices(len(reference), args.field_events, int(report["seed"]) + 10501)
+    points = reference[indices]
+    total = sum(len(m["epochs"]) for m in members)
+    _witness_field_progress(f"{len(points)} full-dimensional reference events; {total} checkpoints; {args.device}", args)
+    fields, qcache, identities, count = {}, {}, [], 0
+    started = time.monotonic()
+    for member, inputs in zip(members, descriptions):
+        if inputs["features"] != points.shape[1]:
+            raise ValueError("Saved reference and potential feature dimensions disagree")
+        directory = root / "density" / member["directory"]
+        identity = _background_identity(inputs)
+        identities.append(identity)
+        if identity not in qcache:
+            background = _load_background(directory, inputs, args.device)
+            qcache[identity] = _background_score_array(
+                points, background, args.device,
+                mass_conditioning=inputs["settings"].get("mass_conditioning", False), batch_size=args.batch_size,
+            )
+        if identity != reference_metadata["background_model_hash"]:
+            raise ValueError("Saved reference B was generated with a different background")
+        model = build_potential(args.device, inputs["features"], inputs["settings"], initialization="random")
+        epochs = [int(e) for e in member["epochs"]]
+        weights = _checkpoint_weights(directory, epochs)
+        for epoch, weight in zip(epochs, weights):
+            _load_checkpoint(directory, model, epoch, args.device)
+            values = _witness_model_fields(model, points, qcache[identity], args.device, args.batch_size)
+            for key, value in values.items():
+                if key not in fields:
+                    fields[key] = np.zeros_like(value)
+                fields[key] += value * float(weight) / len(members)
+            count += 1
+        _witness_field_progress(f"{count}/{total} checkpoints; elapsed {time.monotonic() - started:.1f}s", args)
+        del model
+    mass_conditioning = bool(descriptions[0]["settings"].get("mass_conditioning", False))
+    dimensions = points.shape[1] - int(mass_conditioning)
+    fields.update(points=points[:, :dimensions], reference_indices=indices)
+    metadata = {
+        "fits": [{"fit_index": m["fit_index"], "directory": m["directory"], "epochs": m["epochs"],
+                  "checkpoint_weights": _checkpoint_weights(root / "density" / m["directory"], m["epochs"]).tolist()}
+                 for m in members],
+        "fit_weighting": "equal across the frozen selected fits",
+        "reference_B_sha256": reference_metadata["reference_B_sha256"],
+        "background_identities": sorted(set(identities)), "reference_events_used": len(points),
+        "full_reference_events": len(reference), "dimensions": dimensions,
+        "field": "conditional binned means over the saved full-dimensional background reference B",
+        "direction": "conditional mean of -gradient_z u; direction preserved, arrow lengths compressed",
+        "operator": "full-dimensional laplacian_z u + gradient_z u dot gradient_z log q(z|m)",
+        "selection": "frozen final saved ensemble scores; the raw potential field is not the final PEW score",
+        "field_truth_labels_used": False, "background_reference_is_independent_closure_test": False,
+        "elapsed_seconds": time.monotonic() - started,
+    }
+    return fields, metadata
+
+
+def project_witness_fields(fields, pair, args):
+    xy = fields["points"][:, pair]
+    lo, hi = np.quantile(xy, [0.005, 0.995], axis=0)
+    pad = np.maximum((hi - lo) * 0.04, 0.05)
+    xedges = np.linspace(lo[0] - pad[0], hi[0] + pad[0], args.grid_size + 1)
+    yedges = np.linspace(lo[1] - pad[1], hi[1] + pad[1], args.grid_size + 1)
+    counts = np.histogram2d(*xy.T, bins=(xedges, yedges))[0].T
+    density = gaussian_filter(counts, args.smoothing, mode="constant")
+    supported = (density >= args.min_cell_events) & (gaussian_filter((counts > 0).astype(float), args.smoothing) > 0.25)
+    if supported.sum() < 16:
+        raise ValueError("Too few supported projection cells; increase --field-events or reduce --grid-size")
+
+    def average(values):
+        total = np.histogram2d(*xy.T, bins=(xedges, yedges), weights=values)[0].T
+        result = gaussian_filter(total, args.smoothing, mode="constant") / np.maximum(density, 1e-30)
+        return np.ma.array(result, mask=~supported)
+
+    return {
+        "x": (xedges[1:] + xedges[:-1]) / 2, "y": (yedges[1:] + yedges[:-1]) / 2,
+        "xedges": xedges, "yedges": yedges, "density": density, "supported": supported,
+        "potential": average(fields["potential"]), "operator": average(fields["operator"]),
+        "dx": average(fields["direction"][:, pair[0]]), "dy": average(fields["direction"][:, pair[1]]),
+    }
+
+
+def _witness_latent_axes(ax, grid, pair):
+    ax.set(xlim=(grid["xedges"][0], grid["xedges"][-1]),
+           ylim=(grid["yedges"][0], grid["yedges"][-1]),
+           xlabel=rf"Latent coordinate $z_{{{pair[0] + 1}}}$",
+           ylabel=rf"Latent coordinate $z_{{{pair[1] + 1}}}$")
+    ax.set_aspect("equal", adjustable="box")
+
+
+def _witness_heat(ax, grid, response=False):
+    values = grid["operator"] if response else grid["potential"]
+    if response:
+        limit = max(float(np.quantile(np.abs(values.compressed()), 0.98)), 1e-10)
+        kwargs = {"norm": TwoSlopeNorm(vmin=-limit, vcenter=0, vmax=limit), "cmap": _WITNESS_RESPONSE}
+    else:
+        low, high = np.quantile(values.compressed(), [0.01, 0.99])
+        kwargs = {"vmin": float(low), "vmax": float(max(high, low + 1e-10)), "cmap": _WITNESS_EXCESS}
+    image = ax.imshow(values, origin="lower", interpolation="bilinear",
+        extent=(grid["xedges"][0], grid["xedges"][-1], grid["yedges"][0], grid["yedges"][-1]), **kwargs)
+    levels = np.unique(np.quantile(grid["density"][grid["supported"]], [0.3, 0.55, 0.8, 0.95]))
+    if len(levels) > 1:
+        ax.contour(grid["x"], grid["y"], grid["density"], levels=levels,
+                   colors="#608898", alpha=0.55, linewidths=0.65)
+    return image
+
+
+def _witness_direction(ax, grid, stream=False):
+    norm = np.ma.sqrt(grid["dx"] ** 2 + grid["dy"] ** 2)
+    typical = max(float(np.median(norm.compressed())), 1e-12)
+    span = min(np.ptp(grid["x"]), np.ptp(grid["y"]))
+    dx = grid["dx"] / (typical + norm) * span * 0.055
+    dy = grid["dy"] / (typical + norm) * span * 0.055
+    if stream:
+        ax.streamplot(grid["x"], grid["y"], dx, dy, color="#264b5a", density=1.15,
+                      linewidth=0.8, arrowsize=1.0, minlength=0.07, maxlength=3.0)
+    else:
+        stride = max(1, len(grid["x"]) // 22)
+        x, y = np.meshgrid(grid["x"], grid["y"])
+        s = (slice(None, None, stride), slice(None, None, stride))
+        ax.quiver(x[s], y[s], dx[s], dy[s], color="#193d50", angles="xy",
+                  scale_units="xy", scale=1, width=0.003, headwidth=3.8, headlength=4.5)
+
+
+def _witness_cloud(ax, record, population, pair, seed, *, signal=False, background=True, selection=None, cut=None):
+    accepted = np.flatnonzero(record["mask"])
+    if background:
+        use = np.flatnonzero(population[accepted] & (record["labels"][accepted] == 0))
+        selected = _witness_sample_indices(len(use), 3500, seed)
+        xy = record["latent"][use[selected]][:, pair]
+        ax.scatter(*xy.T, s=1.5, c="#1f4857", alpha=0.10, edgecolors="none", rasterized=True)
+    if signal:
+        selected_mask = np.ones(len(population), bool) if selection is None else np.asarray(selection) > 0
+        if selected_mask.shape != population.shape:
+            raise ValueError("Signal overlay selection is misaligned")
+        use = np.flatnonzero(population[accepted] & selected_mask[accepted] & (record["labels"][accepted] == 1))
+        selected = _witness_sample_indices(len(use), 1200, seed + 1)
+        xy = record["latent"][use[selected]][:, pair]
+        if len(xy):
+            label = "Signal Events" if cut is None else rf"Signal Events ($\epsilon_B={cut * 100:g}\%$)"
+            ax.scatter(*xy.T, s=10, marker="x", linewidths=0.65, color="black",
+                       path_effects=[path_effects.withStroke(linewidth=1.4, foreground="white")],
+                       label=label, rasterized=True, zorder=5)
+
+
+def parse_witness_pairs(values, dimensions):
+    import itertools
+
+    try:
+        pairs = (list(itertools.combinations(range(dimensions), 2)) if values == ["all"]
+                 else [tuple(int(n) - 1 for n in value.split(":")) for value in values])
+    except ValueError as error:
+        raise ValueError("Latent pairs must be one-based pairs such as 1:2, or all") from error
+    if any(len(pair) != 2 or pair[0] == pair[1] or min(pair) < 0 or max(pair) >= dimensions for pair in pairs):
+        raise ValueError("Requested latent pair is invalid")
+    return list(dict.fromkeys(pairs))
+
+
+def witness_signal_selections(record, full=None):
+    from .mass_spectrum import match_ids
+
+    if full is not None:
+        sr = np.asarray(full["is_signal_region"], bool)
+        indices = match_ids(record["event_ids"], full["event_ids"][sr])
+        if (not np.array_equal(record["mass"][indices], full["mass"][sr])
+                or not np.array_equal(record["labels"][indices], full["labels"][sr])):
+            raise ValueError("Frozen signal overlays differ from the full-mass primary SR population")
+        selections = {}
+        for i, cut in enumerate(WITNESS_CUTS):
+            selections[cut] = np.zeros(len(record["labels"]), float)
+            selections[cut][indices] = full["cut_masks"][i, sr]
+        return selections
+    selections = {}
+    for cut in WITNESS_CUTS:
+        selected = exact_background_selection(record, cut)
+        if selected is None or selected["weights"].shape[0] != 1:
+            raise ValueError(f"Cannot form the saved ensemble's {100 * cut:g}% BG working point")
+        selections[cut] = selected["weights"][0]
+    return selections
+
+
+def plot_witness_projections(grid, pair, record, population, output, args, *, selections=None, save_figure=None, legend_factory=None):
+    if legend_factory is None:
+        from paper_plot import inside_legend
+
+        legend_factory = inside_legend
+
+    tag = f"z{pair[0] + 1}_z{pair[1] + 1}"
+    versions = [("01_witness_landscape", False, False, False, None),
+                ("02_witness_flow", False, True, False, None),
+                ("03_stein_identity_response", True, False, False, None),
+                ("03_stein_identity_response_flow", True, True, False, None)]
+    if np.any(population & (np.asarray(record["labels"]) == 1) & np.asarray(record["mask"], bool)):
+        versions.append(("02_witness_flow_signal", False, True, True, None))
+        if selections is None:
+            selections = witness_signal_selections(record)
+        for cut in (None, *WITNESS_CUTS):
+            token = "" if cut is None else "_" + f"{cut * 100:g}pct".replace("0.5pct", "0p5pct")
+            versions.extend((("03_stein_identity_response_signal" + token, True, False, True, cut),
+                             ("03_stein_identity_response_flow_signal" + token, True, True, True, cut)))
+    output.mkdir(parents=True, exist_ok=True)
+    for name, response, stream, signal, cut in versions:
+        fig, ax = f.plt.subplots(figsize=(5.8, 5.1), layout="compressed")
+        image = _witness_heat(ax, grid, response)
+        if name == "01_witness_landscape":
+            _witness_cloud(ax, record, population, pair, args.sampling_seed)
+        if signal:
+            _witness_cloud(ax, record, population, pair, args.sampling_seed, signal=True, background=False,
+                  selection=None if cut is None else selections[cut], cut=cut)
+        _witness_direction(ax, grid, stream)
+        _witness_latent_axes(ax, grid, pair)
+        cb = fig.colorbar(image, ax=ax, fraction=0.045, pad=0.025, shrink=0.9, extend="both")
+        cb.set_label(r"Projected Stein response $\langle \mathcal{A}_q u\rangle_q$" if response
+                     else r"Projected potential $\langle -u\rangle_q$")
+        cb.outline.set_linewidth(0.5)
+        legend = legend_factory(ax, allow_headroom=False) if signal else None
+        if save_figure is not None:
+            save_figure(fig, ax, output / f"{name}_{tag}", args.plot_formats, args.overwrite, legend)
+        else:
+            try:
+                for fmt in args.plot_formats:
+                    path = output / f"{name}_{tag}.{fmt}"
+                    if path.exists() and not args.overwrite:
+                        raise FileExistsError(f"Output exists: {path}")
+                    fig.savefig(path, dpi=args.dpi, bbox_inches="tight", pad_inches=0.035)
+            finally:
+                f.plt.close(fig)
+    return tag
 
 
 def main(argv=None):
