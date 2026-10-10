@@ -1,12 +1,15 @@
 from __future__ import annotations
 from collections import Counter, deque
 import hashlib
+import fcntl
 import json
 import os
 import queue
 import re
 import signal
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 from contextlib import ExitStack, contextmanager
@@ -191,11 +194,31 @@ def durable_progress_event(event):
     return completed > 0 and (completed % IO_PERSIST_EVERY == 0 or completed == total)
 
 
+def progress_line_events(line):
+    """Decode complete records, including adjacent records from older workers.
+
+    Do not split on the prefix: a message can itself contain that text. Broken
+    JSON still raises; this recovery is only for complete concatenated records.
+    """
+    decoder = json.JSONDecoder()
+    remaining = line.strip()
+    events = []
+    while remaining:
+        if not remaining.startswith(EVENT_PREFIX):
+            raise ValueError("Unexpected text after worker progress record")
+        event, end = decoder.raw_decode(remaining[len(EVENT_PREFIX):])
+        if not isinstance(event, dict):
+            raise ValueError("Worker progress record must be a JSON object")
+        events.append(event)
+        remaining = remaining[len(EVENT_PREFIX) + end:].lstrip()
+    return events
+
+
 def durable_progress_line(line):
     if not line.startswith(EVENT_PREFIX):
         return False
     try:
-        return durable_progress_event(json.loads(line[len(EVENT_PREFIX):]))
+        return any(durable_progress_event(event) for event in progress_line_events(line))
     except (TypeError, ValueError, json.JSONDecodeError):
         return False
 
@@ -248,10 +271,38 @@ def _emit_event(event, *, console=False):
     elif os.environ.get("RIDDLE_WORKER_PROGRESS") == "1":
         line = EVENT_PREFIX + json.dumps(event)
         with _OUTPUT_LOCK:
-            print(line, flush=True)
+            # Spawned workers have independent thread locks. They must share a
+            # process lock as well, including for records larger than PIPE_BUF.
+            with _worker_output_lock():
+                sys.stdout.write(line + "\n")
+                sys.stdout.flush()
     elif console:
         with _OUTPUT_LOCK:
             _CONSOLE_MESSAGES.event(event)
+
+
+@contextmanager
+def _worker_output_lock():
+    path = os.environ.get("RIDDLE_PROGRESS_LOCK")
+    if path is None:
+        yield
+        return
+    # Open independently in each process: inherited flock file descriptions
+    # would share lock ownership after fork and would not serialize writers.
+    with open(path, "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+@contextmanager
+def _progress_environment(env):
+    # Node-local scratch, not the shared results volume. Descendants inherit
+    # this path, and each monitored worker gets its own independent lock.
+    with tempfile.TemporaryDirectory(prefix="riddle-progress-") as directory:
+        yield {**env, "RIDDLE_PROGRESS_LOCK": str(Path(directory) / "output.lock")}
 
 
 class ProgressStage:
@@ -384,7 +435,8 @@ class WorkerDisplays:
 
     def line(self, line):
         if line.startswith(EVENT_PREFIX):
-            self.event(json.loads(line[len(EVENT_PREFIX):]))
+            for event in progress_line_events(line):
+                self.event(event)
         else:
             self.displays[None].line(line)
 
@@ -536,7 +588,8 @@ class WorkerDisplay:
     def line(self, line):
         text = line.rstrip("\r\n")
         if text.startswith(EVENT_PREFIX):
-            self.event(json.loads(text[len(EVENT_PREFIX) :]))
+            for event in progress_line_events(text):
+                self.event(event)
             return
         warning = "[WARNING] resume: "
         if text.startswith(warning):
@@ -573,10 +626,11 @@ def monitor_worker(command, env, log, label, *, resume=False, cancel_event=None)
     messages = queue.Queue()
     recent_output = deque(maxlen=30)
     with (
+        _progress_environment(env) as worker_env,
         log.open("a" if resume else "w") as raw_stream,
         subprocess.Popen(
             command,
-            env=env,
+            env=worker_env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
