@@ -589,7 +589,8 @@ def finish(args, contract, *, acceleration,
         }
         write_json(output / "density/selected_scoring_calibration.json", stein_scoring)
     support_enabled = bool(scoring_cfg["support_guard"]["enabled"]) if scoring_cfg is not None else False
-    support_text = " with q-reference-B latent-radius support guard" if support_enabled else ""
+    support_statistic = scoring_cfg["support_guard"]["statistic"] if support_enabled else "disabled"
+    support_text = f" with q-reference-B {support_statistic} support guard" if support_enabled else ""
     write_json(
         output / "protocol.json",
         {
@@ -649,13 +650,13 @@ def finish(args, contract, *, acceleration,
                       "log p_signal(z|mjj) ensemble - log q_phi(z|mjj)" if background_correction is not None else
                       "logit conditional background percentile" if active["score_flow"] else "log mean residual/background density ratio"),
             "raw_score": ((f"Stein {scoring_cfg['mode']} ensemble score"
-                           f"{' after q-reference-B latent-radius support correction' if support_enabled else ''} before final calibration")
+                           f"{' after q-reference-B ' + support_statistic + ' support correction' if support_enabled else ''} before final calibration")
                           if core == "stein_witness" else
                           "log p_signal(z|mjj) ensemble - log q_phi(z|mjj)" if background_correction is not None else
                           "log mean residual/background density ratio"),
             **({
                 "unguarded_ensemble_score": f"arithmetic mean of selected per-fit {scoring_cfg['mode']} Stein scores before support correction",
-                "support_guard": ("q-reference-B latent Euclidean radius excluding mass; label-free and truth-blind"
+                "support_guard": (f"q-reference-B {support_statistic} excluding mass; label-free and truth-blind"
                                   if support_enabled else "disabled"),
             } if core == "stein_witness" else {}),
             "background_correction": (None if background_correction is None else {
@@ -723,11 +724,11 @@ def finish(args, contract, *, acceleration,
                               if args.method == "iad" else
                               "p: mapped pure-signal SR reference; q: mapped pure-background SR reference")
                              + " with mjj context for conditional q-normalization"
-                             + (", q-reference-B latent-radius support calibration" if support_enabled else "")
+                             + (f", q-reference-B {support_statistic} support calibration" if support_enabled else "")
                              + ", and final conditional calibration")
                             if oracle_method and core == "stein_witness" else
                             ("SR mapped latents with mjj context for conditional q-normalization"
-                             + (", q-reference-B latent-radius support calibration" if support_enabled else "")
+                             + (f", q-reference-B {support_statistic} support calibration" if support_enabled else "")
                              + ", and final conditional calibration; no truth labels")
                             if core == "stein_witness" else
                             "SR latents plus mass context (mjj - 3.5 TeV) / 0.2 TeV; no truth labels"),

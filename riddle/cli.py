@@ -112,6 +112,11 @@ def parser():
         run.add_argument("--mps", choices=["auto", "on", "off"], default="auto")
         run.add_argument("--score-sidebands-only", action="store_true",
                          help="Backfill frozen SR + sideband exports from completed native results without training")
+        rescoring = run.add_mutually_exclusive_group()
+        rescoring.add_argument("--rescore", action="store_true",
+                               help="Re-score completed RIDDLE models in --output without training")
+        rescoring.add_argument("--rescore-from", type=Path,
+                               help="Re-score frozen RIDDLE models without training; matching source/output roots update in place")
         run.add_argument("--sideband-scoring", action=argparse.BooleanOptionalAction, default=True,
                          help="Export frozen held-out sideband scores after SR scoring (default: enabled)")
         run.add_argument("--sideband-reference-events", type=positive, default=65536,
@@ -172,10 +177,30 @@ def campaign_runs(args):
     return requests
 
 
+def configure_rescoring(args):
+    in_place = getattr(args, "rescore", False)
+    source = getattr(args, "rescore_from", None)
+    if not in_place and source is None:
+        return
+    if in_place and source is not None:
+        raise ValueError("--rescore and --rescore-from are mutually exclusive")
+    option = "--rescore" if in_place else "--rescore-from"
+    if args.methods != ["riddle"] or args.command != "run" or getattr(args, "score_sidebands_only", False):
+        raise ValueError(f"{option} requires run mode, --methods riddle and no --score-sidebands-only")
+    source = Path(args.output if in_place else source).resolve()
+    destination = Path(args.output).resolve()
+    if destination != source and (destination.is_relative_to(source) or source.is_relative_to(destination)):
+        raise ValueError("Re-scoring roots must match or be separate and nonoverlapping")
+    args.rescore_from = source
+    args.rescore = False
+    args.resume = True
+
+
 def run_campaign(args, *, cancel_event=None):
     from .storage import configure_verification
 
     configure_verification(getattr(args, "verify_workers", 8))
+    configure_rescoring(args)
     resume_policy(args)
     if len(args.methods) != len(set(args.methods)) or len(args.scenarios) != len(set(args.scenarios)):
         raise ValueError("Duplicate methods/scenarios")
@@ -183,6 +208,7 @@ def run_campaign(args, *, cancel_event=None):
     if cancel_event is not None and cancel_event.is_set():
         raise RuntimeError("Background preparation cancelled")
     if (getattr(args, "scan_bg_workers", 1) > 1 and not getattr(args, "score_sidebands_only", False)
+            and not getattr(args, "rescore_from", None)
             and not getattr(args, "background_phase", None)
             and getattr(args, "command", "run") != "scan"):
         from .background_stage import run_seed_backgrounds
@@ -277,6 +303,7 @@ def run_campaign(args, *, cancel_event=None):
                 "campaign_seed": base_seed,
                 "run_index": run_index,
                 "independent_run_count": run_overrides["runs"] or 1,
+                "rescore_output_locked": bool(getattr(args, "rescore_from", None)),
             }
             if method == "lacathode":
                 options.update(run_overrides)
@@ -285,6 +312,8 @@ def run_campaign(args, *, cancel_event=None):
             elif method in ("iad", "supervised"):
                 options["runs"] = args.fits
             env = os.environ.copy()
+            if getattr(args, "rescore_from", None):
+                env["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
             manifest = manifests[scenario]
             injection = (manifest.get("injection_scan") or {}).get(
                 "signal_events", manifest.get("preparation", {}).get("injected_signal_rows", "nominal"))
@@ -374,6 +403,7 @@ def main(argv=None):
     configure_verification(getattr(args, "verify_workers", 8))
     if args.command in ("run", "scan"):
         try:
+            configure_rescoring(args)
             resume_policy(args)
         except ValueError as error:
             p.error(str(error))

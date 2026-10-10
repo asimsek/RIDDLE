@@ -143,7 +143,7 @@ def residual_limits(summaries):
 def spectrum_style(ax):
     import matplotlib as mpl
 
-    scale = ax.figure.get_figwidth() / (8.6 / 2.54)
+    scale = 0.8 * ax.figure.get_figwidth() / (8.6 / 2.54)
     ax.xaxis.label.set_fontsize(mpl.rcParams["axes.labelsize"] * scale)
     ax.yaxis.label.set_fontsize(mpl.rcParams["axes.labelsize"] * scale)
     ax.tick_params(axis="x", labelsize=mpl.rcParams["xtick.labelsize"] * scale)
@@ -189,7 +189,7 @@ def mass_legend(ax, title=None):
     legend = ax.legend([handles[i] for i in order], [labels[i] for i in order],
                        loc="upper right", title=title, frameon=True, framealpha=0.93,
                        borderpad=0.42, labelspacing=0.32, handlelength=1.9, ncol=1,
-                       fontsize=mpl.rcParams["legend.fontsize"] * ax.figure.get_figwidth() / (8.6 / 2.54),
+                       fontsize=0.8 * mpl.rcParams["legend.fontsize"] * ax.figure.get_figwidth() / (8.6 / 2.54),
                        borderaxespad=0.5)
     for _ in range(20):
         ax.figure.canvas.draw()
@@ -252,8 +252,9 @@ def spectrum_cuts_figure(summaries, edges, units, bounds=(3.3, 3.7)):
     import matplotlib.pyplot as plt
 
     width = 17.6 / 2.54
-    fig, ax = plt.subplots(figsize=(width, width * 0.78))
-    fig.subplots_adjust(left=0.14, right=0.97, bottom=0.14, top=0.96)
+    fig, (ax, residual_ax) = plt.subplots(2, 1, figsize=(width, width * 0.8), sharex=True,
+        gridspec_kw={"height_ratios": [3, 1], "hspace": 0.06})
+    fig.subplots_adjust(left=0.14, right=0.97, bottom=0.13, top=0.96)
     bin_width = np.diff(edges)
     centers = (edges[1:] + edges[:-1]) / 2
     colors = ("#627887", "#276a87", "#71b6c1", "#ed9a56", "#c64732")
@@ -268,8 +269,19 @@ def spectrum_cuts_figure(summaries, edges, units, bounds=(3.3, 3.7)):
         ax.errorbar(centers[positive], (values / bin_width)[positive], xerr=bin_width[positive] / 2,
                     fmt="o", ls="none", color=color, markersize=3.2, elinewidth=0.7,
                     label=label, zorder=3)
+        residual, valid = spectrum_residual(summary)
+        residual_ax.errorbar(centers[valid], residual[valid], xerr=bin_width[valid] / 2,
+                             fmt="o", ls="none", color=color, markersize=3.0,
+                             elinewidth=0.7, zorder=3)
+    ax.plot([], [], color="black", ls="--", lw=1.0, label="Background")
     signal_region_lines(ax, bounds)
-    ax.set(xlabel="Dijet Mass [TeV]", ylabel=mass_ylabel(units), yscale="log",
+    ax.set(ylabel=mass_ylabel(units), yscale="log",
            xlim=(edges[0], edges[-1]))
-    spectrum_style(ax)
+    signal_region_lines(residual_ax, bounds)
+    residual_ax.axhline(0, color="black", lw=0.6, zorder=1)
+    residual_ax.set(xlabel="Dijet Mass [TeV]",
+                    ylabel=r"$\frac{\mathrm{Data}-\mathrm{Background}}{\sigma_{\mathrm{Data}}}$",
+                    ylim=residual_limits(summaries))
+    for axis in (ax, residual_ax):
+        spectrum_style(axis)
     return fig, ax

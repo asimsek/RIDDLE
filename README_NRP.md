@@ -31,16 +31,10 @@ If `riddle-shared` already exists, stop and inspect it before proceeding; these 
 
 ### JupterHub Setup (on your local terminal)
 
-Download the pod definition:
+Start Jupyter:
 
 ```bash
-curl -fSL https://raw.githubusercontent.com/asimsek/RIDDLE/main/config/nrp/jupyter.yaml -o riddle-jupyter.yaml
-```
-
-Then start Jupyter:
-
-```bash
-kubectl apply -n cua-asimsek -f riddle-jupyter.yaml
+kubectl apply -n cua-asimsek -f https://raw.githubusercontent.com/asimsek/RIDDLE/main/config/nrp/jupyter.yaml
 kubectl get pod riddle-jupyter -n cua-asimsek -o wide
 kubectl logs -n cua-asimsek riddle-jupyter -c jupyter
 ```

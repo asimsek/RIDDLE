@@ -116,6 +116,20 @@ def job(args):
         if any(method not in ("riddle", "iad", "supervised") for method in args.methods):
             raise ValueError("--score-sidebands-only supports RIDDLE, IAD and Supervised")
         command.append("--score-sidebands-only")
+    if getattr(args, "rescore", False) or getattr(args, "rescore_from", None):
+        option = "--rescore" if getattr(args, "rescore", False) else "--rescore-from"
+        if getattr(args, "rescore", False) and getattr(args, "rescore_from", None):
+            raise ValueError("--rescore and --rescore-from are mutually exclusive")
+        if args.methods != ["riddle"] or getattr(args, "workflow", "run") != "run" or getattr(args, "score_sidebands_only", False):
+            raise ValueError(f"{option} requires run mode, --methods riddle and no --score-sidebands-only")
+        if getattr(args, "rescore", False):
+            command.append("--rescore")
+        else:
+            source = Path(os.path.normpath(os.path.join("/shared/work/RIDDLE", str(args.rescore_from))))
+            destination = Path(os.path.normpath(os.path.join("/shared/work/RIDDLE", str(args.results or "results"))))
+            if source != destination and (source.is_relative_to(destination) or destination.is_relative_to(source)):
+                raise ValueError("--rescore-from and --results must match or be separate and nonoverlapping")
+            command.extend(["--rescore-from", str(args.rescore_from)])
     if not getattr(args, "sideband_scoring", True):
         command.append("--no-sideband-scoring")
     command.extend(["--sideband-reference-events", str(getattr(args, "sideband_reference_events", 65536))])
@@ -346,6 +360,10 @@ def main(argv=None):
                    help="CUDA MPS policy forwarded to the training framework")
     p.add_argument("--score-sidebands-only", action="store_true",
                    help="Backfill frozen sideband scores from completed native results without training")
+    rescoring = p.add_mutually_exclusive_group()
+    rescoring.add_argument("--rescore", action="store_true",
+                           help="Re-score completed RIDDLE models in --results without training")
+    rescoring.add_argument("--rescore-from", help="Re-score frozen RIDDLE models without training; matching source/results roots update in place")
     p.add_argument("--sideband-scoring", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--sideband-reference-events", type=positive, default=65536)
     p.add_argument("--verbose", type=int, choices=(0, 1, 2), default=1,

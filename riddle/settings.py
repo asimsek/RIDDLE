@@ -92,6 +92,8 @@ def validate_residual(value):
                 "bootstrap_replicas": 4000,
                 "min_tail_events": 50,
                 "seed": 75501,
+                "background_control": False,
+                "require_all_working_points": False,
             },
             "support_guard": {
                 "enabled": True,
@@ -250,8 +252,8 @@ def validate_residual(value):
         raise ValueError("Invalid Stein support guard settings")
     if type(support_guard["enabled"]) is not bool:
         raise ValueError("stein.scoring.support_guard.enabled must be boolean")
-    if support_guard["statistic"] != "radius":
-        raise ValueError("stein.scoring.support_guard.statistic must be radius")
+    if support_guard["statistic"] not in ("radius", "radius_and_qscore"):
+        raise ValueError("stein.scoring.support_guard.statistic must be radius or radius_and_qscore")
     integer(support_guard["mass_bins"], "stein.scoring.support_guard.mass_bins", 1)
     number(support_guard["gate_quantile"], "stein.scoring.support_guard.gate_quantile", maximum=1)
     number(support_guard["weight"], "stein.scoring.support_guard.weight", strict=False)
@@ -259,6 +261,10 @@ def validate_residual(value):
     if support_guard["enabled"] and scoring["mode"] not in ("tail_focus", "potential_qnorm"):
         raise ValueError("stein.scoring.support_guard.enabled requires tail_focus or potential_qnorm")
     auto = scoring["auto_switch"]
+    if type(auto["background_control"]) is not bool:
+        raise ValueError("auto-switch background_control must be boolean")
+    if type(auto["require_all_working_points"]) is not bool:
+        raise ValueError("auto-switch require_all_working_points must be boolean")
     if (not isinstance(auto["enabled"], dict) or set(auto["enabled"]) != {"riddle", "iad", "supervised"}
             or any(type(v) is not bool for v in auto["enabled"].values())):
         raise ValueError("Auto-switch requires independent boolean riddle/iad/supervised switches")

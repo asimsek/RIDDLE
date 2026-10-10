@@ -317,6 +317,10 @@ def white_log_density_mesh(ax, xedges, yedges, histogram, colorbar_label):
 
 def cleanup_legacy_summary_folders(output):
     output = Path(output)
+    for variant in VARIANT_ORDER:
+        for extension in ("csv", "json", "yaml"):
+            (variant_output(output, variant) / "07_tables" /
+             f"table_05_{variant}_signal_injection_score_stages.{extension}").unlink(missing_ok=True)
     root = output / "01_comparison" / "Signal-Injected"
     for name in ("Signal-region", "Full-region", "Dataset-Variant-Summary"):
         path = root / name
@@ -657,6 +661,20 @@ def plot_dijet_spectra(groups, args, output, *, scan=False):
         record = load_full_mass(derived_root, report, workers=1)
         if record is None and derived_root != root:
             record = load_full_mass(root, report, workers=1)
+            derived_root = root
+        if record is not None and not scan and identity[0] == "background_only":
+            with np.load(derived_root / "full_mass/reference_D.npz", allow_pickle=False) as archive:
+                scores = np.asarray(archive["scores"], float)
+                threshold = np.asarray(archive["threshold_indices"])
+                assessment = np.asarray(archive["assessment_indices"])
+            indices = np.r_[threshold, assessment]
+            if (scores.ndim != 1 or not np.isfinite(scores).all()
+                    or threshold.ndim != 1 or assessment.ndim != 1
+                    or not np.issubdtype(indices.dtype, np.integer)
+                    or not np.array_equal(np.sort(indices), np.arange(len(scores)))
+                    or min(len(threshold), len(assessment)) < 1024):
+                raise ValueError("Invalid independent background assessment split")
+            record["background_count_reference"] = (scores[threshold], scores[assessment])
         return identity, method, record
 
     loaded = parallel_plot_tasks(load, tasks, args.io_workers, "SPECTRA LOAD", args.verbose)
@@ -719,6 +737,96 @@ def plot_dijet_spectra(groups, args, output, *, scan=False):
             stem = "dijet_mass_uncut" if cut is None else f"dijet_mass_{cut * 100:g}pct".replace("0.5pct", "0p5pct")
             save_figure(fig, ax, destination / stem, args.plot_formats, args.overwrite,
                         {"spectrum_legend": {}})
+        if scenario == "background_only":
+            plot_background_count_closure(method, records, args, output)
+
+
+def background_count_curve(record):
+    from riddle.full_mass import REFERENCE_SEEDS, tie_uniform
+    from riddle.mass_spectrum import mixture_errors
+
+    threshold_reference, sample = record["background_count_reference"]
+    use = np.asarray(record["is_signal_region"], bool) & np.asarray(record["mask"], bool) & (record["labels"] == 0)
+    data = np.asarray(record["scores"], float)[use]
+    if len(data) < 2:
+        return None
+    if not np.isfinite(data).all():
+        raise ValueError("Nonfinite held-out background scores")
+    ordered = np.sort(threshold_reference, kind="stable")
+    sample_ids = np.column_stack((np.full(len(sample), 2**64 - 1, dtype=np.uint64),
+                                  np.arange(len(sample), dtype=np.uint64)))
+    sample_ties = tie_uniform(sample_ids, REFERENCE_SEEDS["ties"])
+    data_ties = tie_uniform(record["event_ids"][use], REFERENCE_SEEDS["ties"])
+    counts = []
+    for alpha in np.geomspace(1 / len(ordered), 1, 250):
+        target = alpha * len(ordered)
+        threshold = ordered[-int(np.ceil(target))]
+        above = len(ordered) - np.searchsorted(ordered, threshold, side="right")
+        tied = np.searchsorted(ordered, threshold, side="right") - np.searchsorted(ordered, threshold, side="left")
+        probability = float(np.clip((target - above) / tied, 0, 1))
+        if alpha == 1:
+            threshold = -np.inf
+        selected_data = (data > threshold) | ((data == threshold) & (data_ties < probability))
+        selected_sample = (sample > threshold) | ((sample == threshold) & (sample_ties < probability))
+        if np.any(selected_data):
+            counts.append((int(selected_data.sum()), int(selected_sample.sum())))
+    counts = np.asarray(counts, float)
+    if not len(counts):
+        return None
+    data_counts, sample_counts = counts.T
+    normalization = len(data) / len(sample)
+    ratio = normalization * sample_counts / data_counts
+    sample_low, sample_high = mixture_errors(sample_counts, sample_counts)
+    data_low, data_high = mixture_errors(data_counts, data_counts)
+    low_error = np.hypot(normalization * sample_low / data_counts, ratio * data_high / data_counts)
+    high_error = np.hypot(normalization * sample_high / data_counts, ratio * data_low / data_counts)
+    return dict(data_counts=data_counts, sample_counts=sample_counts, ratio=ratio,
+                low=np.maximum(0, ratio - low_error), high=ratio + high_error,
+                data_population=len(data), sample_population=len(sample),
+                seed=int(record["manifest"]["identity"]["seed"]))
+
+
+def background_count_axes(ax, maximum):
+    ax.set(xscale="log", xlim=(1, max(2, maximum)), ylim=(0, 2),
+           xlabel="Number of data background events",
+           ylabel=r"$N_{\mathrm{bg}}^{\mathrm{Sample}} / N_{\mathrm{bg}}^{\mathrm{Data}}$")
+    for value, style in ((1.0, "-"), (0.9, "--"), (1.1, "--"), (0.8, ":"), (1.2, ":")):
+        ax.axhline(value, color="black", ls=style, lw=0.5, zorder=1)
+
+
+def plot_background_count_closure(method, records, args, output):
+    curves = parallel_plot_tasks(background_count_curve, records, args.io_workers, "BG COUNTS", args.verbose)
+    curves = [curve for curve in curves if curve is not None]
+    if not curves:
+        return
+    destination = output / "02_mass_sculpting" / METHOD_LABELS[method] / "BG-Only"
+    stem = "background_sample_to_data_vs_background_events"
+    color = METHOD_COLORS[method]
+    for curve in curves:
+        fig, ax = new_figure("", "")
+        ax.plot(curve["data_counts"], curve["ratio"], color=color, label=METHOD_LABELS[method])
+        ax.fill_between(curve["data_counts"], curve["low"], curve["high"], color=color, alpha=0.2, linewidth=0)
+        background_count_axes(ax, curve["data_population"])
+        legend = inside_legend(ax, allow_headroom=False)
+        save_figure(fig, ax, destination / f"seed_{curve['seed']:03d}" / stem,
+                    args.plot_formats, args.overwrite, legend)
+    maximum = max(curve["data_population"] for curve in curves)
+    grid = np.geomspace(1, maximum, 250)
+    values = []
+    for curve in curves:
+        x, indices, counts = np.unique(curve["data_counts"], return_index=True, return_counts=True)
+        ratio = np.add.reduceat(curve["ratio"], indices) / counts
+        interpolated = np.full_like(grid, np.nan)
+        inside = (grid >= x[0]) & (grid <= x[-1])
+        interpolated[inside] = np.interp(np.log(grid[inside]), np.log(x), ratio)
+        values.append(interpolated)
+    fig, ax = new_figure("", "")
+    draw_run_summary(ax, grid, values, label=METHOD_LABELS[method], color=color)
+    background_count_axes(ax, maximum)
+    legend = inside_legend(ax, allow_headroom=False)
+    save_figure(fig, ax, destination / stem, args.plot_formats, args.overwrite, legend)
+    say(f"[BG COUNTS] {METHOD_LABELS[method]}: independent assessment sample; "
+        "seed plots show count uncertainty; summary shows the seed range", args.verbose)
 
 
 def independent_records(record, seed):
@@ -853,10 +961,10 @@ def interpolate_curve(x, y, grid):
     x, y = x[good], y[good]
     if len(x) < 2:
         return np.full_like(grid, np.nan, dtype=float)
-    order = np.argsort(x)
+    order = np.argsort(x, kind="stable")
     x, y = x[order], y[order]
     unique, indices = np.unique(x, return_index=True)
-    values = y[indices]
+    values = np.maximum.reduceat(y, indices)
     result = np.full_like(grid, np.nan, dtype=float)
     inside = (grid >= unique.min()) & (grid <= unique.max())
     result[inside] = np.interp(np.log10(grid[inside]), np.log10(unique), values)
@@ -864,7 +972,7 @@ def interpolate_curve(x, y, grid):
 
 
 
-def run_summary(matrix):
+def run_summary(matrix, *, common_support=False):
     matrix = np.asarray(matrix, float)
     if matrix.ndim != 2 or not len(matrix):
         raise ValueError("Run summary requires a nonempty run-by-point matrix")
@@ -874,11 +982,15 @@ def run_summary(matrix):
                      out=np.full(matrix.shape[1], np.nan), where=counts > 0)
     low = np.where(counts >= 2, np.min(np.where(finite, matrix, np.inf), axis=0), np.nan)
     high = np.where(counts >= 2, np.max(np.where(finite, matrix, -np.inf), axis=0), np.nan)
+    if common_support:
+        mean[counts != len(matrix)] = np.nan
+        low[counts != len(matrix)] = np.nan
+        high[counts != len(matrix)] = np.nan
     return mean, low, high
 
 
-def draw_run_summary(ax, x, matrix, *, label, color, linestyle="-", **kwargs):
-    mean, low, high = run_summary(matrix)
+def draw_run_summary(ax, x, matrix, *, label, color, linestyle="-", common_support=False, **kwargs):
+    mean, low, high = run_summary(matrix, common_support=common_support)
     ax.plot(x, mean, label=label, color=color, ls=linestyle, **kwargs)
     band = np.isfinite(low) & np.isfinite(high)
     if band.any():
@@ -903,7 +1015,7 @@ def aggregate_metric_runs(run_rows, curve_kind):
         else:
             raise ValueError(curve_kind)
         curves.append(interpolate_curve(b, y, grid))
-    return grid, *run_summary(curves)
+    return grid, *run_summary(curves, common_support=True)
 
 
 def parallel_plot_tasks(function, tasks, workers, stage, verbose, describe=None):
@@ -913,7 +1025,7 @@ def parallel_plot_tasks(function, tasks, workers, stage, verbose, describe=None)
     completed = 0
     values = [None] * len(tasks)
     worker_count = min(workers, len(tasks))
-    compact_progress = stage in ("LOAD", "SCAN LOAD", "METRICS", "SCAN METRICS", "SCORE STAGES", "WITNESS FIELDS") and verbose == 1
+    compact_progress = stage in ("LOAD", "SCAN LOAD", "METRICS", "SCAN METRICS", "WITNESS FIELDS") and verbose == 1
     live = compact_progress and sys.stdout.isatty()
 
     def progress_status():
@@ -1153,18 +1265,18 @@ def plot_performance(cache, output, formats, overwrite, scenarios, variants, reg
                         good = np.isfinite(b) & np.isfinite(s) & (b > 0) & row["metrics"]["supported"]
                         if np.sum(good) < 2:
                             continue
-                        order = np.argsort(s[good])
+                        order = np.argsort(s[good], kind="stable")
                         sx = s[good][order]
                         rej = 1 / b[good][order]
                         unique, idx = np.unique(sx, return_index=True)
                         values = np.full_like(grid, np.nan, float)
                         inside = (grid >= unique.min()) & (grid <= unique.max())
-                        values[inside] = np.interp(grid[inside], unique, rej[idx])
+                        values[inside] = np.interp(grid[inside], unique, np.maximum.reduceat(rej, idx))
                         curves.append(values)
                     if not curves:
                         continue
                     draw_run_summary(ax, grid, curves, label=METHOD_LABELS.get(method, method),
-                                     color=METHOD_COLORS.get(method))
+                                     color=METHOD_COLORS.get(method), common_support=True)
                     drawn += 1
                 if drawn:
                     ax.set_xlim(0, 1)
@@ -1887,6 +1999,8 @@ def plot_stein(groups, records, output, formats, overwrite):
             add_y_headroom(ax, 0.18)
             legend = inside_legend(ax, title="Signal region · " + VARIANT_LABELS.get(variant, variant), borderaxespad=0.75)
             save_figure(fig, ax, base / stem, formats, overwrite, legend)
+        if scenario == "signal_injection":
+            continue
         guarded = raw
         pairs = [("support_radius_vs_support_penalty", radius, penalty, "Support radius", "Support penalty"), ("support_z_vs_support_penalty", zscore, penalty, r"Support $Z_r$", "Support penalty"), ("support_z_vs_guarded_raw_score", zscore, guarded, r"Support $Z_r$", "Guarded raw score"), ("guarded_raw_vs_final_score", guarded, final, "Guarded raw score", "Final anomaly score")]
         if len(quantities) > 5:
@@ -1943,6 +2057,7 @@ def plot_projected_witness(groups, records, args, output):
                                   batch_size=1024, device="cpu", io_workers=1,
                                   sampling_seed=int(report["seed"]) + 10502,
                                   plot_formats=args.plot_formats, overwrite=args.overwrite, dpi=600,
+                                  scenario=identity[0],
                                   verbose=args.verbose,
                                   label=f"{METHOD_LABELS[method]} s{identity[1]} {identity[0]} {identity[2]}")
         fields, metadata = evaluate_saved_witness(root, report, options)
@@ -2142,6 +2257,25 @@ def plot_acceptance(cache, output, formats, overwrite):
         legend = inside_legend(ax, title=REGION_LABELS[region] + " · " + VARIANT_LABELS.get(variant, variant))
         save_figure(fig, ax, figure_path(output, scenario, variant, region) / "mapping_acceptance", formats, overwrite, legend)
 
+def sic_at_signal_efficiency(metrics, signal_grid):
+    b = np.asarray(metrics["background_efficiency"], float)
+    s = np.asarray(metrics["signal_efficiency"], float)
+    good = np.isfinite(b) & np.isfinite(s) & (b > 0) & np.asarray(metrics["supported"], bool)
+    result = np.full_like(signal_grid, np.nan, dtype=float)
+    if np.sum(good) < 2:
+        return result
+    order = np.argsort(s[good], kind="stable")
+    sx = s[good][order]
+    sic = sx / np.sqrt(b[good][order])
+    unique, indices = np.unique(sx, return_index=True)
+    if len(unique) < 2:
+        return result
+    values = np.maximum.reduceat(sic, indices)
+    inside = (signal_grid >= unique[0]) & (signal_grid <= unique[-1])
+    result[inside] = np.interp(signal_grid[inside], unique, values)
+    return result
+
+
 def plot_variant_robustness(cache, output, formats, overwrite, regions):
     for region in regions:
         for target in ("shifted", "deltaR"):
@@ -2158,30 +2292,19 @@ def plot_variant_robustness(cache, output, formats, overwrite, regions):
                 seeds = sorted(set(default_rows) & set(target_rows))
                 ratios = []
                 for seed in seeds:
-                    curves = []
-                    for row in (default_rows[seed], target_rows[seed]):
-                        b = row["metrics"]["background_efficiency"]
-                        s = row["metrics"]["signal_efficiency"]
-                        good = np.isfinite(b) & np.isfinite(s) & (b > 0) & row["metrics"]["supported"]
-                        if np.sum(good) < 2:
-                            curves.append(np.full_like(signal_grid, np.nan))
-                            continue
-                        order = np.argsort(s[good])
-                        sx = s[good][order]
-                        sic = s[good][order] / np.sqrt(b[good][order])
-                        unique, idx = np.unique(sx, return_index=True)
-                        values = np.full_like(signal_grid, np.nan)
-                        inside = (signal_grid >= unique.min()) & (signal_grid <= unique.max())
-                        values[inside] = np.interp(signal_grid[inside], unique, sic[idx])
-                        curves.append(values)
-                    ratio = np.divide(curves[1], curves[0], out=np.full_like(signal_grid, np.nan), where=np.isfinite(curves[0]) & (curves[0] != 0))
+                    curves = [sic_at_signal_efficiency(row["metrics"], signal_grid)
+                              for row in (default_rows[seed], target_rows[seed])]
+                    ratio = np.divide(curves[1], curves[0], out=np.full_like(signal_grid, np.nan),
+                                      where=np.isfinite(curves[0]) & np.isfinite(curves[1]) & (curves[0] > 0))
                     ratios.append(ratio)
                 if ratios:
                     draw_run_summary(ax, signal_grid, ratios, label=METHOD_LABELS.get(method, method),
-                                     color=METHOD_COLORS.get(method))
+                                     color=METHOD_COLORS.get(method), common_support=True)
                     drawn += 1
             if drawn:
-                legend = inside_legend(ax, title=REGION_LABELS[region])
+                ax.set_xlim(signal_grid[-1], signal_grid[0])
+                ax.set_ylim(-1.0, 3.0)
+                legend = inside_legend(ax, title=REGION_LABELS[region], allow_headroom=False)
                 stem = f"sic_ratio_{target}_to_default_vs_signal_efficiency"
                 save_figure(fig, ax, output / "01_comparison" / "Signal-Injected" / safe_component(REGION_LABELS[region]) / stem, formats, overwrite, legend)
             else:
@@ -2229,208 +2352,6 @@ def performance_summary(metrics):
         row[name + " min"] = float(samples.min()) if len(samples) else None
         row[name + " max"] = float(samples.max()) if len(samples) else None
     return row
-
-
-def saved_score_stages(record, report):
-    settings = report.get("contract", {}).get("settings", {}).get("riddle", {})
-    if settings.get("core") != "stein_witness" or settings.get("enhancements", {}).get("score_flow", False):
-        return []
-    if record.get("plot_ensemble", {}).get("ensemble_rebuilt_for_plot", False):
-        return []
-    scoring = settings["stein"]["scoring"]
-    mode = str(np.asarray(record.get("selected_scoring_mode", scoring["mode"])).item())
-    guard = bool(scoring["support_guard"]["enabled"])
-    transform = scoring["final_transform"]
-    mask, labels = np.asarray(record["mask"]), np.asarray(record["labels"])
-    if mask.dtype != bool or mask.shape != labels.shape or not np.isin(labels, (0, 1)).all():
-        raise ValueError("Invalid score-stage evaluation population")
-    stages = []
-    for name, key, stage_mode, stage_guard, stage_transform in (
-            ("Frozen selection", "scores", mode, guard, transform),
-            ("Fixed PEW", "pew_scores", "tail_focus", guard, transform),
-            ("Fixed potential-qnorm", "potential_qnorm_scores", "potential_qnorm", guard, transform),
-            ("Without final calibration", "raw_scores", mode, guard, "identity")):
-        if key not in record:
-            continue
-        values = np.asarray(record[key])
-        if values.shape != labels.shape or not np.isfinite(values[mask]).all():
-            raise ValueError(f"Invalid saved scores for {name}")
-        stages.append(dict(configuration=name, source=key, mode=stage_mode,
-                           guard=stage_guard, transform=stage_transform, scores=values))
-    fits = np.asarray(record.get("fit_scores", []))
-    kind = str(np.asarray(record.get("fit_score_kind", "")).item())
-    if kind == "stein_" + mode and ("pre_guard_scores" in record or fits.size):
-        if "pre_guard_scores" in record:
-            values = np.asarray(record["pre_guard_scores"])
-            count = record["pre_guard_fit_count"]
-        else:
-            if fits.ndim != 2 or fits.shape[1:] != labels.shape or not np.isfinite(fits[:, mask]).all():
-                raise ValueError("Invalid saved member scores for the pre-guard comparison")
-            values = fits[0].astype(np.float64, copy=True)
-            for fit in fits[1:]:
-                values += fit
-            count = len(fits)
-            values /= count
-        selected = record.get("plot_ensemble", {}).get("used_members", [])
-        if selected and count != len(selected):
-            raise ValueError("Saved member scores differ from the plotted ensemble")
-        if values.shape != labels.shape or not np.isfinite(values[mask]).all():
-            raise ValueError("Invalid reconstructed pre-guard scores")
-        if "raw_scores" in record and guard and np.any(
-                np.asarray(record["raw_scores"])[mask] > values[mask] + 1e-8 * np.maximum(1, np.abs(values[mask]))):
-            raise ValueError("Saved guarded scores exceed the reconstructed pre-guard ensemble")
-        stages.append(dict(configuration="Before guard and final calibration", source="mean(fit_scores)",
-                           mode=mode, guard=False, transform="identity", scores=values))
-    return stages
-
-
-def score_stage_metric_values(record, min_background, cached=None, *, signal_metrics=True):
-    metrics = (cached if cached is not None else central_metrics(record, min_background)) if signal_metrics else None
-    values = {"AUC": None if metrics is None else metrics.get("auc"),
-              "Max. SIC": None if metrics is None else metrics.get("max_sic")}
-    for wp in reversed(WORKING_POINTS):
-        values[f"εS@{WORKING_POINT_LABELS[wp]}"] = (None if metrics is None
-            else metrics.get("working_points", {}).get(wp))
-    sculpting = exact_mass_sculpt_curve(record, WORKING_POINTS)
-    for index, wp in enumerate(WORKING_POINTS):
-        values[f"BG χ²/ndf@{WORKING_POINT_LABELS[wp]}"] = (None if sculpting is None
-            else normalize_scalar(sculpting[index]))
-    for name, label in (("BG", 0), ("Signal", 1)):
-        population = np.asarray(record["labels"]) == label
-        values[name + " acceptance"] = float(np.asarray(record["mask"])[population].mean()) if population.any() else None
-    return values
-
-
-def export_score_stage_comparison(items, output, file_formats, min_background, io_workers, verbose, *, variant="default"):
-    from riddle.mass_spectrum import event_keys
-    from riddle.storage import digest
-
-    items = [item for item in items if item["method"] in ("riddle", "iad", "supervised")]
-    tasks, populations, protocols, identities = [], {}, defaultdict(set), set()
-    missing = 0
-    for item in sorted(items, key=lambda item: (item["level"] or 0, item["scenario"], item["method"], item["seed"])):
-        record, report = item["record"], item["report"]
-        if "event_ids" not in record:
-            missing += 1
-            continue
-        event_keys(record["event_ids"])
-        stages = saved_score_stages(record, report)
-        if not stages:
-            missing += 1
-            continue
-        population = (item["scenario"], item["variant"], item["region"], item["level"])
-        if population in populations:
-            require_population_compatibility({"first": populations[population], "current": record})
-        else:
-            populations[population] = record
-        cohort = (*population, item["method"])
-        identity = (*cohort, item["seed"])
-        if identity in identities:
-            raise ValueError("Duplicate seed in the score-stage comparison")
-        identities.add(identity)
-        protocols[cohort].add(aggregation_protocol_signature(item["method"], report))
-        tasks.append((item, stages, digest(record["event_ids"])))
-    if any(len(values) != 1 for values in protocols.values()):
-        raise ValueError("Score-stage summaries require matching scientific configurations across seeds")
-    if missing:
-        say(f"[SCORE STAGES] Skip {missing} results without supported stages or event IDs", verbose)
-    if not tasks:
-        return
-
-    def compute(task):
-        item, stages, ids_sha256 = task
-        record, report = item["record"], item["report"]
-        selector = (read_metadata(item["root"], report, "density/score_selection.json")
-                    if "density/score_selection.json" in report.get("artifacts_sha256", {})
-                    else report.get("protocol", {}).get("score_selection") or {})
-        selected_mode = stages[0]["mode"]
-        if selector and selector.get("selected_mode") != selected_mode:
-            raise ValueError("Frozen selector differs from the saved scoring mode")
-        for stage in stages[1:]:
-            if stage["source"] in ("pew_scores", "potential_qnorm_scores") and stage["mode"] == selected_mode:
-                if not np.array_equal(stage["scores"][record["mask"]], np.asarray(record["scores"])[record["mask"]]):
-                    raise ValueError("The selected candidate differs from the saved final scores")
-        baseline = None
-        rows = []
-        for stage in stages:
-            stage_record = {**record, "scores": stage["scores"], "plot_saved_ensemble": True}
-            cached = item.get("metrics") if stage["configuration"] == "Frozen selection" else None
-            metrics = score_stage_metric_values(stage_record, min_background, cached,
-                                               signal_metrics=item["scenario"] == "signal_injection")
-            if baseline is None:
-                baseline = metrics
-            row = {"Row type": "seed", "Dataset": VARIANT_LABELS.get(item["variant"], item["variant"]),
-                   "Scenario": SCENARIO_LABELS[item["scenario"]], "Region": REGION_LABELS[item["region"]],
-                   "Method": METHOD_LABELS[item["method"]], "N_inj": item["level"],
-                   "Seed": item["seed"], "Seeds": str(item["seed"]), "Completed seeds": 1,
-                   "Available completed seeds": 1, "Configuration": stage["configuration"],
-                   "Scoring mode": stage["mode"], "Frozen selected mode": selected_mode,
-                   "Support guard": stage["guard"], "Final transform": stage["transform"],
-                   "Selector enabled": selector.get("enabled", ""), "Selector reason": selector.get("reason", ""),
-                   "Selector basis": selector.get("selection_basis", ""),
-                   "Score source": stage["source"], "Event IDs SHA256": ids_sha256,
-                   "Score artifact SHA256": report.get("artifacts_sha256", {}).get("signal_region_scores.npz", ""),
-                   "Selector SHA256": str(np.asarray(record.get("score_selection_sha256", "")).item()),
-                   "Result folder": str(item["root"]), "BG events": int((record["labels"] == 0).sum()),
-                   "Signal events": int((record["labels"] == 1).sum()),
-                   "Comparison type": "post-training score-stage diagnostic",
-                   "Causal training ablation": False,
-                   "Threshold basis": "truth-assisted evaluation; selector remains frozen",
-                   "Mass test scope": "saved SR population; not full-mass discovery closure",
-                   "Available configurations": " | ".join(stage["configuration"] for stage in stages)}
-            for name, value in metrics.items():
-                row[name] = normalize_scalar(value)
-                row[name + " min"] = row[name]
-                row[name + " max"] = row[name]
-                if name.startswith("BG χ") or name.endswith("acceptance"):
-                    continue
-                row["Paired final " + name] = normalize_scalar(baseline[name])
-                delta = None if value is None or baseline[name] is None else value - baseline[name]
-                row["Δ " + name] = normalize_scalar(delta)
-                row["Δ " + name + " min"] = row["Δ " + name]
-                row["Δ " + name + " max"] = row["Δ " + name]
-            rows.append(row)
-        return item, rows
-
-    computed = parallel_plot_tasks(compute, tasks, io_workers, "SCORE STAGES", verbose)
-    rows, cohorts = [], defaultdict(lambda: defaultdict(dict))
-    for item, stage_rows in computed:
-        rows.extend(stage_rows)
-        cohort = (item["method"], item["scenario"], item["variant"], item["region"], item["level"])
-        for row in stage_rows:
-            cohorts[cohort][row["Configuration"]][item["seed"]] = row
-    for cohort, configurations in sorted(cohorts.items(), key=lambda pair: str(pair[0])):
-        seeds = sorted(set.intersection(*(set(values) for values in configurations.values())))
-        available = len(set.union(*(set(values) for values in configurations.values())))
-        if not seeds:
-            say(f"[SCORE STAGES] No common seed cohort for {cohort}; per-seed rows saved", verbose)
-            continue
-        if len(seeds) != available:
-            say(f"[SCORE STAGES] Matched summaries use {len(seeds)}/{available} completed seeds for {cohort}", verbose)
-        for configuration, by_seed in configurations.items():
-            samples = [by_seed[seed] for seed in seeds]
-            summary = dict(samples[0])
-            summary.update({"Row type": "summary", "Seed": "", "Seeds": " ".join(map(str, seeds)),
-                            "Completed seeds": len(seeds), "Available completed seeds": available})
-            for name in summary:
-                if name.endswith((" min", " max")):
-                    continue
-                if name in ("BG events", "Signal events", "Event IDs SHA256"):
-                    if len({sample[name] for sample in samples}) != 1:
-                        raise ValueError("Score-stage summary population changed across seeds")
-                elif name in ("Scoring mode", "Frozen selected mode", "Selector enabled", "Selector reason", "Selector basis",
-                              "Score artifact SHA256", "Selector SHA256", "Result folder", "Available configurations"):
-                    summary[name] = " | ".join(sorted({str(sample[name]) for sample in samples}))
-                elif name + " min" in summary or name.startswith("Paired final "):
-                    values = np.asarray([sample[name] for sample in samples], dtype=float)
-                    values = values[np.isfinite(values)]
-                    summary[name] = float(values.mean()) if len(values) else None
-                    if name + " min" in summary:
-                        summary[name + " min"] = float(values.min()) if len(values) else None
-                        summary[name + " max"] = float(values.max()) if len(values) else None
-            rows.append(summary)
-    stem = f"table_05_{variant}_signal_injection_score_stages"
-    write_table_rows(output / "07_tables" / stem, rows, file_formats)
 
 
 def concise_sample_name(value, validation=False):
@@ -2705,7 +2626,10 @@ def aggregate_scan_replica(run_rows):
     }
 
 
-def process_injection_scan(scan_groups, methods, loader, settings, output, formats, file_formats, overwrite, min_background, allow_partial, verbose, require_compatible_populations=False, variant="default", io_workers=1, excluded_seeds=(), score_stage_comparison=True):
+def process_injection_scan(scan_groups, methods, loader, settings, output, formats, file_formats, overwrite, min_background, allow_partial, verbose, require_compatible_populations=False, variant="default", io_workers=1, excluded_seeds=()):
+    if overwrite:
+        for extension in ("csv", "json", "yaml"):
+            (output / "07_tables" / f"table_05_{variant}_signal_injection_score_stages.{extension}").unlink(missing_ok=True)
     configured = [int(value) for value in settings.get("injection_scan", {}).get("signal_events", [])]
     config = settings.get("injection_scan", {})
     cohort = config.get("seeds", list(range(int(config.get("replicas", 0)))))
@@ -2951,17 +2875,6 @@ def process_injection_scan(scan_groups, methods, loader, settings, output, forma
                          "Max. achieved significance max": float(significance.max()) if len(significance) else None})
     if rows:
         write_table_rows(output / "07_tables" / f"table_04_{variant}_signal_injection_dependence", rows, file_formats)
-    if score_stage_comparison and schemas == {2}:
-        items = []
-        for (level, seed, run_index), records in sorted(point_records.items()):
-            for method, record in sorted(records.items()):
-                root, report = data[method][level][seed][run_index]
-                items.append(dict(method=method, scenario="signal_injection", variant=variant,
-                                  region="signal_region", level=level, seed=report["seed"],
-                                  root=root, report=report, record=record,
-                                  metrics=loaded[method][level][seed][run_index]["metrics"]))
-        export_score_stage_comparison(items, output, file_formats, min_background, io_workers, verbose,
-                                     variant=variant)
 
 
 def load_settings_file(path):
@@ -2998,8 +2911,6 @@ def parse_args(argv=None):
                         help="One-based latent-coordinate pairs for Stein projections, or all")
     parser.add_argument("--cross-section-weights", type=Path,
                         help="NPZ with event_ids and physical weights_pb; otherwise mass spectra show events/TeV")
-    parser.add_argument("--score-stage-comparison", action=argparse.BooleanOptionalAction, default=True,
-                        help="Export a detailed injection-scan saved-score comparison table (default: enabled; no model inference)")
     parser.add_argument("--allow-partial-injection-scan", action="store_true")
     parser.add_argument("--require-compatible-populations", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
@@ -3079,8 +2990,7 @@ def run(args):
                                        args.file_formats, args.overwrite, args.min_background,
                                        args.allow_partial_injection_scan, args.verbose,
                                        args.require_compatible_populations, variant=variant,
-                                       io_workers=args.io_workers, excluded_seeds=args.exclude_seeds,
-                                       score_stage_comparison=args.score_stage_comparison)
+                                       io_workers=args.io_workers, excluded_seeds=args.exclude_seeds)
                 plot_dijet_spectra({identity: group for identity, group in groups.items() if identity[3] == variant},
                                    args, destination, scan=True)
         say(f"[DONE] Injection-scan outputs written to {args.output}", args.verbose)

@@ -1,5 +1,6 @@
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from copy import deepcopy
+import errno
 import hashlib
 import json
 import multiprocessing
@@ -12,7 +13,7 @@ import time
 import numpy as np
 
 from .mass_spectrum import CUTS, event_keys, match_ids, mass_edges
-from .storage import atomic_write, digest, environment, file_digest, read_json, save_array, save_npz, verify_artifacts, write_json
+from .storage import atomic_write, copy_file, digest, environment, file_digest, fingerprint_files, locked, read_json, save_array, save_npz, seed_start, verify_artifacts, write_json
 from .worker_progress import emit_message
 
 
@@ -612,3 +613,414 @@ def _export_full_mass(args, report=None):
                  kind="WARNING" if validation["status"] != "passed" else "PASS")
     ended_utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
     emit_message(f"Frozen sideband scoring END; utc={ended_utc}; elapsed={time.monotonic() - started:.1f}s", kind="PASS")
+
+
+RESCORE_PROTOCOL = "frozen_riddle_rescoring_v2_deterministic"
+RESCORE_PARTITIONS = ("signal_region", "test", "validation")
+
+
+def _rescore_link(source, destination):
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists() or destination.is_symlink():
+        if destination.is_symlink() or not destination.is_file() or file_digest(destination) != file_digest(source):
+            raise ValueError(f"Unexpected frozen re-scoring artifact: {destination}")
+    else:
+        try:
+            os.link(source.resolve(), destination)
+        except OSError as error:
+            if error.errno not in (errno.EXDEV, errno.EPERM, errno.EOPNOTSUPP):
+                raise
+            def verified_copy(temporary):
+                copy_file(source, temporary)
+                if file_digest(temporary) != file_digest(source):
+                    raise ValueError(f"Copied frozen re-scoring artifact changed: {destination}")
+            atomic_write(destination, verified_copy)
+
+
+def _rescore_stage(source, output, report, workers):
+    mutable = {"protocol.json", "score_health.json", "score_comparison.json",
+               "density/ensemble_inputs.json", "density/stein_scoring_calibration.json",
+               "density/selected_scoring_calibration.json", "density/score_selection.json"}
+    mutable.update(f"{name}_scores.npz" for name in RESCORE_PARTITIONS)
+    names = [name for name in report["artifacts_sha256"] if name not in mutable]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(lambda name: _rescore_link(source / name, output / name), names))
+    for name in ("stein_scoring", "stein_qscore_cache"):
+        directory = source / "density/.resume" / name
+        for path in directory.rglob("*") if directory.is_dir() else ():
+            if path.is_file():
+                _rescore_link(path, output / "density/.resume" / name / path.relative_to(directory))
+
+
+def _selector_data(args, source, report):
+    from .mapping import Mapper
+    from .model import with_mass_context
+    from .score_selection import assert_disjoint
+
+    roles = read_json(source / "background/data_roles.json")
+    with np.load(source / "background/event_roles.npz", allow_pickle=False) as archive:
+        saved = {key: archive[key] for key in archive.files}
+    mixture = np.load(source / "background/mixture_validation_latents.npy", allow_pickle=False)
+    p = with_mass_context(mixture[:, 1:-2], mixture[:, 0])
+    p_ids = saved["mixture_validation__ids"]
+    indices = saved["closure__source_indices"]
+    if digest(indices) != roles["closure"]["indices_sha256"]:
+        raise ValueError("Frozen closure role indices changed")
+    rows = np.load(args.data / roles["closure"]["source"], mmap_mode="r", allow_pickle=False)[indices]
+    mapper = Mapper(source / "background", args.device)
+    z, mask = mapper.map(rows)
+    if not np.array_equal(mask, saved["closure__mask"]):
+        raise ValueError("Frozen sideband control acceptance changed")
+    control = with_mass_context(z, rows[mask, 0])
+    used = np.unique(np.concatenate([saved[name + "__ids"] for name in roles
+                                    if name not in ("closure", "mixture_validation")]), axis=0)
+    with np.load(source / "signal_region_scores.npz", allow_pickle=False) as archive:
+        evaluation_ids = archive["event_ids"]
+    empty_ids = np.empty((0, 2), dtype=np.uint64)
+    assert_disjoint(p_ids, saved["closure__ids"], used, evaluation_ids)
+    if len(p) != len(p_ids) or len(control) != len(saved["closure__ids"]):
+        raise ValueError("Frozen selector rows and event identities are misaligned")
+    return dict(p=p, p_ids=p_ids, q=None, q_ids=empty_ids, control=control,
+                control_ids=saved["closure__ids"], used_ids_sha256=digest(used),
+                p_source="reserved_signal_region_mixture_validation",
+                q_source="independent_generated_q_reference_C")
+
+
+class FrozenPredictor:
+    def __init__(self, args, source, selection, settings):
+        self.args, self.source, self.selection, self.settings = args, source, selection, settings
+        self.members = selection.get("accepted_members", selection["members"])
+        self.environment = environment()
+
+    def values(self, z, mode, previous=None):
+        from .stein_scoring import _background_identity, _load_background, _qscore, final_transform
+
+        current = deepcopy(self.settings)
+        current["stein"]["scoring"]["mode"] = mode
+        cfg = current["stein"]["scoring"]
+        if previous is not None and str(previous["selected_scoring_mode"].item()) == mode:
+            mask = previous["mask"].astype(bool)
+            if list(previous["accepted_fit_directories"]) != [m["directory"] for m in self.members]:
+                raise ValueError("Saved fit ordering differs from the frozen ensemble")
+            member_values = previous["accepted_fit_scores"][:, mask]
+        else:
+            identity = identity_digest(dict(protocol=RESCORE_PROTOCOL, inputs=digest(z), mode=mode,
+                                            scoring=cfg, members=self.members, environment=self.environment,
+                                            source_report_sha256=file_digest(self.source / "result.json")))
+            work = self.args.output / ".resume/rescore" / identity
+            work.mkdir(parents=True, exist_ok=True)
+            if not (work / "latents.npy").exists():
+                atomic_write(work / "latents.npy", lambda p: save_array(p, z))
+            elif digest(np.load(work / "latents.npy", allow_pickle=False)) != digest(z):
+                raise ValueError("Re-scoring input cache changed")
+            derivatives = mode == "tail_focus"
+            if derivatives:
+                directory = self.args.output / "density" / self.members[0]["directory"]
+                inputs = read_json(directory / "residual_training_inputs.json")
+                background = _load_background(directory, inputs, self.args.device)
+                gradients = _qscore(z, background, self.args.device, cfg,
+                                    self.args.output / "density/.resume/stein_qscore_cache", _background_identity(inputs))
+                if not (work / "qscore.npy").exists():
+                    atomic_write(work / "qscore.npy", lambda p: save_array(p, gradients))
+                elif digest(np.load(work / "qscore.npy", allow_pickle=False)) != digest(gradients):
+                    raise ValueError("Re-scoring gradient cache changed")
+            frozen = dict(members=self.members, settings=current, mode=mode)
+            _predict_members(self.args.output, work, frozen, identity, self.args)
+            member_values = np.stack([np.load(work / f"fit_{int(m['fit_index']):03d}.npy", allow_pickle=False)
+                                      for m in self.members])
+        selected = [next(i for i, m in enumerate(self.members) if m["directory"] == member["directory"])
+                    for member in self.selection["members"]]
+        table = member_values[selected]
+        scores, raw, metadata = final_transform(self.args.output / "density", self.selection["members"],
+                                               table.mean(axis=0), z, self.args.device, current)
+        return scores, raw, table, member_values, metadata
+
+    def __call__(self, z, mode):
+        return self.values(z, mode)[0]
+
+
+def _validate_rescore_source(args, inputs, source_report):
+    from .settings import validate_residual
+    from .stein import _training_contract
+
+    if not source_report.get("completed") or (source_report["seed"], source_report["scenario"], source_report["contract"]["method"]) != (args.seed, args.scenario, args.method):
+        raise ValueError("Re-scoring source must be a completed result for the requested method, scenario and seed")
+    old = source_report["contract"]["inputs"]
+    if any(old.get(key) != inputs.get(key) for key in ("files", "event_ids_sha256", "shared_population", "variant")):
+        raise ValueError("Re-scoring requires the identical prepared-data population")
+    original_settings = source_report["contract"]["settings"]
+    if original_settings["background"] != args.settings["background"]:
+        raise ValueError("Re-scoring must preserve the saved background configuration")
+    if "density/score_selection.json" not in source_report["artifacts_sha256"]:
+        raise ValueError("Re-scoring requires a completed shared-population RIDDLE result with a frozen selector")
+    settings = validate_residual(deepcopy(args.settings["riddle"]))
+    original = validate_residual(deepcopy(original_settings["riddle"]))
+    if _training_contract(original) != _training_contract(settings):
+        raise ValueError("Re-scoring may change scoring settings only; model/training settings must match")
+    original_scoring = deepcopy(original["stein"]["scoring"])
+    current_scoring = deepcopy(settings["stein"]["scoring"])
+    for config in (original_scoring, current_scoring):
+        config.pop("support_guard")
+        config.pop("auto_switch")
+    if original_scoring != current_scoring:
+        raise ValueError("Re-scoring preserves member calibration and reference settings; change only support_guard or auto_switch")
+    return settings
+
+
+def _rescore(args, inputs, *, source=None, source_name=None):
+    import torch
+    from .enhancements import deterministic_spline_sums
+    from .metrics import paired_score_metrics
+    from .production import validate_result_scores
+    from .score_selection import MODES, freeze
+    from .stein_scoring import write_root_provenance
+
+    source = (Path(args.rescore_from).resolve() / args.method / args.scenario / f"seed_{args.seed:03d}") if source is None else Path(source)
+    output = args.output.resolve()
+    if args.method != "riddle" or source == output or (source_name is None and (output.is_relative_to(source) or source.is_relative_to(output))):
+        raise ValueError("Frozen re-scoring requires RIDDLE and separate source/output directories")
+    source_report = read_json(source / "result.json")
+    settings = _validate_rescore_source(args, inputs, source_report)
+    identity = dict(protocol=RESCORE_PROTOCOL, source=str(source if source_name is None else source_name), source_report_sha256=file_digest(source / "result.json"),
+                    scoring=settings["stein"]["scoring"], input_files=inputs["files"])
+    identity_hash = identity_digest(identity)
+    receipt = output / ".resume/rescore_identity.json"
+    if receipt.exists() and read_json(receipt) != identity:
+        raise ValueError("Re-scoring source or requested scoring settings changed; use another output root")
+    result_path = output / "result.json"
+    if result_path.exists():
+        saved = read_json(result_path)
+        if saved.get("rescoring", {}).get("identity_sha256") != identity_hash:
+            raise ValueError("Output contains a result from another re-scoring request")
+        if saved.get("completed"):
+            verify_artifacts(output, saved["artifacts_sha256"], workers=args.verify_workers)
+            emit_message("Verified completed re-scoring result; fitted models remain unchanged")
+            return saved
+    elif not receipt.exists() and any(p.name not in ("training.log", ".resume") for p in output.iterdir()):
+        raise ValueError("Re-scoring requires a new output directory")
+    write_json(receipt, identity)
+    verify_artifacts(source, source_report["artifacts_sha256"], "Verify frozen re-scoring source", workers=args.verify_workers)
+    frozen, selection = frozen_contract(source, source_report, args.verify_workers)
+    if settings.get("core") != "stein_witness" or settings.get("input_space") == "physical":
+        raise ValueError("Re-scoring requires the mass-conditioned latent Stein-witness core")
+    torch.use_deterministic_algorithms(True)
+    seed_start(args.seed)
+    started = time.monotonic()
+    emit_message(f"Frozen re-scoring START; seed={args.seed}; trained models reused")
+    _rescore_stage(source, output, source_report, args.io_workers)
+    ensemble_inputs = read_json(source / "density/ensemble_inputs.json")
+    ensemble_inputs["settings"] = settings
+    write_json(output / "density/ensemble_inputs.json", ensemble_inputs)
+    mapping_identity = ensemble_inputs["mapping_identity"]
+    write_root_provenance(output / "density", selection["members"], selection.get("accepted_members", selection["members"]),
+                          settings, mapping_identity)
+    predictor = FrozenPredictor(args, source, selection, settings)
+    with deterministic_spline_sums():
+        populations = _selector_data(args, source, source_report)
+        decision = freeze(output / "density", settings, args.method, populations,
+                          inputs["shared_population"], args.device, predictor=predictor)
+        selected_mode = decision["selected_mode"]
+        effective = deepcopy(settings["stein"]["scoring"])
+        effective["mode"] = selected_mode
+        selection_hash = file_digest(output / "density/score_selection.json")
+        for partition in RESCORE_PARTITIONS:
+            emit_message(f"Re-score {partition}; selected mode={selected_mode}")
+            with np.load(source / f"{partition}_scores.npz", allow_pickle=False) as archive:
+                arrays = {key: archive[key] for key in archive.files}
+            mask = arrays["mask"].astype(bool)
+            endpoints = {}
+            for mode in MODES:
+                result = predictor.values(arrays["latent"], mode, previous=arrays)
+                endpoints[mode] = result[0]
+                if mode == selected_mode:
+                    selected_prediction = result
+            scores, raw, table, accepted, metadata = selected_prediction
+            for name, values in (("scores", scores), ("raw_scores", raw), ("pew_scores", endpoints["tail_focus"]),
+                                 ("potential_qnorm_scores", endpoints["potential_qnorm"])):
+                arrays[name] = np.full(len(mask), np.nan)
+                arrays[name][mask] = values
+            for name, values in (("fit_scores", table), ("accepted_fit_scores", accepted)):
+                arrays[name] = np.full((len(values), len(mask)), np.nan)
+                arrays[name][:, mask] = values
+            arrays["selected_scoring_mode"] = np.array(selected_mode)
+            arrays["score_selection_sha256"] = np.array(selection_hash)
+            arrays["auto_switch_enabled"] = np.array(decision["enabled"])
+            suffix = "_support_guard" if effective["support_guard"]["enabled"] else ""
+            arrays["score_kind"] = np.array(f"stein_{selected_mode}{suffix}_{effective['final_transform']}")
+            arrays["fit_score_kind"] = arrays["accepted_fit_score_kind"] = np.array(f"stein_{selected_mode}")
+            for prefix, members in (("fit", selection["members"]), ("accepted_fit", predictor.members)):
+                arrays[prefix + "_indices"] = np.array([m["fit_index"] for m in members], dtype=np.int64)
+                arrays[prefix + "_seeds"] = np.array([m["seed"] for m in members], dtype=np.uint32)
+                arrays[prefix + "_directories"] = np.array([m["directory"] for m in members])
+            atomic_write(output / f"{partition}_scores.npz", lambda p: save_npz(p, **arrays))
+            if partition == "signal_region":
+                write_json(output / "score_comparison.json", paired_score_metrics(arrays, effective["auto_switch"]["efficiencies"]))
+    calibration = dict(schema=2, mode=selected_mode, settings=effective, auto_switch=decision,
+                       configured_candidate_provenance=read_json(output / "density/stein_scoring_calibration.json"),
+                       final_reference="full q-reference B; identical for both candidates",
+                       final_reference_sha256=decision["identity"]["reference_B_sha256"],
+                       final_reference_events=decision["identity"]["reference_B_events"],
+                       support_guard=effective["support_guard"], final_transform=effective["final_transform"],
+                       final_mass_bins=effective["final_mass_bins"], final_power=effective["final_power"],
+                       truth_labels_used_by_selector=False)
+    write_json(output / "density/selected_scoring_calibration.json", calibration)
+    protocol = read_json(source / "protocol.json")
+    protocol.update(settings={**protocol["settings"], "riddle": settings}, stein=settings["stein"],
+                    score_selection=decision, stein_scoring=calibration,
+                    score=f"Stein {selected_mode} with frozen {effective['support_guard']['statistic']} support and {effective['final_transform']} calibration",
+                    raw_score=f"Stein {selected_mode} after frozen support correction, before final calibration",
+                    unguarded_ensemble_score=f"arithmetic mean of selected per-fit {selected_mode} Stein scores before support correction",
+                    fit_score_note=f"per-fit {selected_mode} Stein scores; support correction is applied only to the ensemble",
+                    support_guard=f"q-reference-B {effective['support_guard']['statistic']}; label-free and truth-blind",
+                    inputs="Frozen mapped SR latents and mass context; q-reference-B support and conditional calibration",
+                    rescoring=identity)
+    write_json(output / "protocol.json", protocol)
+    write_json(output / "score_health.json", validate_result_scores(output, args.method))
+    report = deepcopy(source_report)
+    report["contract"]["settings"]["riddle"] = settings
+    report["rescoring"] = dict(identity_sha256=identity_hash, identity=identity, trained_models_changed=False,
+                               elapsed_seconds=time.monotonic() - started, inference_environment=environment(),
+                               deterministic_algorithms=torch.are_deterministic_algorithms_enabled(),
+                               cublas_workspace=os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+                               inference_code={path.name: file_digest(path) for path in Path(__file__).parent.glob("*.py")
+                                               if path.name not in ("plotting.py", "figures.py")})
+    artifacts = [path for path in output.rglob("*") if path.is_file() and ".resume" not in path.relative_to(output).parts
+                 and "full_mass" not in path.relative_to(output).parts and path.name not in ("result.json", "training.log")]
+    report.update(completed=True, artifacts_sha256=fingerprint_files(output, artifacts, args.io_workers))
+    write_json(result_path, report)
+    emit_message(f"Frozen re-scoring END; seed={args.seed}; elapsed={time.monotonic() - started:.1f}s")
+    return report
+
+
+def _rescore_snapshot(source, backup, report, workers):
+    names = set(report["artifacts_sha256"]) | {"result.json"}
+    if (source / DERIVED_DIRECTORY).is_dir():
+        names.update(str(path.relative_to(source)) for path in (source / DERIVED_DIRECTORY).rglob("*")
+                     if path.is_file())
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(lambda name: _rescore_link(source / name, backup / name), sorted(names)))
+    for directory_name in ("stein_scoring", "stein_qscore_cache"):
+        directory = source / "density/.resume" / directory_name
+        for path in directory.rglob("*") if directory.is_dir() else ():
+            if path.is_file():
+                _rescore_link(path, backup / path.relative_to(source))
+
+
+def _publish_rescore(output, stage, backup, state, state_path, workers):
+    report = read_json(stage / "result.json")
+    if not report.get("completed"):
+        raise ValueError("The staged re-scoring result is incomplete")
+    verify_artifacts(stage, report["artifacts_sha256"], "Verify replacement scores", workers=workers)
+    files = dict(report["artifacts_sha256"])
+    if (stage / DERIVED_DIRECTORY / "manifest.json").is_file():
+        load_full_mass(stage, report, workers=workers)
+        files.update({str(path.relative_to(stage)): file_digest(path)
+                      for path in (stage / DERIVED_DIRECTORY).rglob("*") if path.is_file()})
+    old = read_json(backup / "result.json")
+    if state["phase"] != "publishing":
+        if file_digest(output / "result.json") != state["source_report_sha256"]:
+            raise ValueError("The original result changed before re-scoring publication")
+        state["phase"] = "publishing"
+        write_json(state_path, state)
+    pending = deepcopy(old)
+    pending.update(completed=False, rescoring_update=dict(backup=state["backup"], stage=state["stage"]))
+    write_json(output / "result.json", pending)
+    obsolete = set(old["artifacts_sha256"]) - set(report["artifacts_sha256"])
+    if (output / DERIVED_DIRECTORY).is_dir():
+        obsolete.update(str(path.relative_to(output)) for path in (output / DERIVED_DIRECTORY).rglob("*")
+                        if path.is_file() and str(path.relative_to(output)) not in files)
+    for name in sorted(files, key=lambda name: (name.endswith("/manifest.json"), name)):
+        destination = output / name
+        checksum = files[name]
+        if destination.is_file() and not destination.is_symlink() and file_digest(destination) == checksum:
+            continue
+        def publish(temporary, name=name, checksum=checksum):
+            temporary.unlink()
+            _rescore_link(stage / name, temporary)
+            if file_digest(temporary) != checksum:
+                raise ValueError(f"Replacement artifact changed during publication: {name}")
+        atomic_write(destination, publish)
+    for name in sorted(obsolete):
+        (output / name).unlink(missing_ok=True)
+    verify_artifacts(output, files, "Verify published re-scoring artifacts", workers=workers)
+    report["rescoring"].update(in_place=True, request_sha256=state["request_sha256"], backup=state["backup"])
+    write_json(output / "result.json", report)
+    state["phase"] = "completed"
+    write_json(state_path, state)
+    emit_message("Updated scores in the original result folder; previous artifacts preserved under .resume", kind="PASS")
+    return report
+
+
+def _rescore_in_place(args, inputs):
+    output = Path(args.output).resolve()
+    request = dict(protocol=RESCORE_PROTOCOL, scoring=args.settings["riddle"]["stein"]["scoring"], inputs=inputs,
+                   background=args.settings["background"],
+                   residual_training=args.settings["riddle"],
+                   sideband_scoring=getattr(args, "sideband_scoring", True),
+                   sideband_reference_events=getattr(args, "sideband_reference_events", 65536))
+    request_hash = identity_digest(request)
+    state_path = output / ".resume/rescore_in_place.json"
+    state = read_json(state_path) if state_path.is_file() else None
+    if state is not None and state["phase"] != "completed" and state["request_sha256"] != request_hash:
+        raise ValueError("An unfinished in-place re-scoring request exists; resume with the same scoring settings and prepared population")
+    current = read_json(output / "result.json")
+    validation_report = current
+    if state is not None and state["phase"] in ("scoring", "ready", "publishing"):
+        validation_report = read_json(output / state["backup"] / "result.json")
+    _validate_rescore_source(args, inputs, validation_report)
+    if current.get("completed") and current.get("rescoring", {}).get("request_sha256") == request_hash:
+        verify_artifacts(output, current["artifacts_sha256"], "Verify completed replacement scores", workers=args.verify_workers)
+        score_sidebands(args, current)
+        if state is not None and state["phase"] != "completed":
+            state["phase"] = "completed"
+            write_json(state_path, state)
+        emit_message("Reuse verified in-place re-scoring result", kind="PASS")
+        return current
+    if state is None or state["phase"] == "completed":
+        if not current.get("completed"):
+            raise ValueError("In-place re-scoring requires a completed original result")
+        source_hash = file_digest(output / "result.json")
+        generation = identity_digest(dict(source_report_sha256=source_hash, request_sha256=request_hash))
+        state = dict(phase="snapshot", request_sha256=request_hash, source_report_sha256=source_hash,
+                     backup=f".resume/rescore_backups/{generation}", stage=f".resume/rescore_stages/{generation}")
+        write_json(state_path, state)
+    backup, stage = output / state["backup"], output / state["stage"]
+    if state["phase"] == "snapshot":
+        if file_digest(output / "result.json") != state["source_report_sha256"]:
+            raise ValueError("The completed original result changed during backup")
+        verify_artifacts(output, current["artifacts_sha256"], "Verify original re-scoring source", workers=args.verify_workers)
+        _rescore_snapshot(output, backup, current, args.io_workers)
+        verify_artifacts(backup, current["artifacts_sha256"], "Verify recoverable score backup", workers=args.verify_workers)
+        if file_digest(backup / "result.json") != state["source_report_sha256"]:
+            raise ValueError("The recoverable original report changed")
+        state["phase"] = "scoring"
+        write_json(state_path, state)
+    if state["phase"] == "scoring":
+        from types import SimpleNamespace
+        stage.mkdir(parents=True, exist_ok=True)
+        staged_args = SimpleNamespace(**{**vars(args), "output": stage})
+        staged_report = _rescore(staged_args, inputs, source=backup, source_name=output)
+        score_sidebands(staged_args, staged_report)
+        state["phase"] = "ready"
+        write_json(state_path, state)
+    return _publish_rescore(output, stage, backup, state, state_path, args.verify_workers)
+
+
+def rescore(args, inputs):
+    source = Path(args.rescore_from).resolve() / args.method / args.scenario / f"seed_{args.seed:03d}"
+    output = Path(args.output).resolve()
+    if not source.is_dir():
+        raise FileNotFoundError(f"Completed re-scoring source is missing: {source}")
+    if args.method != "riddle" or (source != output and (source.is_relative_to(output) or output.is_relative_to(source))):
+        raise ValueError("Frozen re-scoring requires RIDDLE and matching or nonoverlapping source/output folders")
+    if not getattr(args, "rescore_output_locked", False):
+        with locked(output / ".resume/command.lock"):
+            from types import SimpleNamespace
+            locked_args = SimpleNamespace(**{**vars(args), "rescore_output_locked": True})
+            return rescore(locked_args, inputs)
+    if source == output:
+        return _rescore_in_place(args, inputs)
+    with locked(source / ".resume/command.lock"):
+        report = _rescore(args, inputs)
+        score_sidebands(args, report)
+        return report

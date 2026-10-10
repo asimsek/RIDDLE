@@ -188,7 +188,8 @@ def _latent_radius(z):
     return radius
 
 
-def _support_penalties(reference, z, cfg, *, include_reference):
+def _support_penalties(reference, z, cfg, *, include_reference,
+                       background_scores=None, reference_background_scores=None):
     reference = np.asarray(reference)
     z = np.asarray(z)
     if reference.ndim != 2 or z.ndim != 2 or reference.shape[1] != z.shape[1] or len(reference) < 2:
@@ -209,6 +210,25 @@ def _support_penalties(reference, z, cfg, *, include_reference):
     penalties = float(guard["weight"]) * np.logaddexp(
         0.0, (zr - gate_z) / float(guard["temperature"])
     )
+    if guard["statistic"] == "radius_and_qscore":
+        norms = []
+        for values, points in ((background_scores, z), (reference_background_scores, reference)):
+            values = np.asarray(values)
+            if values.shape != (len(points), points.shape[1] - 1) or not np.isfinite(values).all():
+                raise ValueError("Gradient support requires aligned finite frozen background scores")
+            norms.append(np.linalg.norm(values.astype(np.float64), axis=1))
+        query_norm = np.concatenate(norms) if include_reference else norms[0]
+        zq, qmeta = conditional_gaussianize(
+            norms[1], reference_mass, query_norm, query_mass, int(guard["mass_bins"])
+        )
+        gradient_penalties = float(guard["weight"]) * np.logaddexp(
+            0.0, (zq - gate_z) / float(guard["temperature"])
+        )
+        penalties = np.maximum(penalties, gradient_penalties)
+        metadata = {**metadata, "background_gradient_calibration": qmeta,
+                    "background_gradient_statistic": "norm_gradient_z_log_q",
+                    "combination": "maximum_radius_and_gradient_penalty",
+                    "truth_labels_used": False}
     penalty = penalties[:len(z)]
     reference_penalty = penalties[len(z):] if include_reference else None
     if penalty.shape != (len(z),) or not np.isfinite(penalty).all():
@@ -219,8 +239,25 @@ def _support_penalties(reference, z, cfg, *, include_reference):
     return penalty, reference_penalty, metadata
 
 
-def _support_penalty(reference, z, cfg):
-    penalty, _, metadata = _support_penalties(reference, z, cfg, include_reference=False)
+def _support_scores(root, selected, reference, z, device, cfg):
+    if cfg["support_guard"]["statistic"] == "radius":
+        return {}
+    if not selected:
+        raise ValueError("Gradient support requires a frozen selected ensemble")
+    directory = Path(root) / selected[0]["directory"]
+    inputs = json.loads((directory / "residual_training_inputs.json").read_text())
+    identity = _background_identity(inputs)
+    metadata = json.loads((Path(root) / "stein_scoring_reference.json").read_text())
+    if identity != metadata["background_model_hash"]:
+        raise ValueError("Gradient support background differs from reference B")
+    model = _load_background(directory, inputs, device)
+    cache = Path(root) / ".resume/stein_qscore_cache"
+    return dict(background_scores=_qscore(z, model, device, cfg, cache, identity),
+                reference_background_scores=_qscore(reference, model, device, cfg, cache, identity))
+
+
+def _support_penalty(reference, z, cfg, **scores):
+    penalty, _, metadata = _support_penalties(reference, z, cfg, include_reference=False, **scores)
     return penalty, metadata
 
 
@@ -413,6 +450,7 @@ def _load_background(output, inputs, device):
 
 def _qscore(inputs, background_model, device, cfg, cache_root, background_hash):
     from .stein import _background_score_array
+    from .enhancements import deterministic_spline_sums
 
     array = np.asarray(inputs, dtype=np.float32)
     cache_root = Path(cache_root)
@@ -437,10 +475,11 @@ def _qscore(inputs, background_model, device, cfg, cache_root, background_hash):
             raise ValueError("Invalid cached Stein background score")
         return value
     runtime = {}
-    value = _background_score_array(
-        array, background_model, device, mass_conditioning=True,
-        batch_size=int(cfg["qscore_batch_size"]), runtime_metadata=runtime,
-    )
+    with deterministic_spline_sums():
+        value = _background_score_array(
+            array, background_model, device, mass_conditioning=True,
+            batch_size=int(cfg["qscore_batch_size"]), runtime_metadata=runtime,
+        )
     atomic_write(path, lambda p: save_array(p, value))
     write_json(metadata_path, {
         "identity": identity, "events": int(len(array)), "features": int(array.shape[1] - 1),
@@ -757,7 +796,8 @@ def final_transform(root, selected, raw, z, device, settings):
         if reference is None:
             reference, reference_meta = _load_reference_b(root)
         penalty, reference_penalty, radius_metadata = _support_penalties(
-            reference, z, cfg, include_reference=transform != "identity"
+            reference, z, cfg, include_reference=transform != "identity",
+            **_support_scores(root, selected, reference, z, device, cfg),
         )
         guarded_raw = raw - penalty
         if not np.isfinite(guarded_raw).all():
@@ -874,7 +914,7 @@ def write_root_provenance(root, selected, accepted, settings, mapping_identity, 
         "discriminating_raw_score": (f"stein_{cfg['mode']}_support_guard" if support["enabled"]
                                      else f"stein_{cfg['mode']}"),
         "final_monotonic_score": score_kind,
-        "support_reference": "q-reference B latent Euclidean radius excluding mass coordinate",
+        "support_reference": f"q-reference B {support['statistic']} excluding mass coordinate",
         "truth_labels_used": False,
         "settings": cfg,
     }

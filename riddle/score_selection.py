@@ -9,7 +9,7 @@ from .storage import atomic_write, digest, file_digest, save_npz, write_json
 from .stein_scoring import _json_digest, _load_reference_b
 
 MODES = ("tail_focus", "potential_qnorm")
-PROTOCOL = "reserved_ensemble_score_selection_v2_single_comparison"
+PROTOCOL = "reserved_ensemble_score_selection_v3_background_control"
 
 
 def validate_population_contract(settings, manifest, method):
@@ -61,6 +61,7 @@ def bootstrap_gain(p, thresholds, q, cfg, alternative, baseline, seed):
     sorted_values = [np.take_along_axis(x, order, axis=0) for x, order in zip(pools, orders)]
     rng = np.random.default_rng(seed)
     boot = np.empty((cfg["bootstrap_replicas"], 2))
+    boot_points = np.empty((len(boot), 2, len(cfg["efficiencies"]))) if cfg.get("require_all_working_points", False) else None
     target = np.ceil((len(thresholds) - 1) * (1 - np.asarray(cfg["efficiencies"]))).astype(int) + 1
     for b in range(len(boot)):
         cumulative = []
@@ -74,12 +75,22 @@ def bootstrap_gain(p, thresholds, q, cfg, alternative, baseline, seed):
             for k in (0, 2):
                 at = np.searchsorted(sorted_values[k][:, j], cuts, side="right")
                 fractions.append(1 - cumulative[k][at, j] / len(pools[k]))
-            boot[b, j] = (fractions[0] - fractions[1]) @ np.asarray(cfg["weights"])
+            point_gain = fractions[0] - fractions[1]
+            boot[b, j] = point_gain @ np.asarray(cfg["weights"])
+            if boot_points is not None:
+                boot_points[b, j] = point_gain
     delta = boot[:, alternative] - boot[:, baseline]
-    return {"lower": float(np.quantile(delta, 1 - cfg["confidence"])),
+    report = {"lower": float(np.quantile(delta, 1 - cfg["confidence"])),
             "upper": float(np.quantile(delta, cfg["confidence"])),
             "bootstrap_standard_deviation": float(delta.std(ddof=1)),
             "one_sided_confidence": cfg["confidence"]}
+    if boot_points is not None:
+        point_delta = boot_points[:, alternative] - boot_points[:, baseline]
+        confidence = 1 - (1 - cfg["confidence"]) / len(cfg["efficiencies"])
+        report.update(working_point_lower=np.quantile(point_delta, 1 - confidence, axis=0).tolist(),
+                      working_point_upper=np.quantile(point_delta, confidence, axis=0).tolist(),
+                      working_point_one_sided_confidence=confidence)
+    return report
 
 
 def threshold_split(count, seed):
@@ -87,7 +98,41 @@ def threshold_split(count, seed):
     return np.split(indices, [count // 2])
 
 
-def choose(p, q, cfg, baseline="tail_focus", enabled=True):
+def background_control(control, reference, cfg):
+    from scipy.stats import beta
+
+    control, reference = np.asarray(control), np.asarray(reference)
+    if any(a.ndim != 2 or a.shape[1] != 2 or len(a) < 2 or not np.isfinite(a).all()
+           for a in (control, reference)):
+        raise ValueError("Background control requires finite paired scores on disjoint control populations")
+    qt, qa = threshold_split(len(reference), cfg["seed"] + 902)
+    efficiencies = np.asarray(cfg["efficiencies"])
+    if min(len(control), len(qt), len(qa)) * efficiencies.min() < cfg["min_tail_events"]:
+        return dict(status="inconclusive", reason="insufficient_independent_background_control_statistics")
+    cuts = np.quantile(reference[qt], 1 - efficiencies, axis=0, method="higher")
+    counts = [(a[:, None, :] > cuts[None, :, :]).sum(axis=0).T for a in (control, reference[qa])]
+    delta = (1 - cfg["confidence"]) / (2 * len(efficiencies) * 2 * 2)
+
+    def interval(k, n):
+        lower = np.where(k == 0, 0.0, beta.ppf(delta, k, n - k + 1))
+        upper = np.where(k == n, 1.0, beta.ppf(1 - delta, k + 1, n - k))
+        return lower, upper
+
+    lo, hi = interval(counts[0], len(control))
+    qlo, qhi = interval(counts[1], len(qa))
+    compatible = (lo <= qhi) & (qlo <= hi)
+    return dict(status="assessed", candidate_compatible=compatible.all(axis=1).tolist(),
+                compatible_points=compatible.tolist(), control_acceptance=(counts[0] / len(control)).tolist(),
+                reference_acceptance=(counts[1] / len(qa)).tolist(),
+                control_intervals=np.stack((lo, hi), axis=-1).tolist(),
+                reference_intervals=np.stack((qlo, qhi), axis=-1).tolist(),
+                counts=dict(control=len(control), reference_threshold=len(qt), reference_assessment=len(qa)),
+                confidence=cfg["confidence"], multiplicity="Bonferroni over modes, working points, populations and interval tails",
+                interpretation="Background-control compatibility; does not certify signal-region search closure",
+                truth_labels_used=False)
+
+
+def choose(p, q, cfg, baseline="tail_focus", enabled=True, *, control=None, control_reference=None):
     """Pure numerical selection interface: only paired scores, never labels."""
     if baseline not in MODES:
         raise ValueError("Unknown auto-switch baseline")
@@ -122,8 +167,19 @@ def choose(p, q, cfg, baseline="tail_focus", enabled=True):
               **bootstrap_gain(p, q[qt], q[qa], cfg, alternative, base, cfg["seed"] + 901)}
     decision.update(comparison=report, comparison_count=1)
     if report["lower"] > 0 and report["gain"] > 0:
+        if cfg.get("require_all_working_points", False) and not np.all(np.asarray(report["working_point_lower"]) > 0):
+            decision.update(reason="inconclusive_working_point_comparison", selection_basis="working_point_fallback")
+            return decision
         decision.update(selected_mode=MODES[alternative], switched=True,
                         reason="reserved_comparison_supports_alternative", selection_basis="evidence_supported_switch")
+        if cfg.get("background_control", False):
+            audit = (dict(status="inconclusive", reason="missing_independent_background_control")
+                     if control is None or control_reference is None else background_control(control, control_reference, cfg))
+            decision["background_control"] = audit
+            if audit.get("status") != "assessed" or not audit["candidate_compatible"][alternative]:
+                decision.update(selected_mode=baseline, switched=False,
+                                reason="alternative_failed_background_control" if audit["status"] == "assessed"
+                                else audit["reason"], selection_basis="background_control_fallback")
     elif report["upper"] < 0 and report["gain"] < 0:
         decision.update(reason="reserved_comparison_supports_baseline", selection_basis="evidence_supported_baseline")
     else:
@@ -141,20 +197,22 @@ def selector_populations(development, oracle_roles, method, evaluation_ids):
         mixture = development["mixture_validation"]
         p, p_ids = with_mass_context(mixture["z"], mixture["mass"]), mixture["ids"]
         p_source = "reserved_signal_region_mixture_validation"
+    control = development["closure"]
     used = [v["ids"] for k, v in development.items()
-            if k not in ("member_splits", "mixture_validation") and "ids" in v]
+            if k not in ("member_splits", "mixture_validation", "closure") and "ids" in v]
     if "used_ids" in oracle:
         used.append(oracle["used_ids"])
     # Union overlapping mapping roles before checking selector isolation.
     used_ids = np.unique(np.concatenate(used), axis=0)
     q_ids = oracle.get("q_ids", np.empty((0, 2), dtype=np.uint64))
-    assert_disjoint(p_ids, q_ids, used_ids, evaluation_ids)
+    assert_disjoint(p_ids, q_ids, control["ids"], used_ids, evaluation_ids)
     return {"p": p, "p_ids": p_ids, "q": oracle.get("q"), "q_ids": q_ids,
             "p_source": p_source, "used_ids_sha256": digest(used_ids),
+            "control": with_mass_context(control["z"], control["mass"]), "control_ids": control["ids"],
             "q_source": "reserved_pure_background_validation" if oracle else "independent_generated_q_reference_C"}
 
 
-def freeze(root, settings, method, populations, shared_population, device):
+def freeze(root, settings, method, populations, shared_population, device, *, predictor=None):
     """Freeze the decision before scoring any evaluation events; resumable by hash."""
     from .campaign import ensemble_predict
     from .production import require_complete_ensemble
@@ -163,6 +221,8 @@ def freeze(root, settings, method, populations, shared_population, device):
     root = Path(root)
     cfg = settings["stein"]["scoring"]["auto_switch"]
     enabled = cfg["enabled"][method]
+    predict_scores = (lambda z, mode: ensemble_predict(root, z, device, stein_mode=mode,
+                                                      scoring_settings=settings)) if predictor is None else predictor
     reference, reference_meta = _load_reference_b(root)
     selection = json.loads((root / "ensemble_selection.json").read_text())
     require_complete_ensemble(selection)
@@ -188,6 +248,10 @@ def freeze(root, settings, method, populations, shared_population, device):
                 "p_event_ids_sha256": digest(populations["p_ids"]),
                 "q_event_ids_sha256": digest(populations["q_ids"]),
                 "used_event_ids_sha256": populations["used_ids_sha256"]}
+    if cfg["background_control"]:
+        identity["background_control"] = dict(inputs_sha256=digest(populations["control"]),
+                                               event_ids_sha256=digest(populations["control_ids"]),
+                                               context_seed=cfg["seed"] + 903, sampling_seed=cfg["seed"] + 904)
     cache = root / ".resume" / "score_selection" / _json_digest(identity)
     cache.mkdir(parents=True, exist_ok=True)
     saved_path, scores_path = cache / "decision.json", cache / "selector_scores.npz"
@@ -201,18 +265,47 @@ def freeze(root, settings, method, populations, shared_population, device):
             scores = []
             for mode in MODES:
                 emit_message(f"Score selector: {method} {mode} on reserved validation events")
-                scores.append(ensemble_predict(root, np.concatenate((p, q)), device, stein_mode=mode,
-                                               scoring_settings=settings))
+                scores.append(predict_scores(np.concatenate((p, q)), mode))
             paired = np.column_stack(scores)
             ps, qs = paired[:len(p)], paired[len(p):]
         else:
             ps, qs = np.empty((0, 2)), np.empty((0, 2))
-        decision = choose(ps, qs, cfg, cfg["fallback"][method], enabled)
+        provisional = choose(ps, qs, {**cfg, "background_control": False}, cfg["fallback"][method], enabled)
+        control_scores = control_reference = None
+        if cfg["background_control"] and provisional["switched"]:
+            from .background_correction import sample
+            from .enhancements import deterministic_spline_sums
+            from .stein_scoring import _load_background
+            control = populations["control"]
+            member = selection["members"][0]
+            directory = root / member["directory"]
+            inputs = json.loads((directory / "residual_training_inputs.json").read_text())
+            background = _load_background(directory, inputs, device)
+            contexts = np.random.default_rng(cfg["seed"] + 903).choice(
+                control[:, -1], cfg["reference_c_samples"], replace=True).astype(np.float32)
+            if background is None:
+                z = np.random.default_rng(cfg["seed"] + 904).standard_normal(
+                    (len(contexts), control.shape[1] - 1)).astype(np.float32)
+            else:
+                with deterministic_spline_sums():
+                    z = sample(background, contexts, control.shape[1] - 1, cfg["seed"] + 904,
+                               device, batch_size=settings["stein"]["scoring"]["qscore_batch_size"],
+                               strict_batch_size=True).cpu().numpy()
+            generated = np.column_stack((z, contexts)).astype(np.float32)
+            emit_message("Score selector: check proposed switch on reserved sideband controls")
+            paired_control = np.column_stack([predict_scores(np.concatenate((control, generated)), mode)
+                                               for mode in MODES])
+            control_scores, control_reference = paired_control[:len(control)], paired_control[len(control):]
+        decision = choose(ps, qs, cfg, cfg["fallback"][method], enabled,
+                          control=control_scores, control_reference=control_reference)
         qt, qa = threshold_split(len(qs), cfg["seed"])
         atomic_write(scores_path, lambda path: save_npz(path, p_scores=ps, q_scores=qs,
                      p_event_ids=populations["p_ids"] if enabled else np.empty((0, 2), dtype=np.uint64),
                      q_event_ids=populations["q_ids"] if enabled else np.empty((0, 2), dtype=np.uint64),
-                     q_threshold_indices=qt, q_assessment_indices=qa))
+                     q_threshold_indices=qt, q_assessment_indices=qa,
+                     control_event_ids=populations["control_ids"] if control_scores is not None else np.empty((0, 2), dtype=np.uint64),
+                     control_scores=np.empty((0, 2)) if control_scores is None else control_scores,
+                     control_reference_scores=np.empty((0, 2)) if control_reference is None else control_reference))
         decision.update(identity=identity, schema=2, selector_scores_sha256=file_digest(scores_path),
                         p_source=populations["p_source"], q_source=populations["q_source"],
                         evaluation_labels_used=False, evaluation_scores_used=False,

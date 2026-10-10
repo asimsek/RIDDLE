@@ -29,7 +29,7 @@ riddle:
     scoring:
       mode: tail_focus
       auto_switch:
-        enabled: {riddle: true, iad: true, supervised: true}
+        enabled: {riddle: false, iad: false, supervised: false}
         fallback: {riddle: tail_focus, iad: tail_focus, supervised: potential_qnorm}
         reference_c_samples: 131072
         efficiencies: [0.004, 0.01, 0.05, 0.1]
@@ -38,6 +38,8 @@ riddle:
         bootstrap_replicas: 4000
         min_tail_events: 50
         seed: 75501
+        background_control: true
+        require_all_working_points: true
       reference_samples: 524288
       reference_split: 0.5
       mass_bins: 8
@@ -55,7 +57,7 @@ riddle:
       inference_batch_size: 16384
       support_guard:
         enabled: true
-        statistic: radius
+        statistic: radius_and_qscore
         mass_bins: 8
         gate_quantile: 0.999
         weight: 2.0

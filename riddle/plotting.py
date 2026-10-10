@@ -4285,7 +4285,15 @@ def plot_witness_projections(grid, pair, record, population, output, args, *, se
                 ("02_witness_flow", False, True, False, None),
                 ("03_stein_identity_response", True, False, False, None),
                 ("03_stein_identity_response_flow", True, True, False, None)]
-    if np.any(population & (np.asarray(record["labels"]) == 1) & np.asarray(record["mask"], bool)):
+    scenario = getattr(args, "scenario", None)
+    has_signal = np.any(population & (np.asarray(record["labels"]) == 1) & np.asarray(record["mask"], bool))
+    if scenario == "signal_injection" or (scenario is None and has_signal):
+        if args.overwrite:
+            for name, *_ in versions:
+                for path in output.glob(f"{name}_z*_z*.*"):
+                    if path.suffix in (".png", ".pdf") and re.fullmatch(r"z\d+_z\d+", path.stem[len(name) + 1:]):
+                        path.unlink(missing_ok=True)
+        versions = []
         versions.append(("02_witness_flow_signal", False, True, True, None))
         if selections is None:
             selections = witness_signal_selections(record)
@@ -4295,6 +4303,15 @@ def plot_witness_projections(grid, pair, record, population, output, args, *, se
                              ("03_stein_identity_response_flow_signal" + token, True, True, True, cut)))
     output.mkdir(parents=True, exist_ok=True)
     for name, response, stream, signal, cut in versions:
+        if signal:
+            selected = population & np.asarray(record["mask"], bool) & (np.asarray(record["labels"]) == 1)
+            if cut is not None:
+                selected &= np.asarray(selections[cut]) > 0
+            if not selected.any():
+                if args.overwrite:
+                    for extension in ("png", "pdf"):
+                        (output / f"{name}_{tag}.{extension}").unlink(missing_ok=True)
+                continue
         fig, ax = f.plt.subplots(figsize=(5.8, 5.1), layout="compressed")
         image = _witness_heat(ax, grid, response)
         if name == "01_witness_landscape":

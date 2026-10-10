@@ -134,6 +134,15 @@ def main():
     oracle_method = args.method in ("iad", "supervised")
     inputs = validate(args.data, require_event_ids=native_method, require_oracle=oracle_method,
                       require_supervised=args.method == "supervised")
+    update_path = args.output / ".resume/rescore_in_place.json"
+    if update_path.is_file() and not getattr(args, "rescore_from", None):
+        if read_json(update_path)["phase"] != "completed":
+            raise RuntimeError("An in-place scoring update is unfinished; resume with --rescore and the original results root")
+    if getattr(args, "rescore_from", None):
+        from .full_mass import rescore
+        emit_runtime(environment().get("gpu") or "CPU")
+        rescore(args, inputs)
+        return
     if getattr(args, "score_sidebands_only", False):
         if not native_method:
             raise ValueError("Frozen sideband backfill supports native methods only")
