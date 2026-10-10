@@ -228,6 +228,7 @@ def _inference_worker_init(threads):
 
 
 def _member_prediction(job):
+    from .enhancements import deterministic_spline_sums
     from .stein_scoring import member_scores
 
     root, work = Path(job["root"]), Path(job["work"])
@@ -236,10 +237,11 @@ def _member_prediction(job):
     member = job["member"]
     with np.load(root / "density" / member["directory"] / "stein_scoring_calibration.npz", allow_pickle=False) as archive:
         calibration = {name: archive[name] for name in archive.files}
-    values = member_scores(root / "density" / member["directory"], member["epochs"], inputs,
-                           job["device"], mode=job["mode"], scoring_root=root / "density",
-                           scoring_settings=job["settings"], background_scores=qscore, calibration_arrays=calibration,
-                           strict_batch_size=True)
+    with deterministic_spline_sums():
+        values = member_scores(root / "density" / member["directory"], member["epochs"], inputs,
+                               job["device"], mode=job["mode"], scoring_root=root / "density",
+                               scoring_settings=job["settings"], background_scores=qscore, calibration_arrays=calibration,
+                               strict_batch_size=True)
     path = work / f"fit_{int(member['fit_index']):03d}.npy"
     _save_array(path, values)
     write_json(path.with_suffix(".json"), dict(identity=job["identity"], sha256=file_digest(path),
@@ -434,7 +436,15 @@ def load_full_mass(root, report, *, workers=1):
 
 
 def export_full_mass(args, report=None):
+    from .enhancements import deterministic_spline_sums
+
+    with deterministic_spline_sums():
+        return _export_full_mass(args, report)
+
+
+def _export_full_mass(args, report=None):
     import torch
+    from .enhancements import SPLINE_SUM_PROTOCOL as spline_protocol
     from .scan_cache import resolve_reference
     from .stein import _background_score_array
     from .stein_scoring import _load_background, _load_reference_b, final_transform
@@ -459,7 +469,8 @@ def export_full_mass(args, report=None):
         event_ids_sha256=inputs["event_ids_sha256"]), seed=int(report["seed"]),
         reference_events=count, reference_seeds=REFERENCE_SEEDS,
         execution=dict(device=args.device, environment=environment(), torch_threads=args.torch_threads,
-                       deterministic_algorithms=True, cublas_workspace=os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+                       deterministic_algorithms=True, spline_cumsum=spline_protocol,
+                       cublas_workspace=os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
                        code={path.name: file_digest(path)
                         for path in sorted(Path(__file__).parent.glob("*.py"))
                         if path.name not in ("plotting.py", "figures.py")}))

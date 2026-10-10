@@ -1,10 +1,12 @@
 """Label-free RIDDLE enhancements.
 References: doi:10.1214/aoms/1177729394; arXiv:1906.04032, 1604.03540,
 2211.02486; proceedings.mlr.press/v9/gutmann10a.html."""
+from contextlib import contextmanager
 from copy import deepcopy
 import json
 import math
 from pathlib import Path
+from threading import RLock
 
 import numpy as np
 import torch
@@ -14,6 +16,10 @@ from torch.utils.data import DataLoader, TensorDataset
 from .integrity import require_finite
 from .storage import atomic_torch_save, digest, write_json, rng_state, restore_rng, seed_start, persist_boundary, load_checkpoint
 from .worker_progress import emit_message
+
+
+SPLINE_SUM_PROTOCOL = "fixed_prefix_float64_cuda_v1"
+_SPLINE_SUM_LOCK = RLock()
 
 
 def save_torch(path, value):
@@ -33,6 +39,51 @@ def chunks(function, *arrays, device="cpu", size=4096):
                             for i in range(0, len(arrays[0]), size)])
     require_finite(result, "RIDDLE inference")
     return result
+
+
+def fixed_prefix_sum(values, dim=-1):
+    dim = dim % values.ndim
+    dtype = values.dtype
+    accumulation = (torch.float64 if dtype in (torch.float16, torch.bfloat16, torch.float32)
+                    else torch.complex128 if dtype == torch.complex64 else dtype)
+    result = values.to(dtype=accumulation)
+    size = result.shape[dim]
+    offset = 1
+    while offset < size:
+        result = torch.cat((result.narrow(dim, 0, offset),
+                            result.narrow(dim, offset, size - offset)
+                            + result.narrow(dim, 0, size - offset)), dim=dim)
+        offset *= 2
+    return result.to(dtype=dtype)
+
+
+class _SplineTorch:
+    def __getattr__(self, name):
+        return getattr(torch, name)
+
+    def cumsum(self, values, dim, *, dtype=None, out=None):
+        if (values.is_cuda and torch.are_deterministic_algorithms_enabled()
+                and (values.is_floating_point() or values.is_complex())):
+            values = values if dtype is None else values.to(dtype=dtype)
+            result = fixed_prefix_sum(values, dim)
+            if out is not None:
+                out.copy_(result)
+                return out
+            return result
+        return torch.cumsum(values, dim, dtype=dtype, out=out)
+
+
+@contextmanager
+def deterministic_spline_sums():
+    import nflows.transforms.splines.rational_quadratic as spline
+
+    with _SPLINE_SUM_LOCK:
+        previous = spline.torch
+        spline.torch = _SplineTorch()
+        try:
+            yield
+        finally:
+            spline.torch = previous
 
 
 class Rosenblatt(nn.Module):
