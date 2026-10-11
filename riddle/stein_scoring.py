@@ -10,6 +10,8 @@ from .integrity import SCIENTIFIC_VERSION, require_finite
 from .storage import atomic_write, digest, file_digest, save_array, save_npz, write_json
 
 SCORING_PROTOCOL = "stein_scoring_v6_full_b_reserved_selection"
+SUPPORT_CONTEXT_PROTOCOL = "sr_edge_clamped_gradient_support_v1"
+SUPPORT_CONTEXT_RANGE = (-1.0, 1.0)
 REFERENCE_SEEDS = {"mass_context": 93001, "background_sample": 93002, "split": 93003}
 SELECTOR_REFERENCE_SEEDS = {"mass_context": 94001, "background_sample": 94002}
 
@@ -57,7 +59,7 @@ def _mode_identity(cfg):
 
 def _support_identity(cfg):
     guard = cfg["support_guard"]
-    return {
+    value = {
         "enabled": bool(guard["enabled"]),
         "statistic": guard["statistic"],
         "mass_bins": int(guard["mass_bins"]),
@@ -67,6 +69,10 @@ def _support_identity(cfg):
         "temperature": float(guard["temperature"]),
         "radius_excludes_mass": True,
     }
+    if guard["statistic"] == "radius_and_qscore":
+        value.update(gradient_context_protocol=SUPPORT_CONTEXT_PROTOCOL,
+                     gradient_context_range=list(SUPPORT_CONTEXT_RANGE))
+    return value
 
 
 def _scoring_identity(cfg):
@@ -76,6 +82,7 @@ def _scoring_identity(cfg):
         "final_mass_bins": int(cfg["final_mass_bins"]),
         "final_transform": cfg["final_transform"],
         "final_power": float(cfg["final_power"]),
+        "background_gradient_context_protocol": SUPPORT_CONTEXT_PROTOCOL,
     }
 
 
@@ -227,6 +234,8 @@ def _support_penalties(reference, z, cfg, *, include_reference,
         penalties = np.maximum(penalties, gradient_penalties)
         metadata = {**metadata, "background_gradient_calibration": qmeta,
                     "background_gradient_statistic": "norm_gradient_z_log_q",
+                    "gradient_context_protocol": SUPPORT_CONTEXT_PROTOCOL,
+                    "gradient_context_range": list(SUPPORT_CONTEXT_RANGE),
                     "combination": "maximum_radius_and_gradient_penalty",
                     "truth_labels_used": False}
     penalty = penalties[:len(z)]
@@ -237,6 +246,17 @@ def _support_penalties(reference, z, cfg, *, include_reference,
                               or not np.isfinite(reference_penalty).all()):
         raise FloatingPointError("Nonfinite Stein reference support penalty")
     return penalty, reference_penalty, metadata
+
+
+def _support_context(inputs):
+    inputs = np.asarray(inputs, dtype=np.float32)
+    if inputs.ndim != 2 or inputs.shape[1] < 2 or not np.isfinite(inputs).all():
+        raise ValueError("Invalid Stein support mass contexts")
+    outside = (inputs[:, -1] < SUPPORT_CONTEXT_RANGE[0]) | (inputs[:, -1] > SUPPORT_CONTEXT_RANGE[1])
+    if outside.any():
+        inputs = inputs.copy()
+        inputs[:, -1] = np.clip(inputs[:, -1], *SUPPORT_CONTEXT_RANGE)
+    return inputs
 
 
 def _support_scores(root, selected, reference, z, device, cfg):
@@ -252,8 +272,11 @@ def _support_scores(root, selected, reference, z, device, cfg):
         raise ValueError("Gradient support background differs from reference B")
     model = _load_background(directory, inputs, device)
     cache = Path(root) / ".resume/stein_qscore_cache"
-    return dict(background_scores=_qscore(z, model, device, cfg, cache, identity),
-                reference_background_scores=_qscore(reference, model, device, cfg, cache, identity))
+    guarded_reference = _support_context(reference)
+    if not np.array_equal(guarded_reference, reference):
+        raise ValueError("Stein support reference B must lie in the fixed SR mass-context domain")
+    return dict(background_scores=_qscore(_support_context(z), model, device, cfg, cache, identity),
+                reference_background_scores=_qscore(guarded_reference, model, device, cfg, cache, identity))
 
 
 def _support_penalty(reference, z, cfg, **scores):
@@ -675,7 +698,7 @@ def member_scores(output, order, z, device, *, mode=None, scoring_root=None, nor
             if background_scores is None:
                 background = _load_background(output, inputs, device)
                 qscore = _qscore(
-                    z, background, device, cfg, Path(scoring_root) / ".resume/stein_qscore_cache", background_hash
+                    _support_context(z), background, device, cfg, Path(scoring_root) / ".resume/stein_qscore_cache", background_hash
                 )
             else:
                 qscore = np.asarray(background_scores)
@@ -910,6 +933,7 @@ def write_root_provenance(root, selected, accepted, settings, mapping_identity, 
         "selected_checkpoints": selected_checkpoints,
         "selected_checkpoint_sha256": checkpoint_hashes,
         "conditional_calibration": "equal-occupancy mass bins with interpolated empirical midrank CDF",
+        "background_gradient_context_protocol": SUPPORT_CONTEXT_PROTOCOL,
         "precalibration_ensemble_score": f"stein_{cfg['mode']}",
         "discriminating_raw_score": (f"stein_{cfg['mode']}_support_guard" if support["enabled"]
                                      else f"stein_{cfg['mode']}"),

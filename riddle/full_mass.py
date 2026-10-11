@@ -309,7 +309,7 @@ def diagnostic_validation(record, assessment_scores, rules):
     widths = np.diff(edges)
     result = dict(schema=1, thresholds_use_evaluation_labels=False,
                   closure_uses_simulation_background_labels=True, cuts=[], physics_certified=False,
-                  calibration_domain="SR; sidebands use the unchanged edge-clamped SR calibration",
+                  calibration_domain="SR; sidebands use the frozen edge-clamped SR score and support calibration",
                   fit_model="diagnostic exp(a+b*log(m)+c*log(m)^2), integrated over mass bins",
                   fit_is_publication_search_model=False)
     if not np.any(labels == 0):
@@ -580,7 +580,7 @@ def _export_full_mass(args, report=None):
     from .enhancements import SPLINE_SUM_PROTOCOL as spline_protocol
     from .scan_cache import resolve_reference
     from .stein import _background_score_array
-    from .stein_scoring import _load_background, _load_reference_b, final_transform
+    from .stein_scoring import SUPPORT_CONTEXT_PROTOCOL, _load_background, _load_reference_b, _support_context, final_transform
     from .training import residual_background_sample
 
     destination = Path(args.output)
@@ -697,7 +697,7 @@ def _export_full_mass(args, report=None):
             first = root / "density" / frozen["members"][0]["directory"]
             model = _load_background(first, read_json(first / "residual_training_inputs.json"), args.device)
             runtime = {}
-            qscore = _background_score_array(latents, model, args.device, mass_conditioning=True,
+            qscore = _background_score_array(_support_context(latents), model, args.device, mass_conditioning=True,
                 batch_size=frozen["settings"]["stein"]["scoring"]["qscore_batch_size"], runtime_metadata=runtime)
             if runtime["qscore_batch_size_used"] not in (0, runtime["qscore_batch_size_requested"]):
                 raise RuntimeError("Frozen background scoring reduced its batch after GPU OOM; resume with more free GPU memory")
@@ -742,6 +742,7 @@ def _export_full_mass(args, report=None):
                     execution_resources=dict(workers=args.workers, io_workers=args.io_workers,
                                              verify_workers=getattr(args, "verify_workers", 8)),
                     background_correction_domain="SR only" if report["contract"]["method"] in ("iad", "supervised") else "sidebands",
+                    background_gradient_context_protocol=SUPPORT_CONTEXT_PROTOCOL,
                     physics_certified=False, elapsed_seconds=time.monotonic() - started)
     write_json(manifest_path, manifest)
     emit_closure_status(validation)
@@ -749,7 +750,7 @@ def _export_full_mass(args, report=None):
     emit_message(f"Frozen sideband scoring END; utc={ended_utc}; elapsed={time.monotonic() - started:.1f}s", kind="PASS")
 
 
-RESCORE_PROTOCOL = "frozen_riddle_rescoring_v2_deterministic"
+RESCORE_PROTOCOL = "frozen_native_rescoring_v3_sr_support_context"
 RESCORE_PARTITIONS = ("signal_region", "test", "validation")
 RESCORE_METHODS = ("riddle", "iad", "supervised")
 
@@ -873,7 +874,7 @@ class FrozenPredictor:
         self.environment = environment()
 
     def values(self, z, mode, previous=None):
-        from .stein_scoring import _background_identity, _load_background, _qscore, final_transform
+        from .stein_scoring import _background_identity, _load_background, _qscore, _support_context, final_transform
 
         current = deepcopy(self.settings)
         current["stein"]["scoring"]["mode"] = mode
@@ -898,7 +899,7 @@ class FrozenPredictor:
                 directory = self.args.output / "density" / self.members[0]["directory"]
                 inputs = read_json(directory / "residual_training_inputs.json")
                 background = _load_background(directory, inputs, self.args.device)
-                gradients = _qscore(z, background, self.args.device, cfg,
+                gradients = _qscore(_support_context(z), background, self.args.device, cfg,
                                     self.args.output / "density/.resume/stein_qscore_cache", _background_identity(inputs))
                 if not (work / "qscore.npy").exists():
                     atomic_write(work / "qscore.npy", lambda p: save_array(p, gradients))
@@ -1142,7 +1143,17 @@ def _rescore_in_place(args, inputs):
     state_path = output / ".resume/rescore_in_place.json"
     state = read_json(state_path) if state_path.is_file() else None
     if state is not None and state["phase"] != "completed" and state["request_sha256"] != request_hash:
-        raise ValueError("An unfinished in-place re-scoring request exists; resume with the same scoring settings and prepared population")
+        legacy_request = {**request, "protocol": "frozen_riddle_rescoring_v2_deterministic"}
+        if (not getattr(args, "resume_across_code_change", False)
+                or state["request_sha256"] != identity_digest(legacy_request)):
+            raise ValueError("An unfinished in-place re-scoring request exists; resume with the same scoring settings and prepared population")
+        if state["phase"] == "publishing":
+            _publish_rescore(output, output / state["stage"], output / state["backup"],
+                             state, state_path, args.verify_workers)
+        elif state["phase"] not in ("snapshot", "scoring", "ready") or file_digest(output / "result.json") != state["source_report_sha256"]:
+            raise ValueError("The original result changed during the scoring-calibration upgrade")
+        emit_message("Upgrade frozen scoring calibration; previous stages and trained models preserved")
+        state = None
     current = read_json(output / "result.json")
     validation_report = current
     if state is not None and state["phase"] in ("scoring", "ready", "publishing"):
