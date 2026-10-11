@@ -12,7 +12,7 @@ import time
 from collections import defaultdict
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from contextlib import contextmanager
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from pathlib import Path
 
 import matplotlib
@@ -35,7 +35,7 @@ from riddle.metrics import efficiency_curve, oracle_metrics
 from riddle.plotting import ScoreLoader, discover, event_size_rows, exact_background_selection, method_family, read_discovery_result, read_metadata, result_paths, result_variant, scientific_protocol, settings_rows, verify_plot_input
 from riddle.figures import equal_occupancy, shape_chi2
 from riddle.stein_scoring import conditional_gaussianize
-from riddle.storage import file_digest
+from riddle.storage import file_digest, load_array, open_npz, ram_cache_limit, ram_file_cache, read_json
 
 METHOD_ORDER = ("riddle", "iad", "supervised", "lacathode", "ranode")
 METHOD_ALIASES = {"riddle": "riddle", "riddlev2": "riddle", "riddlev3": "riddle", "iad": "iad", "idealized": "iad", "idealized_ad": "iad", "supervised": "supervised", "supervised_ad": "supervised", "lacathode": "lacathode", "ranode": "ranode"}
@@ -184,6 +184,17 @@ def inside_legend(ax, title=None, ncol=None, fontsize=None, borderaxespad=0.5, a
     return _inside_legend(ax, **options)
 
 
+def _legend_layout_renderer(ax, initialize=False):
+    figure = ax.figure
+    if initialize:
+        figure.canvas.draw()
+    else:
+        layout = figure.get_layout_engine()
+        if layout is not None:
+            layout.execute(figure)
+    return figure.canvas.get_renderer()
+
+
 def _inside_legend(ax, title=None, ncol=None, fontsize=None, borderaxespad=0.5, allow_headroom=True):
     handles, labels = ax.get_legend_handles_labels()
     pairs = []
@@ -200,10 +211,9 @@ def _inside_legend(ax, title=None, ncol=None, fontsize=None, borderaxespad=0.5, 
     columns = ncol or (2 if len(labels) >= 5 else 1)
     font = fontsize or STYLE["legend.fontsize"]
     best = None
-    for location in candidates:
+    for index, location in enumerate(candidates):
         legend = ax.legend(handles, labels, loc=location, frameon=True, framealpha=0.93, borderpad=0.42, labelspacing=0.32, handlelength=1.9, columnspacing=0.8, ncol=columns, title=title, fontsize=font, borderaxespad=borderaxespad)
-        ax.figure.canvas.draw()
-        renderer = ax.figure.canvas.get_renderer()
+        renderer = _legend_layout_renderer(ax, initialize=index == 0)
         box = legend.get_window_extent(renderer=renderer)
         axes_box = ax.get_window_extent(renderer=renderer)
         score = legend_overlap_score(ax, legend)
@@ -248,11 +258,10 @@ def _scan_legend_overlap(ax, legend):
 def _scan_legend(ax, title=None):
     options = dict(title=title, frameon=True, framealpha=0.93, borderpad=0.42,
                    labelspacing=0.32, handlelength=1.5, fontsize=STYLE["legend.fontsize"] - 0.3)
-    for location in ("upper right", "upper left", "lower right", "lower left", "center right",
-                     "center left", "upper center", "lower center"):
+    for index, location in enumerate(("upper right", "upper left", "lower right", "lower left", "center right",
+                                     "center left", "upper center", "lower center")):
         legend = ax.legend(loc=location, **options)
-        ax.figure.canvas.draw()
-        renderer = ax.figure.canvas.get_renderer()
+        renderer = _legend_layout_renderer(ax, initialize=index == 0)
         box = legend.get_window_extent(renderer=renderer)
         axes_box = ax.get_window_extent(renderer=renderer)
         if (box.x0 >= axes_box.x0 and box.x1 <= axes_box.x1
@@ -432,6 +441,7 @@ class PaperFigureRenderer:
         self.max_pending = 2 * workers
         self.max_bytes = 128 * 1024**2
         self.verbose = verbose
+        self.workers = workers
         self.submitted = 0
         self.completed = 0
         self.saved_plots = set()
@@ -453,7 +463,7 @@ class PaperFigureRenderer:
         if state == self.last_report and (force or not self.pending):
             return
         if force or now - self.last_update >= 10:
-            say(f"[RENDER] {len(self.saved_plots)} unique plots saved; {len(self.pending)} pending; wall {now - self.started:.1f}s", self.verbose)
+            say(f"[RENDER] Saved so far: {len(self.saved_plots)} plots (cumulative); {len(self.pending)} pending; elapsed {now - self.started:.1f}s", self.verbose)
             say(f"[RENDER TASKS] {self.completed}/{self.submitted} operations completed", self.verbose, 2)
             self.last_update = now
             self.last_report = state
@@ -663,7 +673,7 @@ def plot_dijet_spectra(groups, args, output, *, scan=False):
             record = load_full_mass(root, report, workers=1)
             derived_root = root
         if record is not None and not scan and identity[0] == "background_only":
-            with np.load(derived_root / "full_mass/reference_D.npz", allow_pickle=False) as archive:
+            with open_npz(derived_root / "full_mass/reference_D.npz", allow_pickle=False) as archive:
                 scores = np.asarray(archive["scores"], float)
                 threshold = np.asarray(archive["threshold_indices"])
                 assessment = np.asarray(archive["assessment_indices"])
@@ -1025,7 +1035,7 @@ def parallel_plot_tasks(function, tasks, workers, stage, verbose, describe=None)
     completed = 0
     values = [None] * len(tasks)
     worker_count = min(workers, len(tasks))
-    compact_progress = stage in ("LOAD", "SCAN LOAD", "METRICS", "SCAN METRICS", "WITNESS FIELDS") and verbose == 1
+    compact_progress = stage in ("LOAD", "SCAN LOAD", "METRICS", "SCAN METRICS", "WITNESS FIELDS", "TRAINING LOAD") and verbose == 1
     live = compact_progress and sys.stdout.isatty()
 
     def progress_status():
@@ -1050,7 +1060,7 @@ def parallel_plot_tasks(function, tasks, workers, stage, verbose, describe=None)
               bar_format="{desc} |{bar:16}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}{postfix}]",
               postfix={"workers": worker_count}, mininterval=0.2, miniters=1, disable=not live) as progress, \
             threadpool_limits(limits=1), ThreadPoolExecutor(max_workers=worker_count) as executor:
-        pending = {executor.submit(timed, task): i for i, task in enumerate(tasks)}
+        pending = {executor.submit(copy_context().run, timed, task): i for i, task in enumerate(tasks)}
         last_update = started
         try:
             while pending:
@@ -1860,6 +1870,7 @@ def context_match_weights(reference_context, target_context, bins=30):
 
 
 def plot_latent_closure(groups, records, output, formats, overwrite, verbose):
+    prepared = {}
     for (scenario, seed, variant), group in groups.items():
         if "riddle" not in group:
             continue
@@ -1877,7 +1888,7 @@ def plot_latent_closure(groups, records, output, formats, overwrite, verbose):
         json_path = verify_requested_artifact(root, report, relative_json)
         if npz_path is None or json_path is None:
             continue
-        with np.load(npz_path, allow_pickle=False) as archive:
+        with open_npz(npz_path, allow_pickle=False) as archive:
             if "reference_B" not in archive:
                 continue
             reference = np.asarray(archive["reference_B"], float)
@@ -1894,6 +1905,8 @@ def plot_latent_closure(groups, records, output, formats, overwrite, verbose):
         if weights is None or not np.any(weights > 0):
             say(f"[SKIP] RIDDLE latent closure {variant} seed {seed}: incompatible mass-context ranges", verbose)
             continue
+        prepared[variant] = (actual, reference_z, weights)
+    for variant, (actual, reference_z, weights) in prepared.items():
         base = output / "03_features" / folder_variant(variant) / "latent_closure"
         for i in range(actual.shape[1]):
             pooled = np.concatenate((actual[:, i], reference_z[:, i]))
@@ -1941,7 +1954,7 @@ def support_quantities(root, report, record):
     reference_path = verify_requested_artifact(root, report, "density/stein_scoring_reference.npz")
     if reference_path is None:
         return None
-    with np.load(reference_path, allow_pickle=False) as archive:
+    with open_npz(reference_path, allow_pickle=False) as archive:
         reference = np.asarray(archive["reference_B"], float)
     stein, riddle = active_stein_settings(report)
     scoring = stein.get("scoring", {})
@@ -1957,6 +1970,8 @@ def support_quantities(root, report, record):
 
 
 def plot_stein(groups, records, output, formats, overwrite):
+    distributions = {}
+    projections = {}
     for (scenario, seed, variant), group in groups.items():
         if "riddle" not in group:
             continue
@@ -1975,7 +1990,6 @@ def plot_stein(groups, records, output, formats, overwrite):
         final = np.asarray(record["scores"])[mapped]
         labels = np.asarray(record["labels"])[mapped]
         fit_scores = np.asarray(record.get("fit_scores", []))
-        base = output / "05_stein_witness" / "RIDDLE" / folder_variant(variant)
         quantities = [("final_score_distribution", final, "Final anomaly score"), ("guarded_raw_score_distribution", raw, "Guarded raw score"), ("support_radius_distribution", radius, "Support radius"), ("support_z_distribution", zscore, r"Support $Z_r$"), ("support_penalty_distribution", penalty, "Support penalty")]
         if fit_scores.ndim == 2 and fit_scores.shape[1] == len(record["labels"]):
             kind = str(np.asarray(record.get("fit_score_kind", "")).item()) if "fit_score_kind" in record else ""
@@ -1986,19 +2000,7 @@ def plot_stein(groups, records, output, formats, overwrite):
             finite = np.isfinite(values)
             if not np.any(finite):
                 continue
-            low, high = np.quantile(values[finite], [0.005, 0.995])
-            if high <= low:
-                high = low + 1e-12
-            edges = np.linspace(low, high, 51)
-            fig, ax = new_figure(xlabel, "Density")
-            for truth, noun, color, style in ((0, "BG", "black", "-"), (1, "signal", "#FF0000", "--")):
-                pop = finite & (labels == truth)
-                if np.any(pop):
-                    hist, _ = np.histogram(values[pop], edges, density=True)
-                    ax.stairs(hist, edges, baseline=None, color=color, ls=style, label=f"RIDDLE {noun}")
-            add_y_headroom(ax, 0.18)
-            legend = inside_legend(ax, title="Signal region · " + VARIANT_LABELS.get(variant, variant), borderaxespad=0.75)
-            save_figure(fig, ax, base / stem, formats, overwrite, legend)
+            distributions[(variant, stem)] = (values, finite, labels, xlabel)
         if scenario == "signal_injection":
             continue
         guarded = raw
@@ -2010,10 +2012,29 @@ def plot_stein(groups, records, output, formats, overwrite):
             good = np.isfinite(x) & np.isfinite(y)
             if not np.any(good):
                 continue
-            fig, ax = new_figure(xlabel, ylabel, wide=True)
-            hist, xe, ye = np.histogram2d(x[good], y[good], bins=70)
-            white_log_density_mesh(ax, xe, ye, hist, "Events / bin")
-            save_figure(fig, ax, base / stem, formats, overwrite)
+            projections[(variant, stem)] = (x, y, good, xlabel, ylabel)
+
+    for (variant, stem), (values, finite, labels, xlabel) in distributions.items():
+        base = output / "05_stein_witness" / "RIDDLE" / folder_variant(variant)
+        low, high = np.quantile(values[finite], [0.005, 0.995])
+        if high <= low:
+            high = low + 1e-12
+        edges = np.linspace(low, high, 51)
+        fig, ax = new_figure(xlabel, "Density")
+        for truth, noun, color, style in ((0, "BG", "black", "-"), (1, "signal", "#FF0000", "--")):
+            pop = finite & (labels == truth)
+            if np.any(pop):
+                hist, _ = np.histogram(values[pop], edges, density=True)
+                ax.stairs(hist, edges, baseline=None, color=color, ls=style, label=f"RIDDLE {noun}")
+        add_y_headroom(ax, 0.18)
+        legend = inside_legend(ax, title="Signal region · " + VARIANT_LABELS.get(variant, variant), borderaxespad=0.75)
+        save_figure(fig, ax, base / stem, formats, overwrite, legend)
+    for (variant, stem), (x, y, good, xlabel, ylabel) in projections.items():
+        base = output / "05_stein_witness" / "RIDDLE" / folder_variant(variant)
+        fig, ax = new_figure(xlabel, ylabel, wide=True)
+        hist, xe, ye = np.histogram2d(x[good], y[good], bins=70)
+        white_log_density_mesh(ax, xe, ye, hist, "Events / bin")
+        save_figure(fig, ax, base / stem, formats, overwrite)
 
 
 def plot_projected_witness(groups, records, args, output):
@@ -2026,6 +2047,8 @@ def plot_projected_witness(groups, records, args, output):
     renderer = _FIGURE_RENDERER.get()
     if renderer is not None:
         renderer.flush()
+    field_pool = renderer.pool if renderer is not None else None
+    field_workers = min(args.io_workers, renderer.workers) if field_pool is not None else args.io_workers
     tasks = []
     for identity, group in sorted(groups.items()):
         scenario, seed, variant = identity
@@ -2033,6 +2056,7 @@ def plot_projected_witness(groups, records, args, output):
             key = (method, scenario, variant, "signal_region", seed)
             if method in ("riddle", "iad", "supervised") and key in records:
                 tasks.append((identity, method, root, report, records[key]))
+    field_workers = min(field_workers, max(1, len(tasks)))
 
     def prepare(task):
         identity, method, root, report, record = task
@@ -2055,12 +2079,16 @@ def plot_projected_witness(groups, records, args, output):
         options = SimpleNamespace(field_events=getattr(args, "witness_field_events", 16384),
                                   grid_size=40, smoothing=1.2, min_cell_events=2.0,
                                   batch_size=1024, device="cpu", io_workers=1,
+                                  ram_cache_bytes=(getattr(args, "ram_cache_mb", 0) * 1024**2 * 3 // 4 // field_workers),
                                   sampling_seed=int(report["seed"]) + 10502,
                                   plot_formats=args.plot_formats, overwrite=args.overwrite, dpi=600,
                                   scenario=identity[0],
                                   verbose=args.verbose,
                                   label=f"{METHOD_LABELS[method]} s{identity[1]} {identity[0]} {identity[2]}")
-        fields, metadata = evaluate_saved_witness(root, report, options)
+        if field_pool is None:
+            fields, metadata = evaluate_saved_witness(root, report, options)
+        else:
+            fields, metadata = field_pool.submit(evaluate_saved_witness, root, report, options).result()
         pairs = parse_witness_pairs(getattr(args, "witness_pairs", ["1:2"]), metadata["dimensions"])
         selections = witness_signal_selections(record, full)
         return identity, method, record, population, fields, selections, pairs, options
@@ -2068,7 +2096,8 @@ def plot_projected_witness(groups, records, args, output):
     previous_threads = torch.get_num_threads()
     try:
         torch.set_num_threads(1 if args.io_workers > 1 and len(tasks) > 1 else previous_threads)
-        prepared = parallel_plot_tasks(prepare, tasks, args.io_workers, "WITNESS FIELDS", args.verbose)
+        with ram_cache_limit(getattr(args, "ram_cache_mb", 0) * 1024**2 // 4):
+            prepared = parallel_plot_tasks(prepare, tasks, field_workers, "WITNESS FIELDS", args.verbose)
     finally:
         torch.set_num_threads(previous_threads)
     for item in prepared:
@@ -2087,7 +2116,7 @@ def history_rows(root, report, relative):
     path = verify_requested_artifact(root, report, relative)
     if path is None:
         return None
-    data = json.loads(path.read_text())
+    data = read_json(path)
     return data.get("history", data) if isinstance(data, dict) else data
 
 
@@ -2101,7 +2130,7 @@ def objective_arrays(history, stein=False):
     return np.asarray([row[train_key] for row in history], float), np.asarray([row[validation_key] for row in history], float)
 
 
-def plot_training(groups, output, formats, overwrite):
+def plot_training(groups, output, formats, overwrite, *, io_workers=1, verbose=0):
     represented = set()
     histories_by_type = defaultdict(lambda: ([], []))
     def add(method, identity, stem, ylabel, train, validation, independent=False):
@@ -2109,43 +2138,56 @@ def plot_training(groups, output, formats, overwrite):
         for target, values in zip(histories_by_type[key], (train, validation)):
             values = np.atleast_2d(values)
             target.extend(values if independent else [run_summary(values)[0]])
+    tasks = []
     for identity, group in groups.items():
         for method, (root, report) in group.items():
             key = (method, str(root))
             if key in represented:
                 continue
             represented.add(key)
-            if method in ("riddle", "iad", "supervised"):
-                history = history_rows(root, report, "background/history.json")
-                arrays = objective_arrays(history, False) if history is not None else None
-                if arrays is not None:
-                    add(method, identity, "background_nll", "Negative log likelihood", *arrays)
-                if method in ("iad", "supervised"):
-                    oracle_history = history_rows(root, report, "density/background_correction/history.json")
-                    oracle_arrays = objective_arrays(oracle_history, False) if oracle_history is not None else None
-                    if oracle_arrays is not None:
-                        add(method, identity, "oracle_background_nll", "Negative log likelihood", *oracle_arrays)
-                selection_path = verify_requested_artifact(root, report, "density/ensemble_selection.json")
-                if selection_path is not None:
-                    selection = json.loads(selection_path.read_text())
-                    histories = []
-                    for member in selection.get("members", []):
-                        relative = "density/" + member["directory"] + "/residual_losses.json"
-                        rows = history_rows(root, report, relative)
-                        arrays = objective_arrays(rows, True) if rows is not None else None
-                        if arrays is not None:
-                            histories.append(arrays)
-                    if histories:
-                        train = history_matrix([item[0] for item in histories])
-                        validation = history_matrix([item[1] for item in histories])
-                        add(method, identity, "stein_witness_objective", "Stein objective", train, validation)
-            elif method == "lacathode":
-                for stem, names, ylabel in (("background_nll", ("lacathode_model_train_losses.npy", "lacathode_model_val_losses.npy"), "Negative log likelihood"), ("classifier_bce", ("loss_matris.npy", "val_loss_matris.npy"), "Binary cross-entropy")):
-                    paths = [verify_requested_artifact(root, report, "training/" + name) for name in names]
-                    if all(path is not None for path in paths):
-                        values = [np.atleast_2d(np.load(path, allow_pickle=False)) for path in paths]
-                        independent = report.get("contract", {}).get("lacathode_run_layout") == "independent_background_classifier_v1"
-                        add(method, identity, stem, ylabel, *values, independent=independent)
+            tasks.append((identity, method, root, report))
+
+    def load(task):
+        identity, method, root, report = task
+        collected = []
+        def collect(stem, ylabel, train, validation, independent=False):
+            collected.append((method, identity, stem, ylabel, train, validation, independent))
+        if method in ("riddle", "iad", "supervised"):
+            history = history_rows(root, report, "background/history.json")
+            arrays = objective_arrays(history, False) if history is not None else None
+            if arrays is not None:
+                collect("background_nll", "Negative log likelihood", *arrays)
+            if method in ("iad", "supervised"):
+                oracle_history = history_rows(root, report, "density/background_correction/history.json")
+                oracle_arrays = objective_arrays(oracle_history, False) if oracle_history is not None else None
+                if oracle_arrays is not None:
+                    collect("oracle_background_nll", "Negative log likelihood", *oracle_arrays)
+            selection_path = verify_requested_artifact(root, report, "density/ensemble_selection.json")
+            if selection_path is not None:
+                selection = read_json(selection_path)
+                histories = []
+                for member in selection.get("members", []):
+                    relative = "density/" + member["directory"] + "/residual_losses.json"
+                    rows = history_rows(root, report, relative)
+                    arrays = objective_arrays(rows, True) if rows is not None else None
+                    if arrays is not None:
+                        histories.append(arrays)
+                if histories:
+                    train = history_matrix([item[0] for item in histories])
+                    validation = history_matrix([item[1] for item in histories])
+                    collect("stein_witness_objective", "Stein objective", train, validation)
+        elif method == "lacathode":
+            for stem, names, ylabel in (("background_nll", ("lacathode_model_train_losses.npy", "lacathode_model_val_losses.npy"), "Negative log likelihood"), ("classifier_bce", ("loss_matris.npy", "val_loss_matris.npy"), "Binary cross-entropy")):
+                paths = [verify_requested_artifact(root, report, "training/" + name) for name in names]
+                if all(path is not None for path in paths):
+                    values = [np.atleast_2d(load_array(path, allow_pickle=False)) for path in paths]
+                    independent = report.get("contract", {}).get("lacathode_run_layout") == "independent_background_classifier_v1"
+                    collect(stem, ylabel, *values, independent=independent)
+        return collected
+
+    for rows in parallel_plot_tasks(load, tasks, io_workers, "TRAINING LOAD", verbose):
+        for row in rows:
+            add(*row)
     for (method, scenario, variant, stem, ylabel), (train, validation) in sorted(histories_by_type.items()):
         destination = output / "02_training" / METHOD_LABELS.get(method, safe_component(method)) / SCENARIO_LABELS[scenario] / folder_variant(variant)
         plot_history_band(history_matrix(train), history_matrix(validation), ylabel,
@@ -2902,9 +2944,11 @@ def parse_args(argv=None):
     parser.add_argument("--file-formats", nargs="+", choices=("csv", "json", "yaml"), default=("csv",))
     parser.add_argument("--exclude-seeds", nargs="*", type=int, default=())
     parser.add_argument("--min-background", type=int, default=10)
-    parser.add_argument("--io-workers", type=int, default=2, help="Parallel discovery, result loading and metric workers")
+    parser.add_argument("--io-workers", type=int, default=2, help="Parallel discovery, score/history loading and metric workers")
+    parser.add_argument("--ram-cache-mb", type=int, default=1024,
+                        help="Total retained input-cache budget in MiB across loading and witness workers; 0 disables; no disk cache")
     parser.add_argument("--plot-workers", type=int, default=min(8, max(1, (os.cpu_count() or 1) // 2)),
-                        help="CPU processes for legend layout and image rendering; 1 runs serially")
+                        help="CPU processes for legend layout, image rendering and projected Stein fields; 1 renders serially")
     parser.add_argument("--witness-field-events", type=int, default=16384,
                         help="Maximum saved background-reference events for projected Stein diagnostics")
     parser.add_argument("--witness-pairs", nargs="+", default=["1:2"],
@@ -2918,6 +2962,8 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.io_workers < 1 or args.plot_workers < 1 or args.min_background < 1:
         parser.error("--io-workers, --plot-workers and --min-background must be positive")
+    if args.ram_cache_mb < 0:
+        parser.error("--ram-cache-mb must be nonnegative")
     if args.witness_field_events < 16:
         parser.error("--witness-field-events must be at least 16")
     normal_requested = args.data is not None or args.results is not None
@@ -2940,8 +2986,13 @@ def main(argv=None):
     previous_threads = torch.get_num_threads()
     try:
         torch.set_num_threads(args.io_workers)
-        with threadpool_limits(limits=args.io_workers):
-            return run(args)
+        if args.ram_cache_mb:
+            say(f"[RAM CACHE] Up to {args.ram_cache_mb} MiB for verified inputs across workers", args.verbose)
+        with threadpool_limits(limits=args.io_workers), ram_file_cache(args.ram_cache_mb * 1024**2) as cache:
+            result = run(args)
+            if args.ram_cache_mb:
+                say(f"[RAM CACHE] Loader reused {cache.hits} reads ({cache.reused_bytes / 1024**2:.1f} MiB)", args.verbose, 2)
+            return result
     finally:
         torch.set_num_threads(previous_threads)
 
@@ -3043,7 +3094,8 @@ def render_publication_outputs(args, groups, cache, records, loader, scenarios, 
     say("[STAGE] Build projected Stein-witness diagnostics", args.verbose)
     plot_projected_witness(groups, records, args, args.output)
     say("[STAGE] Render training histories", args.verbose)
-    plot_training(groups, args.output, args.plot_formats, args.overwrite)
+    plot_training(groups, args.output, args.plot_formats, args.overwrite,
+                  io_workers=args.io_workers, verbose=args.verbose)
     say("[STAGE] Export publication tables", args.verbose)
     export_tables(groups, cache, loader, args.output, args.file_formats, args.data, args.verbose)
 

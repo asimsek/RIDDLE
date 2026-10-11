@@ -1,11 +1,13 @@
 from contextlib import contextmanager
 from contextvars import ContextVar, copy_context
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from datetime import datetime, timezone
 from functools import wraps
 from itertools import count
 import fcntl
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -26,8 +28,123 @@ _VERIFY_POOLS = {}
 _VERIFY_GUARD = threading.Lock()
 _IO_DEPTH = ContextVar("riddle_io_depth", default=0)
 _IO_SEQUENCE = count(1)
+_RAM_FILE_CACHE = ContextVar("riddle_ram_file_cache", default=None)
 
 import numpy as np
+
+
+class _RamFileCache:
+    def __init__(self, limit, consume):
+        self.limit = limit
+        self.consume = consume
+        self.entries = OrderedDict()
+        self.lock = threading.Lock()
+        self.size = self.reserved = self.peak = 0
+        self.hits = self.reused_bytes = self.read_bytes = 0
+
+    def lookup(self, path, identity, *, consume=False):
+        with self.lock:
+            entry = self.entries.get(path)
+            if entry is None:
+                return None
+            if entry[0] != identity:
+                self.size -= len(self.entries.pop(path)[2])
+                if consume:
+                    raise ValueError(f"File changed after RAM verification: {path}")
+                return None
+            self.entries.move_to_end(path)
+            if consume:
+                self.hits += 1
+                self.reused_bytes += len(entry[2])
+                if self.consume:
+                    self.size -= len(self.entries.pop(path)[2])
+            return entry
+
+    def warm(self, path, identity):
+        entry = self.lookup(path, identity)
+        if entry is not None:
+            return entry[1]
+        size = identity[2]
+        with self.lock:
+            if size > self.limit or self.reserved + size > self.limit:
+                return None
+            while self.entries and self.size + self.reserved + size > self.limit:
+                self.size -= len(self.entries.popitem(last=False)[1][2])
+            self.reserved += size
+            self.peak = max(self.peak, self.size + self.reserved)
+        try:
+            with Path(path).open("rb") as stream:
+                payload = stream.read(size + 1)
+                if (len(payload) != size or _digest_identity(os.fstat(stream.fileno())) != identity
+                        or _digest_identity(Path(path).stat()) != identity):
+                    raise ValueError(f"File changed during RAM preload: {path}")
+            checksum = hashlib.sha256(payload).hexdigest()
+            with self.lock:
+                self.entries[path] = identity, checksum, payload
+                self.size += size
+                self.read_bytes += size
+            return checksum
+        finally:
+            with self.lock:
+                self.reserved -= size
+
+    def clear(self):
+        with self.lock:
+            self.entries.clear()
+            self.size = 0
+
+    def resize(self, limit):
+        with self.lock:
+            self.limit = limit
+            while self.entries and self.size + self.reserved > limit:
+                self.size -= len(self.entries.popitem(last=False)[1][2])
+
+
+@contextmanager
+def ram_file_cache(max_bytes, *, consume=False):
+    if type(max_bytes) is not int or max_bytes < 0:
+        raise ValueError("RAM cache size must be a nonnegative integer")
+    cache = _RamFileCache(max_bytes, consume)
+    token = _RAM_FILE_CACHE.set(cache if max_bytes else None)
+    try:
+        yield cache
+    finally:
+        _RAM_FILE_CACHE.reset(token)
+        cache.clear()
+
+
+@contextmanager
+def ram_cache_limit(max_bytes):
+    if type(max_bytes) is not int or max_bytes < 0:
+        raise ValueError("RAM cache size must be a nonnegative integer")
+    cache = _RAM_FILE_CACHE.get()
+    if cache is None:
+        yield
+        return
+    previous = cache.limit
+    cache.resize(max_bytes)
+    try:
+        yield
+    finally:
+        cache.resize(previous)
+
+
+@contextmanager
+def _input_source(path, *, mmap=False):
+    cache = _RAM_FILE_CACHE.get()
+    if cache is None or mmap or not isinstance(path, (str, os.PathLike)):
+        yield path
+        return
+    path = Path(path).resolve()
+    identity = _digest_identity(path.stat())
+    entry = cache.lookup(str(path), identity, consume=True)
+    if entry is None:
+        yield path
+        return
+    with io.BytesIO(entry[2]) as stream:
+        yield stream
+    if _digest_identity(path.stat()) != identity:
+        raise ValueError(f"File changed while reading cached input: {path}")
 
 
 @contextmanager
@@ -75,13 +192,16 @@ def _timed_file_operation(operation):
 def load_array(path, *args, **kwargs):
     operation = "Open memory-mapped array" if kwargs.get("mmap_mode") else "Read NumPy array"
     with timed_io(operation, path):
-        return np.load(path, *args, **kwargs)
+        if not isinstance(path, (str, os.PathLike)) or Path(path).suffix != ".npy":
+            return np.load(path, *args, **kwargs)
+        with _input_source(path, mmap=bool(kwargs.get("mmap_mode"))) as source:
+            return np.load(source, *args, **kwargs)
 
 
 @contextmanager
 def open_npz(path, **kwargs):
     with timed_io("Read NumPy archive", path):
-        with np.load(path, **kwargs) as archive:
+        with _input_source(path, mmap=bool(kwargs.get("mmap_mode"))) as source, np.load(source, **kwargs) as archive:
             yield archive
 
 
@@ -89,12 +209,14 @@ def open_npz(path, **kwargs):
 def load_checkpoint(path, *args, **kwargs):
     import torch
 
-    return torch.load(path, *args, **kwargs)
+    with _input_source(path, mmap=bool(kwargs.get("mmap"))) as source:
+        return torch.load(source, *args, **kwargs)
 
 
 @_timed_file_operation("Read JSON")
 def read_json(path):
-    return json.loads(Path(path).read_text())
+    with _input_source(path) as source:
+        return json.loads(source.read()) if hasattr(source, "read") else json.loads(Path(source).read_text())
 
 
 def copy_file(source, destination, **kwargs):
@@ -250,6 +372,12 @@ def file_digest(path, *, durable=True):
         if cached is not None and cached[:-1] == before:
             return cached[-1]
         with timed_io("Checksum file", path, durable=durable):
+            cache = _RAM_FILE_CACHE.get()
+            value = cache.warm(key, before) if cache is not None else None
+            if value is not None:
+                with _DIGEST_GUARD:
+                    _DIGEST_CACHE[key] = (*before, value)
+                return value
             with path.open("rb") as stream:
                 value = hashlib.file_digest(stream, "sha256").hexdigest()
                 if _digest_identity(os.fstat(stream.fileno())) != before or _digest_identity(path.stat()) != before:
@@ -285,12 +413,15 @@ def digest(value):
 
 
 @contextmanager
-def locked(path):
+def locked(path, *, shared=False):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as stream:
+    stream = (os.fdopen(os.open(path, os.O_RDONLY | os.O_CREAT, 0o666), "r")
+              if shared else path.open("a"))
+    with stream:
         try:
-            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            operation = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+            fcntl.flock(stream, operation | fcntl.LOCK_NB)
         except BlockingIOError:
             raise RuntimeError(
                 "Another process is using this output; use a distinct method/seed destination"

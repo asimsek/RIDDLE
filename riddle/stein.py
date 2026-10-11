@@ -14,7 +14,7 @@ from .model import real_sr_latents
 from .options import feature_options
 from .settings import validate_residual
 from .stein_scoring import SCORING_PROTOCOL
-from .storage import atomic_torch_save, digest, persist_boundary, restore_rng, rng_state, write_json
+from .storage import atomic_torch_save, digest, persist_boundary, read_json, restore_rng, rng_state, write_json
 from .worker_progress import ProgressStage
 
 PROTOCOL = "stein_witness_v2_exact_laplacian_mass_blind_qscore_cached_tail_rank_closure_gated"
@@ -704,7 +704,7 @@ def _checkpoint_weights(output, order):
     selection_path = Path(output) / "residual_selection.json"
     weights = np.array([], dtype=np.float64)
     if selection_path.exists():
-        selection = json.loads(selection_path.read_text())
+        selection = read_json(selection_path)
         saved_epochs = list(selection.get("epochs", []))
         saved_weights = np.asarray(selection.get("checkpoint_weights", []), dtype=np.float64)
         if saved_weights.shape == (len(saved_epochs),) and all(epoch in saved_epochs for epoch in order):

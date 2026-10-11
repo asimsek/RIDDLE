@@ -7,7 +7,7 @@ import torch
 from scipy.special import ndtri
 
 from .integrity import SCIENTIFIC_VERSION, require_finite
-from .storage import atomic_write, digest, file_digest, save_array, save_npz, write_json
+from .storage import atomic_write, digest, file_digest, load_checkpoint, open_npz, read_json, save_array, save_npz, write_json
 
 SCORING_PROTOCOL = "stein_scoring_v6_full_b_reserved_selection"
 SUPPORT_CONTEXT_PROTOCOL = "sr_edge_clamped_gradient_support_v1"
@@ -286,10 +286,10 @@ def _support_penalty(reference, z, cfg, **scores):
 
 def _load_reference_b(root):
     root = Path(root)
-    reference_meta = json.loads((root / "stein_scoring_reference.json").read_text())
+    reference_meta = read_json(root / "stein_scoring_reference.json")
     if reference_meta.get("scoring_protocol") != SCORING_PROTOCOL:
         raise ValueError("Stein reference B uses a different scoring protocol")
-    with np.load(root / "stein_scoring_reference.npz", allow_pickle=False) as archive:
+    with open_npz(root / "stein_scoring_reference.npz", allow_pickle=False) as archive:
         reference = np.ascontiguousarray(archive["reference_B"], dtype=np.float32)
     if reference.ndim != 2 or len(reference) < 2 or not np.isfinite(reference).all():
         raise ValueError("Invalid Stein reference B array")
@@ -514,7 +514,7 @@ def _qscore(inputs, background_model, device, cfg, cache_root, background_hash):
 def _load_checkpoint(output, model, epoch, device):
     from .stein import PROTOCOL
 
-    checkpoint = torch.load(Path(output) / f"residual_epoch_{epoch}.pt", map_location=device, weights_only=True)
+    checkpoint = load_checkpoint(Path(output) / f"residual_epoch_{epoch}.pt", map_location=device, weights_only=True)
     if (checkpoint.get("scientific_version") != SCIENTIFIC_VERSION
             or checkpoint.get("core") != "stein_witness"
             or checkpoint.get("stein_protocol") != PROTOCOL

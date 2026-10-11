@@ -2,6 +2,7 @@ import argparse
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager
+from contextvars import copy_context
 from dataclasses import dataclass
 import csv
 import hashlib
@@ -22,7 +23,7 @@ from scipy.special import expit
 from sklearn.metrics import roc_curve
 
 from . import figures as f
-from .storage import atomic_write, file_digest, locked, write_json
+from .storage import atomic_write, file_digest, load_array, locked, open_npz, ram_file_cache, read_json, write_json
 from .progress import set_verbosity, colored_status, verbosity, _duration
 from .worker_progress import ProgressStage, local_progress
 from .metrics import acceptance_report, efficiency_curve, oracle_metrics
@@ -519,7 +520,7 @@ def load_scores(root, report, name, *, attempt=None, for_rebuild=False):
     if attempt is not None:
         relative = Path(attempt) / relative
     path = verify_plot_input(root, report, str(relative))
-    with np.load(path, allow_pickle=False) as archive:
+    with open_npz(path, allow_pickle=False) as archive:
         fields = ("mass", "labels", "mask", "scores", "physical")
         if method == "lacathode" or "latent" in archive:
             fields += ("latent",)
@@ -874,7 +875,7 @@ def riddle_plot_ensemble(root, report, *, io_workers=2, device="cpu"):
     mass_conditioning = bool(settings.get("mass_conditioning", False))
     physical_inputs = settings.get("input_space") == "physical"
     validation = real_sr_latents(
-        np.load(path, allow_pickle=False), mass_conditioning=mass_conditioning, physical_inputs=physical_inputs
+        load_array(path, allow_pickle=False), mass_conditioning=mass_conditioning, physical_inputs=physical_inputs
     )
     if digest(validation) != inputs.get("selection_sha256"):
         raise ValueError("Reserved RIDDLE validation events differ from the training selection")
@@ -1021,7 +1022,7 @@ def unfiltered_plot_ensemble(root, report):
 
 def _riddle_saved_fit_scores(root, report, partition):
     path = verify_plot_input(root, report, f"{partition}_scores.npz")
-    with np.load(path, allow_pickle=False) as archive:
+    with open_npz(path, allow_pickle=False) as archive:
         if "accepted_fit_scores" in archive:
             fits = archive["accepted_fit_scores"]
             indices = archive["accepted_fit_indices"] if "accepted_fit_indices" in archive else np.arange(len(fits))
@@ -2151,7 +2152,7 @@ def _background_nll_history(method, source):
                 path = verify_plot_input(root, report, relative)
             except (OSError, ValueError):
                 return None
-            values = np.asarray(np.load(path, allow_pickle=False), dtype=float)
+            values = np.asarray(load_array(path, allow_pickle=False), dtype=float)
             histories[field] = np.atleast_2d(values).mean(axis=0)
         return histories
 
@@ -2167,7 +2168,7 @@ def _background_nll_history(method, source):
             path = verify_plot_input(root, report, str((directory / name).relative_to(root)))
         except (OSError, ValueError):
             return None
-        values = np.asarray(np.load(path, allow_pickle=False), dtype=float)
+        values = np.asarray(load_array(path, allow_pickle=False), dtype=float)
         histories[field] = np.atleast_2d(values).mean(axis=0)
     return histories
 
@@ -2218,7 +2219,7 @@ def _ranode_sr_model_nll_history(source, score_loader=None):
                 path = verify_plot_input(root, report, relative)
             except (OSError, ValueError):
                 return None
-            histories.append(np.asarray(np.load(path, allow_pickle=False), dtype=float))
+            histories.append(np.asarray(load_array(path, allow_pickle=False), dtype=float))
         if not histories or any(values.shape != histories[0].shape for values in histories):
             return None
         result[field] = np.asarray(histories).mean(axis=0)
@@ -2238,7 +2239,7 @@ def _lacathode_sr_classifier_history(source):
             path = verify_plot_input(root, report, str((directory / name).relative_to(root)))
         except (OSError, ValueError):
             return None
-        values = np.asarray(np.load(path, allow_pickle=False), dtype=float)
+        values = np.asarray(load_array(path, allow_pickle=False), dtype=float)
         histories[field] = np.atleast_2d(values).mean(axis=0)
     return histories
 
@@ -2466,7 +2467,7 @@ def training_figures(group, output, score_loader=None):
             )
             for name, label in zip(names, ("Train", "Validation")):
                 verify_plot_input(root, report, str((directory / name).relative_to(root)))
-                values = np.load(directory / name)
+                values = load_array(directory / name)
                 fit_histories = np.atleast_2d(values)
                 epochs = np.arange(fit_histories.shape[1])
                 mean_history = fit_histories.mean(axis=0)
@@ -2490,7 +2491,7 @@ def verify_plot_input(root, report, name):
 
 
 def read_metadata(root, report, name):
-    return json.loads(verify_plot_input(root, report, name).read_text())
+    return read_json(verify_plot_input(root, report, name))
 
 
 def method_band(ax, x, values, key, scenario, metric, seeds, classifier_fits=None):
@@ -3268,7 +3269,7 @@ def render_ranode_training(source, output, *, signal_attempts=None):
             values = []
             for attempt in attempts:
                 path = attempt + f"/results/upstream/{stage}/fit/" + kind + suffix + ".npy"
-                values.append(np.load(
+                values.append(load_array(
                     verify_plot_input(root, report, path), allow_pickle=False,
                 ))
             values = np.asarray(values)
@@ -3309,7 +3310,7 @@ def _ensemble_member_scores(method, source, score_loader, *, scope="signal_regio
         return record, scores, "equal-weight log-mean-exp of likelihood-ratio fits"
 
     path = verify_plot_input(root, report, f"{partition}_scores.npz")
-    with np.load(path, allow_pickle=False) as archive:
+    with open_npz(path, allow_pickle=False) as archive:
         if method in RIDDLE_NATIVE_METHODS and "accepted_fit_scores" in archive:
             scores = np.asarray(archive["accepted_fit_scores"], dtype=np.float64)
             indices = np.asarray(archive["accepted_fit_indices"], dtype=int)
@@ -4029,7 +4030,7 @@ def witness_population_mask(data, report, record, mode):
     path = directory / "event_ids.npz"
     if _witness_sha256(path) != inputs.get("event_ids_sha256"):
         raise ValueError("Prepared event IDs differ from the saved result; supply its original --data directory")
-    with np.load(path, allow_pickle=False) as archive:
+    with open_npz(path, allow_pickle=False) as archive:
         primary = archive["innerdata_test.npy"]
         extra_bg = archive["innerdata_extrabkg_test.npy"]
         extra_signal = archive["innerdata_extrasig.npy"]
@@ -4070,6 +4071,16 @@ def _witness_model_fields(model, inputs, qscore, device, batch_size):
 
 
 def evaluate_saved_witness(root, report, args):
+    budget = getattr(args, "ram_cache_bytes", 0)
+    if not budget:
+        return _evaluate_saved_witness(root, report, args)
+    with ram_file_cache(budget, consume=True) as cache:
+        result = _evaluate_saved_witness(root, report, args)
+        _witness_field_progress(f"RAM inputs: {cache.hits} reads reused; {cache.reused_bytes / 1024**2:.1f} MiB", args)
+        return result
+
+
+def _evaluate_saved_witness(root, report, args):
     import torch
     from riddle.production import require_complete_ensemble
     from riddle.stein import PROTOCOL, _background_score_array, _checkpoint_weights, build_potential
@@ -4094,13 +4105,15 @@ def evaluate_saved_witness(root, report, args):
         descriptions.append(inputs)
     _witness_field_progress(f"Verify {len(paths)} witness artifacts; workers={args.io_workers}", args)
     with ThreadPoolExecutor(max_workers=args.io_workers) as pool:
-        list(pool.map(lambda name: verify_plot_input(root, report, name), paths))
+        futures = [pool.submit(copy_context().run, verify_plot_input, root, report, name) for name in paths]
+        for future in futures:
+            future.result()
     reference, reference_metadata = _load_reference_b(root / "density")
     indices = _witness_sample_indices(len(reference), args.field_events, int(report["seed"]) + 10501)
     points = reference[indices]
     total = sum(len(m["epochs"]) for m in members)
     _witness_field_progress(f"{len(points)} full-dimensional reference events; {total} checkpoints; {args.device}", args)
-    fields, qcache, identities, count = {}, {}, [], 0
+    fields, qcache, identities, fit_metadata, count = {}, {}, [], [], 0
     started = time.monotonic()
     for member, inputs in zip(members, descriptions):
         if inputs["features"] != points.shape[1]:
@@ -4119,6 +4132,8 @@ def evaluate_saved_witness(root, report, args):
         model = build_potential(args.device, inputs["features"], inputs["settings"], initialization="random")
         epochs = [int(e) for e in member["epochs"]]
         weights = _checkpoint_weights(directory, epochs)
+        fit_metadata.append({"fit_index": member["fit_index"], "directory": member["directory"],
+                             "epochs": member["epochs"], "checkpoint_weights": weights.tolist()})
         for epoch, weight in zip(epochs, weights):
             _load_checkpoint(directory, model, epoch, args.device)
             values = _witness_model_fields(model, points, qcache[identity], args.device, args.batch_size)
@@ -4133,9 +4148,7 @@ def evaluate_saved_witness(root, report, args):
     dimensions = points.shape[1] - int(mass_conditioning)
     fields.update(points=points[:, :dimensions], reference_indices=indices)
     metadata = {
-        "fits": [{"fit_index": m["fit_index"], "directory": m["directory"], "epochs": m["epochs"],
-                  "checkpoint_weights": _checkpoint_weights(root / "density" / m["directory"], m["epochs"]).tolist()}
-                 for m in members],
+        "fits": fit_metadata,
         "fit_weighting": "equal across the frozen selected fits",
         "reference_B_sha256": reference_metadata["reference_B_sha256"],
         "background_identities": sorted(set(identities)), "reference_events_used": len(points),

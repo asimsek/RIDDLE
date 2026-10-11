@@ -1,4 +1,5 @@
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
+from contextlib import ExitStack
 from copy import deepcopy
 import errno
 import hashlib
@@ -13,7 +14,7 @@ import time
 import numpy as np
 
 from .mass_spectrum import CUTS, MASS_CLOSURE_PROTOCOL, background_closure_fit, event_keys, match_ids, mass_edges
-from .storage import atomic_write, copy_file, digest, environment, file_digest, fingerprint_files, locked, read_json, save_array, save_npz, seed_start, verify_artifacts, write_json
+from .storage import atomic_write, copy_file, digest, environment, file_digest, fingerprint_files, locked, open_npz, read_json, save_array, save_npz, seed_start, verify_artifacts, write_json
 from .worker_progress import emit_message
 
 
@@ -433,21 +434,88 @@ def _diagnostic_code():
     return {path.name: file_digest(path) for path in (Path(__file__), Path(__file__).with_name("mass_spectrum.py"))}
 
 
+def _verify_mass_diagnostic_update(journal, state):
+    originals = {name: update["old_sha256"] for name, update in state["updates"].items()}
+    backup = journal.parent / identity_digest(dict(validation=originals["validation.json"],
+                                                  manifest=originals["manifest.json"]))
+    verify_artifacts(backup, originals, "Verify diagnostic recovery backup")
+    original = read_json(backup / "manifest.json")
+    updated = state["updates"]["manifest.json"]["value"]
+    generations = [deepcopy(value) for value in (original, updated)]
+    for value in generations:
+        for name in ("validation_status", "diagnostic_protocol", "diagnostic_code_sha256",
+                     "diagnostic_updated_utc", "diagnostic_scores_recomputed"):
+            value.pop(name, None)
+        value["artifacts_sha256"].pop("validation.json")
+    if generations[0] != generations[1]:
+        raise ValueError(f"Pending diagnostic update changes the frozen score export: {journal.parent.parent.parent}")
+
+
+def _retire_superseded_mass_diagnostic(root, journal, state):
+    transaction_path = root / ".resume/rescore_in_place.json"
+    if not transaction_path.is_file():
+        raise ValueError(f"Full-mass diagnostic metadata changed during publication: {root}")
+    transaction = read_json(transaction_path)
+    if transaction.get("phase") != "completed":
+        raise ValueError(f"Finish the pending in-place re-scoring before recovering diagnostics: {root}")
+    generation = identity_digest(dict(source_report_sha256=transaction["source_report_sha256"],
+                                      request_sha256=transaction["request_sha256"]))
+    for name, directory in (("stage", "rescore_stages"), ("backup", "rescore_backups")):
+        expected = root / f".resume/{directory}/{generation}"
+        if transaction[name] != str(expected.relative_to(root)) or expected.resolve() != expected:
+            raise ValueError(f"Invalid completed re-scoring recovery path: {root}")
+    stage, backup = root / transaction["stage"], root / transaction["backup"]
+    report = read_json(root / "result.json")
+    published = read_json(stage / "result.json")
+    published["rescoring"].update(in_place=True, request_sha256=transaction["request_sha256"],
+                                 backup=transaction["backup"])
+    manifest = read_json(root / DERIVED_DIRECTORY / "manifest.json")
+    previous = state["updates"]["manifest.json"]["value"]
+    if (report != published or manifest != read_json(stage / DERIVED_DIRECTORY / "manifest.json")
+            or file_digest(backup / "result.json") != transaction["source_report_sha256"]
+            or previous["identity"]["seed"] != manifest["identity"]["seed"]
+            or previous["identity"]["inputs"] != manifest["identity"]["inputs"]
+            or previous["identity"] == manifest["identity"]):
+        raise ValueError(f"Cannot verify a superseding full-mass publication: {root}")
+    _validate_full_mass_manifest(manifest, report)
+    verify_artifacts(root, report["artifacts_sha256"], "Verify superseding result")
+    verify_artifacts(root / DERIVED_DIRECTORY, manifest["artifacts_sha256"],
+                     "Verify superseding full-mass export")
+    checksum = file_digest(journal)
+    archived = journal.parent / "superseded" / f"{checksum}.json"
+    if archived.is_symlink():
+        raise ValueError(f"Invalid superseded diagnostic archive: {archived}")
+    if not archived.is_file():
+        atomic_write(archived, lambda path: copy_file(journal, path))
+    if file_digest(archived) != checksum:
+        raise ValueError(f"Superseded diagnostic archive changed: {archived}")
+    journal.unlink()
+    emit_message(f"Recovered superseded full-mass diagnostic record: {root}; scores unchanged", kind="PASS")
+
+
 def _recover_mass_diagnostic(root):
-    root = Path(root)
+    root = Path(root).resolve()
     journal = root / ".resume/full_mass_diagnostics/pending.json"
+    transaction = root / ".resume/rescore_in_place.json"
+    if transaction.is_file() and read_json(transaction).get("phase") == "publishing":
+        raise ValueError(f"Finish the pending in-place re-scoring before recovering diagnostics: {root}")
     if not journal.is_file():
         return
     state = read_json(journal)
     if state.get("protocol") != MASS_CLOSURE_PROTOCOL or set(state.get("updates", {})) != {"validation.json", "manifest.json"}:
-        raise ValueError("Invalid pending full-mass diagnostic update")
+        raise ValueError(f"Invalid pending full-mass diagnostic update: {root}")
     export = root / DERIVED_DIRECTORY
     for name, update in state["updates"].items():
-        if (update["new_sha256"] != _diagnostic_json_digest(update["value"])
-                or file_digest(export / name) not in (update["old_sha256"], update["new_sha256"])):
-            raise ValueError("Full-mass diagnostic metadata changed during publication")
+        if update["new_sha256"] != _diagnostic_json_digest(update["value"]):
+            raise ValueError(f"Pending full-mass diagnostic payload checksum mismatch: {root}/{name}")
     if state["updates"]["manifest.json"]["value"]["artifacts_sha256"]["validation.json"] != state["updates"]["validation.json"]["new_sha256"]:
-        raise ValueError("Pending full-mass diagnostic checksum is inconsistent")
+        raise ValueError(f"Pending full-mass diagnostic checksum is inconsistent: {root}")
+    _verify_mass_diagnostic_update(journal, state)
+    if any(file_digest(export / name) not in (update["old_sha256"], update["new_sha256"])
+           for name, update in state["updates"].items()):
+        _retire_superseded_mass_diagnostic(root, journal, state)
+        return
+    _validate_full_mass_manifest(state["updates"]["manifest.json"]["value"], read_json(root / "result.json"))
     for name in ("validation.json", "manifest.json"):
         update = state["updates"][name]
         if file_digest(export / name) != update["new_sha256"]:
@@ -551,13 +619,18 @@ def load_full_mass(root, report, *, workers=1):
     path = root / DERIVED_DIRECTORY / "manifest.json"
     if not path.is_file():
         return None
-    with locked(root / ".resume/full_mass_diagnostics.lock"):
+    lock = root / ".resume/full_mass_diagnostics.lock"
+    with ExitStack() as locks:
+        locks.enter_context(locked(lock, shared=True))
+        if (root / ".resume/full_mass_diagnostics/pending.json").is_file():
+            locks.close()
+            locks.enter_context(locked(lock))
         _recover_mass_diagnostic(root)
         manifest = read_json(path)
         _validate_full_mass_manifest(manifest, report)
         verify_artifacts(root / DERIVED_DIRECTORY, manifest["artifacts_sha256"], "Verify full-mass scores", workers=workers)
-    with np.load(root / DERIVED_DIRECTORY / "scores.npz", allow_pickle=False) as archive:
-        record = {name: archive[name] for name in archive.files}
+        with open_npz(root / DERIVED_DIRECTORY / "scores.npz", allow_pickle=False) as archive:
+            record = {name: archive[name] for name in archive.files}
     if (record["scores"].shape != record["mass"].shape
             or record["cut_masks"].shape != (len(CUTS), len(record["mass"]))
             or not np.isfinite(record["scores"][record["mask"]]).all()
@@ -721,30 +794,32 @@ def _export_full_mass(args, report=None):
                   is_signal_region=np.r_[np.ones(len(sr_rows), bool), np.zeros(len(sb_rows), bool)])
     record["cut_masks"] = apply_rules(record["scores"], record["mask"], test_ids, rules, REFERENCE_SEEDS["ties"])
     validation = diagnostic_validation(record, reference_scores[assessment_indices], rules)
-    export.mkdir(parents=True, exist_ok=True)
-    atomic_write(export / "scores.npz", lambda path: save_npz(path, **record))
-    atomic_write(export / "sideband_scores.npz", lambda path: save_npz(path, mass=sb_rows[:, 0],
-        event_ids=sb_ids, scores=aligned_sb, mask=sb_mask,
-        cut_masks=record["cut_masks"][:, len(sr_rows):], score_scope=np.array("held_out_sidebands")))
-    atomic_write(export / "reference_D.npz", lambda path: save_npz(path, scores=reference_scores,
-        threshold_indices=threshold_indices, assessment_indices=assessment_indices))
-    write_json(export / "validation.json", validation)
-    artifacts = {name: file_digest(export / name) for name in
-                 ("scores.npz", "sideband_scores.npz", "reference_D.npz", "validation.json")}
-    manifest = dict(protocol=PROTOCOL, completed=True, identity=identity, artifacts_sha256=artifacts,
-                    diagnostic_protocol=MASS_CLOSURE_PROTOCOL, diagnostic_code_sha256=_diagnostic_code(),
-                    population="primary_held_out_innerdata_test_plus_outerdata_test",
-                    population_event_ids_sha256=digest(test_ids), thresholds=rules,
-                    thresholds_source="independent_generated_reference_D_threshold_half",
-                    threshold_truth_labels_used=False, SR_scores_preserved=True,
-                    SR_source_sha256=source_report["artifacts_sha256"]["signal_region_scores.npz"],
-                    reference_D_sha256=digest(reference_d), validation_status=validation["status"],
-                    execution_resources=dict(workers=args.workers, io_workers=args.io_workers,
-                                             verify_workers=getattr(args, "verify_workers", 8)),
-                    background_correction_domain="SR only" if report["contract"]["method"] in ("iad", "supervised") else "sidebands",
-                    background_gradient_context_protocol=SUPPORT_CONTEXT_PROTOCOL,
-                    physics_certified=False, elapsed_seconds=time.monotonic() - started)
-    write_json(manifest_path, manifest)
+    with locked(destination / ".resume/full_mass_diagnostics.lock"):
+        _recover_mass_diagnostic(destination)
+        export.mkdir(parents=True, exist_ok=True)
+        atomic_write(export / "scores.npz", lambda path: save_npz(path, **record))
+        atomic_write(export / "sideband_scores.npz", lambda path: save_npz(path, mass=sb_rows[:, 0],
+            event_ids=sb_ids, scores=aligned_sb, mask=sb_mask,
+            cut_masks=record["cut_masks"][:, len(sr_rows):], score_scope=np.array("held_out_sidebands")))
+        atomic_write(export / "reference_D.npz", lambda path: save_npz(path, scores=reference_scores,
+            threshold_indices=threshold_indices, assessment_indices=assessment_indices))
+        write_json(export / "validation.json", validation)
+        artifacts = {name: file_digest(export / name) for name in
+                     ("scores.npz", "sideband_scores.npz", "reference_D.npz", "validation.json")}
+        manifest = dict(protocol=PROTOCOL, completed=True, identity=identity, artifacts_sha256=artifacts,
+                        diagnostic_protocol=MASS_CLOSURE_PROTOCOL, diagnostic_code_sha256=_diagnostic_code(),
+                        population="primary_held_out_innerdata_test_plus_outerdata_test",
+                        population_event_ids_sha256=digest(test_ids), thresholds=rules,
+                        thresholds_source="independent_generated_reference_D_threshold_half",
+                        threshold_truth_labels_used=False, SR_scores_preserved=True,
+                        SR_source_sha256=source_report["artifacts_sha256"]["signal_region_scores.npz"],
+                        reference_D_sha256=digest(reference_d), validation_status=validation["status"],
+                        execution_resources=dict(workers=args.workers, io_workers=args.io_workers,
+                                                 verify_workers=getattr(args, "verify_workers", 8)),
+                        background_correction_domain="SR only" if report["contract"]["method"] in ("iad", "supervised") else "sidebands",
+                        background_gradient_context_protocol=SUPPORT_CONTEXT_PROTOCOL,
+                        physics_certified=False, elapsed_seconds=time.monotonic() - started)
+        write_json(manifest_path, manifest)
     emit_closure_status(validation)
     ended_utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
     emit_message(f"Frozen sideband scoring END; utc={ended_utc}; elapsed={time.monotonic() - started:.1f}s", kind="PASS")
@@ -1088,6 +1163,13 @@ def _rescore_snapshot(source, backup, report, workers):
 
 
 def _publish_rescore(output, stage, backup, state, state_path, workers):
+    with locked(output / ".resume/full_mass_diagnostics.lock"):
+        if state["phase"] != "publishing":
+            _recover_mass_diagnostic(output)
+        return _publish_rescore_locked(output, stage, backup, state, state_path, workers)
+
+
+def _publish_rescore_locked(output, stage, backup, state, state_path, workers):
     report = read_json(stage / "result.json")
     if not report.get("completed"):
         raise ValueError("The staged re-scoring result is incomplete")
@@ -1128,6 +1210,7 @@ def _publish_rescore(output, stage, backup, state, state_path, workers):
     write_json(output / "result.json", report)
     state["phase"] = "completed"
     write_json(state_path, state)
+    _recover_mass_diagnostic(output)
     emit_message("Updated scores in the original result folder; previous artifacts preserved under .resume", kind="PASS")
     return report
 
@@ -1142,6 +1225,9 @@ def _rescore_in_place(args, inputs):
     request_hash = identity_digest(request)
     state_path = output / ".resume/rescore_in_place.json"
     state = read_json(state_path) if state_path.is_file() else None
+    if state is None or state["phase"] != "publishing":
+        with locked(output / ".resume/full_mass_diagnostics.lock"):
+            _recover_mass_diagnostic(output)
     if state is not None and state["phase"] != "completed" and state["request_sha256"] != request_hash:
         legacy_request = {**request, "protocol": "frozen_riddle_rescoring_v2_deterministic"}
         if (not getattr(args, "resume_across_code_change", False)
@@ -1160,6 +1246,9 @@ def _rescore_in_place(args, inputs):
         validation_report = read_json(output / state["backup"] / "result.json")
     _validate_rescore_source(args, inputs, validation_report)
     if current.get("completed") and current.get("rescoring", {}).get("request_sha256") == request_hash:
+        if state is not None and state["phase"] == "publishing":
+            return _publish_rescore(output, output / state["stage"], output / state["backup"],
+                                    state, state_path, args.verify_workers)
         verify_artifacts(output, current["artifacts_sha256"], "Verify completed replacement scores", workers=args.verify_workers)
         score_sidebands(args, current)
         if state is not None and state["phase"] != "completed":
