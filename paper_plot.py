@@ -711,6 +711,7 @@ def plot_dijet_spectra(groups, args, output, *, scan=False):
         cohorts[(method, scenario, level)].append(record)
     if missing:
         say(f"[SPECTRA] {missing} results need --score-sidebands-only before full-mass plotting", args.verbose)
+    background_curves = {}
     for (method, scenario, level), records in cohorts.items():
         first = records[0]
         statuses = sorted({record["manifest"]["validation_status"] for record in records})
@@ -748,7 +749,8 @@ def plot_dijet_spectra(groups, args, output, *, scan=False):
             save_figure(fig, ax, destination / stem, args.plot_formats, args.overwrite,
                         {"spectrum_legend": {}})
         if scenario == "background_only":
-            plot_background_count_closure(method, records, args, output)
+            background_curves[method] = plot_background_count_closure(method, records, args, output)
+    plot_background_count_comparison(background_curves, args, output)
 
 
 def background_count_curve(record):
@@ -808,7 +810,7 @@ def plot_background_count_closure(method, records, args, output):
     curves = parallel_plot_tasks(background_count_curve, records, args.io_workers, "BG COUNTS", args.verbose)
     curves = [curve for curve in curves if curve is not None]
     if not curves:
-        return
+        return []
     destination = output / "02_mass_sculpting" / METHOD_LABELS[method] / "BG-Only"
     stem = "background_sample_to_data_vs_background_events"
     color = METHOD_COLORS[method]
@@ -822,6 +824,18 @@ def plot_background_count_closure(method, records, args, output):
                     args.plot_formats, args.overwrite, legend)
     maximum = max(curve["data_population"] for curve in curves)
     grid = np.geomspace(1, maximum, 250)
+    values = background_count_summary(curves, grid)
+    fig, ax = new_figure("", "")
+    draw_run_summary(ax, grid, values, label=METHOD_LABELS[method], color=color)
+    background_count_axes(ax, maximum)
+    legend = inside_legend(ax, allow_headroom=False)
+    save_figure(fig, ax, destination / stem, args.plot_formats, args.overwrite, legend)
+    say(f"[BG COUNTS] {METHOD_LABELS[method]}: independent assessment sample; "
+        "seed plots show count uncertainty; summary shows the seed range", args.verbose)
+    return curves
+
+
+def background_count_summary(curves, grid):
     values = []
     for curve in curves:
         x, indices, counts = np.unique(curve["data_counts"], return_index=True, return_counts=True)
@@ -830,13 +844,31 @@ def plot_background_count_closure(method, records, args, output):
         inside = (grid >= x[0]) & (grid <= x[-1])
         interpolated[inside] = np.interp(np.log(grid[inside]), np.log(x), ratio)
         values.append(interpolated)
+    return values
+
+
+def plot_background_count_comparison(cohorts, args, output):
+    cohorts = {method: curves for method, curves in cohorts.items() if curves}
+    if len(cohorts) < 2:
+        return
+    common = set.intersection(*({curve["seed"] for curve in curves} for curves in cohorts.values()))
+    if not common:
+        say("[BG COUNTS] Method overlay skipped: no common completed seeds", args.verbose)
+        return
+    cohorts = {method: [curve for curve in curves if curve["seed"] in common]
+               for method, curves in cohorts.items()}
+    maximum = max(curve["data_population"] for curves in cohorts.values() for curve in curves)
+    grid = np.geomspace(1, maximum, 250)
     fig, ax = new_figure("", "")
-    draw_run_summary(ax, grid, values, label=METHOD_LABELS[method], color=color)
+    for method in METHOD_ORDER:
+        if method in cohorts:
+            draw_run_summary(ax, grid, background_count_summary(cohorts[method], grid),
+                             label=METHOD_LABELS[method], color=METHOD_COLORS[method], common_support=True)
     background_count_axes(ax, maximum)
     legend = inside_legend(ax, allow_headroom=False)
-    save_figure(fig, ax, destination / stem, args.plot_formats, args.overwrite, legend)
-    say(f"[BG COUNTS] {METHOD_LABELS[method]}: independent assessment sample; "
-        "seed plots show count uncertainty; summary shows the seed range", args.verbose)
+    save_figure(fig, ax, output / "02_mass_sculpting" / "BG-Only" /
+                "background_sample_to_data_vs_background_events", args.plot_formats, args.overwrite, legend)
+    say(f"[BG COUNTS] Method overlay: mean and min–max across {len(common)} common seeds", args.verbose)
 
 
 def independent_records(record, seed):

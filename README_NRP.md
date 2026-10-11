@@ -313,7 +313,7 @@ cd /shared/work/RIDDLE
 python paper_plot.py --data data/lhco --results results \
   --config config/settings.yaml --output paper_plots \
   --methods riddle iad supervised --variants default deltaR shifted \
-  --plot-formats png --file-formats csv --io-workers 16 --plot-workers 16 --overwrite --verbose 1
+  --plot-formats pdf --file-formats csv --io-workers 16 --plot-workers 16 --overwrite --verbose 1
 ```
 
 All completed methods are discovered automatically.<br>
@@ -449,7 +449,7 @@ cd /shared/work/RIDDLE
 python paper_plot.py --scan-data data/injection_scan --scan-results results_injection_scan \
   --config config/settings.yaml --output paper_plots \
   --methods riddle iad supervised --variants default deltaR shifted \
-  --plot-formats png --file-formats csv --io-workers 16 --plot-workers 16 --overwrite --verbose 1
+  --plot-formats pdf --file-formats csv --io-workers 16 --plot-workers 16 --overwrite --verbose 1
 ```
 
 For preliminary plots using only available completed results, add `--allow-partial-injection-scan`.<br>

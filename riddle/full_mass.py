@@ -21,6 +21,7 @@ from .worker_progress import emit_message
 PROTOCOL = "frozen_native_full_mass_v1"
 DERIVED_DIRECTORY = "full_mass"
 REFERENCE_SEEDS = {"contexts": 96001, "background": 96002, "split": 96003, "ties": 96004}
+BACKGROUND_YIELD_PROTOCOL = "independent_sr_count_closure_v1"
 
 
 def _export_process(args, report):
@@ -367,9 +368,42 @@ def diagnostic_validation(record, assessment_scores, rules):
     return update_mass_closure(result)
 
 
+def background_yield_closure(cut, comparisons):
+    from scipy.stats import fisher_exact
+
+    sample = cut.get("independent_reference_assessment", {})
+    data = cut.get("regions", {}).get("signal_region", {})
+    result = dict(protocol=BACKGROUND_YIELD_PROTOCOL, family_confidence=0.99,
+                  p_value_threshold=0.01 / max(1, comparisons),
+                  multiple_testing="Bonferroni across the frozen SR working points",
+                  test="two-sided Fisher exact comparison of independent selected counts",
+                  truth_labels_used_for_diagnostic=True, used_for_scoring=False)
+    counts = [sample.get("events"), sample.get("selected"),
+              data.get("background_events"), data.get("selected_background")]
+    if any(value is None for value in counts):
+        return {**result, "status": "inconclusive", "reason": "Independent background counts unavailable"}
+    if (any(type(value) is not int or value < 0 for value in counts)
+            or counts[1] > counts[0] or counts[3] > counts[2]):
+        raise ValueError("Invalid independent background-yield counts")
+    sample_events, sample_selected, data_events, data_selected = counts
+    result.update(sample_events=sample_events, sample_selected=sample_selected,
+                  data_events=data_events, data_selected=data_selected)
+    if min(sample_events, data_events) < 2:
+        return {**result, "status": "inconclusive", "reason": "Too few independent background events"}
+    result["normalized_sample_to_data"] = (sample_selected * data_events / (data_selected * sample_events)
+                                            if data_selected else None)
+    result["p_value"] = float(fisher_exact([[sample_selected, sample_events - sample_selected],
+                                           [data_selected, data_events - data_selected]]).pvalue)
+    result["status"] = "failed" if result["p_value"] < result["p_value_threshold"] else "passed"
+    if sample_selected == data_selected == 0:
+        result.update(status="inconclusive", reason="No selected background events")
+    return result
+
+
 def update_mass_closure(validation):
     result = deepcopy(validation)
-    result.update(schema=2, diagnostic_protocol=MASS_CLOSURE_PROTOCOL,
+    result.update(schema=3, diagnostic_protocol=MASS_CLOSURE_PROTOCOL,
+                  background_yield_protocol=BACKGROUND_YIELD_PROTOCOL,
                   fit_model="diagnostic exp(a+b*log(m)+c*log(m)^2), integrated over mass bins",
                   fit_is_publication_search_model=False, physics_certified=False,
                   fit_range_policy="Fixed local SR window; merge narrow bins next to SR boundaries",
@@ -377,7 +411,8 @@ def update_mass_closure(validation):
     cuts = result.get("cuts", [])
     if not cuts:
         result.update(status="inconclusive", baseline_status="inconclusive",
-                      mass_fit_status="inconclusive", boundary_status="inconclusive")
+                      mass_fit_status="inconclusive", boundary_status="inconclusive",
+                      background_yield_status="inconclusive")
         return result
     first = cuts[0]["mass_acceptance"]
     if not first or any(row["high_TeV"] != first[i + 1]["low_TeV"] for i, row in enumerate(first[:-1])):
@@ -399,12 +434,14 @@ def update_mass_closure(validation):
             fit.update(conditional_status=fit["status"], status="inconclusive",
                        reason="Uncut background does not validate the diagnostic model")
         cut["background_fit_closure"] = fit
+        cut["background_yield_closure"] = background_yield_closure(cut, len(cuts))
 
     def combined(statuses):
         return "failed" if "failed" in statuses else "inconclusive" if not statuses or "inconclusive" in statuses else "passed"
 
     result["mass_fit_status"] = combined([cut["background_fit_closure"]["status"] for cut in cuts])
     result["boundary_status"] = combined([boundary["status"] for cut in cuts for boundary in cut["SR_boundaries"]])
+    result["background_yield_status"] = combined([cut["background_yield_closure"]["status"] for cut in cuts])
     result["status"] = combined([result["mass_fit_status"], result["boundary_status"]])
     result["failed_checks"] = [name for name in ("mass_fit", "boundary") if result[name + "_status"] == "failed"]
     if baseline["status"] != "passed":
@@ -424,6 +461,13 @@ def emit_closure_status(validation):
         if fit["status"] == "failed":
             checks = ", ".join(fit["failed_checks"])
             emit_message(f"Mass-fit failure at epsilon_B={100 * cut['background_acceptance']:g}%: {checks}", kind="WARNING")
+    yield_status = validation.get("background_yield_status", "inconclusive")
+    emit_message(f"Independent SR background-yield diagnostic: {yield_status}",
+                 kind="PASS" if yield_status == "passed" else "WARNING")
+    failed = [f"{100 * cut['background_acceptance']:g}%" for cut in validation.get("cuts", [])
+              if cut.get("background_yield_closure", {}).get("status") == "failed"]
+    if failed:
+        emit_message("Background-yield mismatch at epsilon_B=" + ", ".join(failed), kind="WARNING")
 
 
 def _diagnostic_json_digest(value):
@@ -594,6 +638,7 @@ def refresh_mass_diagnostics(args):
 
     started = time.monotonic()
     statuses = []
+    yield_statuses = []
     with threadpool_limits(limits=1), ThreadPoolExecutor(max_workers=min(args.io_workers, len(jobs))) as pool:
         futures = {pool.submit(copy_context().run, refresh_mass_diagnostic, root): root for root in jobs}
         with training_progress("Refresh full-mass diagnostics", len(jobs), unit="result") as progress:
@@ -602,15 +647,21 @@ def refresh_mass_diagnostics(args):
                 root = futures[future]
                 validation = future.result()
                 statuses.append(validation["status"])
+                yield_statuses.append(validation["background_yield_status"])
                 colored_status(f"{root.parents[2].name}/{root.parent.parent.name} {root.parent.name} {root.name}: {validation['status']}",
                                kind="PASS" if validation["status"] == "passed" else "WARNING",
                                level=2 if validation["status"] == "passed" else 0)
                 if validation["status"] != "passed":
                     colored_status(f"Uncut model {validation['baseline_status']}; mass fit {validation['mass_fit_status']}; boundaries {validation['boundary_status']}", kind="WARNING")
+                colored_status(f"{root.parents[2].name}/{root.parent.parent.name} {root.parent.name} {root.name}: SR background-yield {validation['background_yield_status']}",
+                               kind="PASS" if validation["background_yield_status"] == "passed" else "WARNING", level=2)
                 progress.update(index)
     counts = ", ".join(f"{statuses.count(status)} {status}" for status in ("passed", "failed", "inconclusive") if status in statuses)
     emit_message(f"Refreshed {len(jobs)} diagnostics in {time.monotonic() - started:.1f}s; {counts}",
                  kind="PASS" if all(status == "passed" for status in statuses) else "WARNING")
+    counts = ", ".join(f"{yield_statuses.count(status)} {status}" for status in ("passed", "failed", "inconclusive") if status in yield_statuses)
+    emit_message(f"Independent SR background-yield diagnostics: {counts}",
+                 kind="PASS" if all(status == "passed" for status in yield_statuses) else "WARNING")
     emit_message("Training, calibration, scores and thresholds unchanged", kind="PASS")
 
 
