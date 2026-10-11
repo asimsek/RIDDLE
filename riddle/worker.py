@@ -83,9 +83,10 @@ def main():
     if concurrent:
         from .mps import configure_mps
 
+        mps_workers = workers * int(getattr(args, "rescore_concurrency", 1))
         if (
             args.device != "cpu"
-            and workers > 1
+            and mps_workers > 1
             and args.mps != "off"
             and not os.environ.get("CUDA_VISIBLE_DEVICES", "").startswith(("GPU-", "MIG-"))
         ):
@@ -101,7 +102,7 @@ def main():
                     raise RuntimeError("Cannot verify GPU identity for MPS; use --mps off") from None
                 args.mps = "off"
                 emit_message("GPU identity unavailable; using ordinary concurrent fits", kind="WARNING")
-        status = configure_mps(args.mps, args.device, workers)
+        status = configure_mps(args.mps, args.device, mps_workers)
         args.runtime_mps = status.to_dict()
         if status.requested and not status.active:
             emit_message("MPS unavailable; ordinary concurrent fits remain enabled", kind="WARNING")

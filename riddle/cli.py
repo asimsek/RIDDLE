@@ -126,6 +126,8 @@ def parser():
                                help="Re-score completed RIDDLE/IAD/Supervised models in --output without training")
         rescoring.add_argument("--rescore-from", type=Path,
                                help="Re-score frozen RIDDLE/IAD/Supervised models without training; matching source/output roots update in place")
+        run.add_argument("--rescore-workers", type=positive, default=1,
+                         help="Concurrent seeds during re-scoring; each seed uses --workers fit processes (default: 1)")
         run.add_argument("--sideband-scoring", action=argparse.BooleanOptionalAction, default=True,
                          help="Export frozen held-out sideband scores after SR scoring (default: enabled)")
         run.add_argument("--sideband-reference-events", type=positive, default=65536,
@@ -190,6 +192,8 @@ def configure_rescoring(args):
     in_place = getattr(args, "rescore", False)
     source = getattr(args, "rescore_from", None)
     if not in_place and source is None:
+        if getattr(args, "rescore_workers", 1) != 1:
+            raise ValueError("--rescore-workers requires --rescore or --rescore-from")
         return
     if in_place and source is not None:
         raise ValueError("--rescore and --rescore-from are mutually exclusive")
@@ -203,6 +207,41 @@ def configure_rescoring(args):
     args.rescore_from = source
     args.rescore = False
     args.resume = True
+
+
+def _run_rescore_seeds(requests, workers, run_one, *, cancel_event=None):
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import threading
+    from .worker_progress import emit_message
+
+    grouped = {}
+    for request in requests:
+        grouped.setdefault(request[3], []).append(request)
+    if not grouped:
+        return
+    concurrency = min(workers, len(grouped))
+    cancel = cancel_event if cancel_event is not None else threading.Event()
+    emit_message(f"Re-scoring seeds: {len(grouped)}; concurrent={concurrency}")
+
+    def execute(seed_requests):
+        for request in seed_requests:
+            if cancel.is_set():
+                raise RuntimeError("Re-scoring cancelled after another worker failed")
+            run_one(request, cancel, concurrency)
+
+    pool = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="rescore-seed")
+    futures = []
+    try:
+        futures = [pool.submit(execute, seed_requests) for seed_requests in grouped.values()]
+        for future in as_completed(futures):
+            future.result()
+    except BaseException:
+        cancel.set()
+        for future in futures:
+            future.cancel()
+        raise
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
 
 
 def run_campaign(args, *, cancel_event=None):
@@ -289,7 +328,8 @@ def run_campaign(args, *, cancel_event=None):
         if args.methods == ["ranode"] and getattr(args, "fractions", None) is not None:
             raise ValueError("R-ANODE retains its upstream learned fraction; --fractions is RIDDLE-only")
     for scenario in args.scenarios:
-        for method, base_seed, run_index, seed in requests:
+        def run_one(request, cancel_event=cancel_event, rescore_concurrency=1):
+            method, base_seed, run_index, seed = request
             output = args.output / method / scenario / f"seed_{seed:03d}"
             if getattr(args, "score_sidebands_only", False):
                 from .storage import read_json
@@ -297,7 +337,7 @@ def run_campaign(args, *, cancel_event=None):
                 result_path = output / "result.json"
                 if not result_path.is_file() or not read_json(result_path).get("completed"):
                     emit_message(f"Skip unfinished sideband backfill: {method} seed {seed} {scenario}", kind="WARNING")
-                    continue
+                    return
             if output.exists() and not args.resume:
                 raise FileExistsError("Result exists; use --resume or a new output")
             output.mkdir(parents=True, exist_ok=True)
@@ -323,6 +363,7 @@ def run_campaign(args, *, cancel_event=None):
             env = os.environ.copy()
             if getattr(args, "rescore_from", None):
                 env["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+                options["rescore_concurrency"] = rescore_concurrency
             manifest = manifests[scenario]
             injection = (manifest.get("injection_scan") or {}).get(
                 "signal_events", manifest.get("preparation", {}).get("injected_signal_rows", "nominal"))
@@ -402,6 +443,11 @@ def run_campaign(args, *, cancel_event=None):
                     resume=args.resume,
                     cancel_event=cancel_event,
                 )
+        if getattr(args, "rescore_from", None) and getattr(args, "rescore_workers", 1) > 1:
+            _run_rescore_seeds(requests, args.rescore_workers, run_one, cancel_event=cancel_event)
+        else:
+            for request in requests:
+                run_one(request)
 
 
 def main(argv=None):

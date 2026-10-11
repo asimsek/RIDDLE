@@ -130,6 +130,9 @@ def job(args):
             if source != destination and (source.is_relative_to(destination) or destination.is_relative_to(source)):
                 raise ValueError("--rescore-from and --results must match or be separate and nonoverlapping")
             command.extend(["--rescore-from", str(args.rescore_from)])
+        command.extend(["--rescore-workers", str(getattr(args, "rescore_workers", 1))])
+    elif getattr(args, "rescore_workers", 1) != 1:
+        raise ValueError("--rescore-workers requires --rescore or --rescore-from")
     if not getattr(args, "sideband_scoring", True):
         command.append("--no-sideband-scoring")
     command.extend(["--sideband-reference-events", str(getattr(args, "sideband_reference_events", 65536))])
@@ -364,6 +367,8 @@ def main(argv=None):
     rescoring.add_argument("--rescore", action="store_true",
                            help="Re-score completed RIDDLE/IAD/Supervised models in --results without training")
     rescoring.add_argument("--rescore-from", help="Re-score frozen RIDDLE/IAD/Supervised models without training; matching source/results roots update in place")
+    p.add_argument("--rescore-workers", type=positive, default=1,
+                   help="Concurrent re-scoring seeds; each seed uses --workers fit processes (default: 1)")
     p.add_argument("--sideband-scoring", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--sideband-reference-events", type=positive, default=65536)
     p.add_argument("--verbose", type=int, choices=(0, 1, 2), default=1,
