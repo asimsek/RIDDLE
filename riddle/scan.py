@@ -113,7 +113,7 @@ def prepare_scan(args):
 
 
 def run_scan(args):
-    from .cli import run_campaign
+    from .cli import run_campaign, _run_rescore_seeds
 
     settings = load_settings(args.config)
     population = load_config(getattr(args, "population_config", None))
@@ -124,9 +124,11 @@ def run_scan(args):
         raise ValueError("Provide distinct 32-bit scan training seeds")
     plan = points(args)
     data_root, output_root = args.data.resolve(), args.output.resolve()
+    rescore_root = getattr(args, "rescore_from", None)
+    rescore_root = None if rescore_root is None else Path(rescore_root).resolve()
     baseline = population["injected_signal_events"]
     background_mode = settings["injection_scan"]["background_mode"] if getattr(args, "scan_reuse", True) else "retrain"
-    if background_mode == "reuse":
+    if background_mode == "reuse" or rescore_root is not None:
         plan.sort(key=lambda point: point["signal_events"] != baseline)
     require_current_layout(data_root)
     require_current_layout(output_root)
@@ -158,7 +160,7 @@ def run_scan(args):
         require_background_population(nominal_background, background_population(data, manifest), data)
     from .background_stage import NATIVE_METHODS, run_staged
     workers = getattr(args, "scan_bg_workers", 1)
-    if workers > 1 and background_mode == "reuse":
+    if workers > 1 and background_mode == "reuse" and rescore_root is None:
         from .worker_progress import emit_message
         emit_message("Background reuse is active; --scan-bg-workers applies to retraining scans")
     for seed in selected_seeds:
@@ -172,7 +174,7 @@ def run_scan(args):
                 options.seeds, options.methods = [seed], [method]
                 options.command = "scan"
                 variant = manifests[point["signal_events"]].get("variant", "default")
-                candidates = reuse_candidates(args, output_root, variant, seed) if getattr(args, "scan_reuse", True) else []
+                candidates = reuse_candidates(args, output_root, variant, seed) if rescore_root is None and getattr(args, "scan_reuse", True) else []
                 options.scan_result_candidates = candidates
                 options.scan_background_mode = background_mode
                 options.scan_background_baseline = baseline
@@ -180,8 +182,24 @@ def run_scan(args):
                 options.riddle_background_reuse_candidates = []
                 options.oracle_background_reuse_candidates = []
                 options.supervised_ensemble_reuse_candidates = candidates
+                if rescore_root is not None:
+                    options.rescore_from = rescore_root / point_name(point)
+                    options.rescore_workers = 1
                 tasks.append(options)
-            if (not getattr(args, "score_sidebands_only", False)
+            if rescore_root is not None:
+                by_strength = {point["signal_events"]: options for point, options in zip(plan, tasks)}
+
+                def execute_rescore(request, cancel_event=None, rescore_concurrency=1):
+                    run_campaign(by_strength[request[3]], cancel_event=cancel_event,
+                                 rescore_concurrency=rescore_concurrency)
+
+                nominal = by_strength.pop(baseline, None)
+                if nominal is not None:
+                    run_campaign(nominal)
+                remaining = [(method, seed, 0, strength) for strength in by_strength]
+                _run_rescore_seeds(remaining, getattr(args, "rescore_workers", 1), execute_rescore,
+                                   group_name=f"scan strengths for {method} seed {seed}")
+            elif (not getattr(args, "score_sidebands_only", False)
                     and background_mode == "retrain" and method in NATIVE_METHODS and (
                     workers > 1 or getattr(args, "background_only", False))):
                 def execute(options, *, cancel_event=None):

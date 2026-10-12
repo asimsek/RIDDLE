@@ -156,11 +156,87 @@ def resolve_reference(root, report):
     if original.get("completed") is not True or original.get("scan_reuse") is not None:
         raise ValueError("Scan references require an original completed result")
     if reference_content(report) != reference_content(original):
-        raise ValueError("Scan reference differs from its original producer")
+        raise ValueError(f"Scan reference differs from its original producer: {root}. "
+                         "If the producer was re-scored, update the scan with run.py scan --rescore")
     point = report["contract"]["inputs"].get("injection_scan", {})
     if point.get("schema") != 2 or point.get("signal_events") != report["contract"]["inputs"].get("preparation", {}).get("injected_signal_rows"):
         raise ValueError("Invalid scan reference injection strength")
     return source, report
+
+
+def _frozen_reference_content(report):
+    from .full_mass import RESCORE_MUTABLE_ARTIFACTS
+    from .settings import validate_residual
+
+    value = reference_content(report)
+    value.pop("rescoring", None)
+    residual = validate_residual(value["contract"]["settings"]["riddle"])
+    residual["stein"]["scoring"].pop("support_guard")
+    residual["stein"]["scoring"].pop("auto_switch")
+    value["contract"]["settings"]["riddle"] = residual
+    value["artifacts_sha256"] = {name: checksum for name, checksum in value["artifacts_sha256"].items()
+                                 if name not in RESCORE_MUTABLE_ARTIFACTS}
+    return value
+
+
+def refresh_reference(root, output, report, inputs, settings, *, workers=1):
+    from .storage import atomic_write, copy_file, locked
+    from .settings import validate_residual
+
+    root, output = Path(root).resolve(), Path(output).resolve()
+    reuse = report.get("scan_reuse") or {}
+    if reuse.get("schema") != 1 or report.get("completed") is not True:
+        raise ValueError("Scan re-scoring requires a completed, valid reference")
+    if report.get("contract", {}).get("method") not in ("riddle", "iad", "supervised"):
+        raise ValueError("Scan reference re-scoring supports RIDDLE, IAD and Supervised")
+    source = Path(reuse["source_result"])
+    if not source.is_absolute() or source.resolve() in (root, output):
+        raise ValueError("Invalid scan reference source")
+    source = source.resolve()
+    with locked(source / ".resume/command.lock"):
+        original = read_json(source / "result.json")
+        if original.get("completed") is not True or original.get("scan_reuse") is not None:
+            raise ValueError("Scan references require an original completed result; finish its re-scoring first")
+        point = inputs.get("injection_scan") or {}
+        if (point.get("schema") != 2 or point != report["contract"]["inputs"].get("injection_scan")
+                or point.get("signal_events") != original["contract"]["inputs"].get("preparation", {}).get("injected_signal_rows")
+                or comparison_contract({"inputs": inputs}) != comparison_contract({"inputs": original["contract"]["inputs"]})):
+            raise ValueError("Scan reference requires the identical nominal prepared-data population")
+        if _frozen_reference_content(report) != _frozen_reference_content(original):
+            raise ValueError("Scan producer training, fits, populations or non-scoring provenance changed; reference refresh refused")
+        current = validate_residual(original["contract"]["settings"]["riddle"])
+        if current["stein"]["scoring"] != settings["stein"]["scoring"]:
+            raise ValueError("Re-score the referenced main result with the requested scoring settings before updating this scan")
+        verify_artifacts(source, original["artifacts_sha256"], "Verify updated scan producer", workers=workers)
+        refreshed = deepcopy(original)
+        refreshed["contract"]["inputs"] = deepcopy(inputs)
+        refreshed["scan_reuse"] = deepcopy(reuse)
+        refreshed["scan_reuse"]["source_result_sha256"] = file_digest(source / "result.json")
+        requested = deepcopy(reuse.get("requested_contract", refreshed["contract"]))
+        requested["settings"]["riddle"] = deepcopy(settings)
+        refreshed["scan_reuse"]["requested_contract"] = requested
+        resolve_reference(output, refreshed)
+        destination = output / "result.json"
+        if destination.is_file():
+            previous = read_json(destination)
+            if previous == refreshed:
+                emit_message(f"Verified current scan reference for {report['contract']['method']} seed {report['seed']}", kind="PASS")
+                return refreshed
+            if (previous.get("scan_reuse", {}).get("source_result") != reuse["source_result"]
+                    or previous.get("contract", {}).get("inputs") != inputs
+                    or _frozen_reference_content(previous) != _frozen_reference_content(report)):
+                raise ValueError("Output contains a different scan result; reference refresh refused")
+            previous_hash = file_digest(destination)
+            backup = output / ".resume/scan_reference_backups" / previous_hash / "result.json"
+            if not backup.exists():
+                atomic_write(backup, lambda temporary: copy_file(destination, temporary))
+            if file_digest(backup) != previous_hash:
+                raise ValueError("Scan reference backup changed; reference refresh refused")
+        elif any(path.name not in ("training.log", ".resume") for path in output.iterdir()):
+            raise ValueError("Scan reference re-scoring requires an empty output or its existing reference")
+        write_json(destination, refreshed)
+        emit_message(f"Updated scan reference for {report['contract']['method']} seed {report['seed']}; current producer scores reused", kind="PASS")
+        return refreshed
 
 
 def runtime_compatible(previous, current, *, allow_code_change=False, allow_device_change=False):

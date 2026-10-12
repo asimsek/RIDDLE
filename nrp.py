@@ -120,13 +120,14 @@ def job(args):
         option = "--rescore" if getattr(args, "rescore", False) else "--rescore-from"
         if getattr(args, "rescore", False) and getattr(args, "rescore_from", None):
             raise ValueError("--rescore and --rescore-from are mutually exclusive")
-        if any(method not in ("riddle", "iad", "supervised") for method in args.methods) or getattr(args, "workflow", "run") != "run" or getattr(args, "score_sidebands_only", False):
-            raise ValueError(f"{option} requires run mode, methods riddle/iad/supervised and no --score-sidebands-only")
+        if any(method not in ("riddle", "iad", "supervised") for method in args.methods) or getattr(args, "score_sidebands_only", False):
+            raise ValueError(f"{option} requires methods riddle/iad/supervised and no --score-sidebands-only")
         if getattr(args, "rescore", False):
             command.append("--rescore")
         else:
             source = Path(os.path.normpath(os.path.join("/shared/work/RIDDLE", str(args.rescore_from))))
-            destination = Path(os.path.normpath(os.path.join("/shared/work/RIDDLE", str(args.results or "results"))))
+            default_results = "results/injection_scan" if getattr(args, "workflow", "run") == "scan" else "results"
+            destination = Path(os.path.normpath(os.path.join("/shared/work/RIDDLE", str(args.results or default_results))))
             if source != destination and (source.is_relative_to(destination) or destination.is_relative_to(source)):
                 raise ValueError("--rescore-from and --results must match or be separate and nonoverlapping")
             command.extend(["--rescore-from", str(args.rescore_from)])
@@ -368,7 +369,7 @@ def main(argv=None):
                            help="Re-score completed RIDDLE/IAD/Supervised models in --results without training")
     rescoring.add_argument("--rescore-from", help="Re-score frozen RIDDLE/IAD/Supervised models without training; matching source/results roots update in place")
     p.add_argument("--rescore-workers", type=positive, default=1,
-                   help="Concurrent re-scoring seeds; each seed uses --workers fit processes (default: 1)")
+                   help="Concurrent re-scoring seeds in run mode or strengths within each scan seed; each uses --workers fit processes (default: 1)")
     p.add_argument("--sideband-scoring", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--sideband-reference-events", type=positive, default=65536)
     p.add_argument("--verbose", type=int, choices=(0, 1, 2), default=1,

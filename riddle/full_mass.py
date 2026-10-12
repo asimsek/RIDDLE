@@ -879,6 +879,10 @@ def _export_full_mass(args, report=None):
 RESCORE_PROTOCOL = "frozen_native_rescoring_v3_sr_support_context"
 RESCORE_PARTITIONS = ("signal_region", "test", "validation")
 RESCORE_METHODS = ("riddle", "iad", "supervised")
+RESCORE_MUTABLE_ARTIFACTS = frozenset({"protocol.json", "score_health.json", "score_comparison.json",
+                                    "density/ensemble_inputs.json", "density/stein_scoring_calibration.json",
+                                    "density/selected_scoring_calibration.json", "density/score_selection.json"}
+                                   | {f"{name}_scores.npz" for name in RESCORE_PARTITIONS})
 
 
 def _rescore_link(source, destination):
@@ -900,11 +904,7 @@ def _rescore_link(source, destination):
 
 
 def _rescore_stage(source, output, report, workers):
-    mutable = {"protocol.json", "score_health.json", "score_comparison.json",
-               "density/ensemble_inputs.json", "density/stein_scoring_calibration.json",
-               "density/selected_scoring_calibration.json", "density/score_selection.json"}
-    mutable.update(f"{name}_scores.npz" for name in RESCORE_PARTITIONS)
-    names = [name for name in report["artifacts_sha256"] if name not in mutable]
+    names = [name for name in report["artifacts_sha256"] if name not in RESCORE_MUTABLE_ARTIFACTS]
     with ThreadPoolExecutor(max_workers=workers) as pool:
         list(pool.map(lambda name: _rescore_link(source / name, output / name), names))
     for name in ("stein_scoring", "stein_qscore_cache"):
@@ -1349,6 +1349,11 @@ def rescore(args, inputs):
             from types import SimpleNamespace
             locked_args = SimpleNamespace(**{**vars(args), "rescore_output_locked": True})
             return rescore(locked_args, inputs)
+    source_report = read_json(source / "result.json")
+    if source_report.get("scan_reuse") is not None:
+        from .scan_cache import refresh_reference
+        settings = _validate_rescore_source(args, inputs, source_report)
+        return refresh_reference(source, output, source_report, inputs, settings, workers=args.verify_workers)
     if source == output:
         return _rescore_in_place(args, inputs)
     with locked(source / ".resume/command.lock"):

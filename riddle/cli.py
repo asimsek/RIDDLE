@@ -127,7 +127,7 @@ def parser():
         rescoring.add_argument("--rescore-from", type=Path,
                                help="Re-score frozen RIDDLE/IAD/Supervised models without training; matching source/output roots update in place")
         run.add_argument("--rescore-workers", type=positive, default=1,
-                         help="Concurrent seeds during re-scoring; each seed uses --workers fit processes (default: 1)")
+                         help="Concurrent re-scoring seeds in run mode or strengths within each scan seed; each uses --workers fit processes (default: 1)")
         run.add_argument("--sideband-scoring", action=argparse.BooleanOptionalAction, default=True,
                          help="Export frozen held-out sideband scores after SR scoring (default: enabled)")
         run.add_argument("--sideband-reference-events", type=positive, default=65536,
@@ -198,8 +198,10 @@ def configure_rescoring(args):
     if in_place and source is not None:
         raise ValueError("--rescore and --rescore-from are mutually exclusive")
     option = "--rescore" if in_place else "--rescore-from"
-    if any(method not in ("riddle", "iad", "supervised") for method in args.methods) or args.command != "run" or getattr(args, "score_sidebands_only", False):
-        raise ValueError(f"{option} requires run mode, methods riddle/iad/supervised and no --score-sidebands-only")
+    if any(method not in ("riddle", "iad", "supervised") for method in args.methods) or args.command not in ("run", "scan") or getattr(args, "score_sidebands_only", False):
+        raise ValueError(f"{option} requires run or scan mode, methods riddle/iad/supervised and no --score-sidebands-only")
+    if args.command == "scan" and getattr(args, "background_only", False):
+        raise ValueError(f"{option} conflicts with --background-only")
     source = Path(args.output if in_place else source).resolve()
     destination = Path(args.output).resolve()
     if destination != source and (destination.is_relative_to(source) or source.is_relative_to(destination)):
@@ -209,7 +211,7 @@ def configure_rescoring(args):
     args.resume = True
 
 
-def _run_rescore_seeds(requests, workers, run_one, *, cancel_event=None):
+def _run_rescore_seeds(requests, workers, run_one, *, cancel_event=None, group_name="seeds"):
     from concurrent.futures import ThreadPoolExecutor, as_completed
     import threading
     from .worker_progress import emit_message
@@ -221,7 +223,7 @@ def _run_rescore_seeds(requests, workers, run_one, *, cancel_event=None):
         return
     concurrency = min(workers, len(grouped))
     cancel = cancel_event if cancel_event is not None else threading.Event()
-    emit_message(f"Re-scoring seeds: {len(grouped)}; concurrent={concurrency}")
+    emit_message(f"Re-scoring {group_name}: {len(grouped)}; concurrent={concurrency}")
 
     def execute(seed_requests):
         for request in seed_requests:
@@ -244,7 +246,7 @@ def _run_rescore_seeds(requests, workers, run_one, *, cancel_event=None):
         pool.shutdown(wait=True, cancel_futures=True)
 
 
-def run_campaign(args, *, cancel_event=None):
+def run_campaign(args, *, cancel_event=None, rescore_concurrency=1):
     from .storage import configure_verification
 
     configure_verification(getattr(args, "verify_workers", 8))
@@ -328,7 +330,7 @@ def run_campaign(args, *, cancel_event=None):
         if args.methods == ["ranode"] and getattr(args, "fractions", None) is not None:
             raise ValueError("R-ANODE retains its upstream learned fraction; --fractions is RIDDLE-only")
     for scenario in args.scenarios:
-        def run_one(request, cancel_event=cancel_event, rescore_concurrency=1):
+        def run_one(request, cancel_event=cancel_event, rescore_concurrency=rescore_concurrency):
             method, base_seed, run_index, seed = request
             output = args.output / method / scenario / f"seed_{seed:03d}"
             if getattr(args, "score_sidebands_only", False):
