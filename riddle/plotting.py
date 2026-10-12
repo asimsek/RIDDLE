@@ -4287,7 +4287,7 @@ def witness_signal_selections(record, full=None):
     return selections
 
 
-def plot_witness_projections(grid, pair, record, population, output, args, *, selections=None, save_figure=None, legend_factory=None):
+def plot_witness_projections(grid, pair, record, population, output, args, *, selections=None, save_figure=None, legend_factory=None, plot_names=None):
     if legend_factory is None:
         from paper_plot import inside_legend
 
@@ -4301,19 +4301,23 @@ def plot_witness_projections(grid, pair, record, population, output, args, *, se
     scenario = getattr(args, "scenario", None)
     has_signal = np.any(population & (np.asarray(record["labels"]) == 1) & np.asarray(record["mask"], bool))
     if scenario == "signal_injection" or (scenario is None and has_signal):
-        if args.overwrite:
+        if args.overwrite and plot_names is None:
             for name, *_ in versions:
                 for path in output.glob(f"{name}_z*_z*.*"):
                     if path.suffix in (".png", ".pdf") and re.fullmatch(r"z\d+_z\d+", path.stem[len(name) + 1:]):
                         path.unlink(missing_ok=True)
         versions = []
         versions.append(("02_witness_flow_signal", False, True, True, None))
-        if selections is None:
+        if selections is None and plot_names is None:
             selections = witness_signal_selections(record)
         for cut in (None, *WITNESS_CUTS):
             token = "" if cut is None else "_" + f"{cut * 100:g}pct".replace("0.5pct", "0p5pct")
             versions.extend((("03_stein_identity_response_signal" + token, True, False, True, cut),
                              ("03_stein_identity_response_flow_signal" + token, True, True, True, cut)))
+    if plot_names is not None:
+        versions = [version for version in versions if version[0] in plot_names]
+        if selections is None and any(version[4] is not None for version in versions):
+            selections = witness_signal_selections(record)
     output.mkdir(parents=True, exist_ok=True)
     for name, response, stream, signal, cut in versions:
         if signal:

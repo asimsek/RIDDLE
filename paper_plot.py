@@ -662,6 +662,7 @@ def plot_dijet_spectra(groups, args, output, *, scan=False):
     from riddle.full_mass import load_full_mass
     from riddle.mass_spectrum import CUTS, mass_edges, match_ids, normalization_weights, residual_limits, spectrum_histograms, spectrum_summary, spectrum_figure, spectrum_cuts_figure
 
+    focused = getattr(args, "focused", False) and not scan
     tasks = [(identity, method, root, report) for identity, group in sorted(groups.items())
              for method, (root, report) in sorted(group.items()) if method in ("riddle", "iad", "supervised")]
 
@@ -735,29 +736,80 @@ def plot_dijet_spectra(groups, args, output, *, scan=False):
         if level is not None:
             destination = destination / f"N_{int(level):06d}"
         summaries = {cut: spectrum_summary(rows, cut) for cut in (None, *CUTS)}
-        shared_limits = residual_limits(summaries)
+        shared_limits = None if focused else residual_limits(summaries)
         if args.overwrite:
             for extension in ("csv", "json", "yaml"):
                 (destination / f"dijet_mass_spectra.{extension}").unlink(missing_ok=True)
         fig, ax = spectrum_cuts_figure(summaries, edges, units)
         save_figure(fig, ax, destination / "dijet_mass_score_cuts", args.plot_formats,
                     args.overwrite, {"spectrum_legend": {}})
-        for cut in (None, *CUTS):
-            fig, ax = spectrum_figure(summaries[cut], edges, cut, units,
-                                      residual_ylim=shared_limits if cut is not None else None)
-            stem = "dijet_mass_uncut" if cut is None else f"dijet_mass_{cut * 100:g}pct".replace("0.5pct", "0p5pct")
-            save_figure(fig, ax, destination / stem, args.plot_formats, args.overwrite,
-                        {"spectrum_legend": {}})
+        if not focused:
+            for cut in (None, *CUTS):
+                fig, ax = spectrum_figure(summaries[cut], edges, cut, units,
+                                          residual_ylim=shared_limits if cut is not None else None)
+                stem = "dijet_mass_uncut" if cut is None else f"dijet_mass_{cut * 100:g}pct".replace("0.5pct", "0p5pct")
+                save_figure(fig, ax, destination / stem, args.plot_formats, args.overwrite,
+                            {"spectrum_legend": {}})
         if scenario == "background_only":
-            background_curves[method] = plot_background_count_closure(method, records, args, output)
-    plot_background_count_comparison(background_curves, args, output)
+            background_curves[method] = plot_background_count_closure(method, records, args, output, focused=focused)
+    plot_background_count_comparison(background_curves, args, output, allow_single=focused)
+
+
+def background_count_interval(data_counts, sample_counts, data_population, sample_population,
+                              ranked_data, confidence=0.6827):
+    from scipy.special import betaincinv
+
+    data_counts, sample_counts = np.asarray(data_counts, float), np.asarray(sample_counts, float)
+    ranked_data = np.asarray(ranked_data, bool)
+    if (data_counts.shape != sample_counts.shape or ranked_data.shape != data_counts.shape
+            or min(data_population, sample_population) < 1 or not 0 < confidence < 1
+            or not np.isfinite(data_counts).all() or not np.isfinite(sample_counts).all()
+            or np.any(data_counts != np.floor(data_counts)) or np.any(sample_counts != np.floor(sample_counts))
+            or np.any((data_counts < 1) | (data_counts > data_population))
+            or np.any((sample_counts < 0) | (sample_counts > sample_population))):
+        raise ValueError("Invalid background ratio counts")
+    tail = (1 - confidence) / 4
+    data_low = betaincinv(data_counts, data_population - data_counts + 1, tail)
+    data_high = np.ones_like(data_counts)
+    interior = data_counts < data_population
+    data_high[interior] = betaincinv(data_counts[interior] + 1,
+                                   data_population - data_counts[interior], 1 - tail)
+    data_high[ranked_data] = betaincinv(data_counts[ranked_data],
+                                      data_population - data_counts[ranked_data] + 1, 1 - tail)
+    sample_low = np.zeros_like(sample_counts)
+    positive = sample_counts > 0
+    sample_low[positive] = betaincinv(sample_counts[positive],
+                                    sample_population - sample_counts[positive] + 1, tail)
+    sample_high = np.ones_like(sample_counts)
+    interior = sample_counts < sample_population
+    sample_high[interior] = betaincinv(sample_counts[interior] + 1,
+                                     sample_population - sample_counts[interior], 1 - tail)
+    ratio = (sample_counts / sample_population) / (data_counts / data_population)
+    return np.minimum(ratio, sample_low / data_high), np.maximum(ratio, sample_high / data_low)
+
+
+def background_selected_counts(scores, ties, thresholds, probabilities):
+    dtype = [("score", np.float64), ("tie", np.float64)]
+    ordered = np.empty(len(scores), dtype=dtype)
+    ordered["score"], ordered["tie"] = scores, -ties
+    ordered.sort(order=("score", "tie"))
+    cuts = np.empty(len(thresholds), dtype=dtype)
+    cuts["score"], cuts["tie"] = thresholds, -probabilities
+    return len(ordered) - np.searchsorted(ordered, cuts, side="right")
+
+
+def background_count_grid(maximum):
+    return np.unique(np.r_[np.arange(1, min(64, int(maximum)) + 1),
+                           np.geomspace(1, maximum, 250)])
 
 
 def background_count_curve(record):
     from riddle.full_mass import REFERENCE_SEEDS, tie_uniform
-    from riddle.mass_spectrum import mixture_errors
 
-    threshold_reference, sample = record["background_count_reference"]
+    threshold_reference, sample = (np.asarray(values, float) for values in record["background_count_reference"])
+    if any(values.ndim != 1 or not len(values) or not np.isfinite(values).all()
+           for values in (threshold_reference, sample)):
+        raise ValueError("Invalid independent background count references")
     use = np.asarray(record["is_signal_region"], bool) & np.asarray(record["mask"], bool) & (record["labels"] == 0)
     data = np.asarray(record["scores"], float)[use]
     if len(data) < 2:
@@ -769,31 +821,30 @@ def background_count_curve(record):
                                   np.arange(len(sample), dtype=np.uint64)))
     sample_ties = tie_uniform(sample_ids, REFERENCE_SEEDS["ties"])
     data_ties = tie_uniform(record["event_ids"][use], REFERENCE_SEEDS["ties"])
-    counts = []
-    for alpha in np.geomspace(1 / len(ordered), 1, 250):
-        target = alpha * len(ordered)
-        threshold = ordered[-int(np.ceil(target))]
-        above = len(ordered) - np.searchsorted(ordered, threshold, side="right")
-        tied = np.searchsorted(ordered, threshold, side="right") - np.searchsorted(ordered, threshold, side="left")
-        probability = float(np.clip((target - above) / tied, 0, 1))
-        if alpha == 1:
-            threshold = -np.inf
-        selected_data = (data > threshold) | ((data == threshold) & (data_ties < probability))
-        selected_sample = (sample > threshold) | ((sample == threshold) & (sample_ties < probability))
-        if np.any(selected_data):
-            counts.append((int(selected_data.sum()), int(selected_sample.sum())))
-    counts = np.asarray(counts, float)
-    if not len(counts):
-        return None
-    data_counts, sample_counts = counts.T
+    target = np.geomspace(1 / len(ordered), 1, 250) * len(ordered)
+    thresholds = ordered[-np.ceil(target).astype(int)]
+    right = np.searchsorted(ordered, thresholds, side="right")
+    above = len(ordered) - right
+    tied = right - np.searchsorted(ordered, thresholds, side="left")
+    probabilities = np.clip((target - above) / tied, 0, 1)
+    thresholds[-1] = -np.inf
+    extension = np.arange(1, min(64, len(data) - 1) + 1)
+    rank = np.lexsort((data_ties, -data))[extension - 1]
+    ranked_data = np.r_[np.ones(len(extension), bool), np.zeros(len(thresholds), bool)]
+    thresholds = np.r_[data[rank], thresholds]
+    probabilities = np.r_[np.nextafter(data_ties[rank], np.inf), probabilities]
+    data_counts = background_selected_counts(data, data_ties, thresholds, probabilities)
+    sample_counts = background_selected_counts(sample, sample_ties, thresholds, probabilities)
+    selected = ranked_data | (data_counts > len(extension))
+    data_counts, sample_counts, ranked_data = data_counts[selected], sample_counts[selected], ranked_data[selected]
+    order = np.argsort(data_counts, kind="stable")
+    data_counts, sample_counts, ranked_data = data_counts[order], sample_counts[order], ranked_data[order]
     normalization = len(data) / len(sample)
     ratio = normalization * sample_counts / data_counts
-    sample_low, sample_high = mixture_errors(sample_counts, sample_counts)
-    data_low, data_high = mixture_errors(data_counts, data_counts)
-    low_error = np.hypot(normalization * sample_low / data_counts, ratio * data_high / data_counts)
-    high_error = np.hypot(normalization * sample_high / data_counts, ratio * data_low / data_counts)
+    low, high = background_count_interval(data_counts, sample_counts, len(data), len(sample), ranked_data)
+    low[-1] = high[-1] = ratio[-1]
     return dict(data_counts=data_counts, sample_counts=sample_counts, ratio=ratio,
-                low=np.maximum(0, ratio - low_error), high=ratio + high_error,
+                low=low, high=high, ranked_data=ranked_data, count_confidence=0.6827,
                 data_population=len(data), sample_population=len(sample),
                 seed=int(record["manifest"]["identity"]["seed"]))
 
@@ -806,11 +857,13 @@ def background_count_axes(ax, maximum):
         ax.axhline(value, color="black", ls=style, lw=0.5, zorder=1)
 
 
-def plot_background_count_closure(method, records, args, output):
+def plot_background_count_closure(method, records, args, output, *, focused=False):
     curves = parallel_plot_tasks(background_count_curve, records, args.io_workers, "BG COUNTS", args.verbose)
     curves = [curve for curve in curves if curve is not None]
     if not curves:
         return []
+    if focused:
+        return curves
     destination = output / "02_mass_sculpting" / METHOD_LABELS[method] / "BG-Only"
     stem = "background_sample_to_data_vs_background_events"
     color = METHOD_COLORS[method]
@@ -823,33 +876,48 @@ def plot_background_count_closure(method, records, args, output):
         save_figure(fig, ax, destination / f"seed_{curve['seed']:03d}" / stem,
                     args.plot_formats, args.overwrite, legend)
     maximum = max(curve["data_population"] for curve in curves)
-    grid = np.geomspace(1, maximum, 250)
-    values = background_count_summary(curves, grid)
+    grid = background_count_grid(maximum)
     fig, ax = new_figure("", "")
-    draw_run_summary(ax, grid, values, label=METHOD_LABELS[method], color=color)
+    draw_background_count_summary(ax, grid, curves, label=METHOD_LABELS[method], color=color)
     background_count_axes(ax, maximum)
     legend = inside_legend(ax, allow_headroom=False)
     save_figure(fig, ax, destination / stem, args.plot_formats, args.overwrite, legend)
     say(f"[BG COUNTS] {METHOD_LABELS[method]}: independent assessment sample; "
-        "seed plots show count uncertainty; summary shows the seed range", args.verbose)
+        "seed plots show pointwise count intervals; summaries show the seed range "
+        "and a lighter count-interval envelope", args.verbose)
     return curves
 
 
-def background_count_summary(curves, grid):
+def background_count_summary(curves, grid, quantity="ratio"):
     values = []
     for curve in curves:
         x, indices, counts = np.unique(curve["data_counts"], return_index=True, return_counts=True)
-        ratio = np.add.reduceat(curve["ratio"], indices) / counts
+        if quantity == "low":
+            values_at_counts = np.minimum.reduceat(curve[quantity], indices)
+        elif quantity == "high":
+            values_at_counts = np.maximum.reduceat(curve[quantity], indices)
+        else:
+            values_at_counts = np.add.reduceat(curve[quantity], indices) / counts
         interpolated = np.full_like(grid, np.nan)
         inside = (grid >= x[0]) & (grid <= x[-1])
-        interpolated[inside] = np.interp(np.log(grid[inside]), np.log(x), ratio)
+        interpolated[inside] = np.interp(np.log(grid[inside]), np.log(x), values_at_counts)
         values.append(interpolated)
     return values
 
 
-def plot_background_count_comparison(cohorts, args, output):
+def draw_background_count_summary(ax, grid, curves, *, label, color):
+    values = background_count_summary(curves, grid)
+    lower = np.asarray(background_count_summary(curves, grid, "low"))
+    upper = np.asarray(background_count_summary(curves, grid, "high"))
+    supported = np.isfinite(values).all(axis=0) & np.isfinite(lower).all(axis=0) & np.isfinite(upper).all(axis=0)
+    ax.fill_between(grid, np.min(lower, axis=0), np.max(upper, axis=0), where=supported,
+                    color=color, alpha=0.08, linewidth=0)
+    return draw_run_summary(ax, grid, values, label=label, color=color, common_support=True)
+
+
+def plot_background_count_comparison(cohorts, args, output, *, allow_single=False):
     cohorts = {method: curves for method, curves in cohorts.items() if curves}
-    if len(cohorts) < 2:
+    if len(cohorts) < (1 if allow_single else 2):
         return
     common = set.intersection(*({curve["seed"] for curve in curves} for curves in cohorts.values()))
     if not common:
@@ -858,17 +926,18 @@ def plot_background_count_comparison(cohorts, args, output):
     cohorts = {method: [curve for curve in curves if curve["seed"] in common]
                for method, curves in cohorts.items()}
     maximum = max(curve["data_population"] for curves in cohorts.values() for curve in curves)
-    grid = np.geomspace(1, maximum, 250)
+    grid = background_count_grid(maximum)
     fig, ax = new_figure("", "")
     for method in METHOD_ORDER:
         if method in cohorts:
-            draw_run_summary(ax, grid, background_count_summary(cohorts[method], grid),
-                             label=METHOD_LABELS[method], color=METHOD_COLORS[method], common_support=True)
+            draw_background_count_summary(ax, grid, cohorts[method],
+                                          label=METHOD_LABELS[method], color=METHOD_COLORS[method])
     background_count_axes(ax, maximum)
     legend = inside_legend(ax, allow_headroom=False)
     save_figure(fig, ax, output / "02_mass_sculpting" / "BG-Only" /
                 "background_sample_to_data_vs_background_events", args.plot_formats, args.overwrite, legend)
-    say(f"[BG COUNTS] Method overlay: mean and min–max across {len(common)} common seeds", args.verbose)
+    say(f"[BG COUNTS] Method overlay: mean and min–max across {len(common)} common seeds; "
+        "lighter bands enclose the per-seed count intervals", args.verbose)
 
 
 def independent_records(record, seed):
@@ -1254,7 +1323,7 @@ def comparison_methods(cache, scenario, variant, region):
     return [method for method in METHOD_ORDER if any(key[:4] == (method, scenario, variant, region) for key in cache)] + sorted({key[0] for key in cache if key[1:4] == (scenario, variant, region)} - set(METHOD_ORDER))
 
 
-def plot_performance(cache, output, formats, overwrite, scenarios, variants, regions):
+def plot_performance(cache, output, formats, overwrite, scenarios, variants, regions, *, focused=False):
     for scenario in scenarios:
         if scenario != "signal_injection":
             continue
@@ -1328,6 +1397,8 @@ def plot_performance(cache, output, formats, overwrite, scenarios, variants, reg
                     save_figure(fig, ax, destination / "background_rejection_vs_signal_efficiency", formats, overwrite, legend)
                 else:
                     plt.close(fig)
+                if focused:
+                    continue
                 fig, ax = new_figure(r"Background working point, $\epsilon_B$", r"Signal efficiency, $\epsilon_S$")
                 drawn = 0
                 xs = np.asarray(PLOT_WORKING_POINTS)
@@ -1519,7 +1590,7 @@ def representative_records(records):
     return chosen
 
 
-def plot_features(records, output, formats, overwrite, verbose):
+def plot_features(records, output, formats, overwrite, verbose, *, focused=False):
     chosen = representative_records(records)
     by_population = {}
     for (method, scenario, variant, region), (seed, record) in chosen.items():
@@ -1531,6 +1602,9 @@ def plot_features(records, output, formats, overwrite, verbose):
         if current is None or priority < current[0]:
             by_population[identity] = (priority, method, seed, record)
     tasks = [(method, scenario, variant, seed, record) for (scenario, variant), (_, method, seed, record) in sorted(by_population.items())]
+    if focused:
+        signal_variants = {variant for _, scenario, variant, _, _ in tasks if scenario == "signal_injection"}
+        tasks = [task for task in tasks if task[1] == "signal_injection" or task[2] not in signal_variants]
     total_pairs = sum(math.comb(len(FEATURE_NAMES.get(variant, ())), 2) for _, _, variant, _, _ in tasks)
     pair_index = 0
     for method, scenario, variant, seed, record in tasks:
@@ -1556,6 +1630,11 @@ def plot_features(records, output, formats, overwrite, verbose):
                     ax.stairs(hist, edges, baseline=None, color="black", ls="-", label="BG")
             legend = inside_legend(ax, title="Signal region · " + VARIANT_LABELS.get(variant, variant))
             save_figure(fig, ax, base / "input_1d" / safe_component(name), formats, overwrite, legend)
+        if focused:
+            plot_correlations(base, names, values, labels, record, variant, formats, overwrite, focused=True)
+            if method in ("riddle", "iad", "supervised"):
+                plot_latents(base, method, scenario, variant, record, formats, overwrite, verbose, focused=True)
+            continue
         for i in range(len(names)):
             for j in range(i + 1, len(names)):
                 pair_index += 1
@@ -1601,7 +1680,7 @@ def mapped_latents(record):
     return full[:, :width], mask
 
 
-def plot_latents(base, method, scenario, variant, record, formats, overwrite, verbose):
+def plot_latents(base, method, scenario, variant, record, formats, overwrite, verbose, *, focused=False):
     latent, mapped = mapped_latents(record)
     if latent is None or latent.shape[1] == 0:
         return
@@ -1641,6 +1720,8 @@ def plot_latents(base, method, scenario, variant, record, formats, overwrite, ve
         legend = ax.legend(loc="upper left", frameon=True, framealpha=0.93, borderpad=0.42, labelspacing=0.32, handlelength=1.9, columnspacing=0.8, ncol=1, title="Signal region · " + VARIANT_LABELS.get(variant, variant), fontsize=STYLE["legend.fontsize"], borderaxespad=0.75)
         ax.figure.canvas.draw()
         save_figure(fig, ax, base / "latent_1d" / name, formats, overwrite, legend)
+    if focused:
+        return
     pairs = [(i, j) for i in range(latent.shape[1]) for j in range(i + 1, latent.shape[1])]
     for index, (i, j) in enumerate(pairs, 1):
         say(f"[{index}/{len(pairs)}] latent pair {variant}: z{i+1} vs z{j+1}", verbose, 2)
@@ -1661,7 +1742,7 @@ def plot_latents(base, method, scenario, variant, record, formats, overwrite, ve
         save_figure(fig, ax, base / "latent_2d" / f"z{i+1}_vs_z{j+1}", formats, overwrite, legend)
 
 
-def plot_correlations(base, names, physical, labels, record, variant, formats, overwrite):
+def plot_correlations(base, names, physical, labels, record, variant, formats, overwrite, *, focused=False):
     mass = np.asarray(record["mass"], float)
     mass_tev = mass / 1000.0 if np.nanmedian(np.abs(mass)) > 20 else mass
     input_matrix = np.column_stack((mass_tev, physical))
@@ -1677,7 +1758,7 @@ def plot_correlations(base, names, physical, labels, record, variant, formats, o
             latent_matrix = np.column_stack((mass_tev[lpop], latent[lpop]))
             latent_names = [r"$m_{jj}$", *[fr"$z_{{{i+1}}}$" for i in range(latent.shape[1])]]
             correlation_heatmap(latent_matrix, latent_names, base / "correlations" / f"latent_{noun}", formats, overwrite)
-    if latent is not None and physical.shape[1] == latent.shape[1]:
+    if not focused and latent is not None and physical.shape[1] == latent.shape[1]:
         bg = labels == 0
         before = np.corrcoef(physical[bg], rowvar=False)
         after = np.corrcoef(latent[bg & mapped], rowvar=False)
@@ -1770,9 +1851,11 @@ def random_reference_band(mass, efficiencies, trials=100):
     return np.asarray(rows)
 
 
-def plot_mass_sculpting(cache, records, output, formats, overwrite, scenarios, variants, regions, verbose):
+def plot_mass_sculpting(cache, records, output, formats, overwrite, scenarios, variants, regions, verbose, *, focused=False):
     efficiencies = np.geomspace(0.005, 0.2, 28)
     for scenario in scenarios:
+        if focused and scenario != "background_only":
+            continue
         for variant in variants:
             for region in regions:
                 methods = comparison_methods(cache, scenario, variant, region)
@@ -1807,6 +1890,8 @@ def plot_mass_sculpting(cache, records, output, formats, overwrite, scenarios, v
                 ax.set_ylim(5e-1, 3.5e2)
                 legend = inside_legend(ax, title=REGION_LABELS[region] + " · " + VARIANT_LABELS.get(variant, variant), borderaxespad=0.75, allow_headroom=False)
                 save_figure(fig, ax, figure_path(output, scenario, variant, region) / "mass_sculpting_chi2_ndof_vs_background_efficiency", formats, overwrite, legend)
+                if focused:
+                    continue
                 working_point_plots = {}
                 all_efficiencies = []
                 for wp in PLOT_WORKING_POINTS[::-1]:
@@ -1901,7 +1986,7 @@ def context_match_weights(reference_context, target_context, bins=30):
     return weights
 
 
-def plot_latent_closure(groups, records, output, formats, overwrite, verbose):
+def plot_latent_closure(groups, records, output, formats, overwrite, verbose, *, focused=False):
     prepared = {}
     for (scenario, seed, variant), group in groups.items():
         if "riddle" not in group:
@@ -1952,7 +2037,7 @@ def plot_latent_closure(groups, records, output, formats, overwrite, verbose):
             ax.stairs(actual_hist, edges, baseline=None, color="black", ls="-", label="Actual BG")
             ax.stairs(ref_hist, edges, baseline=None, color="#FF0000", ls="--", label="Synthetic BG")
             legend = inside_legend(ax, title="Signal region · " + VARIANT_LABELS.get(variant, variant))
-            save_figure(fig, ax, base / f"z{i+1}", formats, overwrite, legend)
+            save_figure(fig, ax, base / ("1D" if focused else "") / f"z{i+1}", formats, overwrite, legend)
         pairs = [(i, j) for i in range(actual.shape[1]) for j in range(i + 1, actual.shape[1])]
         for index, (i, j) in enumerate(pairs, 1):
             say(f"[{index}/{len(pairs)}] latent closure {variant}: z{i+1} vs z{j+1}", verbose, 2)
@@ -1967,7 +2052,7 @@ def plot_latent_closure(groups, records, output, formats, overwrite, verbose):
             ax.set_xlim(-5.0, 5.0)
             ax.set_ylim(-5.0, 5.0)
             legend = inside_legend(ax, title="Signal region · " + VARIANT_LABELS.get(variant, variant), fontsize=8.0, borderaxespad=0.9)
-            save_figure(fig, ax, base / f"z{i+1}_vs_z{j+1}", formats, overwrite, legend)
+            save_figure(fig, ax, base / ("2D" if focused else "") / f"z{i+1}_vs_z{j+1}", formats, overwrite, legend)
 
 
 def active_stein_settings(report):
@@ -2076,6 +2161,7 @@ def plot_projected_witness(groups, records, args, output):
     from riddle.plotting import _prepared_data_directory
     from riddle.plotting import evaluate_saved_witness, parse_witness_pairs, witness_population_mask, project_witness_fields, witness_signal_selections, plot_witness_projections
 
+    focused = getattr(args, "focused", False)
     renderer = _FIGURE_RENDERER.get()
     if renderer is not None:
         renderer.flush()
@@ -2084,10 +2170,15 @@ def plot_projected_witness(groups, records, args, output):
     tasks = []
     for identity, group in sorted(groups.items()):
         scenario, seed, variant = identity
+        if focused and seed != 42:
+            continue
         for method, (root, report) in sorted(group.items()):
             key = (method, scenario, variant, "signal_region", seed)
             if method in ("riddle", "iad", "supervised") and key in records:
                 tasks.append((identity, method, root, report, records[key]))
+    if focused and not tasks:
+        say("[FOCUSED] Projected Stein plots skipped: no selected seed 42 results", args.verbose)
+        return
     field_workers = min(field_workers, max(1, len(tasks)))
 
     def prepare(task):
@@ -2121,8 +2212,8 @@ def plot_projected_witness(groups, records, args, output):
             fields, metadata = evaluate_saved_witness(root, report, options)
         else:
             fields, metadata = field_pool.submit(evaluate_saved_witness, root, report, options).result()
-        pairs = parse_witness_pairs(getattr(args, "witness_pairs", ["1:2"]), metadata["dimensions"])
-        selections = witness_signal_selections(record, full)
+        pairs = parse_witness_pairs(["1:2"] if focused else getattr(args, "witness_pairs", ["1:2"]), metadata["dimensions"])
+        selections = None if focused else witness_signal_selections(record, full)
         return identity, method, record, population, fields, selections, pairs, options
 
     previous_threads = torch.get_num_threads()
@@ -2141,7 +2232,8 @@ def plot_projected_witness(groups, records, args, output):
         for pair in pairs:
             grid = project_witness_fields(fields, pair, options)
             plot_witness_projections(grid, pair, record, population, destination, options,
-                          selections=selections, save_figure=save_figure, legend_factory=inside_legend)
+                          selections=selections, save_figure=save_figure, legend_factory=inside_legend,
+                          plot_names=("03_stein_identity_response", "03_stein_identity_response_signal") if focused else None)
 
 
 def history_rows(root, report, relative):
@@ -2162,7 +2254,7 @@ def objective_arrays(history, stein=False):
     return np.asarray([row[train_key] for row in history], float), np.asarray([row[validation_key] for row in history], float)
 
 
-def plot_training(groups, output, formats, overwrite, *, io_workers=1, verbose=0):
+def plot_training(groups, output, formats, overwrite, *, io_workers=1, verbose=0, focused=False):
     represented = set()
     histories_by_type = defaultdict(lambda: ([], []))
     def add(method, identity, stem, ylabel, train, validation, independent=False):
@@ -2189,7 +2281,7 @@ def plot_training(groups, output, formats, overwrite, *, io_workers=1, verbose=0
             arrays = objective_arrays(history, False) if history is not None else None
             if arrays is not None:
                 collect("background_nll", "Negative log likelihood", *arrays)
-            if method in ("iad", "supervised"):
+            if not focused and method in ("iad", "supervised"):
                 oracle_history = history_rows(root, report, "density/background_correction/history.json")
                 oracle_arrays = objective_arrays(oracle_history, False) if oracle_history is not None else None
                 if oracle_arrays is not None:
@@ -2210,6 +2302,8 @@ def plot_training(groups, output, formats, overwrite, *, io_workers=1, verbose=0
                     collect("stein_witness_objective", "Stein objective", train, validation)
         elif method == "lacathode":
             for stem, names, ylabel in (("background_nll", ("lacathode_model_train_losses.npy", "lacathode_model_val_losses.npy"), "Negative log likelihood"), ("classifier_bce", ("loss_matris.npy", "val_loss_matris.npy"), "Binary cross-entropy")):
+                if focused and stem != "background_nll":
+                    continue
                 paths = [verify_requested_artifact(root, report, "training/" + name) for name in names]
                 if all(path is not None for path in paths):
                     values = [np.atleast_2d(load_array(path, allow_pickle=False)) for path in paths]
@@ -2988,6 +3082,8 @@ def parse_args(argv=None):
     parser.add_argument("--cross-section-weights", type=Path,
                         help="NPZ with event_ids and physical weights_pb; otherwise mass spectra show events/TeV")
     parser.add_argument("--allow-partial-injection-scan", action="store_true")
+    parser.add_argument("--focused", action="store_true",
+                        help="Selected normal publication plots and tables; projected Stein response uses seed 42 and z1-z2")
     parser.add_argument("--require-compatible-populations", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--verbose", type=int, choices=(0, 1, 2), default=1)
@@ -3006,6 +3102,8 @@ def parse_args(argv=None):
             or (args.workflow == "scan" and normal_requested)):
         parser.error("The input arguments must match --workflow")
     args.workflow = args.workflow or ("scan" if scan_requested else "normal")
+    if args.focused and args.workflow != "normal":
+        parser.error("--focused is available for normal plots only")
     args.results = args.results if args.results is not None else Path("results")
     args.data = args.data if args.data is not None else Path("data/lhco")
     args.scan_results = args.scan_results if args.scan_results is not None else Path("results_injection_scan")
@@ -3031,7 +3129,7 @@ def main(argv=None):
 
 def run(args):
     configure_style()
-    if args.overwrite and args.workflow == "normal":
+    if args.overwrite and args.workflow == "normal" and not getattr(args, "focused", False):
         cleanup_legacy_summary_folders(args.output)
     settings = load_settings_file(args.config)
     scan = args.workflow == "scan"
@@ -3100,7 +3198,8 @@ def run(args):
                                        scenarios, [variant], regions, output=destination)
             say(f"[STAGE] Render {variant} full-mass dijet spectra", args.verbose)
             plot_dijet_spectra(selected_groups, args, destination)
-        plot_variant_robustness(cache, variant_output(args.output, "default"), args.plot_formats, args.overwrite, regions)
+        if not getattr(args, "focused", False):
+            plot_variant_robustness(cache, variant_output(args.output, "default"), args.plot_formats, args.overwrite, regions)
     say(f"[DONE] Publication outputs written to {args.output}", args.verbose)
     return 0
 
@@ -3109,25 +3208,29 @@ def render_publication_outputs(args, groups, cache, records, loader, scenarios, 
     from copy import copy
     args = copy(args)
     args.output = args.output if output is None else output
+    focused = getattr(args, "focused", False)
     say("[STAGE] Render comparison performance plots", args.verbose)
-    plot_performance(cache, args.output, args.plot_formats, args.overwrite, scenarios, variants, regions)
-    plot_score_distributions(groups, records, args.output, args.plot_formats, args.overwrite)
-    plot_stability(cache, args.output, args.plot_formats, args.overwrite, regions)
-    plot_acceptance(cache, args.output, args.plot_formats, args.overwrite)
+    plot_performance(cache, args.output, args.plot_formats, args.overwrite, scenarios, variants, regions, focused=focused)
+    if not focused:
+        plot_score_distributions(groups, records, args.output, args.plot_formats, args.overwrite)
+        plot_stability(cache, args.output, args.plot_formats, args.overwrite, regions)
+        plot_acceptance(cache, args.output, args.plot_formats, args.overwrite)
     say("[STAGE] Render mass-sculpting plots", args.verbose)
-    plot_mass_sculpting(cache, records, args.output, args.plot_formats, args.overwrite, scenarios, variants, regions, args.verbose)
+    plot_mass_sculpting(cache, records, args.output, args.plot_formats, args.overwrite, scenarios, variants, regions, args.verbose, focused=focused)
     say("[STAGE] Render feature diagnostics", args.verbose)
-    plot_features(records, args.output, args.plot_formats, args.overwrite, args.verbose)
-    plot_score_vs_mass(records, args.output, args.plot_formats, args.overwrite)
+    plot_features(records, args.output, args.plot_formats, args.overwrite, args.verbose, focused=focused)
+    if not focused:
+        plot_score_vs_mass(records, args.output, args.plot_formats, args.overwrite)
     say("[STAGE] Render latent diagnostics", args.verbose)
-    plot_latent_closure(groups, records, args.output, args.plot_formats, args.overwrite, args.verbose)
-    say("[STAGE] Render Stein-witness diagnostics", args.verbose)
-    plot_stein(groups, records, args.output, args.plot_formats, args.overwrite)
+    plot_latent_closure(groups, records, args.output, args.plot_formats, args.overwrite, args.verbose, focused=focused)
+    if not focused:
+        say("[STAGE] Render Stein-witness diagnostics", args.verbose)
+        plot_stein(groups, records, args.output, args.plot_formats, args.overwrite)
     say("[STAGE] Build projected Stein-witness diagnostics", args.verbose)
     plot_projected_witness(groups, records, args, args.output)
     say("[STAGE] Render training histories", args.verbose)
     plot_training(groups, args.output, args.plot_formats, args.overwrite,
-                  io_workers=args.io_workers, verbose=args.verbose)
+                  io_workers=args.io_workers, verbose=args.verbose, focused=focused)
     say("[STAGE] Export publication tables", args.verbose)
     export_tables(groups, cache, loader, args.output, args.file_formats, args.data, args.verbose)
 
