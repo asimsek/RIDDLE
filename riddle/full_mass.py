@@ -21,7 +21,7 @@ from .worker_progress import emit_message
 PROTOCOL = "frozen_native_full_mass_v1"
 DERIVED_DIRECTORY = "full_mass"
 REFERENCE_SEEDS = {"contexts": 96001, "background": 96002, "split": 96003, "ties": 96004}
-BACKGROUND_YIELD_PROTOCOL = "independent_sr_count_closure_v1"
+BACKGROUND_YIELD_PROTOCOL = "independent_sr_acceptance_closure_v2_effect_size"
 
 
 def _export_process(args, report):
@@ -369,7 +369,7 @@ def diagnostic_validation(record, assessment_scores, rules):
 
 
 def background_yield_closure(cut, comparisons):
-    from scipy.stats import fisher_exact
+    from scipy.stats import binomtest, fisher_exact
 
     sample = cut.get("independent_reference_assessment", {})
     data = cut.get("regions", {}).get("signal_region", {})
@@ -377,6 +377,8 @@ def background_yield_closure(cut, comparisons):
                   p_value_threshold=0.01 / max(1, comparisons),
                   multiple_testing="Bonferroni across the frozen SR working points",
                   test="two-sided Fisher exact comparison of independent selected counts",
+                  interpretation="Generated q-model versus held-out SR background score-cut acceptance; separate from the sideband-fit SR yield estimate",
+                  target_background_acceptance=cut.get("background_acceptance"),
                   truth_labels_used_for_diagnostic=True, used_for_scoring=False)
     counts = [sample.get("events"), sample.get("selected"),
               data.get("background_events"), data.get("selected_background")]
@@ -390,6 +392,21 @@ def background_yield_closure(cut, comparisons):
                   data_events=data_events, data_selected=data_selected)
     if min(sample_events, data_events) < 2:
         return {**result, "status": "inconclusive", "reason": "Too few independent background events"}
+    sample_rate, data_rate = sample_selected / sample_events, data_selected / data_events
+    confidence = 1 - (1 - result["family_confidence"]) / (2 * max(1, comparisons))
+    sample_ci = binomtest(sample_selected, sample_events).proportion_ci(confidence_level=confidence)
+    data_ci = binomtest(data_selected, data_events).proportion_ci(confidence_level=confidence)
+    result.update(reference_background_acceptance=sample_rate, observed_background_acceptance=data_rate,
+                  acceptance_difference=data_rate - sample_rate,
+                  relative_data_to_reference_difference=data_rate / sample_rate - 1 if sample_rate else None,
+                  normalized_sample_to_data_interval=[float(sample_ci.low / data_ci.high) if data_ci.high else None,
+                                                      float(sample_ci.high / data_ci.low) if data_ci.low else None],
+                  interval_family_confidence=result["family_confidence"],
+                  interval_method="Conservative Clopper-Pearson bounds; Bonferroni across both populations and all working points; null upper bound is unbounded",
+                  uncertainty_includes_model_misspecification=False,
+                  model_predicted_selected_background=sample_rate * data_events,
+                  model_background_significance_multiplier=float(np.sqrt(data_rate / sample_rate)) if sample_rate else None,
+                  significance_multiplier_interpretation="Potential S/sqrt(B) overstatement only if generated-model B replaces actual background; not applied to benchmark AUC, SIC or retention")
     result["normalized_sample_to_data"] = (sample_selected * data_events / (data_selected * sample_events)
                                             if data_selected else None)
     result["p_value"] = float(fisher_exact([[sample_selected, sample_events - sample_selected],
@@ -404,6 +421,7 @@ def update_mass_closure(validation):
     result = deepcopy(validation)
     result.update(schema=3, diagnostic_protocol=MASS_CLOSURE_PROTOCOL,
                   background_yield_protocol=BACKGROUND_YIELD_PROTOCOL,
+                  background_yield_interpretation="Generated-reference SR acceptance closure; sideband-fit SR extrapolation is checked separately",
                   fit_model="diagnostic exp(a+b*log(m)+c*log(m)^2), integrated over mass bins",
                   fit_is_publication_search_model=False, physics_certified=False,
                   fit_range_policy="Fixed local SR window; merge narrow bins next to SR boundaries",
@@ -462,12 +480,17 @@ def emit_closure_status(validation):
             checks = ", ".join(fit["failed_checks"])
             emit_message(f"Mass-fit failure at epsilon_B={100 * cut['background_acceptance']:g}%: {checks}", kind="WARNING")
     yield_status = validation.get("background_yield_status", "inconclusive")
-    emit_message(f"Independent SR background-yield diagnostic: {yield_status}",
+    emit_message(f"Generated-reference SR acceptance diagnostic: {yield_status}",
                  kind="PASS" if yield_status == "passed" else "WARNING")
     failed = [f"{100 * cut['background_acceptance']:g}%" for cut in validation.get("cuts", [])
               if cut.get("background_yield_closure", {}).get("status") == "failed"]
     if failed:
-        emit_message("Background-yield mismatch at epsilon_B=" + ", ".join(failed), kind="WARNING")
+        emit_message("Acceptance mismatch at target epsilon_B=" + ", ".join(failed), kind="WARNING")
+        ratios = [cut["background_yield_closure"].get("normalized_sample_to_data")
+                  for cut in validation.get("cuts", []) if cut.get("background_yield_closure", {}).get("status") == "failed"]
+        ratios = [value for value in ratios if value is not None]
+        if ratios:
+            emit_message(f"Generated-reference/data acceptance ratio: {min(ratios):.3f}–{max(ratios):.3f}", kind="WARNING")
 
 
 def _diagnostic_json_digest(value):
@@ -617,19 +640,38 @@ def refresh_mass_diagnostic(root):
         return validation
 
 
-def refresh_mass_diagnostics(args):
-    roots = list(dict.fromkeys(path.resolve() for path in args.results))
+def _mass_diagnostic_roots(roots, methods, scenarios, seeds=None):
+    from .scan_cache import resolve_reference
+
     jobs = []
     for root in roots:
+        root = Path(root).resolve()
         if not root.is_dir():
             raise ValueError(f"Results folder is missing: {root}")
-        for method in args.methods:
-            for scenario in args.scenarios:
-                for path in sorted((root / method / scenario).glob("seed_*/full_mass/manifest.json")):
-                    seed = int(path.parent.parent.name.removeprefix("seed_"))
-                    if args.seeds is None or seed in args.seeds:
-                        jobs.append(path.parent.parent)
-    jobs = list(dict.fromkeys(jobs))
+        populations = [root, *sorted(path for path in root.glob("signal_*") if path.is_dir())]
+        for population in populations:
+            for method in methods:
+                for scenario in scenarios:
+                    for path in sorted((population / method / scenario).glob("seed_*/result.json")):
+                        case = path.parent
+                        seed = int(case.name.removeprefix("seed_"))
+                        if seeds is not None and seed not in seeds:
+                            continue
+                        report = read_json(path)
+                        if (report.get("seed"), report.get("scenario"), report.get("contract", {}).get("method")) != (seed, scenario, method):
+                            raise ValueError(f"Full-mass diagnostic result identity differs from its folder: {case}")
+                        if (case / DERIVED_DIRECTORY / "manifest.json").is_file():
+                            jobs.append(case.resolve())
+                        elif report.get("completed") and report.get("scan_reuse"):
+                            producer, _ = resolve_reference(case, report)
+                            if (producer / DERIVED_DIRECTORY / "manifest.json").is_file():
+                                jobs.append(producer.resolve())
+    return list(dict.fromkeys(jobs))
+
+
+def refresh_mass_diagnostics(args):
+    roots = list(dict.fromkeys(path.resolve() for path in args.results))
+    jobs = _mass_diagnostic_roots(roots, args.methods, args.scenarios, args.seeds)
     if not jobs:
         raise ValueError("No completed full-mass exports match the requested methods, scenarios and seeds")
     from threadpoolctl import threadpool_limits
@@ -653,14 +695,14 @@ def refresh_mass_diagnostics(args):
                                level=2 if validation["status"] == "passed" else 0)
                 if validation["status"] != "passed":
                     colored_status(f"Uncut model {validation['baseline_status']}; mass fit {validation['mass_fit_status']}; boundaries {validation['boundary_status']}", kind="WARNING")
-                colored_status(f"{root.parents[2].name}/{root.parent.parent.name} {root.parent.name} {root.name}: SR background-yield {validation['background_yield_status']}",
+                colored_status(f"{root.parents[2].name}/{root.parent.parent.name} {root.parent.name} {root.name}: generated-reference SR acceptance {validation['background_yield_status']}",
                                kind="PASS" if validation["background_yield_status"] == "passed" else "WARNING", level=2)
                 progress.update(index)
     counts = ", ".join(f"{statuses.count(status)} {status}" for status in ("passed", "failed", "inconclusive") if status in statuses)
     emit_message(f"Refreshed {len(jobs)} diagnostics in {time.monotonic() - started:.1f}s; {counts}",
                  kind="PASS" if all(status == "passed" for status in statuses) else "WARNING")
     counts = ", ".join(f"{yield_statuses.count(status)} {status}" for status in ("passed", "failed", "inconclusive") if status in yield_statuses)
-    emit_message(f"Independent SR background-yield diagnostics: {counts}",
+    emit_message(f"Generated-reference SR acceptance diagnostics: {counts}",
                  kind="PASS" if all(status == "passed" for status in yield_statuses) else "WARNING")
     emit_message("Training, calibration, scores and thresholds unchanged", kind="PASS")
 
@@ -1351,9 +1393,14 @@ def rescore(args, inputs):
             return rescore(locked_args, inputs)
     source_report = read_json(source / "result.json")
     if source_report.get("scan_reuse") is not None:
-        from .scan_cache import refresh_reference
+        from .scan_cache import refresh_reference, resolve_reference
         settings = _validate_rescore_source(args, inputs, source_report)
-        return refresh_reference(source, output, source_report, inputs, settings, workers=args.verify_workers)
+        refreshed = refresh_reference(source, output, source_report, inputs, settings, workers=args.verify_workers)
+        if source == output and getattr(args, "sideband_scoring", True):
+            producer, _ = resolve_reference(output, refreshed)
+            if (producer / DERIVED_DIRECTORY / "manifest.json").is_file():
+                emit_closure_status(refresh_mass_diagnostic(producer))
+        return refreshed
     if source == output:
         return _rescore_in_place(args, inputs)
     with locked(source / ".resume/command.lock"):
