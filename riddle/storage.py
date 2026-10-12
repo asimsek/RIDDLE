@@ -60,6 +60,12 @@ class _RamFileCache:
                     self.size -= len(self.entries.pop(path)[2])
             return entry
 
+    def invalidate(self, path):
+        with self.lock:
+            entry = self.entries.pop(path, None)
+            if entry is not None:
+                self.size -= len(entry[2])
+
     def warm(self, path, identity):
         entry = self.lookup(path, identity)
         if entry is not None:
@@ -147,6 +153,15 @@ def _input_source(path, *, mmap=False):
         raise ValueError(f"File changed while reading cached input: {path}")
 
 
+def _invalidate_file_caches(path):
+    key = str(Path(path).resolve())
+    cache = _RAM_FILE_CACHE.get()
+    if cache is not None:
+        cache.invalidate(key)
+    with _DIGEST_GUARD:
+        _DIGEST_CACHE.pop(key, None)
+
+
 @contextmanager
 def timed_io(operation, path, *, durable=True):
     if _IO_DEPTH.get():
@@ -221,7 +236,9 @@ def read_json(path):
 
 def copy_file(source, destination, **kwargs):
     with timed_io("Copy file", f"{source} -> {destination}"):
-        return shutil.copy2(source, destination, **kwargs)
+        copied = shutil.copy2(source, destination, **kwargs)
+        _invalidate_file_caches(copied)
+        return copied
 
 
 @_timed_file_operation("Write artifact")
@@ -236,12 +253,14 @@ def atomic_write(path, writer):
         with temporary.open("rb") as stream:
             os.fsync(stream.fileno())
         os.replace(temporary, path)
+        _invalidate_file_caches(path)
     finally:
         temporary.unlink(missing_ok=True)
 
 
 def _cache_digest(path, value):
     path = Path(path)
+    _invalidate_file_caches(path)
     stat = path.stat()
     key = str(path.resolve())
     with _DIGEST_GUARD:
@@ -338,6 +357,7 @@ def write_json(path, value):
 def save_npz(path, **arrays):
     with Path(path).open("wb") as stream:
         np.savez(stream, **arrays)
+    _invalidate_file_caches(path)
 
 
 @_timed_file_operation("Write NumPy array")
