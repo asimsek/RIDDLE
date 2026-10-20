@@ -4199,8 +4199,7 @@ def _witness_latent_axes(ax, grid, pair):
 def _witness_heat(ax, grid, response=False):
     values = grid["operator"] if response else grid["potential"]
     if response:
-        limit = max(float(np.quantile(np.abs(values.compressed()), 0.98)), 1e-10)
-        kwargs = {"norm": TwoSlopeNorm(vmin=-limit, vcenter=0, vmax=limit), "cmap": _WITNESS_RESPONSE}
+        kwargs = {"norm": TwoSlopeNorm(vmin=-1.3, vcenter=0, vmax=1.3), "cmap": _WITNESS_RESPONSE}
     else:
         low, high = np.quantile(values.compressed(), [0.01, 0.99])
         kwargs = {"vmin": float(low), "vmax": float(max(high, low + 1e-10)), "cmap": _WITNESS_EXCESS}

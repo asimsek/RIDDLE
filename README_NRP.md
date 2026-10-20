@@ -321,6 +321,12 @@ Request a method directly with `--methods lacathode`, `--methods riddle`, `--met
 Add `--overwrite` to regenerate matching plots and tables.
 
 
+**Copy/Download the `paper_plots` folder to your local device (e.g.; Mac):**
+
+```bash
+kubectl cp -n cua-asimsek -c jupyter riddle-jupyter:/shared/work/RIDDLE/paper_plots .
+```
+
 ## Optional injection scan
 
 Prepare each strength once with the same population settings as the normal runs; all methods use seeds 40–44.
