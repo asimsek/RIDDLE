@@ -18,9 +18,10 @@ from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.collections import Collection, PathCollection, QuadMesh
 from matplotlib.colors import LinearSegmentedColormap, LogNorm, TwoSlopeNorm
 from matplotlib.lines import Line2D
-from matplotlib.patches import Rectangle
+from matplotlib.patches import Patch, Rectangle
 from matplotlib.ticker import LogLocator, NullFormatter
 import numpy as np
 import torch
@@ -54,9 +55,9 @@ PLOT_WORKING_POINTS = (0.005, 0.01, 0.05, 0.10)
 WORKING_POINT_LABELS = {0.004: "0.4%", 0.005: "0.5%", 0.01: "1%", 0.05: "5%", 0.10: "10%"}
 FEATURE_LABELS = {"m1": r"$m_1$ (TeV)", "delta_m": r"$\Delta m$ (TeV)", "tau21_j1": r"$\tau_{21}^{J_1}$", "tau21_j2": r"$\tau_{21}^{J_2}$", "deltaR": r"$\Delta R_{jj}$"}
 FEATURE_NAMES = {"default": ("m1", "delta_m", "tau21_j1", "tau21_j2"), "shifted": ("m1", "delta_m", "tau21_j1", "tau21_j2"), "deltaR": ("m1", "delta_m", "tau21_j1", "tau21_j2", "deltaR")}
-SINGLE_COLUMN_IN = 8.6 / 2.54
+STANDARD_FIGURE_SIZE = (5.8, 0.78 * 5.8)
 DOUBLE_COLUMN_IN = 17.6 / 2.54
-STYLE = {"font.family": "sans-serif", "font.sans-serif": ["DejaVu Sans"], "mathtext.fontset": "dejavusans", "text.usetex": False, "font.size": 8.2, "axes.labelsize": 8.8, "axes.linewidth": 0.8, "xtick.labelsize": 7.7, "ytick.labelsize": 7.7, "legend.fontsize": 7.3, "legend.title_fontsize": 7.3, "lines.linewidth": 1.0, "lines.markersize": 3.2, "xtick.direction": "in", "ytick.direction": "in", "xtick.top": True, "ytick.right": True, "xtick.minor.visible": True, "ytick.minor.visible": True, "pdf.fonttype": 42, "ps.fonttype": 42, "savefig.dpi": 600, "savefig.facecolor": "white", "savefig.edgecolor": "white", "figure.facecolor": "white", "axes.facecolor": "white"}
+STYLE = {"font.family": "sans-serif", "font.sans-serif": ["DejaVu Sans"], "mathtext.fontset": "dejavusans", "text.usetex": False, "font.size": 8.2, "axes.labelsize": 8.8, "axes.linewidth": 0.8, "xtick.labelsize": 7.7, "ytick.labelsize": 7.7, "legend.fontsize": 7.3, "legend.title_fontsize": 7.3, "lines.linewidth": 1.0, "lines.markersize": 3.2, "xtick.direction": "in", "ytick.direction": "in", "xtick.top": True, "ytick.right": True, "xtick.minor.visible": True, "ytick.minor.visible": True, "pdf.fonttype": 42, "ps.fonttype": 42, "path.simplify": False, "savefig.dpi": 600, "savefig.facecolor": "white", "savefig.edgecolor": "white", "figure.facecolor": "white", "axes.facecolor": "white"}
 _FIGURE_RENDERER = ContextVar("paper_figure_renderer", default=None)
 
 
@@ -128,14 +129,73 @@ def publication_axis_label(value):
 
 
 def new_figure(xlabel, ylabel, wide=False):
-    width = DOUBLE_COLUMN_IN if wide else SINGLE_COLUMN_IN
-    height = 0.78 * width
+    width, height = (DOUBLE_COLUMN_IN, 0.78 * DOUBLE_COLUMN_IN) if wide else STANDARD_FIGURE_SIZE
     fig, ax = plt.subplots(figsize=(width, height))
+    fig._paper_style_scale = 1.0 if wide else width / (8.6 / 2.54)
+    fig._paper_line_scale = fig._paper_style_scale
     fig.subplots_adjust(left=0.19 if not wide else 0.12, right=0.97, bottom=0.18, top=0.96)
     ax.set_xlabel(publication_axis_label(xlabel))
     ax.set_ylabel(publication_axis_label(ylabel))
     ax.minorticks_on()
     return fig, ax
+
+
+def scale_publication_lines(fig):
+    scale = getattr(fig, "_paper_line_scale", 1.0)
+    if scale == 1.0:
+        return
+    for ax in fig.axes:
+        for artist in (*ax.lines, *ax.collections, *ax.patches):
+            if getattr(artist, "_paper_line_scaled", False) or isinstance(artist, QuadMesh):
+                continue
+            if isinstance(artist, Line2D):
+                artist.set_linewidth(artist.get_linewidth() * scale)
+                artist.set_markersize(artist.get_markersize() * scale)
+                artist.set_markeredgewidth(artist.get_markeredgewidth() * scale)
+            elif isinstance(artist, Collection):
+                artist.set_linewidth(np.asarray(artist.get_linewidths()) * scale)
+                if isinstance(artist, PathCollection):
+                    artist.set_sizes(artist.get_sizes() * scale ** 2)
+            elif isinstance(artist, Patch):
+                artist.set_linewidth(artist.get_linewidth() * scale)
+            artist._paper_line_scaled = True
+
+
+def scale_publication_axes(fig):
+    scale_publication_lines(fig)
+    scale = getattr(fig, "_paper_style_scale", 1.0)
+    if scale == 1.0:
+        return
+    for ax in fig.axes:
+        if not getattr(ax, "_paper_style_scaled", False):
+            for axis in (ax.xaxis, ax.yaxis):
+                axis.label.set_fontsize(axis.label.get_fontsize() * scale)
+                axis.labelpad *= scale
+                axis.offsetText.set_fontsize(axis.offsetText.get_fontsize() * scale)
+                for which, ticks in (("major", axis.get_major_ticks()), ("minor", axis.get_minor_ticks())):
+                    if ticks:
+                        tick = ticks[0]
+                        axis.set_tick_params(which=which, labelsize=tick.label1.get_fontsize() * scale,
+                                             length=tick.tick1line.get_markersize() * scale,
+                                             width=tick.tick1line.get_markeredgewidth() * scale,
+                                             pad=tick.get_pad() * scale)
+            for spine in ax.spines.values():
+                spine.set_linewidth(spine.get_linewidth() * scale)
+            ax._paper_style_scaled = True
+        for text in ax.texts:
+            if not getattr(text, "_paper_style_scaled", False):
+                text.set_fontsize(text.get_fontsize() * scale)
+                text._paper_style_scaled = True
+
+
+def publication_legend(ax, *args, **kwargs):
+    scale_publication_axes(ax.figure)
+    scale = getattr(ax.figure, "_paper_style_scale", 1.0)
+    kwargs["fontsize"] = (kwargs.get("fontsize") or STYLE["legend.fontsize"]) * scale
+    kwargs["title_fontsize"] = STYLE["legend.title_fontsize"] * scale
+    legend = ax.legend(*args, **kwargs)
+    legend.get_frame().set_linewidth(legend.get_frame().get_linewidth() * scale)
+    return legend
 
 
 def legend_overlap_score(ax, legend):
@@ -187,12 +247,45 @@ def inside_legend(ax, title=None, ncol=None, fontsize=None, borderaxespad=0.5, a
 def _legend_layout_renderer(ax, initialize=False):
     figure = ax.figure
     if initialize:
-        figure.canvas.draw()
+        figure.draw_without_rendering()
     else:
         layout = figure.get_layout_engine()
         if layout is not None:
             layout.execute(figure)
     return figure.canvas.get_renderer()
+
+
+def _witness_legend(ax, handles, labels, *, title, ncol, fontsize, borderaxespad):
+    legend = publication_legend(ax, handles, labels, loc="upper right", frameon=True,
+                                framealpha=0.93, borderpad=0.42, labelspacing=0.32,
+                                handlelength=1.9, columnspacing=0.8, ncol=ncol or 1,
+                                title=title, fontsize=fontsize, borderaxespad=borderaxespad)
+    bounds = np.asarray(ax._paper_witness_bounds, float)
+    center = bounds.mean(axis=1)
+    spans = np.ptp(bounds, axis=1)
+    content_top = getattr(ax, "_paper_witness_content_top", bounds[1, 1])
+    for collection in ax.collections:
+        if str(collection.get_label()).startswith("Signal Events"):
+            offsets = np.asarray(collection.get_offsets(), float)
+            finite = offsets[np.isfinite(offsets).all(axis=1)]
+            if len(finite):
+                content_top = max(content_top, float(finite[:, 1].max()))
+    for _ in range(6):
+        renderer = _legend_layout_renderer(ax, initialize=True)
+        box = legend.get_window_extent(renderer=renderer)
+        axes_box = ax.get_window_extent(renderer=renderer)
+        clearance = renderer.points_to_pixels(3.0)
+        top = ax.transData.transform((center[0], content_top))[1]
+        if box.y0 >= top + clearance:
+            return legend
+        available = (box.y0 - clearance - axes_box.y0) / axes_box.height - 0.5
+        if available <= 0:
+            break
+        factor = 1.005 * (content_top - center[1]) / (available * spans[1])
+        factor = max(factor, np.ptp(ax.get_ylim()) / spans[1])
+        limits = center[:, None] + factor * (bounds - center[:, None])
+        ax.set(xlim=limits[0], ylim=limits[1])
+    raise RuntimeError("Stein-witness legend could not be separated from the field")
 
 
 def _inside_legend(ax, title=None, ncol=None, fontsize=None, borderaxespad=0.5, allow_headroom=True):
@@ -207,12 +300,15 @@ def _inside_legend(ax, title=None, ncol=None, fontsize=None, borderaxespad=0.5, 
     if not pairs:
         return None
     handles, labels = zip(*pairs)
+    if hasattr(ax, "_paper_witness_bounds"):
+        return _witness_legend(ax, handles, labels, title=title, ncol=ncol,
+                               fontsize=fontsize, borderaxespad=borderaxespad)
     candidates = ("upper right", "upper left", "lower right", "lower left", "center right", "center left", "upper center", "lower center")
     columns = ncol or (2 if len(labels) >= 5 else 1)
     font = fontsize or STYLE["legend.fontsize"]
     best = None
     for index, location in enumerate(candidates):
-        legend = ax.legend(handles, labels, loc=location, frameon=True, framealpha=0.93, borderpad=0.42, labelspacing=0.32, handlelength=1.9, columnspacing=0.8, ncol=columns, title=title, fontsize=font, borderaxespad=borderaxespad)
+        legend = publication_legend(ax, handles, labels, loc=location, frameon=True, framealpha=0.93, borderpad=0.42, labelspacing=0.32, handlelength=1.9, columnspacing=0.8, ncol=columns, title=title, fontsize=font, borderaxespad=borderaxespad)
         renderer = _legend_layout_renderer(ax, initialize=index == 0)
         box = legend.get_window_extent(renderer=renderer)
         axes_box = ax.get_window_extent(renderer=renderer)
@@ -222,14 +318,16 @@ def _inside_legend(ax, title=None, ncol=None, fontsize=None, borderaxespad=0.5, 
         if best is None or score < best[0]:
             best = (score, location)
         legend.remove()
+        if score == 0:
+            break
     score, location = best
     if score >= 1000 and columns > 1:
         return _inside_legend(ax, title=title, ncol=columns - 1, fontsize=font,
                               borderaxespad=borderaxespad, allow_headroom=allow_headroom)
     if score > 2.5 and allow_headroom:
         add_y_headroom(ax, 0.12)
-    legend = ax.legend(handles, labels, loc=location, frameon=True, framealpha=0.93, borderpad=0.42, labelspacing=0.32, handlelength=1.9, columnspacing=0.8, ncol=columns, title=title, fontsize=max(6.7, font - 0.2 if score > 3.5 else font), borderaxespad=borderaxespad)
-    ax.figure.canvas.draw()
+    legend = publication_legend(ax, handles, labels, loc=location, frameon=True, framealpha=0.93, borderpad=0.42, labelspacing=0.32, handlelength=1.9, columnspacing=0.8, ncol=columns, title=title, fontsize=max(6.7, font - 0.2 if score > 3.5 else font), borderaxespad=borderaxespad)
+    ax.figure.draw_without_rendering()
     return legend
 
 
@@ -260,7 +358,7 @@ def _scan_legend(ax, title=None):
                    labelspacing=0.32, handlelength=1.5, fontsize=STYLE["legend.fontsize"] - 0.3)
     for index, location in enumerate(("upper right", "upper left", "lower right", "lower left", "center right",
                                      "center left", "upper center", "lower center")):
-        legend = ax.legend(loc=location, **options)
+        legend = publication_legend(ax, loc=location, **options)
         renderer = _legend_layout_renderer(ax, initialize=index == 0)
         box = legend.get_window_extent(renderer=renderer)
         axes_box = ax.get_window_extent(renderer=renderer)
@@ -269,7 +367,7 @@ def _scan_legend(ax, title=None):
                 and _scan_legend_overlap(ax, legend) == 0):
             return legend
         legend.remove()
-    legend = ax.legend(loc="upper right", **options)
+    legend = publication_legend(ax, loc="upper right", **options)
     for _ in range(3):
         ax.figure.canvas.draw()
         renderer = ax.figure.canvas.get_renderer()
@@ -356,7 +454,7 @@ def cleanup_legacy_summary_folders(output):
 def audit_layout(fig, ax, legend=None):
     if ax.get_title() or fig._suptitle is not None:
         raise RuntimeError("Publication figure contains a main title")
-    fig.canvas.draw()
+    fig.draw_without_rendering()
     renderer = fig.canvas.get_renderer()
     fig_box = fig.bbox
     for artist in (ax.xaxis.label, ax.yaxis.label):
@@ -386,6 +484,7 @@ def save_figure(fig, ax, stem, formats, overwrite, legend=None):
 
 
 def _save_figure(fig, ax, stem, formats, overwrite, legend=None):
+    scale_publication_axes(fig)
     spectrum_legend = legend if isinstance(legend, dict) and "spectrum_legend" in legend else None
     scan_legend = legend if isinstance(legend, dict) and "scan_legend" in legend else None
     if isinstance(legend, dict) and "deferred_legend" in legend:
@@ -393,7 +492,8 @@ def _save_figure(fig, ax, stem, formats, overwrite, legend=None):
     stem.parent.mkdir(parents=True, exist_ok=True)
     if not fig.get_constrained_layout() and (spectrum_legend is None or len(fig.axes) == 1):
         try:
-            fig.tight_layout(pad=0.45)
+            with matplotlib.rc_context({"font.size": STYLE["font.size"] * getattr(fig, "_paper_style_scale", 1.0)}):
+                fig.tight_layout(pad=0.45)
         except Exception:
             pass
     if scan_legend is not None:
@@ -407,10 +507,16 @@ def _save_figure(fig, ax, stem, formats, overwrite, legend=None):
         path = stem.with_suffix("." + extension)
         if path.exists() and not overwrite:
             raise FileExistsError(f"Output exists: {path}")
-        kwargs = {"bbox_inches": "tight", "facecolor": "white"}
-        if extension == "png":
-            kwargs["dpi"] = 600
-        fig.savefig(path, **kwargs)
+        rasterized = ([artist for artist in fig.findobj()
+                       if artist.get_rasterized() and not isinstance(artist, QuadMesh)]
+                      if extension == "pdf" else [])
+        try:
+            for artist in rasterized:
+                artist.set_rasterized(False)
+            fig.savefig(path, bbox_inches="tight", facecolor="white", dpi=600)
+        finally:
+            for artist in rasterized:
+                artist.set_rasterized(True)
 
 
 def _render_worker_init():
@@ -703,7 +809,8 @@ def plot_dijet_spectra(groups, args, output, *, scan=False):
             reference = populations[population_key]
             if len(record["event_ids"]) != len(reference["event_ids"]):
                 raise ValueError("Full-mass method comparisons require identical primary held-out populations")
-            indices = match_ids(record["event_ids"], reference["event_ids"])
+            indices = (slice(None) if np.array_equal(record["event_ids"], reference["event_ids"])
+                       else match_ids(record["event_ids"], reference["event_ids"]))
             if (not np.array_equal(record["mass"][indices], reference["mass"])
                     or not np.array_equal(record["labels"][indices], reference["labels"])):
                 raise ValueError("Full-mass method comparisons require identical primary held-out populations")
@@ -719,7 +826,8 @@ def plot_dijet_spectra(groups, args, output, *, scan=False):
         if statuses != ["passed"]:
             say(f"[SPECTRA] {METHOD_LABELS[method]} {scenario}: closure {', '.join(statuses)}; diagnostic spectra", args.verbose)
         for record in records[1:]:
-            indices = match_ids(record["event_ids"], first["event_ids"])
+            indices = (slice(None) if np.array_equal(record["event_ids"], first["event_ids"])
+                       else match_ids(record["event_ids"], first["event_ids"]))
             if (not np.array_equal(record["mass"][indices], first["mass"])
                     or not np.array_equal(record["labels"][indices], first["labels"])):
                 raise ValueError("Dijet seed bands require identical primary held-out event populations")
@@ -1717,7 +1825,7 @@ def plot_latents(base, method, scenario, variant, record, formats, overwrite, ve
             ax.stairs(hist, edges, baseline=None, color=color, ls=style, label=f"RIDDLE {noun}")
         ax.plot(normal_x, normal_y, color="#00BFC4", ls="--", lw=0.575, label=r"$\mathcal{N}(0,1)$", zorder=5)
         ax.set_ylim(0.0, 2.5)
-        legend = ax.legend(loc="upper left", frameon=True, framealpha=0.93, borderpad=0.42, labelspacing=0.32, handlelength=1.9, columnspacing=0.8, ncol=1, title="Signal region · " + VARIANT_LABELS.get(variant, variant), fontsize=STYLE["legend.fontsize"], borderaxespad=0.75)
+        legend = publication_legend(ax, loc="upper left", frameon=True, framealpha=0.93, borderpad=0.42, labelspacing=0.32, handlelength=1.9, columnspacing=0.8, ncol=1, title="Signal region · " + VARIANT_LABELS.get(variant, variant), fontsize=STYLE["legend.fontsize"], borderaxespad=0.75)
         ax.figure.canvas.draw()
         save_figure(fig, ax, base / "latent_1d" / name, formats, overwrite, legend)
     if focused:
@@ -1816,6 +1924,8 @@ def plot_score_vs_mass(records, output, formats, overwrite):
 
 
 def exact_mass_sculpt_curve(record, efficiencies):
+    from riddle.plotting import fit_scores
+
     labels = np.asarray(record["labels"])
     bg = labels == 0
     mass = np.asarray(record["mass"], float)[bg]
@@ -1823,15 +1933,38 @@ def exact_mass_sculpt_curve(record, efficiencies):
         return None
     edges = equal_occupancy(mass, 300)
     full = np.histogram(mass, edges)[0]
+    mask = np.asarray(record["mask"], bool)[bg]
+    prepared = []
+    for scores in fit_scores(record):
+        scores = np.asarray(scores, dtype=float)[bg]
+        finite = mask & np.isfinite(scores)
+        prepared.append((scores, finite, np.sort(scores[finite])))
     values = []
     for efficiency in efficiencies:
-        selection = exact_background_selection(record, float(efficiency))
-        if selection is None:
+        efficiency = float(efficiency)
+        target = efficiency * len(mass)
+        if target <= 0 or any(len(ordered) < int(np.ceil(target)) for _, _, ordered in prepared):
             values.append(np.nan)
             continue
-        selected = np.mean(selection["weights"], axis=0)[bg]
+        rows = []
+        for scores, finite, ordered in prepared:
+            boundary = float(ordered[len(ordered) - int(np.ceil(target))])
+            left = int(np.searchsorted(ordered, boundary, side="left"))
+            right = int(np.searchsorted(ordered, boundary, side="right"))
+            if right <= left:
+                raise ValueError("Exact background working point has no boundary tie")
+            fraction = float(np.clip((target - (len(ordered) - right)) / (right - left), 0.0, 1.0))
+            weights = np.zeros(len(mass), dtype=float)
+            weights[finite & (scores > boundary)] = 1.0
+            weights[finite & (scores == boundary)] = fraction
+            rows.append(weights)
+        weights = np.asarray(rows)
+        background_efficiency = float(np.mean(np.sum(weights, axis=1) / len(mass)))
+        if not np.isclose(background_efficiency, efficiency, rtol=0, atol=5e-15):
+            raise ValueError(f"Exact background selection failed: {background_efficiency} != {efficiency}")
+        selected = np.mean(weights, axis=0)
         histogram = np.histogram(mass, edges, weights=selected)[0]
-        values.append(shape_chi2(full, histogram, float(efficiency)))
+        values.append(shape_chi2(full, histogram, efficiency))
     return np.asarray(values, float)
 
 
@@ -1988,7 +2121,10 @@ def context_match_weights(reference_context, target_context, bins=30):
 
 def plot_latent_closure(groups, records, output, formats, overwrite, verbose, *, focused=False):
     prepared = {}
-    for (scenario, seed, variant), group in groups.items():
+    candidates = reversed(list(groups.items())) if focused else groups.items()
+    for (scenario, seed, variant), group in candidates:
+        if focused and variant in prepared:
+            continue
         if "riddle" not in group:
             continue
         key = ("riddle", scenario, variant, "signal_region", seed)
@@ -2186,19 +2322,27 @@ def plot_projected_witness(groups, records, args, output):
         protocol = read_metadata(root, report, "protocol.json")
         if protocol.get("core") != "stein_witness":
             return None
-        derived_root = Path(report.get("_full_mass_root", root))
-        full = load_full_mass(derived_root, report, workers=1)
-        if full is None and derived_root != root:
-            full = load_full_mass(root, report, workers=1)
-        if full is not None:
-            indices = match_ids(record["event_ids"], full["event_ids"][full["is_signal_region"]])
+        full = None
+        if focused and identity[0] == "background_only":
             population = np.zeros(len(record["labels"]), bool)
-            population[indices] = True
         else:
-            prepared = _prepared_data_directory(args.data, report)
-            if prepared is None:
-                raise ValueError(f"Original prepared event IDs are required for {method}, seed {identity[1]}")
-            population, _ = witness_population_mask(prepared, report, record, "primary")
+            prepared = _prepared_data_directory(args.data, report) if focused else None
+            if prepared is not None and (prepared / "event_ids.npz").is_file():
+                population, _ = witness_population_mask(prepared, report, record, "primary")
+            else:
+                derived_root = Path(report.get("_full_mass_root", root))
+                full = load_full_mass(derived_root, report, workers=1)
+                if full is None and derived_root != root:
+                    full = load_full_mass(root, report, workers=1)
+                if full is not None:
+                    indices = match_ids(record["event_ids"], full["event_ids"][full["is_signal_region"]])
+                    population = np.zeros(len(record["labels"]), bool)
+                    population[indices] = True
+                else:
+                    prepared = _prepared_data_directory(args.data, report)
+                    if prepared is None:
+                        raise ValueError(f"Original prepared event IDs are required for {method}, seed {identity[1]}")
+                    population, _ = witness_population_mask(prepared, report, record, "primary")
         options = SimpleNamespace(field_events=getattr(args, "witness_field_events", 16384),
                                   grid_size=40, smoothing=1.2, min_cell_events=2.0,
                                   batch_size=1024, device="cpu", io_workers=1,

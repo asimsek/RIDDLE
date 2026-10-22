@@ -4091,23 +4091,33 @@ def _evaluate_saved_witness(root, report, args):
     members = selection["members"]
     if not members:
         raise ValueError("The saved ensemble contains no selected fits")
-    paths = ["density/stein_scoring_reference.json", "density/stein_scoring_reference.npz"]
-    descriptions = []
+    reference_paths = ["density/stein_scoring_reference.json", "density/stein_scoring_reference.npz"]
+    descriptions, fit_paths = [], []
     for member in members:
         prefix = "density/" + member["directory"] + "/"
         inputs = read_metadata(root, report, prefix + "residual_training_inputs.json")
         if inputs.get("core") != "stein_witness" or inputs.get("stein_protocol") != PROTOCOL:
             raise ValueError("This diagnostic requires the saved Stein-witness core")
-        paths.extend([prefix + "residual_selection.json"])
-        paths.extend(prefix + f"residual_epoch_{int(epoch)}.pt" for epoch in member["epochs"])
+        paths = [prefix + "residual_selection.json"]
         if inputs.get("background_correction") is not None:
             paths.append(prefix + "background_correction.pt")
+        paths.extend(prefix + f"residual_epoch_{int(epoch)}.pt" for epoch in member["epochs"])
         descriptions.append(inputs)
-    _witness_field_progress(f"Verify {len(paths)} witness artifacts; workers={args.io_workers}", args)
-    with ThreadPoolExecutor(max_workers=args.io_workers) as pool:
-        futures = [pool.submit(copy_context().run, verify_plot_input, root, report, name) for name in paths]
-        for future in futures:
-            future.result()
+        fit_paths.append(paths)
+
+    def verify(paths):
+        if args.io_workers == 1:
+            for name in paths:
+                verify_plot_input(root, report, name)
+        else:
+            with ThreadPoolExecutor(max_workers=args.io_workers) as pool:
+                futures = [pool.submit(copy_context().run, verify_plot_input, root, report, name) for name in paths]
+                for future in futures:
+                    future.result()
+
+    artifact_count = len(reference_paths) + sum(map(len, fit_paths))
+    _witness_field_progress(f"Verify {artifact_count} witness artifacts in fit batches; workers={args.io_workers}", args)
+    verify(reference_paths)
     reference, reference_metadata = _load_reference_b(root / "density")
     indices = _witness_sample_indices(len(reference), args.field_events, int(report["seed"]) + 10501)
     points = reference[indices]
@@ -4115,9 +4125,10 @@ def _evaluate_saved_witness(root, report, args):
     _witness_field_progress(f"{len(points)} full-dimensional reference events; {total} checkpoints; {args.device}", args)
     fields, qcache, identities, fit_metadata, count = {}, {}, [], [], 0
     started = time.monotonic()
-    for member, inputs in zip(members, descriptions):
+    for member, inputs, paths in zip(members, descriptions, fit_paths):
         if inputs["features"] != points.shape[1]:
             raise ValueError("Saved reference and potential feature dimensions disagree")
+        verify(paths)
         directory = root / "density" / member["directory"]
         identity = _background_identity(inputs)
         identities.append(identity)
@@ -4189,8 +4200,12 @@ def project_witness_fields(fields, pair, args):
 
 
 def _witness_latent_axes(ax, grid, pair):
-    ax.set(xlim=(grid["xedges"][0], grid["xedges"][-1]),
-           ylim=(grid["yedges"][0], grid["yedges"][-1]),
+    bounds = np.array([[grid["xedges"][0], grid["xedges"][-1]],
+                       [grid["yedges"][0], grid["yedges"][-1]]], dtype=float)
+    center = bounds.mean(axis=1)
+    limits = center[:, None] + 1.2 * (bounds - center[:, None])
+    ax._paper_witness_bounds = bounds
+    ax.set(xlim=limits[0], ylim=limits[1],
            xlabel=rf"Latent coordinate $z_{{{pair[0] + 1}}}$",
            ylabel=rf"Latent coordinate $z_{{{pair[1] + 1}}}$")
     ax.set_aspect("equal", adjustable="box")
@@ -4198,6 +4213,8 @@ def _witness_latent_axes(ax, grid, pair):
 
 def _witness_heat(ax, grid, response=False):
     values = grid["operator"] if response else grid["potential"]
+    occupied_rows = np.flatnonzero(np.any(grid["supported"], axis=1))
+    ax._paper_witness_content_top = float(grid["yedges"][occupied_rows[-1] + 1])
     if response:
         kwargs = {"norm": TwoSlopeNorm(vmin=-1.3, vcenter=0, vmax=1.3), "cmap": _WITNESS_RESPONSE}
     else:
@@ -4207,8 +4224,13 @@ def _witness_heat(ax, grid, response=False):
         extent=(grid["xedges"][0], grid["xedges"][-1], grid["yedges"][0], grid["yedges"][-1]), **kwargs)
     levels = np.unique(np.quantile(grid["density"][grid["supported"]], [0.3, 0.55, 0.8, 0.95]))
     if len(levels) > 1:
-        ax.contour(grid["x"], grid["y"], grid["density"], levels=levels,
-                   colors="#608898", alpha=0.55, linewidths=0.65)
+        contours = ax.contour(grid["x"], grid["y"], grid["density"], levels=levels,
+                              colors="#608898", alpha=0.55, linewidths=0.65)
+        for segments in contours.allsegs:
+            for segment in segments:
+                if len(segment):
+                    ax._paper_witness_content_top = max(ax._paper_witness_content_top,
+                                                        float(np.max(segment[:, 1])))
     return image
 
 
@@ -4218,6 +4240,8 @@ def _witness_direction(ax, grid, stream=False):
     span = min(np.ptp(grid["x"]), np.ptp(grid["y"]))
     dx = grid["dx"] / (typical + norm) * span * 0.055
     dy = grid["dy"] / (typical + norm) * span * 0.055
+    arrow_top = float(np.ma.max(grid["y"][:, None] + np.ma.maximum(dy, 0)))
+    ax._paper_witness_content_top = max(ax._paper_witness_content_top, arrow_top)
     if stream:
         ax.streamplot(grid["x"], grid["y"], dx, dy, color="#264b5a", density=1.15,
                       linewidth=0.8, arrowsize=1.0, minlength=0.07, maxlength=3.0)
@@ -4287,6 +4311,8 @@ def witness_signal_selections(record, full=None):
 
 
 def plot_witness_projections(grid, pair, record, population, output, args, *, selections=None, save_figure=None, legend_factory=None, plot_names=None):
+    from paper_plot import scale_publication_axes
+
     if legend_factory is None:
         from paper_plot import inside_legend
 
@@ -4329,6 +4355,7 @@ def plot_witness_projections(grid, pair, record, population, output, args, *, se
                         (output / f"{name}_{tag}.{extension}").unlink(missing_ok=True)
                 continue
         fig, ax = f.plt.subplots(figsize=(5.8, 5.1), layout="compressed")
+        fig._paper_style_scale = fig.get_figwidth() / (8.6 / 2.54)
         image = _witness_heat(ax, grid, response)
         if name == "01_witness_landscape":
             _witness_cloud(ax, record, population, pair, args.sampling_seed)
@@ -4341,6 +4368,7 @@ def plot_witness_projections(grid, pair, record, population, output, args, *, se
         cb.set_label(r"Projected Stein response $\langle \mathcal{A}_q u\rangle_q$" if response
                      else r"Projected potential $\langle -u\rangle_q$")
         cb.outline.set_linewidth(0.5)
+        scale_publication_axes(fig)
         legend = legend_factory(ax, allow_headroom=False) if signal else None
         if save_figure is not None:
             save_figure(fig, ax, output / f"{name}_{tag}", args.plot_formats, args.overwrite, legend)
