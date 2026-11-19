@@ -167,6 +167,15 @@ def job(args):
         raise ValueError(f"Unknown GPU {gpu!r}; choose from {', '.join(GPU_TYPES)}")
     gpu_resource, gpu_product = GPU_TYPES[gpu]
     resource = {"cpu": "8", "memory": "24Gi", gpu_resource: 1}
+    if "lacathode" in args.methods:
+        selected_seeds = getattr(args, "seeds", None)
+        cases = len(selected_seeds or [42])
+        if getattr(args, "workflow", "run") == "scan":
+            strengths = getattr(args, "signal_events", None)
+            cases = cases * len(strengths) if strengths and selected_seeds else args.workers
+        concurrent = min(args.workers, cases)
+        resource.update(cpu=str(max(8, concurrent * args.torch_threads)),
+                        memory=f"{max(24, 8 * concurrent)}Gi")
     result = {
         "apiVersion": "batch/v1",
         "kind": "Job",

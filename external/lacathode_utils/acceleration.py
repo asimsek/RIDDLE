@@ -3,7 +3,38 @@ import ast
 import functools
 import inspect
 import weakref
+import numpy as np
 import torch
+
+
+def _epoch_loss_mean(chunks):
+    if not chunks:
+        return np.empty(0, dtype=np.float64).mean()
+    return torch.cat(chunks).cpu().numpy().astype(np.float64, copy=False).mean()
+
+
+def install_flow_loss_reporting(module):
+    original = module.train_epoch
+    if getattr(original, "_runtime_epoch_losses", False):
+        return
+    source = inspect.getsource(original)
+    replacements = [
+        ("train_loss += loss.mean().item()", "if verbose: train_loss += loss.mean().item()", 1),
+    ]
+    for name, loss, count in (("train_loss_avg", "loss", 2), ("corrected_train_loss_avg", "corrected_loss", 1)):
+        replacements.extend([
+            (f"{name}.extend({loss}.tolist())", f"{name}.append({loss}.detach().reshape(-1))", 1),
+            (f"np.array({name}).flatten().mean()", f"_epoch_loss_mean({name})", count),
+        ])
+    for expected, replacement, count in replacements:
+        if source.count(expected) != count:
+            raise RuntimeError("Unrecognized LaCATHODE flow loss reporting")
+        source = source.replace(expected, replacement)
+    namespace = dict(original.__globals__, _epoch_loss_mean=_epoch_loss_mean)
+    exec(compile(source, f"<runtime flow loss reporting: {original.__code__.co_filename}>", "exec"), namespace)
+    patched = functools.update_wrapper(namespace[original.__name__], original)
+    patched._runtime_epoch_losses = True
+    module.train_epoch = patched
 
 
 def install_validation_counts(module):
@@ -159,6 +190,7 @@ class TensorBatchAcceleration:
             return
         original = fetcher.fetch
         tensors, resident = self._resident_tensors(loader)
+        devices = tuple(dict.fromkeys(tensor.device for tensor in tensors))
 
         def fetch(indices):
             if (
@@ -169,10 +201,9 @@ class TensorBatchAcceleration:
             ):
                 self.report["fallback_batches"] += 1
                 return original(indices)
-            by_device = {tensor.device: None for tensor in tensors}
             try:
-                for device in by_device:
-                    by_device[device] = torch.tensor(indices, dtype=torch.long, device=device)
+                cpu_indices = torch.tensor(indices, dtype=torch.long, device="cpu")
+                by_device = {device: cpu_indices.to(device, non_blocking=True) for device in devices}
                 batch = [tensor.index_select(0, by_device[tensor.device]) for tensor in tensors]
             except torch.cuda.OutOfMemoryError:
                 loader._runtime_gather_verified = False

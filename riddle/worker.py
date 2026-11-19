@@ -78,7 +78,7 @@ def main():
                                 getattr(args, "lacathode_background", "independent"))
         background_mode = getattr(args, "lacathode_background", "independent")
         limit = settings["classifier_runs"] if background_mode == "fixed" else settings["pipeline_runs"]
-        workers = min(workers, limit)
+        workers = max(min(workers, limit), getattr(args, "lacathode_concurrency", 1))
         concurrent = workers > 1
     if concurrent:
         from .mps import configure_mps
@@ -106,7 +106,7 @@ def main():
         args.runtime_mps = status.to_dict()
         if status.requested and not status.active:
             emit_message("MPS unavailable; ordinary concurrent fits remain enabled", kind="WARNING")
-    else:
+    elif not (getattr(args, "lacathode_replica", False) and hasattr(args, "runtime_mps")):
         args.runtime_mps = {"requested": False, "active": False, "started": False,
                             "pipe_directory": None, "log_directory": None,
                             "reason": "disabled_or_single_worker"}
@@ -267,6 +267,9 @@ def main():
         "contract": contract,
         "completed": False,
     }
+    if args.method == "lacathode":
+        report.update(concurrent_cases=getattr(args, "lacathode_concurrency", 1),
+                      torch_threads=args.torch_threads, mps=args.runtime_mps)
     if args.method == "lacathode" and getattr(args, "lacathode_replica", False):
         report.update(campaign_seed=args.campaign_seed, run_index=args.run_index)
     if oracle_method:

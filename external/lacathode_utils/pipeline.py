@@ -851,7 +851,7 @@ def run_single(args, contract):
     from .storage import seed_start, write_json
     from .recovery import EpochRecovery
     from .epoch_hook import install_epoch_recovery
-    from .acceleration import install_validation_counts, install_tensor_batches, execution_report
+    from .acceleration import install_flow_loss_reporting, install_validation_counts, install_tensor_batches, execution_report
     from .worker_progress import ProgressStage, emit_progress
     from .source import verify, COMMIT
     from .resume import resume_policy
@@ -878,6 +878,7 @@ def run_single(args, contract):
 
     device_masks(data_handler)
     install_validation_counts(ANODE_training_utils)
+    install_flow_loss_reporting(ANODE_training_utils)
     original_load = torch.load
 
     def trusted_load(*a, **kw):
@@ -963,7 +964,8 @@ def run_single(args, contract):
                 "ordered_training_candidates": [Path(p).name for p in creation.ANODE_models],
                 "training_selection": "upstream first entry of argpartition best-ten list",
             })
-            run_all.create_data(creation)
+            with torch.no_grad():
+                run_all.create_data(creation)
 
     recovery.stage("creation", create)
 
@@ -1090,6 +1092,7 @@ def evaluate(args, root, data_handler, *, config_file="DE_MAF_model.yml", classi
     with (
         ProgressStage("evaluation", "Evaluate signal-region ensemble"),
         classifier_prediction_device(Classifier),
+        torch.no_grad(),
     ):
         namespace["make_ROCs"](
             str(root),

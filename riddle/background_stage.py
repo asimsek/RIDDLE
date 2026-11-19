@@ -232,6 +232,10 @@ def run_seed_backgrounds(args, run_one):
             if method in NATIVE_METHODS:
                 run_staged(tasks, args.scan_bg_workers, run_one,
                            background_only=getattr(args, "background_only", False))
+            elif method == "lacathode":
+                options = deepcopy(args)
+                options.methods, options.scenarios, options.scan_bg_workers = [method], [scenario], 1
+                run_one(options)
             else:
                 emit_message(f"{method}: background concurrency applies to RIDDLE, IAD and Supervised; retaining the external scheduler")
                 for options in tasks:

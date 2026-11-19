@@ -108,7 +108,7 @@ def parser():
             "--workers",
             type=positive,
             default=1,
-            help="Concurrent RIDDLE/Idealized-RIDDLE/Supervised-RIDDLE/R-ANODE fits, independent LaCathode runs, or fixed-background LaCathode classifier fits",
+            help="Concurrent native or R-ANODE fits, or independent LaCathode seeds and scan points on the selected device",
         )
         run.add_argument("--io-workers", type=positive, default=2,
                          help="Filesystem/host I/O concurrency; independent of PyTorch compute threads")
@@ -211,30 +211,33 @@ def configure_rescoring(args):
     args.resume = True
 
 
-def _run_rescore_seeds(requests, workers, run_one, *, cancel_event=None, group_name="seeds"):
+def _run_concurrent(cases, workers, run_one, label, *, cancel_event=None):
     from concurrent.futures import ThreadPoolExecutor, as_completed
+    import signal
     import threading
     from .worker_progress import emit_message
 
-    grouped = {}
-    for request in requests:
-        grouped.setdefault(request[3], []).append(request)
-    if not grouped:
+    if not cases:
         return
-    concurrency = min(workers, len(grouped))
+    concurrency = min(workers, len(cases))
     cancel = cancel_event if cancel_event is not None else threading.Event()
-    emit_message(f"Re-scoring {group_name}: {len(grouped)}; concurrent={concurrency}")
+    emit_message(f"{label}: {len(cases)}; concurrent={concurrency}")
 
-    def execute(seed_requests):
-        for request in seed_requests:
-            if cancel.is_set():
-                raise RuntimeError("Re-scoring cancelled after another worker failed")
-            run_one(request, cancel, concurrency)
+    def execute(case):
+        if cancel.is_set():
+            raise RuntimeError("Campaign cancelled after another worker failed")
+        run_one(case, cancel, concurrency)
 
-    pool = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="rescore-seed")
+    pool = ThreadPoolExecutor(max_workers=concurrency)
     futures = []
+    previous_handler = None
     try:
-        futures = [pool.submit(execute, seed_requests) for seed_requests in grouped.values()]
+        if threading.current_thread() is threading.main_thread():
+            def terminate(signum, frame):
+                raise SystemExit(128 + signum)
+
+            previous_handler = signal.signal(signal.SIGTERM, terminate)
+        futures = [pool.submit(execute, case) for case in cases]
         for future in as_completed(futures):
             future.result()
     except BaseException:
@@ -243,10 +246,28 @@ def _run_rescore_seeds(requests, workers, run_one, *, cancel_event=None, group_n
             future.cancel()
         raise
     finally:
-        pool.shutdown(wait=True, cancel_futures=True)
+        try:
+            pool.shutdown(wait=True, cancel_futures=True)
+        finally:
+            if previous_handler is not None:
+                signal.signal(signal.SIGTERM, previous_handler)
 
 
-def run_campaign(args, *, cancel_event=None, rescore_concurrency=1):
+def _run_rescore_seeds(requests, workers, run_one, *, cancel_event=None, group_name="seeds"):
+    grouped = {}
+    for request in requests:
+        grouped.setdefault(request[3], []).append(request)
+
+    def execute(seed_requests, cancel, concurrency):
+        for request in seed_requests:
+            if cancel.is_set():
+                raise RuntimeError("Re-scoring cancelled after another worker failed")
+            run_one(request, cancel, concurrency)
+
+    _run_concurrent(grouped.values(), workers, execute, f"Re-scoring {group_name}", cancel_event=cancel_event)
+
+
+def run_campaign(args, *, cancel_event=None, rescore_concurrency=1, lacathode_concurrency=1):
     from .storage import configure_verification
 
     configure_verification(getattr(args, "verify_workers", 8))
@@ -330,7 +351,7 @@ def run_campaign(args, *, cancel_event=None, rescore_concurrency=1):
         if args.methods == ["ranode"] and getattr(args, "fractions", None) is not None:
             raise ValueError("R-ANODE retains its upstream learned fraction; --fractions is RIDDLE-only")
     for scenario in args.scenarios:
-        def run_one(request, cancel_event=cancel_event, rescore_concurrency=rescore_concurrency):
+        def run_one(request, cancel_event=cancel_event, concurrency=max(rescore_concurrency, lacathode_concurrency)):
             method, base_seed, run_index, seed = request
             output = args.output / method / scenario / f"seed_{seed:03d}"
             if getattr(args, "score_sidebands_only", False):
@@ -358,6 +379,9 @@ def run_campaign(args, *, cancel_event=None, rescore_concurrency=1):
             }
             if method == "lacathode":
                 options.update(run_overrides)
+                options["lacathode_concurrency"] = concurrency
+                if concurrency > 1:
+                    options["workers"] = 1
             elif method == "riddle":
                 options["runs"] = args.fits
             elif method in ("iad", "supervised"):
@@ -365,7 +389,7 @@ def run_campaign(args, *, cancel_event=None, rescore_concurrency=1):
             env = os.environ.copy()
             if getattr(args, "rescore_from", None):
                 env["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-                options["rescore_concurrency"] = rescore_concurrency
+                options["rescore_concurrency"] = concurrency
             manifest = manifests[scenario]
             injection = (manifest.get("injection_scan") or {}).get(
                 "signal_events", manifest.get("preparation", {}).get("injected_signal_rows", "nominal"))
@@ -448,8 +472,13 @@ def run_campaign(args, *, cancel_event=None, rescore_concurrency=1):
         if getattr(args, "rescore_from", None) and getattr(args, "rescore_workers", 1) > 1:
             _run_rescore_seeds(requests, args.rescore_workers, run_one, cancel_event=cancel_event)
         else:
+            lacathode = [r for r in requests if r[0] == "lacathode"]
             for request in requests:
-                run_one(request)
+                if request[0] != "lacathode" or args.workers == 1 or len(lacathode) == 1:
+                    run_one(request)
+                elif request == lacathode[0]:
+                    _run_concurrent(lacathode, args.workers, run_one, f"LaCathode {scenario} seeds",
+                                    cancel_event=cancel_event)
 
 
 def main(argv=None):

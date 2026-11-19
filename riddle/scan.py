@@ -113,7 +113,7 @@ def prepare_scan(args):
 
 
 def run_scan(args):
-    from .cli import run_campaign, _run_rescore_seeds
+    from .cli import run_campaign, _run_concurrent, _run_rescore_seeds
 
     settings = load_settings(args.config)
     population = load_config(getattr(args, "population_config", None))
@@ -163,6 +163,7 @@ def run_scan(args):
     if workers > 1 and background_mode == "reuse" and rescore_root is None:
         from .worker_progress import emit_message
         emit_message("Background reuse is active; --scan-bg-workers applies to retraining scans")
+    lacathode_baselines, lacathode_points = [], []
     for seed in selected_seeds:
         for method in args.methods:
             tasks = []
@@ -174,14 +175,13 @@ def run_scan(args):
                 options.seeds, options.methods = [seed], [method]
                 options.command = "scan"
                 variant = manifests[point["signal_events"]].get("variant", "default")
-                candidates = reuse_candidates(args, output_root, variant, seed) if rescore_root is None and getattr(args, "scan_reuse", True) else []
-                options.scan_result_candidates = candidates
                 options.scan_background_mode = background_mode
                 options.scan_background_baseline = baseline
                 options.scan_background_data = str(nominal_data)
                 options.riddle_background_reuse_candidates = []
                 options.oracle_background_reuse_candidates = []
-                options.supervised_ensemble_reuse_candidates = candidates
+                options.scan_result_candidates = []
+                options.supervised_ensemble_reuse_candidates = []
                 if rescore_root is not None:
                     options.rescore_from = rescore_root / point_name(point)
                     options.rescore_workers = 1
@@ -199,6 +199,12 @@ def run_scan(args):
                 remaining = [(method, seed, 0, strength) for strength in by_strength]
                 _run_rescore_seeds(remaining, getattr(args, "rescore_workers", 1), execute_rescore,
                                    group_name=f"scan strengths for {method} seed {seed}")
+            elif method == "lacathode" and args.workers > 1:
+                for options in tasks:
+                    if background_mode == "reuse" and options.data == nominal_data.parent:
+                        lacathode_baselines.append(options)
+                    else:
+                        lacathode_points.append(options)
             elif (not getattr(args, "score_sidebands_only", False)
                     and background_mode == "retrain" and method in NATIVE_METHODS and (
                     workers > 1 or getattr(args, "background_only", False))):
@@ -216,3 +222,15 @@ def run_scan(args):
                     options.scan_result_candidates = candidates
                     options.supervised_ensemble_reuse_candidates = candidates
                     run_campaign(options)
+    if lacathode_baselines or lacathode_points:
+        def launch(options, cancel, concurrency):
+            run_campaign(options, cancel_event=cancel, lacathode_concurrency=concurrency)
+
+        for wave in (lacathode_baselines, lacathode_points):
+            if getattr(args, "scan_reuse", True):
+                variant = nominal_manifest.get("variant", "default")
+                candidates = {seed: reuse_candidates(args, output_root, variant, seed)
+                              for seed in dict.fromkeys(option.seeds[0] for option in wave)}
+                for option in wave:
+                    option.scan_result_candidates = candidates[option.seeds[0]]
+            _run_concurrent(wave, args.workers, launch, "LaCathode scan points")
