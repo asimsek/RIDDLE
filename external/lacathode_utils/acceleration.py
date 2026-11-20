@@ -1,10 +1,83 @@
 from __future__ import annotations
 import ast
+import copy
 import functools
 import inspect
 import weakref
 import numpy as np
 import torch
+
+
+def _valid_moments(moments):
+    means, variances = (torch.cat(values) for values in zip(*moments))
+    return bool((torch.isfinite(means) & torch.isfinite(variances) & (variances > 0)).all())
+
+
+def _install_wide_normalization(norm_type):
+    original_forward = norm_type.forward
+    if getattr(original_forward, "_runtime_wide_moments", False):
+        return
+    original_load = norm_type._load_from_state_dict
+
+    @functools.wraps(original_forward)
+    def forward(layer, inputs, cond_inputs=None, mode="direct"):
+        if layer.training or layer.running_var.dtype == inputs.dtype:
+            return original_forward(layer, inputs, cond_inputs, mode)
+        output, logdet = original_forward(layer, inputs.to(layer.running_var.dtype), cond_inputs, mode)
+        return output.to(inputs.dtype), logdet.to(inputs.dtype)
+
+    @functools.wraps(original_load)
+    def load(layer, state_dict, prefix, *args, **kwargs):
+        saved = state_dict.get(prefix + "running_var")
+        if isinstance(saved, torch.Tensor):
+            dtype = torch.promote_types(layer.log_gamma.dtype, saved.dtype)
+            if layer.running_var.dtype != dtype:
+                layer.running_mean = torch.empty_like(layer.running_mean, dtype=dtype)
+                layer.running_var = torch.empty_like(layer.running_var, dtype=dtype)
+        return original_load(layer, state_dict, prefix, *args, **kwargs)
+
+    forward._runtime_wide_moments = True
+    norm_type.forward = forward
+    norm_type._load_from_state_dict = load
+
+
+@torch.no_grad()
+def _refresh_flow_statistics(model, norm_type, inputs, conditions):
+    layers = [layer for layer in model.modules() if isinstance(layer, norm_type)]
+    for layer in layers:
+        if layer.running_var.dtype != inputs.dtype:
+            layer.running_mean = torch.zeros_like(layer.running_mean, dtype=inputs.dtype)
+            layer.running_var = torch.zeros_like(layer.running_var, dtype=inputs.dtype)
+    model(inputs, conditions)
+    if _valid_moments([(layer.running_mean, layer.running_var) for layer in layers]):
+        return
+    from riddle.production import NumericalFitError
+    from .worker_progress import emit_message
+
+    reference = copy.deepcopy(model).double()
+    wide_layers = [layer for layer in reference.modules() if isinstance(layer, norm_type)]
+    for layer in wide_layers:
+        layer.running_mean.zero_()
+        layer.running_var.zero_()
+    reference(inputs.double(), conditions.double())
+    moments = [
+        (wide.running_mean.to(layer.running_mean), wide.running_var.to(layer.running_var))
+        for layer, wide in zip(layers, wide_layers)
+    ]
+    needs_wide = not _valid_moments(moments)
+    if needs_wide and not _valid_moments([(wide.running_mean, wide.running_var) for wide in wide_layers]):
+        raise NumericalFitError("Flow population moments are nonfinite or nonpositive in float64 on the training sample")
+    for layer, wide, (mean, variance) in zip(layers, wide_layers, moments):
+        if needs_wide and not _valid_moments([(mean, variance)]):
+            mean, variance = wide.running_mean, wide.running_var
+            layer.running_mean, layer.running_var = mean, variance
+        else:
+            layer.running_mean.copy_(mean)
+            layer.running_var.copy_(variance)
+        layer.batch_mean = mean
+        layer.batch_var = variance
+    detail = " and retained out-of-range moments in float64" if needs_wide else ""
+    emit_message(f"Recomputed flow normalization on the full training sample in float64{detail}", level=0)
 
 
 def _epoch_loss_mean(chunks):
@@ -17,9 +90,12 @@ def install_flow_loss_reporting(module):
     original = module.train_epoch
     if getattr(original, "_runtime_epoch_losses", False):
         return
+    _install_wide_normalization(original.__globals__["fnn"].BatchNormFlow)
     source = inspect.getsource(original)
     replacements = [
         ("train_loss += loss.mean().item()", "if verbose: train_loss += loss.mean().item()", 1),
+        ("model(data_loader.dataset.tensors[0].to(data.device),",
+         "_refresh_flow_statistics(model, fnn.BatchNormFlow, data_loader.dataset.tensors[0].to(data.device),", 1),
     ]
     for name, loss, count in (("train_loss_avg", "loss", 2), ("corrected_train_loss_avg", "corrected_loss", 1)):
         replacements.extend([
@@ -30,7 +106,8 @@ def install_flow_loss_reporting(module):
         if source.count(expected) != count:
             raise RuntimeError("Unrecognized LaCATHODE flow loss reporting")
         source = source.replace(expected, replacement)
-    namespace = dict(original.__globals__, _epoch_loss_mean=_epoch_loss_mean)
+    namespace = dict(original.__globals__, _epoch_loss_mean=_epoch_loss_mean,
+                     _refresh_flow_statistics=_refresh_flow_statistics)
     exec(compile(source, f"<runtime flow loss reporting: {original.__code__.co_filename}>", "exec"), namespace)
     patched = functools.update_wrapper(namespace[original.__name__], original)
     patched._runtime_epoch_losses = True
@@ -255,12 +332,12 @@ def execution_report(batches=None):
         if batches is not None
         else "not used by full-array evaluation",
         "array_hashing": "zero-copy contiguous buffer hashing; identical SHA256 contract",
-        "precision": "dtypes; no AMP or TF32",
+        "precision": "upstream training dtype; invalid full-sample moments recomputed in float64 and stored at sufficient precision; no AMP or TF32",
         "unchanged": [
             "optimizer",
             "batch sizes",
             "sampler and RNG",
-            "floating reductions",
+            "loss reductions",
             "checkpoint retention and selection",
             "full-array CPU SR evaluation",
         ],

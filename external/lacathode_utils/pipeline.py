@@ -892,6 +892,8 @@ def run_single(args, contract):
     if contract.get("scan_background") and background_request is None:
         raise ValueError("Nominal LaCathode background is incompatible, missing, or conflicts with existing training")
     recovery = EpochRecovery(root, contract, args.resume, **resume_policy(args))
+    if background_request is None and recovery.archive_invalid_flow(FLOW_PREFIX, background_epochs):
+        recovery = EpochRecovery(root, contract, args.resume, **resume_policy(args))
     background_reuse, creation_reference, evaluation_reference = _activate_background_reuse(
         root, background_request, data_handler, torch.device(args.device)
     )
@@ -938,17 +940,14 @@ def run_single(args, contract):
         emit_progress("flow", "Train background flow", total=background_epochs, unit="epoch", completed=0)
         run_all.train_DE(de)
 
+    def validate_flow():
+        recovery.validate_flow(FLOW_PREFIX, background_epochs)
+
     if background_reuse is None:
-        recovery.stage("flow", flow)
+        recovery.stage("flow", flow, validate=validate_flow)
     else:
         emit_progress("flow", "Reuse shared background flow", total=1, unit="step", completed=1)
-    for name in (f"{FLOW_PREFIX}_train_losses.npy", f"{FLOW_PREFIX}_val_losses.npy"):
-        losses = np.load(root / name, allow_pickle=False)
-        if not losses.size:
-            raise ValueError(f"LaCathode: missing flow losses in {root / name}")
-        if not np.isfinite(losses).all():
-            from riddle.production import NumericalFitError
-            raise NumericalFitError(f"LaCathode: nonfinite flow losses in {root / name}")
+        validate_flow()
 
     def create():
         with ProgressStage("creation", "Build latent/reference datasets"):

@@ -211,7 +211,7 @@ def configure_rescoring(args):
     args.resume = True
 
 
-def _run_concurrent(cases, workers, run_one, label, *, cancel_event=None):
+def _run_concurrent(cases, workers, run_one, label, *, cancel_event=None, finish_independent_cases=False):
     from concurrent.futures import ThreadPoolExecutor, as_completed
     import signal
     import threading
@@ -230,6 +230,7 @@ def _run_concurrent(cases, workers, run_one, label, *, cancel_event=None):
 
     pool = ThreadPoolExecutor(max_workers=concurrency)
     futures = []
+    failures = []
     previous_handler = None
     try:
         if threading.current_thread() is threading.main_thread():
@@ -239,7 +240,14 @@ def _run_concurrent(cases, workers, run_one, label, *, cancel_event=None):
             previous_handler = signal.signal(signal.SIGTERM, terminate)
         futures = [pool.submit(execute, case) for case in cases]
         for future in as_completed(futures):
-            future.result()
+            try:
+                future.result()
+            except Exception as error:
+                if not finish_independent_cases or cancel.is_set():
+                    raise
+                failures.append(error)
+                message = str(error).partition("\n")[0]
+                emit_message(f"{label}: {message}", kind="ERROR")
     except BaseException:
         cancel.set()
         for future in futures:
@@ -251,6 +259,9 @@ def _run_concurrent(cases, workers, run_one, label, *, cancel_event=None):
         finally:
             if previous_handler is not None:
                 signal.signal(signal.SIGTERM, previous_handler)
+    if failures:
+        details = "\n".join(str(error).partition("\n")[0] for error in failures)
+        raise RuntimeError(f"{label}: {len(failures)} of {len(cases)} failed\n{details}") from failures[0]
 
 
 def _run_rescore_seeds(requests, workers, run_one, *, cancel_event=None, group_name="seeds"):
@@ -478,7 +489,7 @@ def run_campaign(args, *, cancel_event=None, rescore_concurrency=1, lacathode_co
                     run_one(request)
                 elif request == lacathode[0]:
                     _run_concurrent(lacathode, args.workers, run_one, f"LaCathode {scenario} seeds",
-                                    cancel_event=cancel_event)
+                                    cancel_event=cancel_event, finish_independent_cases=True)
 
 
 def main(argv=None):

@@ -3,13 +3,15 @@ import functools
 import inspect
 import json
 from pathlib import Path
+from uuid import uuid4
 
 import numpy as np
 import torch
 
 from .storage import atomic_write, write_json, rng_state, restore_rng, file_digest, verify_artifacts, save_array
+from riddle.production import NumericalFitError
 from riddle.storage import persist_boundary
-from .worker_progress import emit_progress
+from .worker_progress import emit_message, emit_progress
 from .resume import check_contract, record_transition
 
 
@@ -210,7 +212,45 @@ class EpochRecovery:
         }
         atomic_write(self.path, lambda p: self.save_torch(state, p))
 
-    def stage(self, phase, function):
+    @staticmethod
+    def check_flow_losses(train, validation):
+        for label, losses in (("training", train), ("validation", validation)):
+            bad = np.flatnonzero(~np.isfinite(losses))
+            if bad.size:
+                entry = int(bad[0])
+                when = f"epoch {entry - 1}" if entry else "initial evaluation"
+                raise NumericalFitError(f"Nonfinite LaCATHODE flow {label} loss at {when}")
+
+    def validate_flow(self, prefix, epochs):
+        losses = [np.load(self.root / f"{prefix}_{key}_losses.npy", allow_pickle=False)
+                  for key in ("train", "val")]
+        if any(array.shape != (epochs + 1,) for array in losses):
+            raise ValueError("Saved LaCATHODE flow loss history has an unexpected length")
+        self.check_flow_losses(*losses)
+
+    def archive_invalid_flow(self, prefix, epochs):
+        if not self.state:
+            return False
+        try:
+            if "flow" in self.done:
+                self.validate_flow(prefix, epochs)
+            elif self.state["phase"] == "flow" and self.state["kind"] == "epoch":
+                count = self.state["next_epoch"]
+                losses = self.state["losses"]
+                if not 0 < count <= epochs or len(losses) != 2 or any(
+                    np.shape(array) != (epochs + 1,) for array in losses
+                ):
+                    raise ValueError("Invalid LaCATHODE flow recovery history")
+                self.check_flow_losses(*(array[:count + 1] for array in losses))
+        except NumericalFitError as error:
+            archive = self.root.parent / ".resume" / f"invalid-flow-{uuid4().hex}"
+            archive.parent.mkdir(parents=True, exist_ok=True)
+            self.root.rename(archive)
+            emit_message(f"{error}; archived {archive}. Restarting this flow from its original seed", kind="WARNING")
+            return True
+        return False
+
+    def stage(self, phase, function, validate=None):
         if phase in self.done:
             if self.state and self.state["phase"] == phase:
                 restore_rng(self.state["rng"])
@@ -220,6 +260,8 @@ class EpochRecovery:
         if not self.state or self.state["phase"] != phase:
             self.save(phase, "start")
         function()
+        if validate is not None:
+            validate()
         self.done.append(phase)
         self.files = {
             p.name: file_digest(p)

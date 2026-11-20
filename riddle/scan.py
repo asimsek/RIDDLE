@@ -233,4 +233,4 @@ def run_scan(args):
                               for seed in dict.fromkeys(option.seeds[0] for option in wave)}
                 for option in wave:
                     option.scan_result_candidates = candidates[option.seeds[0]]
-            _run_concurrent(wave, args.workers, launch, "LaCathode scan points")
+            _run_concurrent(wave, args.workers, launch, "LaCathode scan points", finish_independent_cases=True)

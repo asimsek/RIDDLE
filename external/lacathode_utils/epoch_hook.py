@@ -33,6 +33,12 @@ def install_epoch_recovery(module, name, phase, recovery):
             raise RuntimeError("Unrecognized LaCATHODE loss checkpoint")
         array.func = ast.parse("__runtime_recovery.save_loss_array", mode="eval").body
         array.args += [ast.Name(id="epoch", ctx=ast.Load()), ast.Name(id="epochs", ctx=ast.Load())]
+    if phase == "flow":
+        position = next(i for i, node in enumerate(loop.body)
+                        if isinstance(node, ast.Expr) and node.value is arrays[0])
+        loop.body[position:position] = ast.parse(
+            "__runtime_recovery.check_flow_losses(train_losses[:epoch + 2], val_losses[:epoch + 2])"
+        ).body
     index = function.body.index(loop)
     prefix = ast.parse(f"_runtime_losses = __runtime_recovery.restore_epoch({phase!r}, locals())").body
     if phase == "flow":
