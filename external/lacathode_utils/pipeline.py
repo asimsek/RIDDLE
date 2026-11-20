@@ -532,6 +532,7 @@ def train_fixed_classifiers(args, contract, root, training):
 def collect_runs(args, members):
     import numpy as np
     from .storage import atomic_write, save_npz, save_array, write_json, verify_artifacts
+    from riddle.metrics import acceptance_report
     from riddle.production import validate_result_scores
 
     requested = len(members)
@@ -563,22 +564,35 @@ def collect_runs(args, members):
     inventory = json.loads((args.output / "runs.json").read_text())
     inventory.update(runs=members, requested_runs=requested, excluded_runs=excluded)
     write_json(args.output / "runs.json", inventory)
+    acceptance = json.loads((roots[0] / "mapping_acceptance.json").read_text())
     for partition in ("validation", "test", "signal_region"):
         records = []
         for root in roots:
             with np.load(root / f"{partition}_scores.npz", allow_pickle=False) as archive:
                 records.append({key: archive[key] for key in archive.files})
         first = records[0]
+        pre = first.get("flow_preprocessing_mask", first["mask"])
         for other in records[1:]:
-            if any(not np.array_equal(first[key], other[key])
-                   for key in ("mass", "labels", "mask", "physical")):
+            if (any(not np.array_equal(first[key], other[key]) for key in ("mass", "labels", "physical"))
+                    or not np.array_equal(pre, other.get("flow_preprocessing_mask", other["mask"]))):
                 raise ValueError("Independent LaCathode runs have different event populations or masks")
+        mask = np.logical_and.reduce([record["mask"] for record in records])
         fits = np.stack([record["scores"] for record in records])
-        if not np.isfinite(fits[:, first["mask"]]).all():
+        if not mask.any() or not np.isfinite(fits[:, mask]).all():
             raise ValueError("Nonfinite independent LaCathode scores")
+        fits[:, ~mask] = np.nan
+        latents = np.stack([record["latent"][mask[record["mask"]]] for record in records])
+        if any(not np.array_equal(mask, record["mask"]) for record in records):
+            acceptance[partition] = acceptance_report(first["labels"], mask, first["mass"])
+            acceptance[partition]["common_scoring_population"] = {
+                "unscorable_in_any_run": int((pre & ~mask).sum()),
+                "individual_acceptance_files": [str(Path(member["directory"]) / "mapping_acceptance.json")
+                                                for member in members],
+            }
         atomic_write(args.output / f"{partition}_scores.npz", lambda p: save_npz(
-            p, **{key: first[key] for key in ("mass", "labels", "mask", "physical", "scores", "latent")},
-            fit_scores=fits, fit_latents=np.stack([record["latent"] for record in records]),
+            p, **{key: first[key] for key in ("mass", "labels", "physical")},
+            mask=mask, flow_preprocessing_mask=pre, scores=fits[0], latent=latents[0],
+            fit_scores=fits, fit_latents=latents,
             run_seeds=np.array([member["seed"] for member in members], dtype=np.uint32)))
     summary = args.output / "training"
     summary.mkdir(exist_ok=True)
@@ -599,8 +613,7 @@ def collect_runs(args, members):
                     fit_scores="One score row per independent background-flow-plus-classifier run",
                     primary_classifier_fit=0)
     write_json(args.output / "protocol.json", protocol)
-    write_json(args.output / "mapping_acceptance.json",
-               json.loads((roots[0] / "mapping_acceptance.json").read_text()))
+    write_json(args.output / "mapping_acceptance.json", acceptance)
 
 
 def run(args, contract):
@@ -635,19 +648,12 @@ def run(args, contract):
 @contextmanager
 def classifier_prediction_device(classifier_type):
     """Match prediction inputs to the loaded model, only during SR evaluation."""
-    import torch
-    from riddle.production import score_diagnostics
+    from .evaluation import frozen_predictions
 
     original = classifier_type.predict
 
     def predict(self, x):
-        device = next(self.parameters()).device
-        with torch.no_grad():
-            self.eval()
-            x = torch.tensor(x, device=device)
-            result = self.forward(x).detach().cpu().numpy()
-            score_diagnostics(result.ravel(), stage="LaCathode SR classifier checkpoint", probability=True, summarize=False)
-            return result
+        return frozen_predictions(self.eval(), x, "LaCathode SR classifier checkpoint")
 
     classifier_type.predict = predict
     try:
@@ -1023,6 +1029,7 @@ def run_single(args, contract):
             "scan_background_reuse": background_reuse,
             "reference_samples": reference_samples,
             "selected_checkpoints": 10,
+            "evaluation_acceptance": "Keep the preprocessing population in full-pipeline denominators. Retry nonfinite frozen-flow coordinates in float64. Events still unscorable fail every score cut.",
             "score": "Upstream ten-validation-checkpoint mean per classifier fit; no averaging across fits",
             "primary_classifier_fit": 0,
             "fit_scores": "All classifier fits, in upstream run order, when classifier_runs > 1",
@@ -1043,6 +1050,7 @@ def evaluate(args, root, data_handler, *, config_file="DE_MAF_model.yml", classi
     import torch
 
     from .storage import atomic_write, save_npz, seed_start, write_json, file_digest
+    from .evaluation import frozen_coordinates, frozen_predictions, mapping_audit, native_coordinates
     from .worker_progress import ProgressStage, emit_message
     from riddle.metrics import acceptance_report
 
@@ -1054,6 +1062,8 @@ def evaluate(args, root, data_handler, *, config_file="DE_MAF_model.yml", classi
 
     captured = []
     evaluation_checkpoints = []
+    sr_mapping = None
+    sr_class_counts = None
     original_load_dataset = _install_fixed_load_dataset(data_handler, background_reference)
 
     def evaluation_estimator(*a, **kw):
@@ -1061,10 +1071,28 @@ def evaluate(args, root, data_handler, *, config_file="DE_MAF_model.yml", classi
             evaluation_checkpoints.append(Path(kw["load_path"]))
         return DensityEstimator(*a, **kw)
 
+    def map_signal_region(model, prepared):
+        nonlocal sr_mapping, sr_class_counts
+        if sr_mapping is None:
+            pre = prepared["mask"].cpu().numpy()
+            z, mask, retry = frozen_coordinates(model, prepared)
+            sr_mapping = z, mask, retry, pre
+            sr_class_counts = np.array([prepared[key].sum().item() for key in ("bgmask", "sigmask")])
+        z, mask, _, pre = sr_mapping
+        if not np.array_equal(prepared["mask"].cpu().numpy(), pre):
+            raise ValueError("LaCATHODE SR preprocessing changed between classifier runs")
+        prepared["mask"] = torch.as_tensor(mask, device=prepared["mask"].device)
+        return z
+
     def capture(labels, scores):
         score_diagnostics(np.asarray(scores), stage="LaCathode SR classifier ensemble", probability=True, summarize=False)
         captured.append(dict(labels=labels, scores=scores))
-        return roc_curve(labels, scores)
+        fpr, tpr, cuts = roc_curve(labels, scores)
+        if sr_mapping[1].sum() != sr_mapping[3].sum():
+            counts = np.bincount(np.asarray(labels, dtype=int), minlength=2)
+            fractions = np.divide(counts, sr_class_counts, out=np.ones(2), where=sr_class_counts > 0)
+            fpr, tpr = fpr * fractions[0], tpr * fractions[1]
+        return fpr, tpr, cuts
 
     notebook = json.loads((args.sources / "bkg_sculpting_study.ipynb").read_text())
     text = next(
@@ -1075,6 +1103,12 @@ def evaluate(args, root, data_handler, *, config_file="DE_MAF_model.yml", classi
     function = next(
         n for n in ast.parse(text).body if isinstance(n, ast.FunctionDef) and n.name == "make_ROCs"
     )
+    native = ast.parse("clsf_data = model(prep_datadict['tensor2'], prep_datadict['labels'])[0].detach().cpu().numpy()").body[0]
+    assignments = [node for node in ast.walk(function) if isinstance(node, ast.Assign) and ast.dump(node) == ast.dump(native)]
+    if len(assignments) != 1:
+        raise ValueError("Unexpected pinned LaCATHODE SR mapping expression")
+    assignments[0].value = ast.parse("map_signal_region(model, prep_datadict)", mode="eval").body
+    ast.fix_missing_locations(function)
     namespace = {
         "np": np,
         "torch": torch,
@@ -1085,6 +1119,7 @@ def evaluate(args, root, data_handler, *, config_file="DE_MAF_model.yml", classi
         "DensityEstimator": evaluation_estimator,
         "minimum_validation_loss_models": minimum_validation_loss_models,
         "roc_curve": capture,
+        "map_signal_region": map_signal_region,
     }
     exec(compile(ast.Module(body=[function], type_ignores=[]), "<pinned SR evaluation>", "exec"), namespace)
     seed_start(args.seed)
@@ -1155,15 +1190,12 @@ def evaluate(args, root, data_handler, *, config_file="DE_MAF_model.yml", classi
             if suffix
             else ("innerdata_test.npy", "innerdata_extrabkg_test.npy", "innerdata_extrasig.npy")
         )
-        rows = np.vstack([np.load(args.data / name) for name in names]).astype("float32")
-        prepared = data_handler.load_dataset(rows, external_datadict=reference)
-        x, m = prepared["tensor2"], prepared["labels"]
-        with torch.no_grad():
-            z = np.concatenate(
-                [model(x[o : o + 8192], m[o : o + 8192])[0].numpy() for o in range(0, len(x), 8192)]
-            )
-        mask = prepared["mask"].numpy()
+        arrays = [np.load(args.data / name, mmap_mode="r") for name in names]
+        rows = np.vstack(arrays).astype("float32", copy=False)
         if suffix:
+            prepared = data_handler.load_dataset(rows, external_datadict=reference)
+            pre = prepared["mask"].numpy()
+            z, mask, retry = frozen_coordinates(model, prepared, batch_size=8192)
             fit_predictions = []
             with (
                 ProgressStage(
@@ -1177,20 +1209,20 @@ def evaluate(args, root, data_handler, *, config_file="DE_MAF_model.yml", classi
                     predictions = []
                     for path in paths:
                         classifier = torch.load(path, map_location="cpu", weights_only=False).eval()
-                        predictions.append(
-                            np.concatenate(
-                                [
-                                    classifier(torch.as_tensor(z[o : o + 8192])).numpy().ravel()
-                                    for o in range(0, len(z), 8192)
-                                ]
-                            )
-                        )
-                        score_diagnostics(predictions[-1], stage=f"LaCathode {partition} checkpoint {path}",
-                                          probability=True, summarize=False)
+                        predictions.append(frozen_predictions(classifier, z, f"LaCathode {partition} checkpoint {path}",
+                                                              batch_size=8192))
                         completed += 1
                         progress.update(completed)
                     fit_predictions.append(np.mean(np.stack(predictions), axis=0))
         else:
+            z, mask, retry, pre = sr_mapping
+            if not len(retry):
+                prepared = data_handler.load_dataset(rows, external_datadict=reference)
+                if not np.array_equal(prepared["mask"].numpy(), pre):
+                    raise ValueError("Pinned SR preprocessing mask changed during score export")
+                archived = native_coordinates(model, prepared, batch_size=8192).numpy()
+                if np.isfinite(archived).all():
+                    z = archived
             if any(not np.array_equal(fit["labels"], rows[mask, -1]) for fit in captured):
                 raise ValueError("Pinned SR evaluation event alignment changed")
             fit_predictions = [fit["scores"] for fit in captured]
@@ -1203,6 +1235,12 @@ def evaluate(args, root, data_handler, *, config_file="DE_MAF_model.yml", classi
             fit_scores[:, mask] = np.stack(fit_predictions)
             extra["fit_scores"] = fit_scores
         acceptance[partition] = acceptance_report(rows[:, -1], mask, rows[:, 0])
+        audit = mapping_audit(pre, mask, retry, rows[:, 0], names, [len(array) for array in arrays])
+        acceptance[partition]["frozen_flow"] = audit
+        if audit["float64_retried"]:
+            emit_message(f"Frozen flow {partition}: {audit['float64_retried']} float64 retries, "
+                         f"{audit['float64_recovered']} recovered, {audit['unscorable']} unscorable",
+                         kind="WARNING" if audit["unscorable"] else "INFO")
         atomic_write(
             args.output / f"{partition}_scores.npz",
             lambda p: save_npz(
@@ -1210,6 +1248,7 @@ def evaluate(args, root, data_handler, *, config_file="DE_MAF_model.yml", classi
                 mass=rows[:, 0],
                 labels=rows[:, -1].astype(np.int8),
                 mask=mask,
+                flow_preprocessing_mask=pre,
                 scores=aligned,
                 physical=rows[:, 1:-1],
                 latent=z,
