@@ -122,6 +122,12 @@ def parser():
         run.add_argument("--score-sidebands-only", action="store_true",
                          help="Backfill frozen SR + sideband exports from completed native results without training")
         rescoring = run.add_mutually_exclusive_group()
+        rescoring.add_argument("--backfill-checkpoint-scores", action="store_true",
+                               help="Score saved final witness checkpoints in completed runs")
+        run.add_argument("--checkpoint-trends", action="store_true", help="Measure saved ten-epoch ensemble checkpoints")
+        run.add_argument("--last-epoch", type=positive, help="Backfill exactly this saved one-based epoch")
+        run.add_argument("--extend-witness-to", type=positive, help="Continue frozen witness fits only beyond their saved endpoint")
+        run.add_argument("--checkpoint-archive", nargs="+", type=Path, help="Verified witness continuation studies with registered source fits")
         rescoring.add_argument("--rescore", action="store_true",
                                help="Re-score completed RIDDLE/IAD/Supervised models in --output without training")
         rescoring.add_argument("--rescore-from", type=Path,
@@ -188,9 +194,31 @@ def campaign_runs(args):
     return requests
 
 
+def validate_witness_continuation(args):
+    if (any(m not in ("riddle", "iad", "supervised") for m in args.methods)
+            or any(getattr(args, key, None) for key in ("rescore", "rescore_from", "score_sidebands_only"))
+            or getattr(args, "rescore_workers", 1) != 1):
+        raise ValueError("A training continuation requires native witness training or --backfill-checkpoint-scores")
+    if args.epochs is not None and args.extend_witness_to <= args.epochs:
+        raise ValueError("--extend-witness-to must exceed the original training epoch budget")
+
+
 def configure_rescoring(args):
     in_place = getattr(args, "rescore", False)
     source = getattr(args, "rescore_from", None)
+    backfill = getattr(args, "backfill_checkpoint_scores", False)
+    if backfill:
+        if (in_place or source is not None or getattr(args, "score_sidebands_only", False)
+                or args.command not in ("run", "scan") or any(m not in ("riddle", "iad", "supervised") for m in args.methods)):
+            raise ValueError("Checkpoint backfill requires an existing native run or scan")
+        if getattr(args, "extend_witness_to", None) and getattr(args, "last_epoch", None) not in (None, args.extend_witness_to):
+            raise ValueError("The requested scoring and continuation endpoints must agree")
+        args.resume = True
+        return
+    if any(getattr(args, key, None) for key in ("last_epoch", "checkpoint_archive")):
+        raise ValueError("Exact-epoch and archive options require --backfill-checkpoint-scores")
+    if getattr(args, "extend_witness_to", None):
+        validate_witness_continuation(args)
     if not in_place and source is None:
         if getattr(args, "rescore_workers", 1) != 1:
             raise ValueError("--rescore-workers requires --rescore or --rescore-from")
@@ -290,6 +318,7 @@ def run_campaign(args, *, cancel_event=None, rescore_concurrency=1, lacathode_co
     if cancel_event is not None and cancel_event.is_set():
         raise RuntimeError("Background preparation cancelled")
     if (getattr(args, "scan_bg_workers", 1) > 1 and not getattr(args, "score_sidebands_only", False)
+            and not getattr(args, "backfill_checkpoint_scores", False)
             and not getattr(args, "rescore_from", None)
             and not getattr(args, "background_phase", None)
             and getattr(args, "command", "run") != "scan"):
@@ -365,6 +394,8 @@ def run_campaign(args, *, cancel_event=None, rescore_concurrency=1, lacathode_co
         def run_one(request, cancel_event=cancel_event, concurrency=max(rescore_concurrency, lacathode_concurrency)):
             method, base_seed, run_index, seed = request
             output = args.output / method / scenario / f"seed_{seed:03d}"
+            if getattr(args, "backfill_checkpoint_scores", False) and not (output / "result.json").is_file():
+                raise FileNotFoundError(f"No completed result to backfill: {output}")
             if getattr(args, "score_sidebands_only", False):
                 from .storage import read_json
                 from .worker_progress import emit_message
@@ -398,7 +429,7 @@ def run_campaign(args, *, cancel_event=None, rescore_concurrency=1, lacathode_co
             elif method in ("iad", "supervised"):
                 options["runs"] = args.fits
             env = os.environ.copy()
-            if getattr(args, "rescore_from", None):
+            if getattr(args, "rescore_from", None) or getattr(args, "backfill_checkpoint_scores", False):
                 env["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
                 options["rescore_concurrency"] = concurrency
             manifest = manifests[scenario]
@@ -480,7 +511,7 @@ def run_campaign(args, *, cancel_event=None, rescore_concurrency=1, lacathode_co
                     resume=args.resume,
                     cancel_event=cancel_event,
                 )
-        if getattr(args, "rescore_from", None) and getattr(args, "rescore_workers", 1) > 1:
+        if (getattr(args, "rescore_from", None) or getattr(args, "backfill_checkpoint_scores", False)) and getattr(args, "rescore_workers", 1) > 1:
             _run_rescore_seeds(requests, args.rescore_workers, run_one, cancel_event=cancel_event)
         else:
             lacathode = [r for r in requests if r[0] == "lacathode"]

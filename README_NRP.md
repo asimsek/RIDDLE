@@ -310,9 +310,9 @@ kubectl exec -n cua-asimsek \
 ```bash
 cd /shared/work/RIDDLE
 
-python paper_plot.py --data data/lhco --results results \
-  --config config/settings.yaml --output paper_plots \
-  --methods riddle iad supervised --variants default deltaR shifted \
+python paper_plot.py --data data/lhco --results results --focused \
+  --config config/settings.yaml --output paper_plots_all \
+  --methods riddle iad supervised lacathode --variants default deltaR shifted \
   --plot-formats pdf --file-formats csv --io-workers 16 --plot-workers 16 --overwrite --verbose 1
 ```
 
@@ -454,7 +454,7 @@ cd /shared/work/RIDDLE
 
 python paper_plot.py --scan-data data/injection_scan --scan-results results_injection_scan \
   --config config/settings.yaml --output paper_plots \
-  --methods riddle iad supervised --variants default deltaR shifted \
+  --methods riddle iad supervised lacathode --variants default \
   --plot-formats pdf --file-formats csv --io-workers 16 --plot-workers 16 --overwrite --verbose 1
 ```
 

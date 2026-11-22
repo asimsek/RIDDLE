@@ -291,6 +291,8 @@ def mass_legend(ax, title=None):
     import matplotlib as mpl
 
     handles, labels = ax.get_legend_handles_labels()
+    original = getattr(ax, "_checkpoint_legend_handles", {})
+    handles = [original.get(label, handle) for handle, label in zip(handles, labels)]
     priority = {"Background": 0, "Data": 1, "Signal": 2}
     order = sorted(range(len(labels)), key=lambda i: priority.get(labels[i].split()[0], 3))
     legend = ax.legend([handles[i] for i in order], [labels[i] for i in order],

@@ -13,6 +13,7 @@ from collections import defaultdict
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from contextvars import ContextVar, copy_context
+from copy import copy
 from pathlib import Path
 
 import matplotlib
@@ -59,6 +60,7 @@ STANDARD_FIGURE_SIZE = (5.8, 0.78 * 5.8)
 DOUBLE_COLUMN_IN = 17.6 / 2.54
 STYLE = {"font.family": "sans-serif", "font.sans-serif": ["DejaVu Sans"], "mathtext.fontset": "dejavusans", "text.usetex": False, "font.size": 8.2, "axes.labelsize": 8.8, "axes.linewidth": 0.8, "xtick.labelsize": 7.7, "ytick.labelsize": 7.7, "legend.fontsize": 7.3, "legend.title_fontsize": 7.3, "lines.linewidth": 1.0, "lines.markersize": 3.2, "xtick.direction": "in", "ytick.direction": "in", "xtick.top": True, "ytick.right": True, "xtick.minor.visible": True, "ytick.minor.visible": True, "pdf.fonttype": 42, "ps.fonttype": 42, "path.simplify": False, "savefig.dpi": 600, "savefig.facecolor": "white", "savefig.edgecolor": "white", "figure.facecolor": "white", "axes.facecolor": "white"}
 _FIGURE_RENDERER = ContextVar("paper_figure_renderer", default=None)
+_CHECKPOINT_OVERLAY = ContextVar("paper_checkpoint_overlay", default=None)
 
 
 def say(message, verbose=1, level=1):
@@ -189,6 +191,9 @@ def scale_publication_axes(fig):
 
 
 def publication_legend(ax, *args, **kwargs):
+    if hasattr(ax, "_checkpoint_legend_handles"):
+        handles, labels = args[:2] if len(args) >= 2 else ax.get_legend_handles_labels()
+        args = ([ax._checkpoint_legend_handles.get(label, handle) for handle, label in zip(handles, labels)], labels)
     scale_publication_axes(ax.figure)
     scale = getattr(ax.figure, "_paper_style_scale", 1.0)
     kwargs["fontsize"] = (kwargs.get("fontsize") or STYLE["legend.fontsize"]) * scale
@@ -474,6 +479,12 @@ def audit_layout(fig, ax, legend=None):
 
 def save_figure(fig, ax, stem, formats, overwrite, legend=None):
     try:
+        state = _CHECKPOINT_OVERLAY.get()
+        if state is not None:
+            overlay, root = state
+            stem = overlay.compose(fig, ax, stem, root, legend)
+            if stem is None:
+                return
         renderer = _FIGURE_RENDERER.get()
         if renderer is not None:
             renderer.save(fig, ax, stem, formats, overwrite, legend)
@@ -2698,7 +2709,7 @@ def event_count_text(count, sample, validation=False):
     return f"{number:,}" + (f" {noun}" if noun else "")
 
 
-def compact_configuration_rows(extracted):
+def compact_configuration_rows(extracted, checkpoint_policy=None):
     values = {}
     for row in extracted:
         name = row.get("setting", row.get("Setting", row.get("name", "")))
@@ -2730,6 +2741,9 @@ def compact_configuration_rows(extracted):
     fits = get("settings.riddle.ensemble_fit_count")
     epochs = get("settings.riddle.epochs")
     selected = get("settings.riddle.training.selected_checkpoints")
+    if checkpoint_policy:
+        epochs = ", ".join(map(str, sorted(set(checkpoint_policy["epoch_by_fit"].values()))))
+        selected = 1
     fit_selection = get("settings.riddle.stein.ensemble_fit_selection")
     ensemble = [part for part in (f"{fits} fits" if fits is not None else None, f"{epochs} epochs" if epochs is not None else None, f"{selected} checkpoints/fit" if selected is not None else None, f"selection: {fit_selection}" if fit_selection is not None else None) if part]
     if ensemble:
@@ -2846,7 +2860,7 @@ def export_tables(groups, cache, loader, output, file_formats, data_root, verbos
         variant = result_variant(report)
         scenario = report.get("scenario", "")
         protocol = scientific_protocol(report)
-        for setting, value in compact_configuration_rows(extracted):
+        for setting, value in compact_configuration_rows(extracted, report.get("checkpoint_policy")):
             configuration_values[(variant, protocol, setting)][scenario].add(str(value))
     setting_order = ["Model", "Stein architecture", "Stein ensemble", "Stein optimization", "Stein scoring", "Support guard", "Final calibration", "Stein reference", "Background map", "Background-map training", "Background correction"]
     table2 = []
@@ -2938,7 +2952,7 @@ def aggregate_scan_replica(run_rows):
     }
 
 
-def process_injection_scan(scan_groups, methods, loader, settings, output, formats, file_formats, overwrite, min_background, allow_partial, verbose, require_compatible_populations=False, variant="default", io_workers=1, excluded_seeds=()):
+def process_injection_scan(scan_groups, methods, loader, settings, output, formats, file_formats, overwrite, min_background, allow_partial, verbose, require_compatible_populations=False, variant="default", io_workers=1, excluded_seeds=(), show_missing_epochs=False):
     if overwrite:
         for extension in ("csv", "json", "yaml"):
             (output / "07_tables" / f"table_05_{variant}_signal_injection_score_stages.{extension}").unlink(missing_ok=True)
@@ -3101,30 +3115,25 @@ def process_injection_scan(scan_groups, methods, loader, settings, output, forma
     figure_specs = [("max_sic", "Maximum significance improvement", "maximum_sic_vs_s_over_b"), ("nominal_selected", "Maximum achieved significance", "maximum_nominal_significance_vs_s_over_b"), ("auc", "AUC", "auc_vs_s_over_b")]
     for wp in PLOT_WORKING_POINTS[::-1]:
         figure_specs.append((f"wp_{wp}", r"Signal efficiency, $\epsilon_S$", f"epsS_{WORKING_POINT_LABELS[wp].replace('%','pct').replace('.','p')}_vs_s_over_b"))
-    reference_axis = None
-    reference_counts = None
+    axis_points = {}
     for method, levels in summaries.items():
-        axis = []
-        counts = []
         for level, replicas_data in levels:
             sob = [row["s_over_b"] for row in replicas_data if row["s_over_b"] is not None]
             nominal = [row["nominal"] for row in replicas_data if row["nominal"] is not None]
             if sob and nominal:
-                axis.append((level, 100 * float(np.mean(sob)), float(np.mean(nominal))))
-                counts.append({(row["background"], row["signal"]) for row in replicas_data})
-        if reference_axis is None:
-            reference_axis = axis
-            reference_counts = counts
-        elif ([item[0] for item in axis] != [item[0] for item in reference_axis]
-              or counts != reference_counts
-              or not np.allclose([item[1:] for item in axis], [item[1:] for item in reference_axis],
-                                 rtol=1e-14, atol=0.0)):
-            raise ValueError("Injection-scan methods do not share the same realized S/B and S/sqrt(B) axis")
+                point = (level, 100 * float(np.mean(sob)), float(np.mean(nominal)))
+                counts = {(row["background"], row["signal"]) for row in replicas_data}
+                if level in axis_points:
+                    old, prior_counts = axis_points[level]
+                    if counts != prior_counts or not np.allclose(old, point, rtol=1e-14, atol=0):
+                        raise ValueError("Injection-scan methods do not share the same realized S/B and S/sqrt(B) axis")
+                axis_points[level] = point, counts
+    reference_axis = [point for point, _ in axis_points.values()]
     for field, ylabel, stem in figure_specs:
         fig, ax = new_figure("S/B (%)", ylabel)
         drawn = 0
         for method, levels in summaries.items():
-            x, y, low, high = [], [], [], []
+            x, y, low, high, indices = [], [], [], [], []
             for level, replicas_data in levels:
                 sob = [row["s_over_b"] for row in replicas_data if row["s_over_b"] is not None]
                 if not sob:
@@ -3144,12 +3153,16 @@ def process_injection_scan(scan_groups, methods, loader, settings, output, forma
                 if not values:
                     continue
                 x.append(100 * float(np.mean(sob)))
+                indices.append(configured.index(level))
                 y.append(float(np.mean(values)))
                 low.append(float(np.min(values)) if len(values) > 1 else np.nan)
                 high.append(float(np.max(values)) if len(values) > 1 else np.nan)
             if x:
                 order = np.argsort(x)
                 x, y, low, high = [np.asarray(values)[order] for values in (x, y, low, high)]
+                if show_missing_epochs:
+                    gaps = np.flatnonzero(np.abs(np.diff(np.asarray(indices)[order])) > 1) + 1
+                    x, y, low, high = [np.insert(values, gaps, np.nan) for values in (x, y, low, high)]
                 ax.plot(x, y, color=METHOD_COLORS.get(method), ls="-", marker="x",
                         label=METHOD_LABELS.get(method, method))
                 ax.fill_between(x, low, high, where=np.isfinite(low) & np.isfinite(high), color=METHOD_COLORS.get(method), alpha=0.2, linewidth=0)
@@ -3228,10 +3241,15 @@ def parse_args(argv=None):
     parser.add_argument("--allow-partial-injection-scan", action="store_true")
     parser.add_argument("--focused", action="store_true",
                         help="Selected normal publication plots and tables; projected Stein response uses seed 42 and z1-z2")
+    parser.add_argument("--checkpoint-policy", choices=("lowest-loss", "last", "both"), default="lowest-loss")
+    parser.add_argument("--last-epoch", type=int, help="Require this exact saved one-based epoch")
+    parser.add_argument("--checkpoint-trends", action="store_true", help="Plot only the saved per-seed epoch trend tables")
     parser.add_argument("--require-compatible-populations", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--verbose", type=int, choices=(0, 1, 2), default=1)
     args = parser.parse_args(argv)
+    if args.last_epoch is not None and (args.last_epoch < 1 or args.checkpoint_policy == "lowest-loss"):
+        parser.error("--last-epoch requires a positive epoch and --checkpoint-policy last or both")
     if args.io_workers < 1 or args.plot_workers < 1 or args.min_background < 1:
         parser.error("--io-workers, --plot-workers and --min-background must be positive")
     if args.ram_cache_mb < 0:
@@ -3271,11 +3289,54 @@ def main(argv=None):
         torch.set_num_threads(previous_threads)
 
 
+def plot_checkpoint_trends(args, groups):
+    from riddle.checkpoint_policy import DIRECTORY, METHODS, source_identity
+
+    panels = defaultdict(list)
+    for identity, group in sorted(groups.items()):
+        for method, (root, report) in group.items():
+            if (method not in METHODS or identity[1] in args.exclude_seeds or
+                    args.scenarios and report["scenario"] not in args.scenarios or
+                    args.variants and identity[-1] not in args.variants):
+                continue
+            path = root / DIRECTORY / "trends.json"
+            if not path.exists():
+                print(f"[TRENDS] Missing {path}", flush=True)
+                continue
+            table = read_json(path)
+            if table["source_identity"] != source_identity(read_json(root / "result.json")):
+                raise ValueError(f"Stale checkpoint trend table: {path}")
+            if table["missing_epochs"]:
+                print(f"[TRENDS] {identity} {method}: unavailable epochs {table['missing_epochs']}", flush=True)
+            panels[identity[-1], method, identity[0]].append((identity[1], table["epochs"]))
+    if not panels:
+        raise SystemExit("No saved checkpoint trend tables. Use --backfill-checkpoint-scores --checkpoint-trends")
+    with render_resources(args.plot_workers, args.verbose, args.output):
+        for (variant, method, point), seeds in panels.items():
+            budgets = sorted({float(b) for _, rows in seeds for row in rows.values() for b in row["signal_efficiency"]})
+            metrics = [(str(b), f"Signal efficiency at {b:.2%} background efficiency",
+                        "retention_" + f"{100*b:g}".replace(".", "p") + "pct") for b in budgets]
+            metrics += [("maximum_sic", "Maximum significance improvement", "maximum_sic"),
+                        ("maximum_counting_sensitivity", "Maximum achieved significance", "maximum_significance")]
+            for field, ylabel, stem in metrics:
+                fig, ax = new_figure("Witness training epoch", ylabel)
+                for seed, rows in seeds:
+                    data = sorted((int(e), row["signal_efficiency"].get(field) if field in row["signal_efficiency"] else row.get(field))
+                                  for e, row in rows.items())
+                    measured = [(e, value) for e, value in data if value is not None]
+                    if measured:
+                        x, y = zip(*measured)
+                        ax.plot(x, y, marker="o", label=f"Seed {seed}")
+                if ax.lines:
+                    destination = variant_output(args.output, variant) / "checkpoint_trends" / METHOD_LABELS[method] / str(point)
+                    save_figure(fig, ax, destination / stem, args.plot_formats, args.overwrite, inside_legend(ax))
+                else:
+                    plt.close(fig)
+    return 0
+
+
 def run(args):
     configure_style()
-    if args.overwrite and args.workflow == "normal" and not getattr(args, "focused", False):
-        cleanup_legacy_summary_folders(args.output)
-    settings = load_settings_file(args.config)
     scan = args.workflow == "scan"
     source = args.scan_results if scan else args.results
     say(f"[STAGE] Discover completed {'injection-scan' if scan else 'normal'} results", args.verbose)
@@ -3284,6 +3345,94 @@ def run(args):
     )
     groups_all = discover_variant_results(source, requested, args.variants, scan=scan,
                                          workers=args.io_workers, verbose=args.verbose)
+    if args.checkpoint_trends:
+        return plot_checkpoint_trends(args, groups_all)
+    if args.checkpoint_policy == "lowest-loss":
+        return render_policy(args, groups_all)
+    from riddle.checkpoint_policy import METHODS, checkpoint_result
+    from riddle.checkpoint_overlay import CheckpointOverlay
+
+    selected = {}
+    counts = defaultdict(lambda: [set(), set()])
+    epochs_used = defaultdict(set)
+    primary_seeds = defaultdict(set)
+    for identity, group in groups_all.items():
+        if identity[1] in args.exclude_seeds or (args.variants and identity[-1] not in args.variants):
+            continue
+        for method, (root, report) in group.items():
+            if args.scenarios and report["scenario"] not in args.scenarios:
+                continue
+            if method not in METHODS:
+                if args.checkpoint_policy == "last":
+                    selected.setdefault(identity, {})[method] = root, report
+                continue
+            pair = checkpoint_result(root, report, args.last_epoch)
+            key = method, identity[-1], identity[0]
+            primary_seeds[key].add(identity[1])
+            counts[key][0 if pair else 1].add(identity[1])
+            if pair:
+                selected.setdefault(identity, {})[method] = pair
+                epochs_used[key].update(pair[1]["checkpoint_policy"]["epoch_by_fit"].values())
+    if scan:
+        configuration = load_settings_file(args.config)["injection_scan"]
+        expected = set(configuration.get("seeds", range(configuration.get("replicas", 0)))) - set(args.exclude_seeds)
+        for variant in sorted({identity[-1] for identity in groups_all if not args.variants or identity[-1] in args.variants}):
+            for method in (requested or METHODS):
+                if method in METHODS:
+                    for level in configuration["signal_events"]:
+                        present, missing = counts[method, variant, level]
+                        missing.update(expected - present)
+    for key, (present, missing) in sorted(counts.items()):
+        measured = sorted(epochs_used[key]) or ([args.last_epoch] if args.last_epoch else [])
+        print(f"[CHECKPOINT] {key[0]} {key[1]} {key[2]} last epochs={measured}: "
+              f"{len(present)} contributing seeds {sorted(present)}; missing seeds {sorted(missing)}", flush=True)
+        if args.checkpoint_policy == "both":
+            primary = primary_seeds[key]
+            print(f"[CHECKPOINT] {key[0]} {key[1]} {key[2]} lowest-loss: {len(primary)} contributing seeds "
+                  f"{sorted(primary)}; missing seeds {sorted((present | missing) - primary)}", flush=True)
+    label = args.checkpoint_policy + (f"_epoch_{args.last_epoch}" if args.last_epoch else "")
+    options = copy(args)
+    options.output = args.output / label
+    options.allow_partial_injection_scan = True
+    if args.checkpoint_policy == "last":
+        if not selected:
+            raise SystemExit("No requested final checkpoint results available")
+        options.methods = [m for m in select_requested_methods(groups_all, args.methods, allow_missing=scan, injection_scan=scan)
+                           if any(m in group for group in selected.values())]
+        return render_policy(options, selected)
+    overlay = CheckpointOverlay(METHODS, METHOD_COLORS, METHOD_LABELS)
+    try:
+        if selected:
+            secondary = copy(options)
+            secondary.checkpoint_policy = "last"
+            secondary.methods = [m for m in METHODS if any(m in group for group in selected.values())]
+            secondary.output = options.output / "last"
+            token = _CHECKPOINT_OVERLAY.set((overlay, secondary.output))
+            try:
+                render_policy(secondary, selected)
+            finally:
+                _CHECKPOINT_OVERLAY.reset(token)
+        overlay.last = False
+        token = _CHECKPOINT_OVERLAY.set((overlay, options.output))
+        try:
+            result = render_policy(options, groups_all)
+        finally:
+            _CHECKPOINT_OVERLAY.reset(token)
+        if overlay.curves:
+            with render_resources(args.plot_workers, args.verbose, options.output):
+                for key in list(overlay.curves):
+                    fig, ax, legend = overlay.take(key)
+                    save_figure(fig, ax, options.output / key, args.plot_formats, args.overwrite, legend)
+        return result
+    finally:
+        overlay.spool.cleanup()
+
+
+def render_policy(args, groups_all):
+    if args.overwrite and args.workflow == "normal" and not getattr(args, "focused", False):
+        cleanup_legacy_summary_folders(args.output)
+    scan = args.workflow == "scan"
+    settings = load_settings_file(args.config)
     methods = select_requested_methods(groups_all, args.methods,
                                        allow_missing=scan and args.allow_partial_injection_scan,
                                        injection_scan=scan)
@@ -3315,7 +3464,8 @@ def run(args):
                                        args.file_formats, args.overwrite, args.min_background,
                                        args.allow_partial_injection_scan, args.verbose,
                                        args.require_compatible_populations, variant=variant,
-                                       io_workers=args.io_workers, excluded_seeds=args.exclude_seeds)
+                                       io_workers=args.io_workers, excluded_seeds=args.exclude_seeds,
+                                       show_missing_epochs=args.checkpoint_policy == "last")
                 plot_dijet_spectra({identity: group for identity, group in groups.items() if identity[3] == variant},
                                    args, destination, scan=True)
         say(f"[DONE] Injection-scan outputs written to {args.output}", args.verbose)
@@ -3372,9 +3522,11 @@ def render_publication_outputs(args, groups, cache, records, loader, scenarios, 
         plot_stein(groups, records, args.output, args.plot_formats, args.overwrite)
     say("[STAGE] Build projected Stein-witness diagnostics", args.verbose)
     plot_projected_witness(groups, records, args, args.output)
-    say("[STAGE] Render training histories", args.verbose)
-    plot_training(groups, args.output, args.plot_formats, args.overwrite,
-                  io_workers=args.io_workers, verbose=args.verbose, focused=focused)
+    overlay = _CHECKPOINT_OVERLAY.get()
+    if overlay is None or not overlay[0].last:
+        say("[STAGE] Render training histories", args.verbose)
+        plot_training(groups, args.output, args.plot_formats, args.overwrite,
+                      io_workers=args.io_workers, verbose=args.verbose, focused=focused)
     say("[STAGE] Export publication tables", args.verbose)
     export_tables(groups, cache, loader, args.output, args.file_formats, args.data, args.verbose)
 

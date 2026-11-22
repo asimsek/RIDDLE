@@ -3,7 +3,7 @@ import time
 from pathlib import Path
 import numpy as np
 
-from riddle.storage import atomic_write, save_npz, write_json, digest, file_digest, read_json, load_array, open_npz
+from riddle.storage import atomic_write, save_array, save_npz, write_json, digest, file_digest, read_json, load_array, open_npz
 from riddle.recovery import EpochRecovery
 from riddle.acceleration import install_tensor_batches, execution_report
 from .latent import prepare, Mapper
@@ -242,6 +242,7 @@ def _prepare_background(args, contract):
         mapping_identity["p_training_sha256"] = oracle_roles["receipt"]["p_training_sha256"]
         mapping_identity["p_validation_sha256"] = oracle_roles["receipt"]["p_validation_sha256"]
         if args.method == "supervised":
+            atomic_write(output / "supervised_witness_training.npy", lambda p: save_array(p, training))
             mapping_identity.pop("training_latents_sha256", None)
             mapping_identity.pop("validation_latents_sha256", None)
             mapping_identity.pop("background_reuse", None)

@@ -139,10 +139,16 @@ def main():
     if update_path.is_file() and not getattr(args, "rescore_from", None):
         if read_json(update_path)["phase"] != "completed":
             raise RuntimeError("An in-place scoring update is unfinished; resume with --rescore and the original results root")
+    if native_method:
+        from .checkpoint_policy import score_checkpoints
+    if getattr(args, "backfill_checkpoint_scores", False):
+        score_checkpoints(args, inputs)
+        return
     if getattr(args, "rescore_from", None):
         from .full_mass import rescore
         emit_runtime(environment().get("gpu") or "CPU")
         rescore(args, inputs)
+        score_checkpoints(args, inputs)
         return
     if getattr(args, "score_sidebands_only", False):
         if not native_method:
@@ -228,6 +234,8 @@ def main():
             if native_method and getattr(args, "sideband_scoring", True):
                 from .full_mass import score_sidebands
                 score_sidebands(args)
+            if native_method:
+                score_checkpoints(args, inputs)
             return
     saved, changes = inspect_resume(args.output, contract, resume=args.resume, **policy)
     completed = saved is not None and saved["completed"]
@@ -257,6 +265,8 @@ def main():
         if native_method and getattr(args, "sideband_scoring", True):
             from .full_mass import score_sidebands
             score_sidebands(args, saved)
+        if native_method:
+            score_checkpoints(args, inputs)
         return
     report = {
         "schema": 1,
@@ -328,6 +338,7 @@ def main():
         if p.is_file()
         and ".resume" not in p.relative_to(args.output).parts
         and "full_mass" not in p.relative_to(args.output).parts
+        and "checkpoint_scores" not in p.relative_to(args.output).parts
         and p != path
         and p.name != "training.log"
     ]
@@ -343,6 +354,8 @@ def main():
     if native_method and getattr(args, "sideband_scoring", True):
         from .full_mass import score_sidebands
         score_sidebands(args, report)
+    if native_method:
+        score_checkpoints(args, inputs)
 
 
 if __name__ == "__main__":

@@ -120,7 +120,8 @@ def require_scan_compatibility(method, records):
         if seed not in nominal_reports:
             continue
         root, report = nominal_reports[seed]
-        producer = Path((report.get("scan_reuse") or {}).get("source_result", root)).resolve()
+        producer = Path((report.get("scan_reuse") or {}).get("source_result",
+                        (report.get("checkpoint_policy") or {}).get("source", root))).resolve()
         if (Path(source["source_result"]).resolve() != producer
                 or any(report.get("artifacts_sha256", {}).get(name) != checksum
                        for name, checksum in (source["artifacts_sha256"] or {}).items())):

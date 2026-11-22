@@ -1,5 +1,5 @@
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from copy import deepcopy
 import errno
 import hashlib
@@ -266,7 +266,7 @@ def _member_cache(work, member, identity, events):
     return True
 
 
-def _predict_members(root, work, frozen, identity, args):
+def _predict_members(root, work, frozen, identity, args, *, executor=None, aggregate=True):
     events = len(np.load(work / "latents.npy", mmap_mode="r", allow_pickle=False))
     members = frozen["members"]
     with ThreadPoolExecutor(max_workers=args.io_workers) as pool:
@@ -279,8 +279,9 @@ def _predict_members(root, work, frozen, identity, args):
     emit_message(f"Frozen sideband inference: {sum(available)}/{len(members)} fits cached; workers={max(1, workers)}")
     if jobs:
         started = time.monotonic()
-        with ProcessPoolExecutor(max_workers=max(1, workers), mp_context=multiprocessing.get_context("spawn"),
-                                 initializer=_inference_worker_init, initargs=(args.torch_threads,)) as pool:
+        with (nullcontext(executor) if executor is not None else ProcessPoolExecutor(
+                max_workers=workers, mp_context=multiprocessing.get_context("spawn"),
+                initializer=_inference_worker_init, initargs=(args.torch_threads,))) as pool:
             queued = iter(jobs)
             pending = {pool.submit(_member_prediction, next(queued)) for _ in range(workers)}
             completed = sum(available)
@@ -295,6 +296,8 @@ def _predict_members(root, work, frozen, identity, args):
                         pending.add(pool.submit(_member_prediction, job))
                 if not done:
                     emit_message(f"Frozen scoring: {completed}/{len(members)} fits; elapsed={time.monotonic() - started:.0f}s", level=2)
+    if not aggregate:
+        return
     combined = None
     for member in members:
         values = np.load(work / f"fit_{int(member['fit_index']):03d}.npy", mmap_mode="r", allow_pickle=False)
@@ -764,6 +767,22 @@ def _export_full_mass(args, report=None):
     torch.use_deterministic_algorithms(True)
     frozen, ensemble = frozen_contract(root, source_report, getattr(args, "verify_workers", 8))
     count = int(getattr(args, "sideband_reference_events", 65536))
+    original_bundle = None
+    original_reference = None
+    if report.get("checkpoint_policy"):
+        primary = Path(report["checkpoint_policy"]["source"])
+        prior_path = primary / DERIVED_DIRECTORY / "manifest.json"
+        if prior_path.is_file():
+            prior = read_json(prior_path)
+            prior_id = prior["identity"]
+            if (prior_id["seed"] != report["seed"] or prior_id["inputs"]["files"] != inputs["files"]
+                    or prior_id["inputs"]["event_ids_sha256"] != inputs["event_ids_sha256"]
+                    or prior_id["frozen"]["reference"] != frozen["reference"]
+                    or prior_id["reference_seeds"] != REFERENCE_SEEDS):
+                raise ValueError("The two witness policies have different frozen reference populations")
+            count = prior_id["reference_events"]
+            original_reference = prior["reference_D_sha256"]
+            original_bundle = primary / ".resume/sidebands" / identity_digest(prior_id) / "mapped.npz"
     if count < 32768:
         raise ValueError("Independent sideband threshold reference requires at least 32768 events")
     identity = dict(protocol=PROTOCOL, frozen=frozen, inputs=dict(files=inputs["files"],
@@ -814,6 +833,10 @@ def _export_full_mass(args, report=None):
             raise ValueError("Saved primary SR features differ from the prepared events")
     bundle_path = work / "mapped.npz"
     bundle_meta = work / "mapped.json"
+    if (not bundle_meta.exists() and original_bundle is not None and original_bundle.is_file()
+            and original_bundle.with_suffix(".json").is_file()):
+        _rescore_link(original_bundle, bundle_path)
+        _rescore_link(original_bundle.with_suffix(".json"), bundle_meta)
     if bundle_path.is_file() and bundle_meta.is_file():
         if read_json(bundle_meta).get("sha256") != file_digest(bundle_path):
             raise ValueError("Frozen mapped sideband cache changed")
@@ -848,6 +871,8 @@ def _export_full_mass(args, report=None):
                                                 strict_batch_size=True)
         atomic_write(bundle_path, lambda path: save_npz(path, mask=sb_mask, latents=z, reference_D=reference_d))
         write_json(bundle_meta, dict(sha256=file_digest(bundle_path), truth_labels_used=False))
+    if original_reference is not None and digest(reference_d) != original_reference:
+        raise ValueError("The generated threshold sample differs from the published reference D")
     latents = np.concatenate((z, reference_d))
     if not (work / "latents.npy").is_file():
         _save_array(work / "latents.npy", latents)
@@ -930,7 +955,8 @@ RESCORE_MUTABLE_ARTIFACTS = frozenset({"protocol.json", "score_health.json", "sc
 def _rescore_link(source, destination):
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists() or destination.is_symlink():
-        if destination.is_symlink() or not destination.is_file() or file_digest(destination) != file_digest(source):
+        if (destination.is_symlink() or not destination.is_file()
+                or not destination.samefile(source) and file_digest(destination) != file_digest(source)):
             raise ValueError(f"Unexpected frozen re-scoring artifact: {destination}")
     else:
         try:
@@ -945,15 +971,27 @@ def _rescore_link(source, destination):
             atomic_write(destination, verified_copy)
 
 
-def _rescore_stage(source, output, report, workers):
-    names = [name for name in report["artifacts_sha256"] if name not in RESCORE_MUTABLE_ARTIFACTS]
+def _rescore_stage(source, output, report, workers, *, checkpoint_policy=False, trend_only=False):
+    from .checkpoint_policy import shared_artifact
+
+    names = [name for name in report["artifacts_sha256"] if name not in RESCORE_MUTABLE_ARTIFACTS
+             and (not checkpoint_policy or shared_artifact(name))]
+    if trend_only:
+        names = [name for name in names if Path(name).name in {"residual_training_inputs.json", "background_correction.pt",
+                 "stein_scoring_reference.npz", "stein_scoring_reference.json"}]
     with ThreadPoolExecutor(max_workers=workers) as pool:
         list(pool.map(lambda name: _rescore_link(source / name, output / name), names))
-    for name in ("stein_scoring", "stein_qscore_cache"):
+    for name in (("stein_qscore_cache",) if checkpoint_policy else ("stein_scoring", "stein_qscore_cache")):
         directory = source / "density/.resume" / name
         for path in directory.rglob("*") if directory.is_dir() else ():
-            if path.is_file():
+            if path.is_file() and (not checkpoint_policy or path.with_suffix(".json").is_file()
+                                   and path.with_suffix(".npy").is_file()):
                 _rescore_link(path, output / "density/.resume" / name / path.relative_to(directory))
+    if checkpoint_policy:
+        for name, pattern in (("stein_scoring", "ensemble_*.npz"), ("stein_qscore_cache", "qscore_*.npy")):
+            for path in (output / "density/.resume" / name).glob(pattern):
+                if not path.with_suffix(".json").exists():
+                    path.unlink()
 
 
 def _oracle_selector_roles(args, source, mapper, saved):
@@ -1040,13 +1078,13 @@ class FrozenPredictor:
         self.args, self.source, self.selection, self.settings = args, source, selection, settings
         self.members = selection.get("accepted_members", selection["members"])
         self.environment = environment()
+        self.executor = None
 
-    def values(self, z, mode, previous=None):
-        from .stein_scoring import _background_identity, _load_background, _qscore, _support_context, final_transform
+    def _tables(self, z, current, previous=None):
+        from .stein_scoring import _background_identity, _load_background, _qscore, _support_context
 
-        current = deepcopy(self.settings)
-        current["stein"]["scoring"]["mode"] = mode
         cfg = current["stein"]["scoring"]
+        mode = cfg["mode"]
         if previous is not None and str(previous["selected_scoring_mode"].item()) == mode:
             mask = previous["mask"].astype(bool)
             if list(previous["accepted_fit_directories"]) != [m["directory"] for m in self.members]:
@@ -1074,14 +1112,22 @@ class FrozenPredictor:
                 elif digest(np.load(work / "qscore.npy", allow_pickle=False)) != digest(gradients):
                     raise ValueError("Re-scoring gradient cache changed")
             frozen = dict(members=self.members, settings=current, mode=mode)
-            _predict_members(self.args.output, work, frozen, identity, self.args)
+            _predict_members(self.args.output, work, frozen, identity, self.args, executor=self.executor, aggregate=False)
             member_values = np.stack([np.load(work / f"fit_{int(m['fit_index']):03d}.npy", allow_pickle=False)
                                       for m in self.members])
         selected = [next(i for i, m in enumerate(self.members) if m["directory"] == member["directory"])
                     for member in self.selection["members"]]
-        table = member_values[selected]
+        return member_values[selected], member_values
+
+    def values(self, z, mode, previous=None):
+        from .stein_scoring import final_transform
+
+        current = deepcopy(self.settings)
+        current["stein"]["scoring"]["mode"] = mode
+        table, member_values = self._tables(z, current, previous)
+        reference_mean = None if self.executor is None else lambda reference: self._tables(reference, current)[0].mean(axis=0)
         scores, raw, metadata = final_transform(self.args.output / "density", self.selection["members"],
-                                               table.mean(axis=0), z, self.args.device, current)
+                                               table.mean(axis=0), z, self.args.device, current, reference_mean=reference_mean)
         return scores, raw, table, member_values, metadata
 
     def __call__(self, z, mode):
@@ -1116,7 +1162,7 @@ def _validate_rescore_source(args, inputs, source_report):
     return settings
 
 
-def _rescore(args, inputs, *, source=None, source_name=None):
+def _rescore(args, inputs, *, source=None, source_name=None, checkpoints=None, trend_only=False, scoring_cache=None):
     import torch
     from .enhancements import deterministic_spline_sums
     from .metrics import paired_score_metrics
@@ -1132,6 +1178,10 @@ def _rescore(args, inputs, *, source=None, source_name=None):
     settings = _validate_rescore_source(args, inputs, source_report)
     identity = dict(protocol=RESCORE_PROTOCOL, source=str(source if source_name is None else source_name), source_report_sha256=file_digest(source / "result.json"),
                     scoring=settings["stein"]["scoring"], input_files=inputs["files"])
+    if checkpoints is not None:
+        from .checkpoint_policy import source_identity
+        identity["source_report_sha256"] = source_identity(source_report)
+        identity["witness_checkpoints"] = {name: [item["epoch"], item["sha256"]] for name, item in checkpoints.items()}
     identity_hash = identity_digest(identity)
     receipt = output / ".resume/rescore_identity.json"
     if receipt.exists() and read_json(receipt) != identity:
@@ -1148,15 +1198,25 @@ def _rescore(args, inputs, *, source=None, source_name=None):
     elif not receipt.exists() and any(p.name not in ("training.log", ".resume") for p in output.iterdir()):
         raise ValueError("Re-scoring requires a new output directory")
     write_json(receipt, identity)
-    verify_artifacts(source, source_report["artifacts_sha256"], "Verify frozen re-scoring source", workers=args.verify_workers)
-    frozen, selection = frozen_contract(source, source_report, args.verify_workers)
+    if scoring_cache is None or scoring_cache.get("source") != identity["source_report_sha256"]:
+        verify_artifacts(source, source_report["artifacts_sha256"], "Verify frozen re-scoring source", workers=args.verify_workers)
+        if scoring_cache is not None:
+            scoring_cache.clear()
+            scoring_cache["source"] = identity["source_report_sha256"]
+    if checkpoints is None:
+        _, selection = frozen_contract(source, source_report, args.verify_workers)
+    else:
+        from .checkpoint_policy import stage_selection
+        selection = read_json(source / "density/ensemble_selection.json")
     if settings.get("core") != "stein_witness" or settings.get("input_space") == "physical":
         raise ValueError("Re-scoring requires the mass-conditioned latent Stein-witness core")
     torch.use_deterministic_algorithms(True)
     seed_start(args.seed)
     started = time.monotonic()
     emit_message(f"Frozen re-scoring START; seed={args.seed}; trained models reused")
-    _rescore_stage(source, output, source_report, args.io_workers)
+    _rescore_stage(source, output, source_report, args.io_workers, checkpoint_policy=checkpoints is not None, trend_only=trend_only)
+    if checkpoints is not None:
+        selection = stage_selection(args, source, selection, checkpoints, settings)
     ensemble_inputs = read_json(source / "density/ensemble_inputs.json")
     ensemble_inputs["settings"] = settings
     write_json(output / "density/ensemble_inputs.json", ensemble_inputs)
@@ -1164,14 +1224,28 @@ def _rescore(args, inputs, *, source=None, source_name=None):
     write_root_provenance(output / "density", selection["members"], selection.get("accepted_members", selection["members"]),
                           settings, mapping_identity)
     predictor = FrozenPredictor(args, source, selection, settings)
-    with deterministic_spline_sums():
-        populations = _selector_data(args, source, source_report)
+    with deterministic_spline_sums(), ExitStack() as resources:
+        if checkpoints is not None:
+            predictor.executor = resources.enter_context(ProcessPoolExecutor(max_workers=min(args.workers, len(predictor.members)),
+                mp_context=multiprocessing.get_context("spawn"), initializer=_inference_worker_init, initargs=(args.torch_threads,)))
+        populations = None if scoring_cache is None else scoring_cache.get("populations")
+        if populations is None:
+            populations = _selector_data(args, source, source_report)
+            if scoring_cache is not None:
+                scoring_cache["populations"] = populations
         decision = freeze(output / "density", settings, args.method, populations,
                           inputs["shared_population"], args.device, predictor=predictor)
         selected_mode = decision["selected_mode"]
         effective = deepcopy(settings["stein"]["scoring"])
         effective["mode"] = selected_mode
         selection_hash = file_digest(output / "density/score_selection.json")
+        if trend_only:
+            from .checkpoint_policy import trend_metrics
+            with np.load(source / "signal_region_scores.npz", allow_pickle=False) as archive:
+                mask = archive["mask"].astype(bool)
+                scores = np.full(len(mask), np.nan)
+                scores[mask] = predictor(archive["latent"], selected_mode)
+                return trend_metrics(archive["labels"], mask, scores, source_report, effective["auto_switch"]["efficiencies"])
         for partition in RESCORE_PARTITIONS:
             emit_message(f"Re-score {partition}; selected mode={selected_mode}")
             with np.load(source / f"{partition}_scores.npz", allow_pickle=False) as archive:
@@ -1179,7 +1253,7 @@ def _rescore(args, inputs, *, source=None, source_name=None):
             mask = arrays["mask"].astype(bool)
             endpoints = {}
             for mode in MODES:
-                result = predictor.values(arrays["latent"], mode, previous=arrays)
+                result = predictor.values(arrays["latent"], mode, previous=arrays if checkpoints is None else None)
                 endpoints[mode] = result[0]
                 if mode == selected_mode:
                     selected_prediction = result
@@ -1226,6 +1300,15 @@ def _rescore(args, inputs, *, source=None, source_name=None):
     write_json(output / "protocol.json", protocol)
     write_json(output / "score_health.json", validate_result_scores(output, args.method))
     report = deepcopy(source_report)
+    if checkpoints is not None:
+        report["checkpoint_policy"] = dict(name="last", epoch_by_fit={name: item["epoch"] for name, item in checkpoints.items()},
+                                           source=str(source), source_identity=identity["source_report_sha256"],
+                                           published_selection_sha256=source_report["artifacts_sha256"]["density/ensemble_selection.json"])
+        protocol["checkpoint_policy"] = report["checkpoint_policy"]
+        protocol["selected_checkpoints"] = selection["selected_checkpoints"]
+        if "selected_checkpoints" in report:
+            report["selected_checkpoints"] = selection["selected_checkpoints"]
+        write_json(output / "protocol.json", protocol)
     report["contract"]["settings"]["riddle"] = settings
     report["rescoring"] = dict(identity_sha256=identity_hash, identity=identity, trained_models_changed=False,
                                elapsed_seconds=time.monotonic() - started, inference_environment=environment(),

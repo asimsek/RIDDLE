@@ -749,7 +749,7 @@ def member_scores(output, order, z, device, *, mode=None, scoring_root=None, nor
     return combined
 
 
-def _ensemble_reference(root, selected, device, cfg, settings, reference=None, reference_meta=None):
+def _ensemble_reference(root, selected, device, cfg, settings, reference=None, reference_meta=None, reference_mean=None):
     root = Path(root)
     if reference is None or reference_meta is None:
         reference, reference_meta = _load_reference_b(root)
@@ -784,9 +784,12 @@ def _ensemble_reference(root, selected, device, cfg, settings, reference=None, r
                     or not np.array_equal(mass, reference[:, -1].astype(np.float32))):
                 raise ValueError("Invalid Stein ensemble scoring calibration arrays")
             return raw.astype(np.float64), reference, saved
-    rows = [member_scores(root / m["directory"], m["epochs"], reference, device,
-                          mode=cfg["mode"], scoring_root=root, scoring_settings=settings) for m in selected]
-    raw = np.mean(np.stack(rows), axis=0)
+    if reference_mean is None:
+        rows = [member_scores(root / m["directory"], m["epochs"], reference, device,
+                              mode=cfg["mode"], scoring_root=root, scoring_settings=settings) for m in selected]
+        raw = np.mean(np.stack(rows), axis=0)
+    else:
+        raw = reference_mean(reference)
     if not np.isfinite(raw).all():
         raise FloatingPointError("Nonfinite Stein reference-B ensemble score")
     atomic_write(npz_path, lambda p: save_npz(p, raw=raw.astype(np.float32), mass=reference[:, -1].astype(np.float32)))
@@ -800,7 +803,7 @@ def _ensemble_reference(root, selected, device, cfg, settings, reference=None, r
     return raw.astype(np.float32).astype(np.float64), reference, metadata
 
 
-def final_transform(root, selected, raw, z, device, settings):
+def final_transform(root, selected, raw, z, device, settings, *, reference_mean=None):
     cfg = _scoring(settings)
     raw = np.asarray(raw, dtype=np.float64)
     z = np.asarray(z)
@@ -833,7 +836,7 @@ def final_transform(root, selected, raw, z, device, settings):
             "support_guard": support_metadata,
         }
     reference_raw, reference_latents, reference_score_meta = _ensemble_reference(
-        root, selected, device, cfg, settings, reference=reference, reference_meta=reference_meta
+        root, selected, device, cfg, settings, reference=reference, reference_meta=reference_meta, reference_mean=reference_mean
     )
     if reference is None:
         reference = reference_latents

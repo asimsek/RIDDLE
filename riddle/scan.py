@@ -186,8 +186,10 @@ def run_scan(args):
                     options.rescore_from = rescore_root / point_name(point)
                     options.rescore_workers = 1
                 tasks.append(options)
-            if rescore_root is not None:
+            if rescore_root is not None or getattr(args, "backfill_checkpoint_scores", False):
                 by_strength = {point["signal_events"]: options for point, options in zip(plan, tasks)}
+                for options in by_strength.values():
+                    options.rescore_workers = 1
 
                 def execute_rescore(request, cancel_event=None, rescore_concurrency=1):
                     run_campaign(by_strength[request[3]], cancel_event=cancel_event,

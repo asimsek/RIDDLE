@@ -8,7 +8,7 @@ import sys
 
 import yaml
 
-from riddle.cli import METHODS, DEFAULT_METHODS, SCENARIOS, seeds, positive, method_name, add_seed_argument
+from riddle.cli import METHODS, DEFAULT_METHODS, SCENARIOS, seeds, positive, method_name, add_seed_argument, validate_witness_continuation
 from riddle.storage import atomic_write
 from riddle.resume import add_resume_options
 
@@ -116,7 +116,24 @@ def job(args):
         if any(method not in ("riddle", "iad", "supervised") for method in args.methods):
             raise ValueError("--score-sidebands-only supports RIDDLE, IAD and Supervised")
         command.append("--score-sidebands-only")
-    if getattr(args, "rescore", False) or getattr(args, "rescore_from", None):
+    if getattr(args, "checkpoint_trends", False):
+        command.append("--checkpoint-trends")
+    if getattr(args, "backfill_checkpoint_scores", False):
+        if any(m not in ("riddle", "iad", "supervised") for m in args.methods) or args.score_sidebands_only:
+            raise ValueError("Checkpoint backfill requires native witness methods")
+        command.extend(["--backfill-checkpoint-scores", "--rescore-workers", str(args.rescore_workers)])
+        for option in ("last_epoch", "extend_witness_to"):
+            value = getattr(args, option, None)
+            if value is not None:
+                command.extend(["--" + option.replace("_", "-"), str(value)])
+        if args.checkpoint_archive:
+            command.extend(["--checkpoint-archive", *args.checkpoint_archive])
+    elif any(getattr(args, k, None) for k in ("last_epoch", "checkpoint_archive")):
+        raise ValueError("Exact-epoch and archive options require --backfill-checkpoint-scores")
+    elif getattr(args, "extend_witness_to", None):
+        validate_witness_continuation(args)
+        command.extend(["--extend-witness-to", str(args.extend_witness_to)])
+    elif getattr(args, "rescore", False) or getattr(args, "rescore_from", None):
         option = "--rescore" if getattr(args, "rescore", False) else "--rescore-from"
         if getattr(args, "rescore", False) and getattr(args, "rescore_from", None):
             raise ValueError("--rescore and --rescore-from are mutually exclusive")
@@ -374,6 +391,11 @@ def main(argv=None):
     p.add_argument("--score-sidebands-only", action="store_true",
                    help="Backfill frozen sideband scores from completed native results without training")
     rescoring = p.add_mutually_exclusive_group()
+    rescoring.add_argument("--backfill-checkpoint-scores", action="store_true")
+    p.add_argument("--checkpoint-trends", action="store_true")
+    p.add_argument("--last-epoch", type=positive)
+    p.add_argument("--extend-witness-to", type=positive)
+    p.add_argument("--checkpoint-archive", nargs="+")
     rescoring.add_argument("--rescore", action="store_true",
                            help="Re-score completed RIDDLE/IAD/Supervised models in --results without training")
     rescoring.add_argument("--rescore-from", help="Re-score frozen RIDDLE/IAD/Supervised models without training; matching source/results roots update in place")

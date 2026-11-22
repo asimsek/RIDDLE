@@ -1,5 +1,6 @@
 import json
 import math
+import os
 import random
 import time
 from copy import deepcopy
@@ -641,6 +642,9 @@ def train_stein_witness(train, validation, output, *, epochs, seed, device, chec
             if durable:
                 progress.update(force=True, operation="Persist 10-epoch recovery boundary", minibatch="-")
                 files = _persist(output, candidates)
+                filename = f"residual_epoch_{epoch}.pt"
+                if filename not in files:
+                    atomic_torch_save(output / filename, _payload(model, epoch))
                 state = {
                     "scientific_version": SCIENTIFIC_VERSION,
                     "core": "stein_witness",
@@ -648,6 +652,8 @@ def train_stein_witness(train, validation, output, *, epochs, seed, device, chec
                     "epoch": epoch,
                     "model": model.state_dict(),
                     "optimizer": optimizer.state_dict(),
+                    "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+                    "cublas_workspace": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
                     "scheduler": scheduler.state_dict() if scheduler else None,
                     "rng": rng_state(),
                     "history": history,
