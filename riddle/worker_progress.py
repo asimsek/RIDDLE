@@ -20,6 +20,7 @@ from .storage import IO_PERSIST_EVERY, WORKER_LOG_FLUSH_SECONDS, timed_io
 
 EVENT_PREFIX = "[RIDDLE_WORKER_PROGRESS] "
 _LOCAL_SINK = ContextVar("riddle_progress_sink", default=None)
+_PROGRESS_STREAM = ContextVar("riddle_progress_stream", default=None)
 _OUTPUT_LOCK = threading.RLock()
 _NO_DIGEST = object()
 
@@ -258,7 +259,19 @@ def emit_runtime(gpu):
                  level=1, durable=True)
 
 
+@contextmanager
+def progress_stream(name):
+    token = _PROGRESS_STREAM.set(name)
+    try:
+        yield
+    finally:
+        _PROGRESS_STREAM.reset(token)
+
+
 def _emit_event(event, *, console=False):
+    stream = _PROGRESS_STREAM.get()
+    if stream is not None and "stream" not in event:
+        event = {**event, "stream": stream}
     task = event.get("task") or os.environ.get("RIDDLE_LOG_TASK")
     if task:
         event = {**event, "task": task, "pid": event.get("pid", os.getpid())}

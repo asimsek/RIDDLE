@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 
 from .storage import atomic_torch_save, file_digest, load_checkpoint, read_json, verify_artifacts, write_json
-from .worker_progress import emit_message
+from .worker_progress import emit_message, progress_stream
 
 
 METHODS = ("riddle", "iad", "supervised")
@@ -227,7 +227,7 @@ def _inventory(source, report, selection, output, archived, args, requested):
             pending.append((name, end))
     if pending:
         rows_file = training_rows(args, source, report, output)
-        jobs = [(source, name, epoch, output, rows_file, args.device) for name, epoch in pending]
+        jobs = {name: (source, name, epoch, output, rows_file, args.device) for name, epoch in pending}
         for name, item in fit_tasks(_recovered_weight, jobs, args):
             inventory[name][item["epoch"]] = item
     return inventory, {name: max(entries, default=0) for name, entries in inventory.items()}
@@ -246,12 +246,18 @@ def _calibrate(job):
         _calibration(directory, [epoch], device, cfg, root)
 
 
+def _run_fit_task(function, name, task):
+    with progress_stream(f"Fit {name}"):
+        return function(task)
+
+
 def fit_tasks(function, tasks, args):
     from .full_mass import _inference_worker_init
 
     with ProcessPoolExecutor(max_workers=min(args.workers, len(tasks)), mp_context=multiprocessing.get_context("spawn"),
                              initializer=_inference_worker_init, initargs=(args.torch_threads,)) as pool:
-        return list(pool.map(function, tasks))
+        futures = [pool.submit(_run_fit_task, function, name, task) for name, task in tasks.items()]
+        return [future.result() for future in futures]
 
 
 def _continue_fit(job):
@@ -393,8 +399,9 @@ def extend_fits(args, source, report, selection, output, target, archived):
             pending.append(member)
         if pending:
             rows_file = training_rows(args, source, report, output)
-            fit_tasks(_continue_fit, [(origin, member, rows_file, owner, target, args.device, identity)
-                                      for member in pending], args)
+            jobs = {member["directory"]: (origin, member, rows_file, owner, target, args.device, identity)
+                    for member in pending}
+            fit_tasks(_continue_fit, jobs, args)
         if source != origin:
             for member in members:
                 name = member["directory"]
@@ -418,7 +425,7 @@ def stage_selection(args, source, selection, plan, settings):
     selection = deepcopy(selection)
     root = args.output / "density"
     cfg = settings["stein"]["scoring"]
-    jobs = []
+    jobs = {}
     inventories = {}
     for name, item in plan.items():
         path = Path(item["path"])
@@ -437,14 +444,14 @@ def stage_selection(args, source, selection, plan, settings):
                         maximum_epochs=max(metadata.get("maximum_epochs", metadata["trained_epochs"]), epoch + 1))
         metadata.pop("validation_objective", None)
         write_json(directory / "residual_selection.json", metadata)
-        jobs.append((directory, epoch, root, cfg, args.device))
-    directory = jobs[0][0]
+        jobs[name] = (directory, epoch, root, cfg, args.device)
+    directory = next(iter(jobs.values()))[0]
     inputs = read_json(directory / "residual_training_inputs.json")
     with np.load(root / "stein_scoring_reference.npz", allow_pickle=False) as archive:
         _qscore(archive["reference_A"], _load_background(directory, inputs, args.device), args.device, cfg,
                 root / ".resume/stein_qscore_cache", _background_identity(inputs))
     fit_tasks(_calibrate, jobs, args)
-    for directory, _, _, _, _ in jobs:
+    for directory, _, _, _, _ in jobs.values():
         inventories[str(directory.relative_to(root))] = {p.name: file_digest(p) for p in directory.iterdir() if p.is_file()}
     selection["configurations"] = [c for c in selection["configurations"] if c["name"] == selection["selected_configuration"]]
     for block in [selection, *selection["configurations"]]:

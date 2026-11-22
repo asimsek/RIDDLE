@@ -36,14 +36,14 @@ python run.py setup --methods ranode
 ## Prepare LHCO data
 
 ```bash
-python run.py prepare --dataset lhco --catalog config/datasets.yaml --output data/lhco --io-workers 8 --verbose 1
+python run.py prepare --dataset lhco --catalog config/datasets.yaml --output data/lhco --io-workers 16 --verbose 1
 ```
 
 ### Optional control datasets
 
 ```bash
-python run.py prepare --variant shifted --output data/lhco_shifted --io-workers 8
-python run.py prepare --variant deltaR --output data/lhco_deltaR --io-workers 8
+python run.py prepare --dataset lhco --catalog config/datasets.yaml --variant deltaR --output data/lhco_deltaR --io-workers 16 --verbose 1
+python run.py prepare --dataset lhco --catalog config/datasets.yaml --variant shifted --output data/lhco_shifted --io-workers 16 --verbose 1
 ```
 
 - **Shifted:** replace the first two features by `m1 + 0.1*mjj` and `delta_m + 0.1*mjj`, after conversion to TeV.
@@ -51,61 +51,49 @@ python run.py prepare --variant deltaR --output data/lhco_deltaR --io-workers 8
 
 ## Run
 
-
 **RIDDLE:**
 
 ```bash
 python run.py run --methods riddle --data data/lhco --output results \
-  --scenarios signal_injection --seed 40 41 42 43 44 --device cuda:0 --fits 20 --epochs 100 \
-  --workers 2 --io-workers 8 --mps auto --resume
+  --scenarios signal_injection background_only --seed 40 41 42 43 44 --config config/settings.yaml \
+  --fits 20 --epochs 200 --device cuda:0 --workers 5 --io-workers 2 --torch-threads 2 --mps auto --resume
 ```
 
 **LaCathode:**
 
 ```bash
 python run.py run --methods lacathode --data data/lhco --output results \
-  --scenarios signal_injection --seed 40 41 42 43 44 --device cuda:0 --epochs 100 \
-  --lacathode-background fixed --workers 5 --io-workers 8 --torch-threads 2 --mps auto --resume
+  --scenarios signal_injection background_only --seed 40 41 42 43 44 --config config/settings.yaml \
+  --epochs 100 --lacathode-background independent \
+  --device cuda:0 --workers 5 --io-workers 2 --torch-threads 2 --mps auto --resume
 ```
 
 **R-ANODE:**
 
 ```bash
 python run.py run --methods ranode --data data/lhco --output results \
-  --scenarios signal_injection background_only --seed 40 41 42 43 44 --device cuda:0 \
-  --fits 20 --epochs 300 \
-  --io-workers 8 --resume
+  --scenarios signal_injection background_only --seed 40 41 42 43 44 --config config/settings.yaml \
+  --fits 20 --epochs 300 --device cuda:0 --workers 5 --io-workers 2 --torch-threads 2 --mps auto --resume
 ```
 
 **Idealized AD:**
 
 ```bash
 python run.py run --methods iad --data data/lhco --output results \
-  --scenarios signal_injection --seed 40 41 42 43 44 --device cuda:0 --fits 20 --epochs 100 \
-  --workers 5 --io-workers 2 --torch-threads 2 --mps on --resume
+  --scenarios signal_injection --seed 40 41 42 43 44 --config config/settings.yaml \
+  --fits 20 --epochs 200 --device cuda:0 --workers 5 --io-workers 2 --torch-threads 2 --mps auto --resume
 ```
 
 **Supervised AD:**
 
 ```bash
 python run.py run --methods supervised --data data/lhco --output results \
-  --scenarios signal_injection --seed 40 41 42 43 44 --device cuda:0 --fits 20 --epochs 100 \
-  --workers 5 --io-workers 2 --torch-threads 2 --mps on --resume
+  --scenarios signal_injection --seed 40 41 42 43 44 --config config/settings.yaml \
+  --fits 20 --epochs 200 --device cuda:0 --workers 5 --io-workers 2 --torch-threads 2 --mps auto --resume
 ```
 
-Run the three original methods and both scenarios (`signal_injection`, `background_only`):
-
-```bash
-python run.py run --methods lacathode riddle ranode --data data/lhco --output results \
-  --scenarios signal_injection background_only --seed 40 41 42 43 44 \
-  --fits 20 --epochs 100 \
-  --device cuda:0 --workers 2 --io-workers 8 --mps auto --resume
-```
-
-`--device cpu` for CPU execution.<br>
-`--workers` controls concurrent RIDDLE/Idealized/Supervised/R-ANODE ensemble fits; different seeds run sequentially.<br>
-`--io-workers` controls CPU threads per process.<br>
-MPS is optional on Linux NVIDIA GPUs; `auto` falls back to ordinary concurrency, while `on` requires MPS.
+Use `--device cpu` for CPU execution. On Linux with an NVIDIA GPU, `--mps auto` uses MPS when available.
+`--workers` controls concurrent fits or LaCathode cases, `--io-workers` controls I/O concurrency, and `--torch-threads` sets CPU compute threads per worker.
 
 `--fits` controls the ensemble fits inside RIDDLE/Idealized/Supervised/R-ANODE.<br>
 `--seed 40 41 42 43 44` runs each listed seed once for every requested method; default = 42.<br>
@@ -116,54 +104,60 @@ For all methods, to continue compatible checkpoints after an implementation upda
 To continue unfinished training on a different CUDA GPU, add `--resume-across-device-change`.<br>
 Both require `--resume` and can be combined.
 
-To run a control, change both the data and results locations, for example:
-
-```bash
-python run.py run --methods lacathode riddle ranode --data data/lhco_deltaR \
-  --output results_deltaR --scenarios signal_injection --seed 40 41 42 43 44 \
-  --device cuda:0 --workers 2 --io-workers 8 --mps auto --resume
-python plot.py --results results_deltaR --output plots_deltaR --io-workers 8 --verbose 1 --overwrite
-```
-
-Use the corresponding `shifted` locations for the shifted control.
+For control runs, use the same method commands with `--data data/lhco_deltaR --output results_deltaR` or `--data data/lhco_shifted --output results_shifted`.
 
 ## Plot
 
 ```bash
-python plot.py --results results --output plots --device auto --io-workers 8 --verbose 1 --overwrite
+python paper_plot.py --data data/lhco --results results --focused \
+  --config config/settings.yaml --output paper_plots_all \
+  --methods riddle iad supervised lacathode --variants default deltaR shifted \
+  --plot-formats pdf --file-formats csv --io-workers 16 --plot-workers 16 --overwrite --verbose 1
 ```
 
-All completed methods are discovered automatically.<br>
-Request a method directly with `--methods lacathode`, `--methods riddle`, `--methods ranode`, `--methods iad`, or `--methods supervised`.<br>
-`--plot-workers` controls parallel PDF/PNG export; `--io-workers` controls numerical CPU threads.<br>
-Add `--overwrite` to regenerate matching plots and tables.
+Omit `--focused` for the full set of normal plots.
 
 ## Optional signal-strength scan
 
 ```bash
-python run.py prepare-scan --config config/settings.yaml --output data/injection_scan --io-workers 8 --resume
+python run.py prepare-scan --config config/settings.yaml --output data/injection_scan --io-workers 16 --resume
+```
+
+For a control scan, append `_deltaR` or `_shifted` to the `--data`, `--output`, and `--reuse-results` paths in the scan commands.
+
+```bash
+python run.py prepare-scan --config config/settings.yaml --variant deltaR --output data/injection_scan_deltaR --io-workers 16 --resume
+python run.py prepare-scan --config config/settings.yaml --variant shifted --output data/injection_scan_shifted --io-workers 16 --resume
 ```
 
 ```bash
-python run.py scan --methods riddle iad supervised lacathode --seed 40 41 42 43 44 --config config/settings.yaml \
+python run.py scan --methods riddle iad supervised --seed 40 41 42 43 44 --config config/settings.yaml \
   --data data/injection_scan --output results_injection_scan \
-  --reuse-results results --resume-across-code-change \
-  --fits 20 --epochs 100 \
-  --device cuda:0 --workers 5 --io-workers 2 --torch-threads 2 --mps on --resume
+  --reuse-results results --resume-across-code-change --resume-across-device-change \
+  --fits 20 --epochs 200 --scan-bg-workers 7 \
+  --device cuda:0 --workers 5 --io-workers 2 --torch-threads 2 --mps auto --resume
 ```
 
-Request single method directly with `--methods lacathode`, `--methods riddle`, `--methods ranode`, `--methods iad`, or `--methods supervised`.<br>
-
-R-ANODE method uses 300 epochs. It should be produced seperately:
+```bash
+python run.py scan --methods lacathode --seed 40 41 42 43 44 --config config/settings.yaml \
+  --data data/injection_scan --output results_injection_scan \
+  --reuse-results results --resume-across-code-change --resume-across-device-change \
+  --epochs 100 --lacathode-background independent \
+  --device cuda:0 --workers 5 --io-workers 2 --torch-threads 2 --mps auto --resume
+```
 
 ```bash
 python run.py scan --methods ranode --seed 40 41 42 43 44 --config config/settings.yaml \
   --data data/injection_scan --output results_injection_scan \
-  --reuse-results results --resume-across-code-change \
+  --reuse-results results --resume-across-code-change --resume-across-device-change \
   --fits 20 --epochs 300 \
-  --device cuda:0 --workers 5 --io-workers 2 --torch-threads 2 --mps on --resume
+  --device cuda:0 --workers 5 --io-workers 2 --torch-threads 2 --mps auto --resume
 ```
 
 ```bash
-python plot.py --results results_injection_scan --output plots_injection_scan --io-workers 8 --verbose 1 --overwrite
+python paper_plot.py --scan-data data/injection_scan --scan-results results_injection_scan \
+  --config config/settings.yaml --output paper_plots \
+  --methods riddle iad supervised lacathode --variants default \
+  --checkpoint-policy both --last-epoch 200 \
+  --plot-formats pdf --file-formats csv --io-workers 16 --plot-workers 16 --overwrite --verbose 1
 ```

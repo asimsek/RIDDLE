@@ -129,7 +129,7 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --name riddle-seeds40-44 --methods riddle --scenarios signal_injection \
   --seed 40 41 42 43 44 --config config/settings.yaml --workers 5 --io-workers 2 --torch-threads 2 --mps on \
-  --fits 20 --epochs 100 --data data/lhco --results results \
+  --fits 20 --epochs 200 --data data/lhco --results results \
   | kubectl apply -n cua-asimsek -f -
 ```
 
@@ -138,7 +138,7 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --name riddle-bg-seeds40-44 --methods riddle --scenarios background_only \
   --seed 40 41 42 43 44 --config config/settings.yaml --workers 5 --io-workers 2 --torch-threads 2 --mps on \
-  --fits 20 --epochs 100 --data data/lhco --results results \
+  --fits 20 --epochs 200 --data data/lhco --results results \
   | kubectl apply -n cua-asimsek -f -
 ```
 
@@ -191,7 +191,7 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --name iad-seeds40-44 --methods iad --scenarios signal_injection \
   --seed 40 41 42 43 44 --config config/settings.yaml --workers 5 --io-workers 2 --torch-threads 2 --mps on \
-  --fits 20 --epochs 100 --data data/lhco --results results \
+  --fits 20 --epochs 200 --data data/lhco --results results \
   | kubectl apply -n cua-asimsek -f -
 ```
 
@@ -202,7 +202,7 @@ kubectl exec -n cua-asimsek riddle-jupyter -c jupyter -- \
   python /shared/work/RIDDLE/nrp.py \
   --name supervised-seeds40-44 --methods supervised --scenarios signal_injection \
   --seed 40 41 42 43 44 --config config/settings.yaml --workers 5 --io-workers 2 --torch-threads 2 --mps on \
-  --fits 20 --epochs 100 --data data/lhco --results results \
+  --fits 20 --epochs 200 --data data/lhco --results results \
   | kubectl apply -n cua-asimsek -f -
 ```
 
@@ -352,7 +352,7 @@ for SEED in 40 41 42 43 44; do
     --workflow scan --name "riddle-injection-scan-seed${SEED}" --methods riddle --seed "$SEED" \
     --config config/settings.yaml --data data/injection_scan --results results_injection_scan \
     --reuse-results results --resume-across-code-change --resume-across-device-change \
-    --fits 20 --epochs 100 --workers 5 --scan-bg-workers 7 --io-workers 2 --torch-threads 2 --mps on \
+    --fits 20 --epochs 200 --workers 5 --scan-bg-workers 7 --io-workers 2 --torch-threads 2 --mps on \
     | kubectl apply -n cua-asimsek -f - || break
 done
 ```
@@ -373,7 +373,7 @@ for SEED in 40 41 42 43 44; do
     --workflow scan --name "iad-injection-scan-seed${SEED}" --methods iad --seed "$SEED" \
     --config config/settings.yaml --data data/injection_scan --results results_injection_scan \
     --reuse-results results --resume-across-code-change --resume-across-device-change \
-    --fits 20 --epochs 100 --workers 5 --scan-bg-workers 7 --io-workers 2 --torch-threads 2 --mps on \
+    --fits 20 --epochs 200 --workers 5 --scan-bg-workers 7 --io-workers 2 --torch-threads 2 --mps on \
     | kubectl apply -n cua-asimsek -f - || break
 done
 ```
@@ -394,7 +394,7 @@ for SEED in 40 41 42 43 44; do
     --workflow scan --name "supervised-injection-scan-seed${SEED}" --methods supervised --seed "$SEED" \
     --config config/settings.yaml --data data/injection_scan --results results_injection_scan \
     --reuse-results results --resume-across-code-change --resume-across-device-change \
-    --fits 20 --epochs 100 --workers 5 --scan-bg-workers 7 --io-workers 2 --torch-threads 2 --mps on \
+    --fits 20 --epochs 200 --workers 5 --scan-bg-workers 7 --io-workers 2 --torch-threads 2 --mps on \
     | kubectl apply -n cua-asimsek -f - || break
 done
 ```
@@ -455,6 +455,7 @@ cd /shared/work/RIDDLE
 python paper_plot.py --scan-data data/injection_scan --scan-results results_injection_scan \
   --config config/settings.yaml --output paper_plots \
   --methods riddle iad supervised lacathode --variants default \
+  --checkpoint-policy both --last-epoch 200 \
   --plot-formats pdf --file-formats csv --io-workers 16 --plot-workers 16 --overwrite --verbose 1
 ```
 
