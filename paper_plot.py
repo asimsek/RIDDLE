@@ -358,6 +358,11 @@ def _scan_legend_overlap(ax, legend):
     return intersections
 
 
+def _tight_publication_layout(fig):
+    with matplotlib.rc_context({"font.size": STYLE["font.size"] * getattr(fig, "_paper_style_scale", 1.0)}):
+        fig.tight_layout(pad=0.45)
+
+
 def _scan_legend(ax, title=None):
     options = dict(title=title, frameon=True, framealpha=0.93, borderpad=0.42,
                    labelspacing=0.32, handlelength=1.5, fontsize=STYLE["legend.fontsize"] - 0.3)
@@ -378,7 +383,8 @@ def _scan_legend(ax, title=None):
         renderer = ax.figure.canvas.get_renderer()
         box = legend.get_window_extent(renderer=renderer)
         axes_box = ax.get_window_extent(renderer=renderer)
-        available = (box.y0 - 6 - axes_box.y0) / axes_box.height
+        clearance = renderer.points_to_pixels(8)
+        available = (box.y0 - clearance - axes_box.y0) / axes_box.height
         if available <= 0:
             raise RuntimeError("Injection-scan legend leaves no space for the curves")
         ymin, ymax = ax.get_ylim()
@@ -389,6 +395,8 @@ def _scan_legend(ax, title=None):
                 raise RuntimeError("Injection-scan legend overlaps the curves")
             return legend
         ax.set_ylim(ymin, required * (1 + 1e-12))
+        if not ax.figure.get_constrained_layout():
+            _tight_publication_layout(ax.figure)
     raise RuntimeError("Injection-scan legend could not be separated from the curves")
 
 
@@ -465,7 +473,7 @@ def audit_layout(fig, ax, legend=None):
     for artist in (ax.xaxis.label, ax.yaxis.label):
         box = artist.get_window_extent(renderer=renderer)
         if box.x0 < fig_box.x0 - 2 or box.x1 > fig_box.x1 + 2 or box.y0 < fig_box.y0 - 2 or box.y1 > fig_box.y1 + 2:
-            raise RuntimeError("Axis label is clipped")
+            raise RuntimeError(f"Axis label {artist.get_text()!r} is clipped")
     if legend is not None:
         box = legend.get_window_extent(renderer=renderer)
         axes_box = ax.get_window_extent(renderer=renderer)
@@ -503,8 +511,7 @@ def _save_figure(fig, ax, stem, formats, overwrite, legend=None):
     stem.parent.mkdir(parents=True, exist_ok=True)
     if not fig.get_constrained_layout() and (spectrum_legend is None or len(fig.axes) == 1):
         try:
-            with matplotlib.rc_context({"font.size": STYLE["font.size"] * getattr(fig, "_paper_style_scale", 1.0)}):
-                fig.tight_layout(pad=0.45)
+            _tight_publication_layout(fig)
         except Exception:
             pass
     if scan_legend is not None:
@@ -3454,7 +3461,7 @@ def render_policy(args, groups_all):
         if not groups:
             raise SystemExit("No completed injection-scan results remain after applying filters")
         say("[SUMMARY] Mean across completed seeds; bands show the min–max range across seeds", args.verbose)
-        with render_resources(args.plot_workers, args.verbose, args.output):
+        with render_resources(args.plot_workers, args.verbose, args.output) as renderer:
             for variant in variants:
                 if variant not in discovered_variants:
                     continue
@@ -3466,6 +3473,7 @@ def render_policy(args, groups_all):
                                        args.require_compatible_populations, variant=variant,
                                        io_workers=args.io_workers, excluded_seeds=args.exclude_seeds,
                                        show_missing_epochs=args.checkpoint_policy == "last")
+                renderer.flush()
                 plot_dijet_spectra({identity: group for identity, group in groups.items() if identity[3] == variant},
                                    args, destination, scan=True)
         say(f"[DONE] Injection-scan outputs written to {args.output}", args.verbose)
