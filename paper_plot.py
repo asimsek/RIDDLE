@@ -2172,7 +2172,7 @@ def plot_mass_sculpting(cache, records, output, formats, overwrite, scenarios, v
                 ax.set_xlim(0.20, 0.01)
                 ax.set_yscale("log")
                 ax.set_ylim(5e-1, 3.5e2)
-                legend = inside_legend(ax, title=REGION_LABELS[region] + " · " + VARIANT_LABELS.get(variant, variant), borderaxespad=0.75, allow_headroom=False)
+                legend = inside_legend(ax, title=REGION_LABELS[region] + " · " + VARIANT_LABELS.get(variant, variant), ncol=1, borderaxespad=0.75, allow_headroom=False)
                 save_figure(fig, ax, figure_path(output, scenario, variant, region) / "mass_sculpting_chi2_ndof_vs_background_efficiency", formats, overwrite, legend)
                 if focused:
                     continue
