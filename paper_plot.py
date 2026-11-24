@@ -14,7 +14,9 @@ from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolE
 from contextlib import contextmanager
 from contextvars import ContextVar, copy_context
 from copy import copy
+from functools import partial
 from pathlib import Path
+from threading import Lock
 
 import matplotlib
 matplotlib.use("Agg")
@@ -28,14 +30,14 @@ import numpy as np
 import torch
 import yaml
 from scipy.special import ndtri
-from sklearn.metrics import roc_curve
+from sklearn.metrics import roc_auc_score, roc_curve
 from threadpoolctl import threadpool_limits
 from tqdm import tqdm
 
 from riddle.evaluation import common_acceptance_auc, riddle_score_scope
-from riddle.metrics import efficiency_curve, oracle_metrics
-from riddle.plotting import ScoreLoader, discover, event_size_rows, exact_background_selection, method_family, read_discovery_result, read_metadata, result_paths, result_variant, scientific_protocol, settings_rows, verify_plot_input
-from riddle.figures import equal_occupancy, shape_chi2
+from riddle.metrics import acceptance_report, efficiency_curve
+from riddle.plotting import ScoreLoader, discover, event_size_rows, exact_background_selections, method_family, read_discovery_result, read_metadata, result_paths, result_variant, scientific_protocol, settings_rows, verify_plot_input
+from riddle.figures import cached_plot_calculation, equal_occupancy, plot_calculation_cache, shape_chi2
 from riddle.stein_scoring import conditional_gaussianize
 from riddle.storage import file_digest, load_array, open_npz, ram_cache_limit, ram_file_cache, read_json
 
@@ -464,16 +466,24 @@ def cleanup_legacy_summary_folders(output):
                 path.unlink()
 
 
+def clipped_axis_label(fig, ax):
+    renderer = fig.canvas.get_renderer()
+    bounds = fig.bbox.padded(2)
+    for label in (ax.xaxis.label, ax.yaxis.label):
+        box = label.get_window_extent(renderer=renderer)
+        if not (bounds.contains(*box.min) and bounds.contains(*box.max)):
+            return label
+    return None
+
+
 def audit_layout(fig, ax, legend=None):
     if ax.get_title() or fig._suptitle is not None:
         raise RuntimeError("Publication figure contains a main title")
     fig.draw_without_rendering()
     renderer = fig.canvas.get_renderer()
-    fig_box = fig.bbox
-    for artist in (ax.xaxis.label, ax.yaxis.label):
-        box = artist.get_window_extent(renderer=renderer)
-        if box.x0 < fig_box.x0 - 2 or box.x1 > fig_box.x1 + 2 or box.y0 < fig_box.y0 - 2 or box.y1 > fig_box.y1 + 2:
-            raise RuntimeError(f"Axis label {artist.get_text()!r} is clipped")
+    clipped = clipped_axis_label(fig, ax)
+    if clipped is not None:
+        raise RuntimeError(f"Axis label {clipped.get_text()!r} is clipped")
     if legend is not None:
         box = legend.get_window_extent(renderer=renderer)
         axes_box = ax.get_window_extent(renderer=renderer)
@@ -502,6 +512,31 @@ def save_figure(fig, ax, stem, formats, overwrite, legend=None):
         plt.close(fig)
 
 
+def save_prepared_figure(factory, stem, formats, overwrite, legend):
+    state = _CHECKPOINT_OVERLAY.get()
+    if state is not None:
+        overlay, root = state
+        key = stem.relative_to(root)
+        if overlay.last:
+            overlay.curves[key] = factory, legend
+            return
+        other, _ = overlay.curves.pop(key, (None, None))
+        factory = partial(checkpoint_figure, factory, key, overlay.methods, overlay.colors, other)
+    renderer = _FIGURE_RENDERER.get()
+    if renderer is None:
+        write_render_input(factory, None, stem, formats, overwrite, legend)
+    else:
+        renderer.save(factory, None, stem, formats, overwrite, legend)
+
+
+def checkpoint_figure(factory, key, methods, colors, other):
+    from riddle.checkpoint_overlay import CheckpointOverlay
+
+    fig, ax = factory()
+    CheckpointOverlay.compose_curves(fig, key, methods, colors, other()[0] if other is not None else None)
+    return fig, ax
+
+
 def _save_figure(fig, ax, stem, formats, overwrite, legend=None):
     scale_publication_axes(fig)
     spectrum_legend = legend if isinstance(legend, dict) and "spectrum_legend" in legend else None
@@ -516,6 +551,11 @@ def _save_figure(fig, ax, stem, formats, overwrite, legend=None):
             pass
     if scan_legend is not None:
         legend = _scan_legend(ax, **scan_legend["scan_legend"])
+        fig.draw_without_rendering()
+        if not fig.get_constrained_layout() and clipped_axis_label(fig, ax) is not None:
+            legend.remove()
+            _tight_publication_layout(fig)
+            legend = _scan_legend(ax, **scan_legend["scan_legend"])
     if spectrum_legend is not None:
         from riddle.mass_spectrum import mass_legend
 
@@ -542,14 +582,20 @@ def _render_worker_init():
     threadpool_limits(limits=1)
 
 
+def write_render_input(fig, ax, stem, formats, overwrite, legend):
+    if callable(fig):
+        fig, ax = fig()
+    try:
+        _save_figure(fig, ax, stem, formats, overwrite, legend)
+    finally:
+        plt.close(fig)
+
+
 def _render_figure(payload, stem, formats, overwrite, style):
     started = time.monotonic()
     with matplotlib.rc_context(style):
         fig, ax, legend = pickle.loads(payload)
-        try:
-            _save_figure(fig, ax, stem, formats, overwrite, legend)
-        finally:
-            plt.close(fig)
+        write_render_input(fig, ax, stem, formats, overwrite, legend)
     return time.monotonic() - started, os.getpid()
 
 
@@ -593,6 +639,11 @@ class PaperFigureRenderer:
             self.last_report = state
 
     def summary(self, output=None):
+        overlay = _CHECKPOINT_OVERLAY.get()
+        if overlay is not None and overlay[0].last:
+            say(f"[OVERLAY] Prepared {len(overlay[0].curves)} last-checkpoint figures for comparison", self.verbose)
+            if not self.saved_files:
+                return
         if output is not None:
             for variant in VARIANT_ORDER:
                 directory = variant_output(output, variant).resolve()
@@ -625,7 +676,7 @@ class PaperFigureRenderer:
     def save(self, fig, ax, stem, formats, overwrite, legend):
         paths = tuple(str(stem.with_suffix("." + extension).resolve()) for extension in formats)
         if self.pool is None:
-            _save_figure(fig, ax, stem, formats, overwrite, legend)
+            write_render_input(fig, ax, stem, formats, overwrite, legend)
             self.submitted += 1
             self.completed += 1
             self.record_saved(paths)
@@ -645,7 +696,7 @@ class PaperFigureRenderer:
             payload = pickle.dumps((fig, ax, legend), protocol=pickle.HIGHEST_PROTOCOL)
         except (pickle.PicklingError, AttributeError, TypeError):
             say(f"[RENDER] Serial fallback for {stem}", self.verbose, 2)
-            _save_figure(fig, ax, stem, formats, overwrite, legend)
+            write_render_input(fig, ax, stem, formats, overwrite, legend)
             self.submitted += 1
             self.completed += 1
             self.record_saved(paths)
@@ -782,6 +833,26 @@ def discover_variant_results(root, requested, variants, *, scan=False, workers=1
     return groups
 
 
+def unit_spectrum_counts(bins, size):
+    counts = np.bincount(bins, minlength=3 * size + 1)[:3 * size].reshape(3, size)
+    row = {}
+    for name, values in (("background", counts[0]), ("signal", counts[1]), ("data", counts.sum(axis=0))):
+        row[name] = row[name + "_variance"] = values.astype(float)
+    return row
+
+
+@cached_plot_calculation
+def unit_spectrum_bins(mass, labels, edges):
+    if mass.ndim != 1 or labels.shape != mass.shape:
+        raise ValueError("Misaligned full-mass selections or normalization weights")
+    size = len(edges) - 1
+    index = np.searchsorted(edges, mass, side="right") - 1
+    index[mass == edges[-1]] = size - 1
+    component = np.where(labels == 0, 0, np.where(labels == 1, 1, 2))
+    bins = np.where((index >= 0) & (index < size), index + component * size, 3 * size)
+    return bins, unit_spectrum_counts(bins, size)
+
+
 def plot_dijet_spectra(groups, args, output, *, scan=False):
     from riddle.full_mass import load_full_mass
     from riddle.mass_spectrum import CUTS, mass_edges, match_ids, normalization_weights, residual_limits, spectrum_histograms, spectrum_summary, spectrum_figure, spectrum_cuts_figure
@@ -789,15 +860,46 @@ def plot_dijet_spectra(groups, args, output, *, scan=False):
     focused = getattr(args, "focused", False) and not scan
     tasks = [(identity, method, root, report) for identity, group in sorted(groups.items())
              for method, (root, report) in sorted(group.items()) if method in ("riddle", "iad", "supervised")]
+    populations = {}
+    population_lock = Lock()
 
     def load(task):
         identity, method, root, report = task
         derived_root = Path(report.get("_full_mass_root", root))
-        record = load_full_mass(derived_root, report, workers=1)
+        record = load_full_mass(derived_root, report, workers=args.io_workers)
         if record is None and derived_root != root:
-            record = load_full_mass(root, report, workers=1)
+            record = load_full_mass(root, report, workers=args.io_workers)
             derived_root = root
-        if record is not None and not scan and identity[0] == "background_only":
+        if record is None:
+            return identity, method, None
+        with population_lock:
+            reference = populations.get(identity[0])
+            if reference is None:
+                reference = {key: record[key] for key in ("event_ids", "mass", "labels")}
+                reference["edges"] = mass_edges(record["mass"])
+                populations[identity[0]] = reference
+        if record["event_ids"] is not reference["event_ids"]:
+            if len(record["event_ids"]) != len(reference["event_ids"]):
+                raise ValueError("Full-mass method comparisons require identical primary held-out populations")
+            indices = (slice(None) if np.array_equal(record["event_ids"], reference["event_ids"])
+                       else match_ids(record["event_ids"], reference["event_ids"]))
+            if (not np.array_equal(record["mass"][indices], reference["mass"])
+                    or not np.array_equal(record["labels"][indices], reference["labels"])):
+                raise ValueError("Full-mass method comparisons require identical primary held-out populations")
+        edges = reference["edges"]
+        weight_file = getattr(args, "cross_section_weights", None)
+        if weight_file is None and record["cut_masks"].dtype == bool:
+            bins, uncut = unit_spectrum_bins(record["mass"], record["labels"], edges)
+            histograms = {None: uncut}
+            for cut, mask in zip(CUTS, record["cut_masks"], strict=True):
+                histograms[cut] = unit_spectrum_counts(bins[mask], len(edges) - 1)
+            units = "events"
+        else:
+            weights, units, _ = normalization_weights(record, weight_file)
+            histograms = spectrum_histograms(record, weights, edges)
+        spectrum = dict(histograms=histograms, edges=edges, units=units,
+                        status=record["manifest"]["validation_status"])
+        if not scan and identity[0] == "background_only":
             with open_npz(derived_root / "full_mass/reference_D.npz", allow_pickle=False) as archive:
                 scores = np.asarray(archive["scores"], float)
                 threshold = np.asarray(archive["threshold_indices"])
@@ -810,54 +912,31 @@ def plot_dijet_spectra(groups, args, output, *, scan=False):
                     or min(len(threshold), len(assessment)) < 1024):
                 raise ValueError("Invalid independent background assessment split")
             record["background_count_reference"] = (scores[threshold], scores[assessment])
-        return identity, method, record
+            spectrum["background_counts"] = record
+        return identity, method, spectrum
 
     loaded = parallel_plot_tasks(load, tasks, args.io_workers, "SPECTRA LOAD", args.verbose)
+    populations.clear()
     cohorts = defaultdict(list)
-    populations = {}
     missing = 0
-    for identity, method, record in loaded:
-        if record is None:
+    for identity, method, spectrum in loaded:
+        if spectrum is None:
             missing += 1
             continue
         scenario = "signal_injection" if scan else identity[0]
         level = identity[0] if scan else None
-        population_key = (scenario, level)
-        if population_key in populations:
-            reference = populations[population_key]
-            if len(record["event_ids"]) != len(reference["event_ids"]):
-                raise ValueError("Full-mass method comparisons require identical primary held-out populations")
-            indices = (slice(None) if np.array_equal(record["event_ids"], reference["event_ids"])
-                       else match_ids(record["event_ids"], reference["event_ids"]))
-            if (not np.array_equal(record["mass"][indices], reference["mass"])
-                    or not np.array_equal(record["labels"][indices], reference["labels"])):
-                raise ValueError("Full-mass method comparisons require identical primary held-out populations")
-        else:
-            populations[population_key] = record
-        cohorts[(method, scenario, level)].append(record)
+        cohorts[(method, scenario, level)].append(spectrum)
     if missing:
         say(f"[SPECTRA] {missing} results need --score-sidebands-only before full-mass plotting", args.verbose)
     background_curves = {}
-    for (method, scenario, level), records in cohorts.items():
-        first = records[0]
-        statuses = sorted({record["manifest"]["validation_status"] for record in records})
+    for (method, scenario, level), spectra in cohorts.items():
+        statuses = sorted({spectrum["status"] for spectrum in spectra})
         if statuses != ["passed"]:
             say(f"[SPECTRA] {METHOD_LABELS[method]} {scenario}: closure {', '.join(statuses)}; diagnostic spectra", args.verbose)
-        for record in records[1:]:
-            indices = (slice(None) if np.array_equal(record["event_ids"], first["event_ids"])
-                       else match_ids(record["event_ids"], first["event_ids"]))
-            if (not np.array_equal(record["mass"][indices], first["mass"])
-                    or not np.array_equal(record["labels"][indices], first["labels"])):
-                raise ValueError("Dijet seed bands require identical primary held-out event populations")
-        edges = mass_edges(first["mass"])
-        rows = []
-        units = None
-        for record in records:
-            weights, record_units, _ = normalization_weights(record, getattr(args, "cross_section_weights", None))
-            if units is not None and units != record_units:
-                raise ValueError("Inconsistent mass-spectrum normalization")
-            units = record_units
-            rows.append(spectrum_histograms(record, weights, edges))
+        edges, units = spectra[0]["edges"], spectra[0]["units"]
+        if any(spectrum["units"] != units for spectrum in spectra):
+            raise ValueError("Inconsistent mass-spectrum normalization")
+        rows = [spectrum["histograms"] for spectrum in spectra]
         destination = output / "04_dijet_spectra" / METHOD_LABELS[method] / SCENARIO_LABELS[scenario]
         if level is not None:
             destination = destination / f"N_{int(level):06d}"
@@ -866,17 +945,18 @@ def plot_dijet_spectra(groups, args, output, *, scan=False):
         if args.overwrite:
             for extension in ("csv", "json", "yaml"):
                 (destination / f"dijet_mass_spectra.{extension}").unlink(missing_ok=True)
-        fig, ax = spectrum_cuts_figure(summaries, edges, units)
-        save_figure(fig, ax, destination / "dijet_mass_score_cuts", args.plot_formats,
-                    args.overwrite, {"spectrum_legend": {}})
+        save_prepared_figure(partial(spectrum_cuts_figure, summaries, edges, units),
+                             destination / "dijet_mass_score_cuts", args.plot_formats,
+                             args.overwrite, {"spectrum_legend": {}})
         if not focused:
             for cut in (None, *CUTS):
-                fig, ax = spectrum_figure(summaries[cut], edges, cut, units,
-                                          residual_ylim=shared_limits if cut is not None else None)
+                factory = partial(spectrum_figure, summaries[cut], edges, cut, units,
+                                  residual_ylim=shared_limits if cut is not None else None)
                 stem = "dijet_mass_uncut" if cut is None else f"dijet_mass_{cut * 100:g}pct".replace("0.5pct", "0p5pct")
-                save_figure(fig, ax, destination / stem, args.plot_formats, args.overwrite,
-                            {"spectrum_legend": {}})
+                save_prepared_figure(factory, destination / stem, args.plot_formats, args.overwrite,
+                                     {"spectrum_legend": {}})
         if scenario == "background_only":
+            records = [spectrum["background_counts"] for spectrum in spectra]
             background_curves[method] = plot_background_count_closure(method, records, args, output, focused=focused)
     plot_background_count_comparison(background_curves, args, output, allow_single=focused)
 
@@ -1177,18 +1257,25 @@ def full_pipeline_curve(record):
     return np.asarray(b), np.asarray(s), np.asarray(cuts)
 
 
-def central_metrics(record, min_background):
+def central_metrics(record, min_background, *, include_curve=True):
     labels = np.asarray(record["labels"])
-    if len(np.unique(labels)) < 2:
+    mask = np.asarray(record["mask"])
+    counts = acceptance_report(labels, mask)["full"]
+    if not all(row["total"] for row in counts.values()):
         return None
-    metrics = oracle_metrics(labels, record["scores"], record["mask"], min_background=min_background, min_efficiency=1e-4)
-    b, s, cuts = full_pipeline_curve(record)
-    supported = (b >= 1e-4) & (np.rint(b * np.sum(labels == 0)) >= min_background)
-    wp = {}
-    for budget in WORKING_POINTS:
-        selection = exact_background_selection(record, budget)
-        wp[budget] = None if selection is None else selection["signal_efficiency"]
-    return {"auc": metrics["conditional_auc"], "max_sic": metrics["full_pipeline_max_sic"], "background_efficiency": b, "signal_efficiency": s, "cuts": cuts, "supported": supported, "working_points": wp, "acceptance": metrics["acceptance"]}
+    selections = exact_background_selections(record, WORKING_POINTS)
+    wp = {budget: selection["signal_efficiency"] if selection is not None else None
+          for budget, selection in zip(WORKING_POINTS, selections)}
+    result = {"auc": None, "max_sic": None, "working_points": wp, "acceptance": counts}
+    if include_curve or all(row["mapped"] for row in counts.values()):
+        b, s, cuts = full_pipeline_curve(record)
+        supported = (b >= 1e-4) & (np.rint(b * counts["background"]["total"]) >= min_background)
+        result["auc"] = float(roc_auc_score(labels[mask], np.asarray(record["scores"])[mask]))
+        if supported.any():
+            result["max_sic"] = float(np.max(s[supported] / np.sqrt(b[supported])))
+        if include_curve:
+            result.update(background_efficiency=b, signal_efficiency=s, cuts=cuts, supported=supported)
+    return result
 
 
 def interpolate_curve(x, y, grid):
@@ -1262,7 +1349,7 @@ def parallel_plot_tasks(function, tasks, workers, stage, verbose, describe=None)
     completed = 0
     values = [None] * len(tasks)
     worker_count = min(workers, len(tasks))
-    compact_progress = stage in ("LOAD", "SCAN LOAD", "METRICS", "SCAN METRICS", "WITNESS FIELDS", "TRAINING LOAD") and verbose == 1
+    compact_progress = stage in ("LOAD", "METRICS", "SCAN METRICS", "WITNESS FIELDS", "TRAINING LOAD") and verbose == 1
     live = compact_progress and sys.stdout.isatty()
 
     def progress_status():
@@ -1941,6 +2028,33 @@ def plot_score_vs_mass(records, output, formats, overwrite):
         save_figure(fig, ax, output / "03_features" / folder_variant(variant) / "score_vs_mass" / f"{safe_component(METHOD_LABELS.get(method, method))}_{safe_component(SCENARIO_LABELS[scenario])}", formats, overwrite)
 
 
+@cached_plot_calculation
+def sculpting_mass_bins(mass):
+    edges = equal_occupancy(mass, 300)
+    full = np.histogram(mass, edges)[0]
+    blocks = []
+    block_size = 65536
+    for start in range(0, len(mass), block_size):
+        chunk = mass[start:start + block_size]
+        order = np.argsort(chunk)
+        sorted_mass = chunk[order]
+        stops = np.r_[sorted_mass.searchsorted(edges[:-1], side="left"),
+                      sorted_mass.searchsorted(edges[-1], side="right")]
+        blocks.append((order + start, stops))
+    return full, blocks
+
+
+def weighted_sculpting_counts(weights, blocks, bins):
+    """Use NumPy's weighted histogram summation order at each working point."""
+    cumulative = np.zeros(bins + 1)
+    for order, stops in blocks:
+        prefix = np.empty(len(order) + 1)
+        prefix[0] = 0
+        np.cumsum(weights[order], out=prefix[1:])
+        cumulative += prefix[stops]
+    return np.diff(cumulative)
+
+
 def exact_mass_sculpt_curve(record, efficiencies):
     from riddle.plotting import fit_scores
 
@@ -1949,8 +2063,7 @@ def exact_mass_sculpt_curve(record, efficiencies):
     mass = np.asarray(record["mass"], float)[bg]
     if len(mass) < 300:
         return None
-    edges = equal_occupancy(mass, 300)
-    full = np.histogram(mass, edges)[0]
+    full, blocks = sculpting_mass_bins(mass)
     mask = np.asarray(record["mask"], bool)[bg]
     prepared = []
     for scores in fit_scores(record):
@@ -1981,11 +2094,12 @@ def exact_mass_sculpt_curve(record, efficiencies):
         if not np.isclose(background_efficiency, efficiency, rtol=0, atol=5e-15):
             raise ValueError(f"Exact background selection failed: {background_efficiency} != {efficiency}")
         selected = np.mean(weights, axis=0)
-        histogram = np.histogram(mass, edges, weights=selected)[0]
+        histogram = weighted_sculpting_counts(selected, blocks, len(full))
         values.append(shape_chi2(full, histogram, efficiency))
     return np.asarray(values, float)
 
 
+@cached_plot_calculation
 def random_reference_band(mass, efficiencies, trials=100):
     edges = equal_occupancy(mass, 300)
     full = np.histogram(mass, edges)[0]
@@ -2000,6 +2114,25 @@ def random_reference_band(mass, efficiencies, trials=100):
             curve.append(shape_chi2(full, np.bincount(ids[chosen], minlength=len(full)), count / len(mass)))
         rows.append(curve)
     return np.asarray(rows)
+
+
+def background_efficiency_by_mass(candidates, budgets):
+    reference = candidates[0][1]
+    mass = np.asarray(reference["mass"], float)
+    if np.nanmedian(np.abs(mass)) > 20:
+        mass = mass / 1000.0
+    bg = np.asarray(reference["labels"]) == 0
+    mass = mass[bg]
+    edges = equal_occupancy(mass, min(24, max(10, len(mass) // 50)))
+    total = np.histogram(mass, edges)[0]
+    rows = defaultdict(list)
+    for _, candidate in candidates:
+        for budget, selection in zip(budgets, exact_background_selections(candidate, budgets)):
+            if selection is not None:
+                weights = np.mean(selection["weights"], axis=0)[bg]
+                selected = np.histogram(mass, edges, weights=weights)[0]
+                rows[budget].append(np.divide(selected, total, out=np.full_like(selected, np.nan), where=total > 0))
+    return 0.5 * (edges[:-1] + edges[1:]), rows
 
 
 def plot_mass_sculpting(cache, records, output, formats, overwrite, scenarios, variants, regions, verbose, *, focused=False):
@@ -2043,37 +2176,20 @@ def plot_mass_sculpting(cache, records, output, formats, overwrite, scenarios, v
                 save_figure(fig, ax, figure_path(output, scenario, variant, region) / "mass_sculpting_chi2_ndof_vs_background_efficiency", formats, overwrite, legend)
                 if focused:
                     continue
-                working_point_plots = {}
+                budgets = PLOT_WORKING_POINTS[::-1]
+                working_point_plots = {wp: [] for wp in budgets}
                 all_efficiencies = []
-                for wp in PLOT_WORKING_POINTS[::-1]:
-                    rows = []
-                    for method in methods:
-                        candidates = [(seed, record) for (m, sc, v, rg, seed), record in records.items() if (m, sc, v, rg) == (method, scenario, variant, region)]
-                        if not candidates:
-                            continue
-                        seed, record = sorted(candidates)[0]
-                        labels = np.asarray(record["labels"])
-                        mass = np.asarray(record["mass"], float)
-                        if np.nanmedian(np.abs(mass)) > 20:
-                            mass = mass / 1000.0
-                        bg = labels == 0
-                        edges = equal_occupancy(mass[bg], min(24, max(10, len(mass[bg]) // 50)))
-                        total = np.histogram(mass[bg], edges)[0]
-                        efficiencies_by_run = []
-                        for _, candidate in sorted(candidates):
-                            selection = exact_background_selection(candidate, wp)
-                            if selection is None:
-                                continue
-                            selected_counts = np.histogram(mass[bg], edges, weights=np.mean(selection["weights"], axis=0)[bg])[0]
-                            efficiencies_by_run.append(np.divide(selected_counts, total, out=np.full_like(selected_counts, np.nan, dtype=float), where=total > 0))
-                        if not efficiencies_by_run:
-                            continue
-                        centers = 0.5 * (edges[:-1] + edges[1:])
+                for method in methods:
+                    candidates = sorted((seed, record) for (m, sc, v, rg, seed), record in records.items()
+                                        if (m, sc, v, rg) == (method, scenario, variant, region))
+                    if not candidates:
+                        continue
+                    centers, by_budget = background_efficiency_by_mass(candidates, budgets)
+                    for wp, efficiencies_by_run in by_budget.items():
                         matrix = np.asarray(efficiencies_by_run)
-                        rows.append((method, centers, matrix))
+                        working_point_plots[wp].append((method, centers, matrix))
                         all_efficiencies.extend(matrix[np.isfinite(matrix)].tolist())
-                    if rows:
-                        working_point_plots[wp] = rows
+                working_point_plots = {wp: rows for wp, rows in working_point_plots.items() if rows}
                 if working_point_plots:
                     maximum = max(all_efficiencies) if all_efficiencies else max(PLOT_WORKING_POINTS)
                     shared_ymax = max(0.15, 1.18 * maximum, 1.18 * max(PLOT_WORKING_POINTS))
@@ -2334,6 +2450,7 @@ def plot_projected_witness(groups, records, args, output):
         say("[FOCUSED] Projected Stein plots skipped: no selected seed 42 results", args.verbose)
         return
     field_workers = min(field_workers, max(1, len(tasks)))
+    input_budget, _ = plot_cache_budgets(getattr(args, "ram_cache_mb", 0))
 
     def prepare(task):
         identity, method, root, report, record = task
@@ -2364,7 +2481,7 @@ def plot_projected_witness(groups, records, args, output):
         options = SimpleNamespace(field_events=getattr(args, "witness_field_events", 16384),
                                   grid_size=40, smoothing=1.2, min_cell_events=2.0,
                                   batch_size=1024, device="cpu", io_workers=1,
-                                  ram_cache_bytes=(getattr(args, "ram_cache_mb", 0) * 1024**2 * 3 // 4 // field_workers),
+                                  ram_cache_bytes=input_budget * 3 // 4 // field_workers,
                                   sampling_seed=int(report["seed"]) + 10502,
                                   plot_formats=args.plot_formats, overwrite=args.overwrite, dpi=600,
                                   scenario=identity[0],
@@ -2381,7 +2498,7 @@ def plot_projected_witness(groups, records, args, output):
     previous_threads = torch.get_num_threads()
     try:
         torch.set_num_threads(1 if args.io_workers > 1 and len(tasks) > 1 else previous_threads)
-        with ram_cache_limit(getattr(args, "ram_cache_mb", 0) * 1024**2 // 4):
+        with ram_cache_limit(input_budget // 4):
             prepared = parallel_plot_tasks(prepare, tasks, field_workers, "WITNESS FIELDS", args.verbose)
     finally:
         torch.set_num_threads(previous_threads)
@@ -2641,11 +2758,20 @@ def plot_variant_robustness(cache, output, formats, overwrite, regions):
                 plt.close(fig)
 
 
-def write_table_rows(base, rows, formats):
+def write_table_rows(base, rows, formats, *, overwrite=True):
+    state = _CHECKPOINT_OVERLAY.get()
+    if state is not None:
+        overlay, root = state
+        rows = overlay.table_rows(base.relative_to(root), rows)
     if not rows:
         return
     base.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = list(rows[0])
+    if not overwrite:
+        for fmt in formats:
+            path = base.with_suffix("." + fmt)
+            if path.exists():
+                raise FileExistsError(f"Output exists: {path}")
     for fmt in formats:
         path = base.with_suffix("." + fmt)
         if fmt == "csv":
@@ -3032,37 +3158,29 @@ def process_injection_scan(scan_groups, methods, loader, settings, output, forma
                 for run_index, (root, report) in sorted(runs.items()):
                     tasks.append(((method, level, replica, run_index), root, report))
 
-    def load(task):
-        key, root, report = task
-        say(f"[SCAN LOAD] {key}: {root}", verbose, 2)
-        try:
-            return key, loader(root, report, "signal_region"), report, None
-        except Exception as error:
-            return key, None, report, f"{type(error).__name__}: {error}"
-
-    def describe(task, result):
-        method, level, replica, _ = task[0]
-        status = "; failed" if result[3] else ""
-        return f"{METHOD_LABELS.get(method, method)} s{replica} N={level} {variant}{status}"
-
-    loaded_tasks = parallel_plot_tasks(load, tasks, io_workers, "SCAN LOAD", verbose, describe)
-
     def compute(task):
-        key, record, report, error = task
-        if error is not None:
-            return key, record, None, None, error
+        key, root, report = task
+        say(f"[SCAN METRICS] {key}: {root}", verbose, 2)
         try:
-            metrics = central_metrics(record, min_background)
+            record = loader(root, report, "signal_region")
+            metrics = central_metrics(record, min_background, include_curve=False)
             if metrics is None:
                 raise ValueError("signal metrics are unavailable")
             counts = scan_realized_counts(report)
             if counts is None:
                 raise ValueError("uncut_signal_region provenance is missing")
-            return key, record, metrics, counts, None
+            population = ({field: record[field] for field in ("mass", "labels", "physical", "event_ids") if field in record}
+                          if require_compatible_populations else None)
+            return key, population, metrics, counts, None
         except Exception as error:
-            return key, record, None, None, f"{type(error).__name__}: {error}"
+            return key, None, None, None, f"{type(error).__name__}: {error}"
 
-    for key, record, metrics, counts, error in parallel_plot_tasks(compute, loaded_tasks, io_workers, "SCAN METRICS", verbose):
+    def describe(task, result):
+        method, level, replica, _ = task[0]
+        status = "; failed" if result[-1] else ""
+        return f"{METHOD_LABELS.get(method, method)} s{replica} N={level} {variant}{status}"
+
+    for key, population, metrics, counts, error in parallel_plot_tasks(compute, tasks, io_workers, "SCAN METRICS", verbose, describe):
         method, level, replica, run_index = key
         if error is not None:
             invalid[method].append(f"N_inj={level} seed={replica} run={run_index}: {error}")
@@ -3073,7 +3191,8 @@ def process_injection_scan(scan_groups, methods, loader, settings, output, forma
             "background": background,
             "signal": signal,
         }
-        point_records[(level, replica, run_index)][method] = record
+        if population is not None:
+            point_records[(level, replica, run_index)][method] = population
         point_counts[(level, replica)].add(counts)
     for identity, group in scan_groups.items():
         level, replica, run_index, source_variant = identity
@@ -3118,10 +3237,69 @@ def process_injection_scan(scan_groups, methods, loader, settings, output, forma
         raise incomplete_scan_error(f"Strict injection-scan comparison could not build complete summaries for: {labels}")
     if not summaries:
         return
-    destination = output / "06_injection_scan" / VARIANT_LABELS.get(variant, variant)
+    axis_points, curves = injection_scan_curves(summaries, configured)
+    destination = output / "06_injection_scan"
+    state = _CHECKPOINT_OVERLAY.get()
+    if state is None:
+        draw_injection_curves(curves, axis_points, destination / folder_variant(variant),
+                              formats, overwrite, variant, show_missing_epochs)
+    else:
+        overlay, _ = state
+        if overlay.last:
+            overlay.scan_points[variant] = axis_points, curves
+        else:
+            last_axes, last_curves = overlay.scan_points.pop(variant, ({}, {}))
+            last_plot_axes = dict(last_axes)
+            individual_last = {}
+            for field, series in curves.items():
+                native = {m: value for m, value in series.items() if METHOD_LABELS.get(m, m) not in overlay.methods}
+                for _, _, _, _, indices in native.values():
+                    for index in indices:
+                        level = configured[index]
+                        axes = axis_points[level]
+                        if level in last_axes and last_axes[level][1] != axes[1]:
+                            raise ValueError("Checkpoint and native scan curves have different realized event populations")
+                        last_plot_axes[level] = axes
+                available = {**last_curves.get(field, {}), **native}
+                individual_last[field] = {m: available[m] for m in requested_methods if m in available}
+            token = _CHECKPOINT_OVERLAY.set(None)
+            try:
+                if last_curves:
+                    draw_injection_curves(individual_last, last_plot_axes, destination / "last_epoch" / variant,
+                                          formats, overwrite, variant, True)
+                draw_injection_curves(curves, axis_points, destination / "lowest_loss" / variant,
+                                      formats, overwrite, variant, False)
+            finally:
+                _CHECKPOINT_OVERLAY.reset(token)
+            axis_points = {**last_axes, **axis_points}
+        draw_injection_curves(curves, axis_points, destination, formats, overwrite, variant, show_missing_epochs)
+    rows = []
+    for method, levels in summaries.items():
+        for level, replicas_data in levels:
+            metrics = [metrics for row in replicas_data for metrics in row["run_metrics"]]
+            significance = [metric["max_sic"] * row["nominal"] for row in replicas_data
+                            for metric in row["run_metrics"]
+                            if metric["max_sic"] is not None and row["nominal"] is not None]
+            significance = np.asarray(significance, float)
+            significance = significance[np.isfinite(significance)]
+            rows.append({"Method": METHOD_LABELS.get(method, method), "N_inj": int(level),
+                         **performance_summary(metrics),
+                         "Max. achieved significance": float(significance.mean()) if len(significance) else None,
+                         "Max. achieved significance min": float(significance.min()) if len(significance) else None,
+                         "Max. achieved significance max": float(significance.max()) if len(significance) else None})
+    if rows:
+        write_table_rows(output / "07_tables" / f"table_04_{variant}_signal_injection_dependence", rows, file_formats,
+                         overwrite=overwrite)
+
+
+def injection_figure_specs():
     figure_specs = [("max_sic", "Maximum significance improvement", "maximum_sic_vs_s_over_b"), ("nominal_selected", "Maximum achieved significance", "maximum_nominal_significance_vs_s_over_b"), ("auc", "AUC", "auc_vs_s_over_b")]
     for wp in PLOT_WORKING_POINTS[::-1]:
         figure_specs.append((f"wp_{wp}", r"Signal efficiency, $\epsilon_S$", f"epsS_{WORKING_POINT_LABELS[wp].replace('%','pct').replace('.','p')}_vs_s_over_b"))
+    return figure_specs
+
+
+def injection_scan_curves(summaries, configured):
     axis_points = {}
     for method, levels in summaries.items():
         for level, replicas_data in levels:
@@ -3135,10 +3313,9 @@ def process_injection_scan(scan_groups, methods, loader, settings, output, forma
                     if counts != prior_counts or not np.allclose(old, point, rtol=1e-14, atol=0):
                         raise ValueError("Injection-scan methods do not share the same realized S/B and S/sqrt(B) axis")
                 axis_points[level] = point, counts
-    reference_axis = [point for point, _ in axis_points.values()]
-    for field, ylabel, stem in figure_specs:
-        fig, ax = new_figure("S/B (%)", ylabel)
-        drawn = 0
+    curves = {}
+    for field, _, _ in injection_figure_specs():
+        curves[field] = {}
         for method, levels in summaries.items():
             x, y, low, high, indices = [], [], [], [], []
             for level, replicas_data in levels:
@@ -3165,48 +3342,45 @@ def process_injection_scan(scan_groups, methods, loader, settings, output, forma
                 low.append(float(np.min(values)) if len(values) > 1 else np.nan)
                 high.append(float(np.max(values)) if len(values) > 1 else np.nan)
             if x:
-                order = np.argsort(x)
-                x, y, low, high = [np.asarray(values)[order] for values in (x, y, low, high)]
-                if show_missing_epochs:
-                    gaps = np.flatnonzero(np.abs(np.diff(np.asarray(indices)[order])) > 1) + 1
-                    x, y, low, high = [np.insert(values, gaps, np.nan) for values in (x, y, low, high)]
-                ax.plot(x, y, color=METHOD_COLORS.get(method), ls="-", marker="x",
-                        label=METHOD_LABELS.get(method, method))
-                ax.fill_between(x, low, high, where=np.isfinite(low) & np.isfinite(high), color=METHOD_COLORS.get(method), alpha=0.2, linewidth=0)
-                drawn += 1
-        if drawn:
-            if field == "nominal_selected":
-                for significance in (3, 5):
-                    ax.axhline(significance, color="0.5", ls=":", lw=0.7, label="_nolegend_")
-            ax.invert_xaxis()
-            top = ax.twiny()
-            top.set_xlim(ax.get_xlim())
-            if reference_axis:
-                ordered_axis = sorted(reference_axis, key=lambda item: item[1])
-                top.set_xticks([item[1] for item in ordered_axis])
-                top.set_xticklabels([f"{item[2]:.2g}" for item in ordered_axis])
-            top.set_xlabel(r"$S/\sqrt{B}$")
-            top.tick_params(axis="x", labelsize=6.7)
+                curves[field][method] = x, y, low, high, indices
+    return axis_points, curves
+
+
+def draw_injection_curves(curves, axis_points, destination, formats, overwrite, variant, show_missing_epochs):
+    reference_axis = [point for point, _ in axis_points.values()]
+    for field, ylabel, stem in injection_figure_specs():
+        series = curves.get(field, {})
+        if series:
+            factory = partial(injection_figure, field, ylabel, series, reference_axis, show_missing_epochs)
             legend = {"scan_legend": {"title": VARIANT_LABELS.get(variant, variant)}}
-            save_figure(fig, ax, destination / stem, formats, overwrite, legend)
-        else:
-            plt.close(fig)
-    rows = []
-    for method, levels in summaries.items():
-        for level, replicas_data in levels:
-            metrics = [metrics for row in replicas_data for metrics in row["run_metrics"]]
-            significance = [metric["max_sic"] * row["nominal"] for row in replicas_data
-                            for metric in row["run_metrics"]
-                            if metric["max_sic"] is not None and row["nominal"] is not None]
-            significance = np.asarray(significance, float)
-            significance = significance[np.isfinite(significance)]
-            rows.append({"Method": METHOD_LABELS.get(method, method), "N_inj": int(level),
-                         **performance_summary(metrics),
-                         "Max. achieved significance": float(significance.mean()) if len(significance) else None,
-                         "Max. achieved significance min": float(significance.min()) if len(significance) else None,
-                         "Max. achieved significance max": float(significance.max()) if len(significance) else None})
-    if rows:
-        write_table_rows(output / "07_tables" / f"table_04_{variant}_signal_injection_dependence", rows, file_formats)
+            save_prepared_figure(factory, destination / stem, formats, overwrite, legend)
+
+
+def injection_figure(field, ylabel, series, reference_axis, show_missing_epochs):
+    fig, ax = new_figure("S/B (%)", ylabel)
+    for method, (x, y, low, high, indices) in series.items():
+        order = np.argsort(x)
+        x, y, low, high = [np.asarray(values)[order] for values in (x, y, low, high)]
+        if show_missing_epochs:
+            gaps = np.flatnonzero(np.abs(np.diff(np.asarray(indices)[order])) > 1) + 1
+            x, y, low, high = [np.insert(values, gaps, np.nan) for values in (x, y, low, high)]
+        ax.plot(x, y, color=METHOD_COLORS.get(method), ls="-", marker="x",
+                label=METHOD_LABELS.get(method, method))
+        ax.fill_between(x, low, high, where=np.isfinite(low) & np.isfinite(high),
+                        color=METHOD_COLORS.get(method), alpha=0.2, linewidth=0)
+    if field == "nominal_selected":
+        for significance in (3, 5):
+            ax.axhline(significance, color="0.5", ls=":", lw=0.7, label="_nolegend_")
+    ax.invert_xaxis()
+    top = ax.twiny()
+    top.set_xlim(ax.get_xlim())
+    if reference_axis:
+        ordered_axis = sorted(reference_axis, key=lambda item: item[1])
+        top.set_xticks([item[1] for item in ordered_axis])
+        top.set_xticklabels([f"{item[2]:.2g}" for item in ordered_axis])
+    top.set_xlabel(r"$S/\sqrt{B}$")
+    top.tick_params(axis="x", labelsize=6.7)
+    return fig, ax
 
 
 def load_settings_file(path):
@@ -3236,7 +3410,7 @@ def parse_args(argv=None):
     parser.add_argument("--min-background", type=int, default=10)
     parser.add_argument("--io-workers", type=int, default=2, help="Parallel discovery, score/history loading and metric workers")
     parser.add_argument("--ram-cache-mb", type=int, default=1024,
-                        help="Total retained input-cache budget in MiB across loading and witness workers; 0 disables; no disk cache")
+                        help="RAM budget in MiB shared by verified inputs and reusable calculations. Use 0 to disable the cache.")
     parser.add_argument("--plot-workers", type=int, default=min(8, max(1, (os.cpu_count() or 1) // 2)),
                         help="CPU processes for legend layout, image rendering and projected Stein fields; 1 renders serially")
     parser.add_argument("--witness-field-events", type=int, default=16384,
@@ -3247,14 +3421,17 @@ def parse_args(argv=None):
                         help="NPZ with event_ids and physical weights_pb; otherwise mass spectra show events/TeV")
     parser.add_argument("--allow-partial-injection-scan", action="store_true")
     parser.add_argument("--focused", action="store_true",
-                        help="Selected normal publication plots and tables; projected Stein response uses seed 42 and z1-z2")
-    parser.add_argument("--checkpoint-policy", choices=("lowest-loss", "last", "both"), default="lowest-loss")
+                        help="Selected normal plots and tables (seed 42, z1-z2 witness), or only injection-dependence plots and tables for a scan")
+    parser.add_argument("--checkpoint-policy", choices=("lowest-loss", "last-epoch", "last", "both"), default="lowest-loss",
+                        help="Normal plots accept lowest-loss or last-epoch (also last). Scans also accept both.")
     parser.add_argument("--last-epoch", type=int, help="Require this exact saved one-based epoch")
     parser.add_argument("--checkpoint-trends", action="store_true", help="Plot only the saved per-seed epoch trend tables")
     parser.add_argument("--require-compatible-populations", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--verbose", type=int, choices=(0, 1, 2), default=1)
     args = parser.parse_args(argv)
+    if args.checkpoint_policy == "last-epoch":
+        args.checkpoint_policy = "last"
     if args.last_epoch is not None and (args.last_epoch < 1 or args.checkpoint_policy == "lowest-loss"):
         parser.error("--last-epoch requires a positive epoch and --checkpoint-policy last or both")
     if args.io_workers < 1 or args.plot_workers < 1 or args.min_background < 1:
@@ -3271,13 +3448,19 @@ def parse_args(argv=None):
             or (args.workflow == "scan" and normal_requested)):
         parser.error("The input arguments must match --workflow")
     args.workflow = args.workflow or ("scan" if scan_requested else "normal")
-    if args.focused and args.workflow != "normal":
-        parser.error("--focused is available for normal plots only")
+    if args.workflow == "normal" and args.checkpoint_policy == "both":
+        parser.error("--checkpoint-policy both is for injection scans. For normal plots choose lowest-loss or last-epoch.")
     args.results = args.results if args.results is not None else Path("results")
     args.data = args.data if args.data is not None else Path("data/lhco")
     args.scan_results = args.scan_results if args.scan_results is not None else Path("results_injection_scan")
     args.scan_data = args.scan_data if args.scan_data is not None else Path("data/injection_scan")
     return args
+
+
+def plot_cache_budgets(mebibytes):
+    total = mebibytes * 1024**2
+    calculations = min(total // 8, 32 * 1024**2)
+    return total - calculations, calculations
 
 
 def main(argv=None):
@@ -3286,11 +3469,13 @@ def main(argv=None):
     try:
         torch.set_num_threads(args.io_workers)
         if args.ram_cache_mb:
-            say(f"[RAM CACHE] Up to {args.ram_cache_mb} MiB for verified inputs across workers", args.verbose)
-        with threadpool_limits(limits=args.io_workers), ram_file_cache(args.ram_cache_mb * 1024**2) as cache:
+            say(f"[RAM CACHE] Up to {args.ram_cache_mb} MiB for verified inputs and shared calculations", args.verbose)
+        inputs, calculations = plot_cache_budgets(args.ram_cache_mb)
+        with threadpool_limits(limits=args.io_workers), plot_calculation_cache(calculations) as computed, ram_file_cache(inputs) as cache:
             result = run(args)
             if args.ram_cache_mb:
                 say(f"[RAM CACHE] Loader reused {cache.hits} reads ({cache.reused_bytes / 1024**2:.1f} MiB)", args.verbose, 2)
+                say(f"[RAM CACHE] Reused {computed['hits']} calculations", args.verbose, 2)
             return result
     finally:
         torch.set_num_threads(previous_threads)
@@ -3335,8 +3520,12 @@ def plot_checkpoint_trends(args, groups):
                         x, y = zip(*measured)
                         ax.plot(x, y, marker="o", label=f"Seed {seed}")
                 if ax.lines:
-                    destination = variant_output(args.output, variant) / "checkpoint_trends" / METHOD_LABELS[method] / str(point)
-                    save_figure(fig, ax, destination / stem, args.plot_formats, args.overwrite, inside_legend(ax))
+                    base = variant_output(args.output, variant)
+                    if args.workflow == "scan":
+                        path = base / "06_injection_scan" / folder_variant(variant) / f"checkpoint_trend_{method}_N_{point:06d}_{stem}"
+                    else:
+                        path = base / "02_training" / METHOD_LABELS[method] / SCENARIO_LABELS[point] / folder_variant(variant) / f"checkpoint_trend_{stem}"
+                    save_figure(fig, ax, path, args.plot_formats, args.overwrite, inside_legend(ax))
                 else:
                     plt.close(fig)
     return 0
@@ -3363,6 +3552,7 @@ def run(args):
     counts = defaultdict(lambda: [set(), set()])
     epochs_used = defaultdict(set)
     primary_seeds = defaultdict(set)
+    checkpoint_tasks = []
     for identity, group in groups_all.items():
         if identity[1] in args.exclude_seeds or (args.variants and identity[-1] not in args.variants):
             continue
@@ -3373,13 +3563,20 @@ def run(args):
                 if args.checkpoint_policy == "last":
                     selected.setdefault(identity, {})[method] = root, report
                 continue
-            pair = checkpoint_result(root, report, args.last_epoch)
-            key = method, identity[-1], identity[0]
-            primary_seeds[key].add(identity[1])
-            counts[key][0 if pair else 1].add(identity[1])
-            if pair:
-                selected.setdefault(identity, {})[method] = pair
-                epochs_used[key].update(pair[1]["checkpoint_policy"]["epoch_by_fit"].values())
+            checkpoint_tasks.append((identity, method, root, report))
+
+    def select_checkpoint(task):
+        identity, method, root, report = task
+        return identity, method, checkpoint_result(root, report, args.last_epoch)
+
+    for identity, method, pair in parallel_plot_tasks(select_checkpoint, checkpoint_tasks, args.io_workers,
+                                                       "CHECKPOINT LOAD", args.verbose):
+        key = method, identity[-1], identity[0]
+        primary_seeds[key].add(identity[1])
+        counts[key][0 if pair else 1].add(identity[1])
+        if pair:
+            selected.setdefault(identity, {})[method] = pair
+            epochs_used[key].update(pair[1]["checkpoint_policy"]["epoch_by_fit"].values())
     if scan:
         configuration = load_settings_file(args.config)["injection_scan"]
         expected = set(configuration.get("seeds", range(configuration.get("replicas", 0)))) - set(args.exclude_seeds)
@@ -3397,9 +3594,7 @@ def run(args):
             primary = primary_seeds[key]
             print(f"[CHECKPOINT] {key[0]} {key[1]} {key[2]} lowest-loss: {len(primary)} contributing seeds "
                   f"{sorted(primary)}; missing seeds {sorted((present | missing) - primary)}", flush=True)
-    label = args.checkpoint_policy + (f"_epoch_{args.last_epoch}" if args.last_epoch else "")
     options = copy(args)
-    options.output = args.output / label
     options.allow_partial_injection_scan = True
     if args.checkpoint_policy == "last":
         if not selected:
@@ -3407,13 +3602,12 @@ def run(args):
         options.methods = [m for m in select_requested_methods(groups_all, args.methods, allow_missing=scan, injection_scan=scan)
                            if any(m in group for group in selected.values())]
         return render_policy(options, selected)
-    overlay = CheckpointOverlay(METHODS, METHOD_COLORS, METHOD_LABELS)
+    overlay = CheckpointOverlay(METHODS, METHOD_COLORS, METHOD_LABELS, last_epoch=args.last_epoch)
     try:
         if selected:
             secondary = copy(options)
             secondary.checkpoint_policy = "last"
             secondary.methods = [m for m in METHODS if any(m in group for group in selected.values())]
-            secondary.output = options.output / "last"
             token = _CHECKPOINT_OVERLAY.set((overlay, secondary.output))
             try:
                 render_policy(secondary, selected)
@@ -3423,6 +3617,8 @@ def run(args):
         token = _CHECKPOINT_OVERLAY.set((overlay, options.output))
         try:
             result = render_policy(options, groups_all)
+            for key in list(overlay.tables):
+                write_table_rows(options.output / key, [], args.file_formats, overwrite=args.overwrite)
         finally:
             _CHECKPOINT_OVERLAY.reset(token)
         if overlay.curves:
@@ -3432,10 +3628,12 @@ def run(args):
                     save_figure(fig, ax, options.output / key, args.plot_formats, args.overwrite, legend)
         return result
     finally:
-        overlay.spool.cleanup()
+        if overlay.spool is not None:
+            overlay.spool.cleanup()
 
 
 def render_policy(args, groups_all):
+    overlay = _CHECKPOINT_OVERLAY.get()
     if args.overwrite and args.workflow == "normal" and not getattr(args, "focused", False):
         cleanup_legacy_summary_folders(args.output)
     scan = args.workflow == "scan"
@@ -3451,7 +3649,8 @@ def render_policy(args, groups_all):
         if variant not in discovered_variants:
             say(f"[WARN] No completed {variant} results found in the selected result folders", args.verbose)
     loader = ScoreLoader(safeguard_filtering=True, ensemble_fit_selection=True, io_workers=args.io_workers,
-                         device="cpu", eager_partitions=False)
+                         device="cpu", eager_partitions=False, scan_only=scan,
+                         focused=not scan and getattr(args, "focused", False))
     if scan:
         groups = {identity: {canonical_method(method): value for method, value in group.items()
                              if canonical_method(method) in methods and (not args.scenarios or value[1]["scenario"] in args.scenarios)}
@@ -3461,7 +3660,7 @@ def render_policy(args, groups_all):
         if not groups:
             raise SystemExit("No completed injection-scan results remain after applying filters")
         say("[SUMMARY] Mean across completed seeds; bands show the min–max range across seeds", args.verbose)
-        with render_resources(args.plot_workers, args.verbose, args.output) as renderer:
+        with render_resources(args.plot_workers, args.verbose, args.output):
             for variant in variants:
                 if variant not in discovered_variants:
                     continue
@@ -3473,10 +3672,11 @@ def render_policy(args, groups_all):
                                        args.require_compatible_populations, variant=variant,
                                        io_workers=args.io_workers, excluded_seeds=args.exclude_seeds,
                                        show_missing_epochs=args.checkpoint_policy == "last")
-                renderer.flush()
-                plot_dijet_spectra({identity: group for identity, group in groups.items() if identity[3] == variant},
-                                   args, destination, scan=True)
-        say(f"[DONE] Injection-scan outputs written to {args.output}", args.verbose)
+                if not getattr(args, "focused", False):
+                    plot_dijet_spectra({identity: group for identity, group in groups.items() if identity[3] == variant},
+                                       args, destination, scan=True)
+        if overlay is None or not overlay[0].last:
+            say(f"[DONE] Injection-scan outputs written to {args.output}", args.verbose)
         return 0
     scenarios = list(args.scenarios) if args.scenarios else sorted({identity[0] for identity in groups_all}, key=lambda value: ("signal_injection", "background_only").index(value))
     regions = ["signal_region"]
@@ -3530,11 +3730,9 @@ def render_publication_outputs(args, groups, cache, records, loader, scenarios, 
         plot_stein(groups, records, args.output, args.plot_formats, args.overwrite)
     say("[STAGE] Build projected Stein-witness diagnostics", args.verbose)
     plot_projected_witness(groups, records, args, args.output)
-    overlay = _CHECKPOINT_OVERLAY.get()
-    if overlay is None or not overlay[0].last:
-        say("[STAGE] Render training histories", args.verbose)
-        plot_training(groups, args.output, args.plot_formats, args.overwrite,
-                      io_workers=args.io_workers, verbose=args.verbose, focused=focused)
+    say("[STAGE] Render training histories", args.verbose)
+    plot_training(groups, args.output, args.plot_formats, args.overwrite,
+                  io_workers=args.io_workers, verbose=args.verbose, focused=focused)
     say("[STAGE] Export publication tables", args.verbose)
     export_tables(groups, cache, loader, args.output, args.file_formats, args.data, args.verbose)
 

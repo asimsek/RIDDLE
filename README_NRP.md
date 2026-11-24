@@ -311,7 +311,7 @@ kubectl exec -n cua-asimsek \
 cd /shared/work/RIDDLE
 
 python paper_plot.py --data data/lhco --results results --focused \
-  --config config/settings.yaml --output paper_plots_all \
+  --config config/settings.yaml --output paper_plots \
   --methods riddle iad supervised lacathode --variants default deltaR shifted \
   --plot-formats pdf --file-formats csv --io-workers 16 --plot-workers 16 --overwrite --verbose 1
 ```

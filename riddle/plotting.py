@@ -514,37 +514,59 @@ class NoValidFits(ValueError):
     """A result cannot be plotted, but other method/run results can continue."""
 
 
-def load_scores(root, report, name, *, attempt=None, for_rebuild=False):
+def _stored_array_shape(archive, key):
+    with archive.zip.open(key + ".npy") as member:
+        version = np.lib.format.read_magic(member)
+        if version == (1, 0):
+            return np.lib.format.read_array_header_1_0(member)[0]
+        if version == (2, 0):
+            return np.lib.format.read_array_header_2_0(member)[0]
+    return archive[key].shape
+
+
+@f.cached_plot_calculation
+def _validate_plot_event_ids(ids):
+    from .mass_spectrum import event_keys
+
+    event_keys(ids)
+
+
+def load_scores(root, report, name, *, attempt=None, for_rebuild=False, scan_only=False, focused=False):
     method = method_family(report.get("method"))
     relative = Path(name + "_scores.npz")
     if attempt is not None:
         relative = Path(attempt) / relative
+    saved_health = None
+    compact = scan_only or (focused and "method_health.json" in report.get("artifacts_sha256", {}))
+    if (compact and attempt is None and not for_rebuild and method in RIDDLE_NATIVE_METHODS
+            and "score_health.json" in report.get("artifacts_sha256", {})):
+        health = read_metadata(root, report, "score_health.json")
+        if health.get("schema") == 1 and health.get("method") == method and health.get("status") == "passed":
+            saved_health = health.get("partitions", {}).get(name)
     path = verify_plot_input(root, report, str(relative))
     with open_npz(path, allow_pickle=False) as archive:
+        names = set(archive.files)
+        mapping_shapes = ({k: _stored_array_shape(archive, k) for k in ("latent", "density_inputs") if k in names}
+                          if saved_health is not None else {})
         fields = ("mass", "labels", "mask", "scores", "physical")
-        if method == "lacathode" or "latent" in archive:
+        if method == "lacathode" or ((focused or saved_health is None) and "latent" in names):
             fields += ("latent",)
         data = {k: archive[k] for k in fields}
-
-
-
-        if method in RIDDLE_NATIVE_METHODS and "density_inputs" in archive:
+        if saved_health is None and method in RIDDLE_NATIVE_METHODS and "density_inputs" in names:
             data["density_inputs"] = archive["density_inputs"]
-            if "background_log_density" in archive:
+            if "background_log_density" in names:
                 data["background_log_density"] = archive["background_log_density"]
-        for key in ("raw_scores", "score_kind", "fit_score_kind", "event_ids",
-                    "preprocessing_mask", "score_domain_mask", "score_scope",
-                    "accepted_fit_indices", "accepted_fit_seeds", "fit_indices",
-                    "pew_scores", "potential_qnorm_scores", "selected_scoring_mode",
-                    "auto_switch_enabled", "score_selection_sha256"):
-            if key in archive:
-                data[key] = archive[key]
-        if "fit_scores" in archive:
+        fields = ("score_kind", "fit_score_kind", "event_ids", "preprocessing_mask", "score_domain_mask", "score_scope")
+        if saved_health is None:
+            fields += ("raw_scores", "accepted_fit_indices", "accepted_fit_seeds", "fit_indices", "pew_scores",
+                       "potential_qnorm_scores", "selected_scoring_mode", "auto_switch_enabled", "score_selection_sha256")
+        data.update({key: archive[key] for key in fields if key in names})
+        if saved_health is None and "fit_scores" in names:
             data["fit_scores"] = archive["fit_scores"]
             if report.get("contract", {}).get("lacathode_run_layout") == "independent_background_classifier_v1":
                 data["fit_latents"] = archive["fit_latents"]
                 data["run_seeds"] = archive["run_seeds"]
-        if "is_signal_region" in archive:
+        if "is_signal_region" in names:
             data["is_signal_region"] = archive["is_signal_region"]
             region = data["is_signal_region"]
             if region.shape != data["mass"].shape or region.dtype != bool:
@@ -561,7 +583,7 @@ def load_scores(root, report, name, *, attempt=None, for_rebuild=False):
         if method in RIDDLE_NATIVE_METHODS:
             from .production import validate_region
 
-            if "is_signal_region" not in archive:
+            if "is_signal_region" not in names:
                 raise ValueError(f"{BUILTINS[method].label} SR membership is missing; regenerate its score artifacts")
             data["is_signal_region"] = validate_region(data["is_signal_region"], len(data["mass"]))
             if name == "signal_region" and not data["is_signal_region"].all():
@@ -584,11 +606,9 @@ def load_scores(root, report, name, *, attempt=None, for_rebuild=False):
     if any(data[k].shape != (n,) for k in ("mass", "labels", "scores", "mask")):
         raise ValueError("Misaligned score arrays")
     mapped_rows = int(data["mask"].sum())
-    invalid_mapping_shape = (
-        ("latent" in data and data["latent"].shape != (mapped_rows, latent_dimensions))
-        or ("density_inputs" in data and data["density_inputs"].shape != (mapped_rows, latent_dimensions))
-        or ("background_log_density" in data and data["background_log_density"].shape != (mapped_rows,))
-    )
+    mapping_shapes.update({k: data[k].shape for k in ("latent", "density_inputs") if k in data})
+    invalid_mapping_shape = (any(shape != (mapped_rows, latent_dimensions) for shape in mapping_shapes.values())
+                             or ("background_log_density" in data and data["background_log_density"].shape != (mapped_rows,)))
     if data["mask"].dtype != bool or data["physical"].shape != (n, physical_dimensions) or invalid_mapping_shape:
         details = (f"physical={data['physical'].shape}, expected={(n, physical_dimensions)}; "
                    f"mask accepted={mapped_rows}; latent={data.get('latent', np.empty((0,))).shape if 'latent' in data else 'absent'}, "
@@ -611,7 +631,18 @@ def load_scores(root, report, name, *, attempt=None, for_rebuild=False):
     if (not data["mask"].any() or not np.isfinite(data["scores"][data["mask"]]).all()
             or not np.isnan(data["scores"][~data["mask"]]).all()):
         raise InvalidFitScores(f"{path}: empty/nonfinite accepted scores or invalid rejected-event scores")
-    validate_score_record(data, method=method, stage=str(path))
+    validation_data = data
+    ids = data.get("event_ids")
+    if ids is not None and ids.shape == (n, 2) and ids.dtype == np.uint64:
+        try:
+            _validate_plot_event_ids(ids)
+        except ValueError as error:
+            raise ValueError(f"{path}: invalid or duplicate evaluation event identities") from error
+        validation_data = {key: value for key, value in data.items() if key != "event_ids"}
+    health = validate_score_record(validation_data, method=method, stage=str(path))
+    if saved_health is not None and any(saved_health.get(key) != health[key]
+                                        for key in ("events", "rejected_events", "minimum", "maximum")):
+        raise ValueError(f"{path}: saved ensemble scores disagree with their registered health report")
     if method in RIDDLE_NATIVE_METHODS and "method_health.json" in report.get("artifacts_sha256", {}):
         data["plot_saved_ensemble"] = True
     if method == "lacathode":
@@ -1042,10 +1073,11 @@ def _riddle_saved_fit_scores(root, report, partition):
     return fits, np.asarray(indices, dtype=np.int64), score_kind
 
 
-def apply_riddle_ensemble_fit_selection(root, report, records, audit, *, enabled=True):
+def apply_riddle_ensemble_fit_selection(root, report, records, audit, *, enabled=True, selection=None):
     from .production import select_ensemble_members
 
-    selection = read_metadata(root, report, "density/ensemble_selection.json")
+    if selection is None:
+        selection = read_metadata(root, report, "density/ensemble_selection.json")
     config = next(c for c in selection["configurations"] if c["name"] == selection["selected_configuration"])
     accepted = [dict(m, fit_index=m.get("fit_index", i)) for i, m in enumerate(
         selection.get("accepted_members", config.get("accepted_members", selection["members"])))
@@ -1131,7 +1163,7 @@ class ScoreLoader:
     """Load saved method predictions once; ensemble members are not repeat runs."""
 
     def __init__(self, *, safeguard_filtering=True, ensemble_fit_selection=True, io_workers=2, device="cpu",
-                 eager_partitions=True):
+                 eager_partitions=True, scan_only=False, focused=False):
         self.cache = {}
         self.validated = set()
         self.fit_audit = {}
@@ -1139,7 +1171,9 @@ class ScoreLoader:
         self.ensemble_fit_selection = ensemble_fit_selection
         self.io_workers = io_workers
         self.device = plot_device_argument(device)
-        self.eager_partitions = eager_partitions
+        self.eager_partitions = eager_partitions and not scan_only
+        self.scan_only = scan_only
+        self.focused = focused
         self._load_locks = {}
         self._load_guard = threading.Lock()
         self._inference_lock = threading.Lock()
@@ -1149,12 +1183,20 @@ class ScoreLoader:
         with self._load_guard:
             lock = self._load_locks.setdefault(identity, threading.Lock())
         with lock:
-            return self._load(root, report, partition, identity)
+            try:
+                return self._load(root, report, partition, identity)
+            finally:
+                if self.scan_only:
+                    for name in ("validation", "test", "signal_region"):
+                        self.cache.pop((identity, name), None)
+                    self.fit_audit.pop(identity, None)
+                    self.validated.discard(identity)
 
     def _load(self, root, report, partition, identity):
         method = method_family(report["method"])
         legacy_riddle = method == "riddle" and report.get("contract", {}).get("scientific_version", 1) < 3
         if identity not in self.validated:
+            selection = None
             if method in ("riddle", "iad", "supervised", "ranode") and (not self.safeguard_filtering or legacy_riddle or method == "ranode"):
                 if not self.safeguard_filtering:
                     records, audit = unfiltered_plot_ensemble(root, report)
@@ -1200,9 +1242,10 @@ class ScoreLoader:
                 names = ("validation", "test", "signal_region") if self.eager_partitions else (partition,)
                 for name in names:
                     key = (identity, name)
-                    records[name] = self.cache.get(key) if key in self.cache else load_scores(root, report, name)
+                    records[name] = self.cache[key] if key in self.cache else load_scores(
+                        root, report, name, scan_only=self.scan_only, focused=self.focused)
                 records, audit = apply_riddle_ensemble_fit_selection(
-                    root, report, records, self.fit_audit[identity], enabled=self.ensemble_fit_selection
+                    root, report, records, self.fit_audit[identity], enabled=self.ensemble_fit_selection, selection=selection
                 )
                 self.cache.update({(identity, name): record for name, record in records.items()})
                 self.fit_audit[identity] = audit
@@ -1215,7 +1258,7 @@ class ScoreLoader:
             self.validated.add(identity)
         key = (identity, partition)
         if key not in self.cache:
-            record = load_scores(root, report, partition)
+            record = load_scores(root, report, partition, focused=self.focused)
             if method in RIDDLE_NATIVE_METHODS and not legacy_riddle:
                 selected, audit = apply_riddle_ensemble_fit_selection(
                     root, report, {partition: record}, self.fit_audit[identity], enabled=self.ensemble_fit_selection
@@ -2865,58 +2908,49 @@ def background_cuts(record, budgets):
 
 
 def exact_background_selection(record, budget):
-    """Set exact empirical BG efficiency using equal fractional weights at score ties.
-    Apply the BG-derived boundary weights to signal too; evaluation only."""
+    return next(exact_background_selections(record, (budget,)))
+
+
+def exact_background_selections(record, budgets):
+    """Share the background ordering across cuts and weight tied events equally."""
     labels = np.asarray(record["labels"])
     mask = np.asarray(record["mask"], dtype=bool)
-    total_background = int(np.sum(labels == 0))
-    total_signal = int(np.sum(labels == 1))
-    target = float(budget) * total_background
-    if total_background <= 0 or target <= 0:
-        return None
-
-    rows, cuts, fractions = [], [], []
+    background, signal = labels == 0, labels == 1
+    total_background, total_signal = int(background.sum()), int(signal.sum())
+    if total_background == 0:
+        yield from (None for _ in budgets)
+        return
+    members = []
     for scores in fit_scores(record):
         scores = np.asarray(scores, dtype=float)
-        available = mask & (labels == 0) & np.isfinite(scores)
-        bg_scores = scores[available]
-        if len(bg_scores) < int(np.ceil(target)):
-            return None
-        ordered = np.sort(bg_scores)[::-1]
-        boundary = float(ordered[int(np.ceil(target)) - 1])
-        higher_background = int(np.sum(bg_scores > boundary))
-        tied_background = int(np.sum(bg_scores == boundary))
-        if tied_background < 1:
-            raise ValueError("Exact background working point has no boundary tie")
-        fraction = float((target - higher_background) / tied_background)
-
-        fraction = float(np.clip(fraction, 0.0, 1.0))
-        weights = np.zeros(len(scores), dtype=float)
         finite = mask & np.isfinite(scores)
-        weights[finite & (scores > boundary)] = 1.0
-        weights[finite & (scores == boundary)] = fraction
-        rows.append(weights)
-        cuts.append(boundary)
-        fractions.append(fraction)
-
-    weights = np.asarray(rows)
-    bg_eff = float(np.mean(np.sum(weights[:, labels == 0], axis=1) / total_background))
-    sig_eff = (
-        float(np.mean(np.sum(weights[:, labels == 1], axis=1) / total_signal))
-        if total_signal > 0 else None
-    )
-
-
-    if not np.isclose(bg_eff, budget, rtol=0, atol=5e-15):
-        raise ValueError(f"Exact background selection failed: {bg_eff} != {budget}")
-    return dict(
-        weights=weights,
-        cuts=np.asarray(cuts, dtype=float),
-        boundary_fractions=np.asarray(fractions, dtype=float),
-        background_efficiency=float(budget),
-        signal_efficiency=sig_eff,
-        fit_count=len(weights),
-    )
+        members.append((scores, finite, np.sort(scores[finite & background])))
+    for budget in budgets:
+        target = float(budget) * total_background
+        if target <= 0:
+            yield None
+            continue
+        position = int(np.ceil(target))
+        if any(len(ordered) < position for _, _, ordered in members):
+            yield None
+            continue
+        weights = np.zeros((len(members), len(labels)), dtype=float)
+        cuts, fractions = [], []
+        for row, (scores, finite, ordered) in zip(weights, members):
+            boundary = ordered[-position]
+            right = ordered.searchsorted(boundary, side="right")
+            tied = right - ordered.searchsorted(boundary, side="left")
+            fraction = float(np.clip((target - (len(ordered) - right)) / tied, 0.0, 1.0))
+            row[finite & (scores > boundary)] = 1.0
+            row[finite & (scores == boundary)] = fraction
+            cuts.append(boundary)
+            fractions.append(fraction)
+        bg_eff = float(np.mean(np.sum(weights[:, background], axis=1) / total_background))
+        sig_eff = float(np.mean(np.sum(weights[:, signal], axis=1) / total_signal)) if total_signal else None
+        if not np.isclose(bg_eff, budget, rtol=0, atol=5e-15):
+            raise ValueError(f"Exact background selection failed: {bg_eff} != {budget}")
+        yield dict(weights=weights, cuts=np.asarray(cuts), boundary_fractions=np.asarray(fractions),
+                   background_efficiency=float(budget), signal_efficiency=sig_eff, fit_count=len(weights))
 
 
 def weighted_selection_efficiency(record, selection, truth):
@@ -4002,14 +4036,6 @@ def _witness_field_progress(message, args):
 
 
 
-def _witness_sha256(path):
-    h = hashlib.sha256()
-    with Path(path).open("rb") as stream:
-        for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
-            h.update(block)
-    return h.hexdigest()
-
-
 def _witness_sample_indices(count, limit, seed):
     if count <= limit:
         return np.arange(count)
@@ -4024,21 +4050,29 @@ def _witness_identity_rows(ids):
     return ids.view(np.dtype([("source", "<u8"), ("entry", "<u8")])).reshape(-1)
 
 
-def witness_population_mask(data, report, record, mode):
-    directory = data if (data / "inputs.json").is_file() else data / report["scenario"]
-    inputs = report["contract"]["inputs"]
-    path = directory / "event_ids.npz"
-    if _witness_sha256(path) != inputs.get("event_ids_sha256"):
-        raise ValueError("Prepared event IDs differ from the saved result; supply its original --data directory")
+@f.cached_plot_calculation
+def _prepared_witness_population(path, checksum, mode):
     with open_npz(path, allow_pickle=False) as archive:
         primary = archive["innerdata_test.npy"]
         extra_bg = archive["innerdata_extrabkg_test.npy"]
         extra_signal = archive["innerdata_extrasig.npy"]
     expected = np.concatenate((primary, extra_bg, extra_signal))
+    if file_digest(path) != checksum:
+        raise ValueError(f"Prepared witness population changed while reading {path}")
+    chosen = primary if mode == "primary" else np.concatenate((primary, extra_bg)) if mode == "injected" else expected
+    return expected, np.isin(_witness_identity_rows(expected), _witness_identity_rows(chosen))
+
+
+def witness_population_mask(data, report, record, mode):
+    directory = data if (data / "inputs.json").is_file() else data / report["scenario"]
+    path = directory / "event_ids.npz"
+    checksum = file_digest(path)
+    if checksum != report["contract"]["inputs"].get("event_ids_sha256"):
+        raise ValueError("Prepared event IDs differ from the saved result; supply its original --data directory")
+    expected, mask = _prepared_witness_population(path, checksum, mode)
     if not np.array_equal(expected, record.get("event_ids")):
         raise ValueError("SR scores do not match the prepared evaluation event IDs and order")
-    chosen = primary if mode == "primary" else np.concatenate((primary, extra_bg)) if mode == "injected" else expected
-    return np.isin(_witness_identity_rows(expected), _witness_identity_rows(chosen)), directory
+    return mask, directory
 
 
 def _witness_model_fields(model, inputs, qscore, device, batch_size):

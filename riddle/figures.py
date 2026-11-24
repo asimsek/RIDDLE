@@ -1,5 +1,5 @@
 from collections import OrderedDict, deque
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor
 from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
@@ -12,6 +12,7 @@ import multiprocessing
 import pickle
 import re
 import sys
+from threading import Lock
 import matplotlib
 
 matplotlib.use("Agg")
@@ -164,19 +165,50 @@ def cached_plot_calculation(function):
             return function(*args, **kwargs)
         key = (function.__module__, function.__qualname__, _calculation_key(args), _calculation_key(kwargs))
         entries = cache["entries"]
-        if key in entries:
-            entries.move_to_end(key)
-            return deepcopy(entries[key][0])
-        result = function(*args, **kwargs)
-        size = _calculation_bytes(key) + _calculation_bytes(result)
-        if size <= cache["limit"]:
-            while entries and (cache["bytes"] + size > cache["limit"] or len(entries) >= 4096):
-                _, (_, old_size) = entries.popitem(last=False)
-                cache["bytes"] -= old_size
-            entries[key] = (deepcopy(result), size)
-            cache["bytes"] += size
-        return result
+        with cache["lock"]:
+            if key in entries:
+                entries.move_to_end(key)
+                cache["hits"] += 1
+                return deepcopy(entries[key][0])
+            pending = cache["pending"]
+            owner = key not in pending
+            if owner:
+                pending[key] = Future()
+            else:
+                cache["hits"] += 1
+            future = pending[key]
+        if not owner:
+            return deepcopy(future.result())
+        try:
+            result = function(*args, **kwargs)
+            size = _calculation_bytes(key) + _calculation_bytes(result)
+            snapshot = deepcopy(result)
+            with cache["lock"]:
+                if size <= cache["limit"]:
+                    while entries and (cache["bytes"] + size > cache["limit"] or len(entries) >= 4096):
+                        _, (_, old_size) = entries.popitem(last=False)
+                        cache["bytes"] -= old_size
+                    entries[key] = (snapshot, size)
+                    cache["bytes"] += size
+                future.set_result(snapshot)
+                del pending[key]
+            return result
+        except BaseException as error:
+            with cache["lock"]:
+                future.set_exception(error)
+                del pending[key]
+            raise
     return calculate
+
+
+@contextmanager
+def plot_calculation_cache(max_bytes):
+    cache = dict(entries=OrderedDict(), bytes=0, limit=max_bytes, lock=Lock(), pending={}, hits=0)
+    token = _PLOT_CACHE.set(cache)
+    try:
+        yield cache
+    finally:
+        _PLOT_CACHE.reset(token)
 
 
 
@@ -254,13 +286,12 @@ def plot_resources(*, workers=1, cache_mb=1024):
     if workers < 1 or cache_mb < 0:
         raise ValueError("Plot workers must be positive and cache size nonnegative")
     exporter = FigureExporter(workers)
-    cache_token = _PLOT_CACHE.set(dict(entries=OrderedDict(), bytes=0, limit=cache_mb * 1024**2))
     export_token = _FIGURE_EXPORTER.set(exporter)
     try:
-        yield exporter
-        exporter.flush()
+        with plot_calculation_cache(cache_mb * 1024**2):
+            yield exporter
+            exporter.flush()
     finally:
-        _PLOT_CACHE.reset(cache_token)
         _FIGURE_EXPORTER.reset(export_token)
         exporter.close()
 

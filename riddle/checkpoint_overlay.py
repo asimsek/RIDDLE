@@ -14,17 +14,23 @@ from matplotlib.transforms import IdentityTransform
 
 
 class CheckpointOverlay:
-    def __init__(self, methods, colors, labels):
+    def __init__(self, methods, colors, labels, *, last_epoch=None):
         self.methods = {labels[key] for key in methods}
         self.colors = {tuple(to_rgb(colors[key])) for key in methods}
         self.curves = {}
         self.surfaces = set()
+        self.tables = {}
+        self.scan_points = {}
+        self.last_epoch = last_epoch
         self.last = True
-        self.spool = tempfile.TemporaryDirectory(prefix="riddle-checkpoint-figures-")
+        self.spool = None
         self.buffered = 0
 
     def take(self, key):
         path = self.curves.pop(key)
+        if isinstance(path, tuple):
+            factory, legend = path
+            return (*factory(), legend)
         if isinstance(path, bytes):
             self.buffered -= len(path)
             return pickle.loads(path)
@@ -33,8 +39,30 @@ class CheckpointOverlay:
         path.unlink()
         return payload
 
-    def _artists(self, ax, stem):
-        single_method = any(part in self.methods for part in stem.parts)
+    def table_rows(self, key, rows):
+        if self.last:
+            if rows:
+                self.tables[key] = rows
+            return []
+        last = self.tables.pop(key, [])
+        remaining = {(row["Method"], row["N_inj"]): row for row in last}
+        combined = []
+        for row in rows:
+            other = remaining.pop((row["Method"], row["N_inj"]), None)
+            if other is not None:
+                combined.append((other, "last"))
+            policy = "lowest-loss" if row["Method"] in self.methods else "native"
+            combined.append((row, policy))
+        combined.extend((row, "last") for row in remaining.values())
+        result = [{**row, "Checkpoint policy": policy} for row, policy in combined]
+        if self.last_epoch is not None:
+            for row in result:
+                row["Last epoch"] = self.last_epoch if row["Checkpoint policy"] == "last" else None
+        return result
+
+    @staticmethod
+    def _artists(ax, stem, methods, colors):
+        single_method = any(part in methods for part in stem.parts)
         for artist in [*ax.lines, *ax.patches, *ax.collections]:
             if artist.get_gid() == "signal_region_boundary" or artist.get_transform() != ax.transData:
                 continue
@@ -51,7 +79,7 @@ class CheckpointOverlay:
                     continue
                 color = color[0]
             label = artist.get_label() or ""
-            if single_method or label in self.methods or tuple(to_rgb(color)) in self.colors:
+            if single_method or label in methods or tuple(to_rgb(color)) in colors:
                 yield artist, color
 
     @staticmethod
@@ -103,45 +131,51 @@ class CheckpointOverlay:
         if surface or any(axis.images for axis in fig.axes):
             if self.last:
                 self.surfaces.add(key)
-            elif key not in self.surfaces:
                 return stem
-            return stem.with_name(stem.name + ("_last" if self.last else "_lowest-loss"))
+            return None if key in self.surfaces or "05_stein_witness" in key.parts else stem
         if self.last:
-            if any(next(self._artists(axis, key), None) is not None for axis in fig.axes):
+            if any(next(self._artists(axis, key, self.methods, self.colors), None) is not None for axis in fig.axes):
                 payload = pickle.dumps((fig, ax, legend), protocol=pickle.HIGHEST_PROTOCOL)
                 if self.buffered + len(payload) <= 128 * 1024**2:
                     self.curves[key] = payload
                     self.buffered += len(payload)
                 else:
+                    if self.spool is None:
+                        self.spool = tempfile.TemporaryDirectory(prefix="riddle-checkpoint-figures-")
                     path = Path(self.spool.name) / f"{len(self.curves)}.pickle"
                     path.write_bytes(payload)
                     self.curves[key] = path
             return None
+        other = self.take(key)[0] if key in self.curves else None
+        self.compose_curves(fig, key, self.methods, self.colors, other)
+        return stem
+
+    @classmethod
+    def compose_curves(cls, fig, key, methods, colors, other):
         additions = []
         limits = []
-        if key in self.curves:
-            other, _, _ = self.take(key)
-            additions = [[self._clone(artist) for artist, _ in self._artists(axis, key)] for axis in other.axes]
+        if other is not None:
+            additions = [[cls._clone(artist) for artist, _ in cls._artists(axis, key, methods, colors)] for axis in other.axes]
             limits = [axis.get_ylim() for axis in other.axes]
             plt.close(other)
         for i, axis in enumerate(fig.axes):
-            artists = list(self._artists(axis, key))
+            artists = list(cls._artists(axis, key, methods, colors))
             handles, labels = axis.get_legend_handles_labels()
             native_artists = {artist for artist, _ in artists}
             original = {}
             for handle, label in zip(handles, labels):
                 if handle in native_artists:
-                    original[label] = self._clone(handle)
+                    original[label] = cls._clone(handle)
                 elif isinstance(handle, ErrorbarContainer):
                     line, caps, bars = handle.lines
                     if any(a in native_artists for a in (line, *caps, *bars)):
-                        elements = (self._clone(line) if line is not None else None,
-                                    tuple(self._clone(a) for a in caps), tuple(self._clone(a) for a in bars))
+                        elements = (cls._clone(line) if line is not None else None,
+                                    tuple(cls._clone(a) for a in caps), tuple(cls._clone(a) for a in bars))
                         original[label] = ErrorbarContainer(elements, has_xerr=handle.has_xerr, has_yerr=handle.has_yerr)
             if original:
                 axis._checkpoint_legend_handles = original
             for artist, color in artists:
-                self._fade(artist, color)
+                cls._fade(artist, color)
             for artist in additions[i] if i < len(additions) else ():
                 artist.set_transform(axis.transData)
                 if isinstance(artist, Line2D):
@@ -156,4 +190,3 @@ class CheckpointOverlay:
                     current = axis.get_ylim()
                     bounds = sorted((*current, *limits[i]))
                     axis.set_ylim((bounds[-1], bounds[0]) if current[0] > current[1] else (bounds[0], bounds[-1]))
-        return stem
